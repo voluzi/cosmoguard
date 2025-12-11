@@ -1,4 +1,4 @@
-module github.com/NibiruChain/cosmoguard
+module github.com/voluzi/cosmoguard
 
 go 1.24.0
 

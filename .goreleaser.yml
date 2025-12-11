@@ -22,8 +22,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/NibiruChain/cosmoguard/pkg/cosmoguard.Version={{ .Version }}
-      - -X github.com/NibiruChain/cosmoguard/pkg/cosmoguard.CommitHash={{ .Commit }}
+      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.Version={{ .Version }}
+      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.CommitHash={{ .Commit }}
 
   - id: linux
     main: ./cmd/cosmoguard
@@ -42,8 +42,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/NibiruChain/cosmoguard/pkg/cosmoguard.Version={{ .Version }}
-      - -X github.com/NibiruChain/cosmoguard/pkg/cosmoguard.CommitHash={{ .Commit }}
+      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.Version={{ .Version }}
+      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.CommitHash={{ .Commit }}
 
 universal_binaries:
   - id: darwin

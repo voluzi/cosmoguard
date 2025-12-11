@@ -8,7 +8,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NibiruChain/cosmoguard/pkg/util"
+	"github.com/voluzi/cosmoguard/pkg/util"
 )
 
 type UpstreamPool struct {

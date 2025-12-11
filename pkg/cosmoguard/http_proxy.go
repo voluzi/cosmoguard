@@ -12,8 +12,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NibiruChain/cosmoguard/pkg/cache"
-	"github.com/NibiruChain/cosmoguard/pkg/util"
+	"github.com/voluzi/cosmoguard/pkg/cache"
+	"github.com/voluzi/cosmoguard/pkg/util"
 )
 
 type EndpointHandler interface {

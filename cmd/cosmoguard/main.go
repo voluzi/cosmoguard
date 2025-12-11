@@ -8,7 +8,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NibiruChain/cosmoguard/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
 )
 
 const (

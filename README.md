@@ -1,9 +1,9 @@
 # CosmoGuard
 
-[![Test](https://github.com/NibiruChain/cosmoguard/actions/workflows/test.yml/badge.svg)](https://github.com/NibiruChain/cosmoguard/actions/workflows/test.yml)
-[![GoReleaser](https://github.com/NibiruChain/cosmoguard/actions/workflows/goreleaser.yml/badge.svg)](https://github.com/NibiruChain/cosmoguard/actions/workflows/goreleaser.yml)
-[![Docker Builds](https://github.com/NibiruChain/cosmoguard/actions/workflows/docker.yml/badge.svg)](https://github.com/NibiruChain/cosmoguard/actions/workflows/docker.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/NibiruChain/cosmoguard/blob/main/LICENSE.md)
+[![Test](https://github.com/voluzi/cosmoguard/actions/workflows/test.yml/badge.svg)](https://github.com/voluzi/cosmoguard/actions/workflows/test.yml)
+[![GoReleaser](https://github.com/voluzi/cosmoguard/actions/workflows/goreleaser.yml/badge.svg)](https://github.com/voluzi/cosmoguard/actions/workflows/goreleaser.yml)
+[![Docker Builds](https://github.com/voluzi/cosmoguard/actions/workflows/docker.yml/badge.svg)](https://github.com/voluzi/cosmoguard/actions/workflows/docker.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/voluzi/cosmoguard/blob/main/LICENSE.md)
 
 ## Introduction
 **CosmoGuard** is a specialized firewall designed for Cosmos nodes. It offers fine-grained control over API access by allowing node administrators to manage access at the API endpoint level, rather than just by port. Additionally, it features a caching mechanism to optimize performance by caching responses for specified endpoints.
@@ -37,7 +37,7 @@
 
 An official docker image is available. You can use it by mounting config file at the root path (or use `-config` flag if you want to mount it somewhere else):
 ```bash
-$ docker run -it --name cosmoguard -v /path/to/config/file.yaml:/root/cosmoguard.yaml ghcr.io/nibiruchain/cosmoguard --help
+$ docker run -it --name cosmoguard -v /path/to/config/file.yaml:/root/cosmoguard.yaml ghcr.io/voluzi/cosmoguard --help
 Usage of cosmoguard:
   -config string
     	Path to configuration file. (default "/root/cosmoguard.yaml")
@@ -52,7 +52,7 @@ Usage of cosmoguard:
 #### Build from source
 1. Clone the repo and install using Makefile:
 ```bash
-$ git clone https://github.com/NibiruChain/cosmoguard.git
+$ git clone https://github.com/voluzi/cosmoguard.git
 $ cd cosmoguard
 $ make install
 ```

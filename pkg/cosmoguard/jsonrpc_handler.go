@@ -14,7 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NibiruChain/cosmoguard/pkg/cache"
+	"github.com/voluzi/cosmoguard/pkg/cache"
 )
 
 type JsonRpcHandler struct {

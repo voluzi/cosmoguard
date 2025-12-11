@@ -9,7 +9,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/segmentio/fasthash/fnv1a"
 
-	"github.com/NibiruChain/cosmoguard/pkg/cache"
+	"github.com/voluzi/cosmoguard/pkg/cache"
 )
 
 var (
