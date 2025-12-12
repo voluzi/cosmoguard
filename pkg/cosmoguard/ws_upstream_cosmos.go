@@ -129,8 +129,16 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(msg *JsonRpcMsg) {
 func (u *UpstreamConnManagerCosmos) makeRequestWithID(id string, req *JsonRpcMsg) (*JsonRpcMsg, error) {
 	request := req.CloneWithID(id)
 
+	// Check if client is connected before attempting to send
+	if u.client == nil || u.client.IsClosed() {
+		return nil, ErrClosed
+	}
+
+	// Create a buffered channel to prevent goroutine leak on timeout
+	respChan := make(chan *JsonRpcMsg, 1)
+
 	u.respMux.Lock()
-	u.respMap[id] = make(chan *JsonRpcMsg)
+	u.respMap[id] = respChan
 	u.respMux.Unlock()
 
 	u.log.WithFields(map[string]interface{}{
@@ -138,11 +146,14 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithID(id string, req *JsonRpcMsg
 		"method": request.Method,
 	}).Debug("submitting request")
 	if err := u.client.SendMsg(request); err != nil {
+		u.respMux.Lock()
+		delete(u.respMap, id)
+		u.respMux.Unlock()
 		return nil, err
 	}
 
 	select {
-	case response := <-u.respMap[id]:
+	case response := <-respChan:
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
@@ -211,7 +222,13 @@ func (u *UpstreamConnManagerCosmos) subscribeWithID(id string, param string) err
 }
 
 func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
-	param := u.subByID[id]
+	u.subMux.Lock()
+	param, ok := u.subByID[id]
+	u.subMux.Unlock()
+
+	if !ok {
+		return fmt.Errorf("subscription with ID %s not found", id)
+	}
 
 	msg := &JsonRpcMsg{
 		Version: jsonRpcVersion,

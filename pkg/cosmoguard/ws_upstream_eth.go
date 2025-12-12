@@ -93,14 +93,22 @@ func (u *UpstreamConnManagerEth) onUpstreamMessage(msg *JsonRpcMsg) {
 			u.log.Errorf("dropped message from upstream with no ID and no params")
 			return
 		}
-		params := msg.Params.(map[string]interface{})
+		params, ok := msg.Params.(map[string]interface{})
+		if !ok {
+			u.log.Errorf("dropped message from upstream: params is not a map")
+			return
+		}
 		sub, ok := params["subscription"]
 		if !ok {
 			u.log.Errorf("dropped message from upstream with no ID")
 			return
 		}
 
-		subscriptionID := sub.(string)
+		subscriptionID, ok := sub.(string)
+		if !ok {
+			u.log.Errorf("dropped message from upstream: subscription ID is not a string")
+			return
+		}
 		msg.ID = subscriptionID
 		query, ok := u.subByID[subscriptionID]
 		if ok {
@@ -144,8 +152,11 @@ func (u *UpstreamConnManagerEth) makeRequestWithID(id string, req *JsonRpcMsg) (
 		return nil, ErrClosed
 	}
 
+	// Create a buffered channel to prevent goroutine leak on timeout
+	respChan := make(chan *JsonRpcMsg, 1)
+
 	u.respMux.Lock()
-	u.respMap[id] = make(chan *JsonRpcMsg)
+	u.respMap[id] = respChan
 	u.respMux.Unlock()
 
 	u.log.WithFields(map[string]interface{}{
@@ -153,11 +164,14 @@ func (u *UpstreamConnManagerEth) makeRequestWithID(id string, req *JsonRpcMsg) (
 		"method": request.Method,
 	}).Debug("submitting request")
 	if err := u.client.SendMsg(request); err != nil {
+		u.respMux.Lock()
+		delete(u.respMap, id)
+		u.respMux.Unlock()
 		return nil, err
 	}
 
 	select {
-	case response := <-u.respMap[id]:
+	case response := <-respChan:
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
@@ -213,7 +227,10 @@ func (u *UpstreamConnManagerEth) subscribeWithID(id string, param string) (strin
 		return "", err
 	}
 
-	subID := resp.Result.(string)
+	subID, ok := resp.Result.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected subscription ID type: %T", resp.Result)
+	}
 
 	u.subMux.Lock()
 	defer u.subMux.Unlock()
@@ -256,11 +273,13 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 
 func (u *UpstreamConnManagerEth) resetAll() {
 	u.subMux.Lock()
-	defer u.subMux.Unlock()
-
 	u.subByParam = make(map[string]string)
 	u.subByID = make(map[string]string)
+	u.subMux.Unlock()
+
+	u.respMux.Lock()
 	u.respMap = make(map[string]chan *JsonRpcMsg)
+	u.respMux.Unlock()
 }
 
 func (u *UpstreamConnManagerEth) reSubmitSubscriptions() error {

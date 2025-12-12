@@ -14,8 +14,8 @@ type reusableReader struct {
 
 func ReusableReader(r io.ReadCloser) io.ReadCloser {
 	readBuf := bytes.Buffer{}
-	readBuf.ReadFrom(r)
-	r.Close()
+	_, _ = readBuf.ReadFrom(r) // Error is intentionally ignored as we proceed with whatever was read
+	_ = r.Close()
 	backBuf := bytes.Buffer{}
 
 	return reusableReader{

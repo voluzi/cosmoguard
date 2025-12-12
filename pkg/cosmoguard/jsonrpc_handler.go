@@ -3,7 +3,6 @@ package cosmoguard
 import (
 	"bytes"
 	"fmt"
-	"hash/maphash"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,7 +23,6 @@ type JsonRpcHandler struct {
 	wsPath           string
 	rules            []*JsonRpcRule
 	rulesMutex       sync.RWMutex // Mutex to block readers when rules are being updated
-	hash             *maphash.Hash
 	log              *log.Entry
 	responseTimeHist *prometheus.HistogramVec
 	batchResTimeHist *prometheus.HistogramVec
@@ -36,7 +34,6 @@ func NewJsonRpcHandler(name string, opts ...Option[JsonRpcHandlerOptions]) (*Jso
 		opt(cfg)
 	}
 	handler := &JsonRpcHandler{
-		hash:   &maphash.Hash{},
 		wsPath: cfg.WebsocketPath,
 	}
 
@@ -100,10 +97,11 @@ func (h *JsonRpcHandler) Start(logger *log.Entry) error {
 	h.log = logger.WithField("handler", "jsonrpc")
 
 	if h.responseTimeHist != nil {
-		prometheus.MustRegister(h.responseTimeHist)
+		// Use Register instead of MustRegister to handle re-registration gracefully
+		_ = prometheus.Register(h.responseTimeHist)
 	}
 	if h.batchResTimeHist != nil {
-		prometheus.MustRegister(h.batchResTimeHist)
+		_ = prometheus.Register(h.batchResTimeHist)
 	}
 
 	if h.wsProxy != nil {

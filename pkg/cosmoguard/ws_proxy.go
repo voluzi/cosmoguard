@@ -59,7 +59,8 @@ func NewJsonRpcWebSocketProxy(name, backend, path string, connections int, upstr
 func (p *JsonRpcWebSocketProxy) Run(log *log.Entry) error {
 	p.log = log.WithField("type", "websocket")
 	if p.responseTimeHist != nil {
-		prometheus.MustRegister(p.responseTimeHist)
+		// Use Register instead of MustRegister to handle re-registration gracefully
+		_ = prometheus.Register(p.responseTimeHist)
 	}
 	return p.broker.Start(p.log)
 }

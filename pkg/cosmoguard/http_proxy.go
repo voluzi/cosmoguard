@@ -105,7 +105,8 @@ func NewHttpProxy(name, localAddr, remoteAddr string, opts ...Option[HttpProxyOp
 
 func (p *HttpProxy) Run() error {
 	if p.responseTimeHist != nil {
-		prometheus.MustRegister(p.responseTimeHist)
+		// Use Register instead of MustRegister to handle re-registration gracefully
+		_ = prometheus.Register(p.responseTimeHist)
 	}
 
 	for _, eh := range p.endpointHandlers {
