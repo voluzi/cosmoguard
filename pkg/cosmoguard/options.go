@@ -1,8 +1,17 @@
 package cosmoguard
 
+import "github.com/olric-data/olric"
+
 type SharedOptions struct {
 	CacheConfig    *CacheGlobalConfig
+	ServerConfig   *ServerConfig
+	Authenticator  *Authenticator
 	MetricsEnabled bool
+	// OlricClient is the in-process olric handle used by the v4
+	// cluster-shared rate limiter (cache.backend=olric, the default).
+	// nil when no clusterRuntime is wired (tests, programmatic
+	// embedders) — NewRateLimiter falls back to in-memory in that case.
+	OlricClient *olric.EmbeddedClient
 }
 
 func DefaultSharedOptions() *SharedOptions {
@@ -14,6 +23,8 @@ func DefaultSharedOptions() *SharedOptions {
 type HttpProxyOptions struct {
 	*SharedOptions
 	EndpointHandlers []*httpProxyEndpointHandler
+	CORSConfig       *CORSConfig
+	UpstreamConfig   *UpstreamConfig
 }
 
 func DefaultHttpProxyOptions() *HttpProxyOptions {
@@ -36,11 +47,18 @@ func DefaultGrpcProxyOptions() *GrpcProxyOptions {
 
 type JsonRpcHandlerOptions struct {
 	*SharedOptions
-	WebsocketBackend     string
+	// WebsocketBackend is the single-backend form (v3 compat). Used only
+	// when WebsocketBackends is empty.
+	WebsocketBackend string
+	// WebsocketBackends is the v4 multi-upstream form. When non-empty,
+	// the broker spreads its connection pool across all listed backends
+	// in even round-robin shares.
+	WebsocketBackends    []string
 	WebsocketEnabled     bool
 	WebsocketConnections int
 	WebsocketPath        string
 	UpstreamConstructor  UpstreamConnManagerConstructor
+	MaxBatchSize         int
 }
 
 func DefaultJsonRpcHandlerOptions() *JsonRpcHandlerOptions {
@@ -57,7 +75,7 @@ func DefaultJsonRpcHandlerOptions() *JsonRpcHandlerOptions {
 
 type Option[T any] func(*T)
 
-func WithCacheConfig[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions](c *CacheGlobalConfig) Option[T] {
+func WithCacheConfig[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions | GrpcProxyOptions](c *CacheGlobalConfig) Option[T] {
 	return func(opts *T) {
 		switch x := any(opts).(type) {
 		case *SharedOptions:
@@ -66,6 +84,28 @@ func WithCacheConfig[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions]
 			x.CacheConfig = c
 		case *JsonRpcHandlerOptions:
 			x.CacheConfig = c
+		case *GrpcProxyOptions:
+			x.CacheConfig = c
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithOlricClient threads the cluster runtime's in-process olric handle
+// into proxies that build rate limiters. nil disables the cluster-shared
+// limiter — useful for tests that don't spin up clusterRuntime.
+func WithOlricClient[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions | GrpcProxyOptions](c *olric.EmbeddedClient) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *SharedOptions:
+			x.OlricClient = c
+		case *HttpProxyOptions:
+			x.OlricClient = c
+		case *JsonRpcHandlerOptions:
+			x.OlricClient = c
+		case *GrpcProxyOptions:
+			x.OlricClient = c
 		default:
 			panic("unexpected use")
 		}
@@ -83,6 +123,71 @@ func WithMetricsEnabled[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptio
 			x.MetricsEnabled = b
 		case *GrpcProxyOptions:
 			x.MetricsEnabled = b
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithServerConfig threads HTTP/WS server hardening knobs (timeouts, body
+// caps) into proxies that bind a listener. nil leaves the proxy with Go's
+// stdlib defaults.
+func WithServerConfig[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions](c *ServerConfig) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *SharedOptions:
+			x.ServerConfig = c
+		case *HttpProxyOptions:
+			x.ServerConfig = c
+		case *JsonRpcHandlerOptions:
+			x.ServerConfig = c
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithAuthenticator threads a shared *Authenticator through proxies so all
+// of them resolve identities and strip credential headers consistently.
+// nil leaves auth disabled.
+func WithAuthenticator[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions | GrpcProxyOptions](a *Authenticator) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *SharedOptions:
+			x.Authenticator = a
+		case *HttpProxyOptions:
+			x.Authenticator = a
+		case *JsonRpcHandlerOptions:
+			x.Authenticator = a
+		case *GrpcProxyOptions:
+			x.Authenticator = a
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithCORSConfig threads the CORS policy into a HttpProxy. nil leaves CORS
+// disabled (upstream's CORS headers pass through unchanged — v3 behavior).
+func WithCORSConfig[T HttpProxyOptions](c *CORSConfig) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *HttpProxyOptions:
+			x.CORSConfig = c
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithUpstreamConfig threads pool-level upstream behavior (picker strategy
+// and retry budget) into a HttpProxy. nil leaves both at their defaults
+// (weighted-round-robin, 2 retries).
+func WithUpstreamConfig[T HttpProxyOptions](c *UpstreamConfig) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *HttpProxyOptions:
+			x.UpstreamConfig = c
 		default:
 			panic("unexpected use")
 		}
@@ -108,6 +213,20 @@ func WithWebSocketBackend[T JsonRpcHandlerOptions](backend string) Option[T] {
 		switch x := any(opts).(type) {
 		case *JsonRpcHandlerOptions:
 			x.WebsocketBackend = backend
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithWebSocketBackends supplies the multi-upstream WS backend list. When
+// set, the broker spreads its connection pool evenly across all backends;
+// each long-lived client connection sticks to the upstream it landed on.
+func WithWebSocketBackends[T JsonRpcHandlerOptions](backends []string) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *JsonRpcHandlerOptions:
+			x.WebsocketBackends = backends
 		default:
 			panic("unexpected use")
 		}
@@ -152,6 +271,19 @@ func WithUpstreamManager[T JsonRpcHandlerOptions](constructor UpstreamConnManage
 		switch x := any(opts).(type) {
 		case *JsonRpcHandlerOptions:
 			x.UpstreamConstructor = constructor
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithMaxBatchSize caps the number of requests a JSON-RPC batch may contain.
+// 0 disables the cap.
+func WithMaxBatchSize[T JsonRpcHandlerOptions](n int) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *JsonRpcHandlerOptions:
+			x.MaxBatchSize = n
 		default:
 			panic("unexpected use")
 		}

@@ -56,6 +56,123 @@ func TestJsonRpcMsg_UnmarshalJSON(t *testing.T) {
 	}
 }
 
+// TestJsonRpcMsg_ResultByteFidelity proves that parsing a response and
+// then re-marshalling it preserves the exact byte order of object keys
+// inside `result`. The bug this guards against: with `Result interface{}`
+// (plain), jsoniter decodes nested objects as map[string]interface{}, then
+// remarshals with alphabetically-sorted keys — the cached replay no longer
+// matches the upstream's natural order, breaking the project's
+// byte-identical Cosmos-compatibility invariant.
+func TestJsonRpcMsg_ResultByteFidelity(t *testing.T) {
+	// Keys deliberately ordered "z, a, m" — a sorting-aware decoder would
+	// emit "a, m, z" on round-trip.
+	in := `{"jsonrpc":"2.0","id":1,"result":{"z":1,"a":2,"m":{"y":1,"b":2}}}`
+
+	var msg JsonRpcMsg
+	assert.NilError(t, json.Unmarshal([]byte(in), &msg))
+
+	out, err := msg.Marshal()
+	assert.NilError(t, err)
+
+	// The slice of `result` in the round-trip output must match the input.
+	const want = `"result":{"z":1,"a":2,"m":{"y":1,"b":2}}`
+	if !contains(string(out), want) {
+		t.Fatalf("result bytes not preserved\n  in:  %s\n  out: %s", in, string(out))
+	}
+}
+
+// TestJsonRpcMsg_WireSuffixRoundTrip proves Marshal appends the wire
+// suffix (typically "\n" from Cosmos/EVM JSON-RPC servers) so cache-hit
+// replays are byte-identical to the original upstream payload, not
+// just the parsed JSON. Without this, the trailing newline that
+// upstreams emit drops on every cache hit and breaks the byte-
+// identical compatibility invariant on the wire framing.
+func TestJsonRpcMsg_WireSuffixRoundTrip(t *testing.T) {
+	msg := &JsonRpcMsg{
+		Version:    "2.0",
+		ID:         1,
+		Result:     []byte(`"0x1af4"`),
+		WireSuffix: []byte("\n"),
+	}
+	out, err := msg.Marshal()
+	assert.NilError(t, err)
+	want := `{"jsonrpc":"2.0","id":1,"result":"0x1af4"}` + "\n"
+	assert.Equal(t, string(out), want)
+
+	// CloneWithID must carry the suffix forward, otherwise the cache's
+	// "replace upstream id with client id" rewrite would silently drop
+	// the trailing wire bytes on every hit.
+	clone := msg.CloneWithID("abc")
+	cloneOut, err := clone.Marshal()
+	assert.NilError(t, err)
+	assert.Equal(t, string(cloneOut), `{"jsonrpc":"2.0","id":"abc","result":"0x1af4"}`+"\n")
+
+	// A nil/empty WireSuffix must produce the bare JSON object — the
+	// pre-change behaviour for cosmoguard-generated responses
+	// (UnauthorizedResponse, EmptyResult) that never came from an
+	// upstream wire payload.
+	bare := &JsonRpcMsg{Version: "2.0", ID: 1, Result: []byte(`"0x1af4"`)}
+	bareOut, err := bare.Marshal()
+	assert.NilError(t, err)
+	assert.Equal(t, string(bareOut), `{"jsonrpc":"2.0","id":1,"result":"0x1af4"}`)
+}
+
+// TestTrailingWhitespace covers the helper that detects the upstream's
+// trailing wire bytes before they get attached to the cached message.
+func TestTrailingWhitespace(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"{}\n", "\n"},
+		{"{}\r\n", "\r\n"},
+		{"{} \t\n", " \t\n"},
+		{"{}", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		got := string(trailingWhitespace([]byte(c.in)))
+		assert.Equal(t, got, c.want)
+	}
+}
+
+// TestJsonRpcMsg_ResultNullRoundTrips proves an explicit `"result":null`
+// is preserved verbatim across a parse/marshal round-trip. JSON-RPC 2.0
+// requires a successful response to carry either `result` or `error`;
+// dropping `result:null` on the wire breaks compliance and breaks
+// upstream-byte-identical replays for endpoints like eth_getBlockByHash
+// that return null for unknown hashes. IsEmptyResult() must still
+// classify it as empty so the CacheEmptyResult gate keeps working.
+func TestJsonRpcMsg_ResultNullRoundTrips(t *testing.T) {
+	const in = `{"jsonrpc":"2.0","id":1,"result":null}`
+	var msg JsonRpcMsg
+	assert.NilError(t, json.Unmarshal([]byte(in), &msg))
+	assert.Assert(t, msg.Result != nil, "result:null must NOT collapse to nil Result")
+	assert.Assert(t, msg.IsEmptyResult(), "result:null must still register as empty")
+
+	out, err := msg.Marshal()
+	assert.NilError(t, err)
+	if !contains(string(out), `"result":null`) {
+		t.Fatalf("result:null lost on round-trip\n  in:  %s\n  out: %s", in, string(out))
+	}
+
+	// An absent result field still parses to nil Result (no result
+	// key on the wire) and IsEmptyResult agrees.
+	var absent JsonRpcMsg
+	assert.NilError(t, json.Unmarshal([]byte(`{"jsonrpc":"2.0","id":1}`), &absent))
+	assert.Assert(t, absent.Result == nil, "absent result must parse to nil Result")
+	assert.Assert(t, absent.IsEmptyResult(), "absent result must register as empty")
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 func TestJsonRpcMsg_Marshal(t *testing.T) {
 	msg := &JsonRpcMsg{
 		Version: "2.0",
@@ -81,7 +198,7 @@ func TestJsonRpcMsg_Clone(t *testing.T) {
 		ID:      1,
 		Method:  "status",
 		Params:  map[string]interface{}{"key": "value"},
-		Result:  "success",
+		Result:  []byte(`"success"`),
 		Error: &JsonRpcError{
 			Code:    100,
 			Message: "error",
@@ -93,7 +210,7 @@ func TestJsonRpcMsg_Clone(t *testing.T) {
 	assert.Equal(t, clone.Version, original.Version)
 	assert.Equal(t, clone.ID, original.ID)
 	assert.Equal(t, clone.Method, original.Method)
-	assert.Equal(t, clone.Result, original.Result)
+	assert.Equal(t, string(clone.Result), string(original.Result))
 	assert.Equal(t, clone.Error.Code, original.Error.Code)
 
 	// Verify it's a different object
@@ -285,9 +402,11 @@ func TestWithResult(t *testing.T) {
 	assert.Equal(t, resp.Version, "2.0")
 	assert.Equal(t, resp.ID, 789)
 	assert.Assert(t, resp.Result != nil)
-	// Check the map content
-	resultMap := resp.Result.(map[string]string)
-	assert.Equal(t, resultMap["status"], "ok")
+	// Result is now stored as marshalled bytes (RawMessage); verify the
+	// value round-trips back to the original map.
+	var parsed map[string]string
+	assert.NilError(t, json.Unmarshal(resp.Result, &parsed))
+	assert.Equal(t, parsed["status"], "ok")
 }
 
 func TestErrorResponse(t *testing.T) {
@@ -324,13 +443,13 @@ func TestJsonRpcResponses_Operations(t *testing.T) {
 		responses := &JsonRpcResponses{}
 
 		req := &JsonRpcMsg{ID: 1, Method: "method1"}
-		resp := &JsonRpcMsg{ID: 1, Result: "success"}
+		resp := &JsonRpcMsg{ID: 1, Result: []byte(`"success"`)}
 
 		responses.AddResponse(req, resp)
 
 		final := responses.GetFinal()
 		assert.Equal(t, len(final), 1)
-		assert.Equal(t, final[0].Result, "success")
+		assert.Equal(t, string(final[0].Result), `"success"`)
 	})
 
 	t.Run("Deny", func(t *testing.T) {
@@ -371,8 +490,8 @@ func TestJsonRpcResponses_Operations(t *testing.T) {
 		responses.AddPending(req1)
 		responses.AddPending(req2)
 
-		resp1 := &JsonRpcMsg{ID: 1, Result: "result1"}
-		resp2 := &JsonRpcMsg{ID: 2, Result: "result2"}
+		resp1 := &JsonRpcMsg{ID: 1, Result: []byte(`"result1"`)}
+		resp2 := &JsonRpcMsg{ID: 2, Result: []byte(`"result2"`)}
 
 		responses.Set(JsonRpcMsgs{req1, req2}, JsonRpcMsgs{resp1, resp2})
 

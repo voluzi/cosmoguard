@@ -115,7 +115,26 @@ func TestResponseWriterWrapper(t *testing.T) {
 	})
 }
 
+// withTrustAll temporarily configures the package-level
+// trustedProxies allowlist to "trust everyone" for the duration of
+// the calling test, then restores the previous allowlist. Tests that
+// need the legacy "every forwarded header is honored" semantics call
+// this once at the top.
+func withTrustAll(t *testing.T) {
+	t.Helper()
+	prev := trustedProxies.Load()
+	if err := SetTrustedProxies([]string{"0.0.0.0/0", "::/0"}); err != nil {
+		t.Fatalf("withTrustAll: %v", err)
+	}
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+}
+
 func TestGetSourceIP(t *testing.T) {
+	// Legacy header-trusting behavior is gated behind the trusted-
+	// proxies allowlist; tests written before that gate existed
+	// assume "trust everyone".
+	withTrustAll(t)
+
 	tests := []struct {
 		name       string
 		headers    map[string]string
@@ -152,6 +171,21 @@ func TestGetSourceIP(t *testing.T) {
 			remoteAddr: "192.168.1.1:8080",
 			expected:   "192.168.1.1:8080",
 		},
+		{
+			// X-Forwarded-For chain: "client, lb-1, lb-2" — return just
+			// the leftmost (original client) per the spec.
+			name:       "X-Forwarded-For chain",
+			headers:    map[string]string{"X-Forwarded-For": "1.2.3.4, 10.0.0.1, 10.0.0.2"},
+			remoteAddr: "5.6.7.8:1234",
+			expected:   "1.2.3.4",
+		},
+		{
+			// X-Forwarded-For chain with no spaces around commas.
+			name:       "X-Forwarded-For chain no spaces",
+			headers:    map[string]string{"X-Forwarded-For": "1.2.3.4,10.0.0.1"},
+			remoteAddr: "5.6.7.8:1234",
+			expected:   "1.2.3.4",
+		},
 	}
 
 	for _, tt := range tests {
@@ -165,6 +199,89 @@ func TestGetSourceIP(t *testing.T) {
 			result := GetSourceIP(req)
 			assert.Equal(t, result, tt.expected)
 		})
+	}
+}
+
+// TestGetSourceIP_DefaultDeny pins the secure-by-default behavior:
+// when no trustedProxies CIDRs are configured (the v4 default), the
+// X-Real-Ip / X-Forwarded-For headers MUST be ignored and the source
+// IP comes from r.RemoteAddr. A naked cosmoguard hit directly from
+// the internet must not be tricked into rate-limiting (or auditing)
+// the wrong client by anyone who sends `X-Real-Ip: 1.2.3.4`.
+func TestGetSourceIP_DefaultDeny(t *testing.T) {
+	// Ensure the global is empty for this test even if a prior test
+	// left it populated.
+	prev := trustedProxies.Load()
+	trustedProxies.Store(nil)
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "5.6.7.8:1234"
+	req.Header.Set("X-Real-Ip", "1.2.3.4")
+	req.Header.Set("X-Forwarded-For", "9.9.9.9")
+
+	if got := GetSourceIP(req); got != "5.6.7.8:1234" {
+		t.Fatalf("default-deny must ignore client-supplied headers, got %q", got)
+	}
+}
+
+// TestGetSourceIP_TrustedPeerHonored exercises the gate's positive
+// path: when the immediate peer matches the configured allowlist,
+// X-Real-Ip / X-Forwarded-For are honored; a peer outside the
+// allowlist is treated as untrusted and the headers are ignored.
+func TestGetSourceIP_TrustedPeerHonored(t *testing.T) {
+	prev := trustedProxies.Load()
+	if err := SetTrustedProxies([]string{"10.0.0.0/8"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	// Trusted peer: headers are honored.
+	r1 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r1.RemoteAddr = "10.1.2.3:55555"
+	r1.Header.Set("X-Real-Ip", "1.2.3.4")
+	if got := GetSourceIP(r1); got != "1.2.3.4" {
+		t.Fatalf("trusted peer should honor X-Real-Ip, got %q", got)
+	}
+
+	// Untrusted peer: header is ignored, RemoteAddr is returned.
+	r2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r2.RemoteAddr = "8.8.8.8:55555"
+	r2.Header.Set("X-Real-Ip", "1.2.3.4")
+	if got := GetSourceIP(r2); got != "8.8.8.8:55555" {
+		t.Fatalf("untrusted peer must ignore X-Real-Ip, got %q", got)
+	}
+}
+
+// TestSetTrustedProxies_BareIPAccepted pins the operator-friendly
+// shortcut: a bare IP without a "/mask" is auto-expanded to /32
+// (v4) or /128 (v6). Operators often list LB IPs directly and
+// shouldn't get a confusing "invalid CIDR" startup error.
+func TestSetTrustedProxies_BareIPAccepted(t *testing.T) {
+	prev := trustedProxies.Load()
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	if err := SetTrustedProxies([]string{"10.0.0.1", "2001:db8::1"}); err != nil {
+		t.Fatalf("bare IPs should parse: %v", err)
+	}
+	if !remotePeerTrusted("10.0.0.1:9999") {
+		t.Fatal("10.0.0.1 should be trusted")
+	}
+	if remotePeerTrusted("10.0.0.2:9999") {
+		t.Fatal("10.0.0.2 must NOT be trusted (only /32 allowed)")
+	}
+}
+
+// TestSetTrustedProxies_BadCIDRRejected pins startup failure on
+// a malformed CIDR. Without this, a typo would silently degrade to
+// "trust nothing" and operators would chase a missing-IP bug.
+func TestSetTrustedProxies_BadCIDRRejected(t *testing.T) {
+	prev := trustedProxies.Load()
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	err := SetTrustedProxies([]string{"10.0.0.0/8", "not-a-cidr"})
+	if err == nil {
+		t.Fatal("expected an error on malformed CIDR")
 	}
 }
 
