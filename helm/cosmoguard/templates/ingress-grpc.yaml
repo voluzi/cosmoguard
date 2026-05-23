@@ -1,0 +1,34 @@
+{{- include "cosmoguard.exposureValidation" . -}}
+{{- if and .Values.ingressGrpc.enabled (gt (len .Values.ingressGrpc.hosts) 0) -}}
+{{- $fullName := include "cosmoguard.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-grpc
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+  {{- with .Values.ingressGrpc.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingressGrpc.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingressGrpc.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $h := .Values.ingressGrpc.hosts }}
+    - host: {{ $h | quote }}
+      http:
+        paths:
+          - path: {{ $.Values.ingressGrpc.path }}
+            pathType: {{ $.Values.ingressGrpc.pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $.Values.service.grpcPort }}
+    {{- end }}
+{{- end -}}

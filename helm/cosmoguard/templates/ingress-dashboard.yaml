@@ -1,0 +1,43 @@
+{{- include "cosmoguard.exposureValidation" . -}}
+{{- if .Values.ingressDashboard.enabled -}}
+{{- if not .Values.config.dashboard.enable -}}
+{{- fail "cosmoguard: ingressDashboard.enabled=true requires config.dashboard.enable=true (the dashboard listener must exist on the pod before routing traffic to it)" -}}
+{{- end -}}
+{{- if eq (len .Values.ingressDashboard.hosts) 0 -}}
+{{- fail "cosmoguard: ingressDashboard.enabled=true requires ingressDashboard.hosts to be non-empty" -}}
+{{- end -}}
+{{- $fullName := include "cosmoguard.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  # -dashboard suffix keeps this Ingress distinct from the public proxy
+  # Ingress so kubectl-level RBAC and audit logging can differentiate
+  # operator-only traffic.
+  name: {{ $fullName }}-dashboard
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+  {{- with .Values.ingressDashboard.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingressDashboard.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingressDashboard.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $h := .Values.ingressDashboard.hosts }}
+    - host: {{ $h | quote }}
+      http:
+        paths:
+          - path: {{ $.Values.ingressDashboard.path }}
+            pathType: {{ $.Values.ingressDashboard.pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $.Values.service.dashboardPort | default $.Values.config.dashboard.port }}
+    {{- end }}
+{{- end -}}

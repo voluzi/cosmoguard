@@ -3,7 +3,9 @@ name: GoReleaser
 on:
   push:
     tags:
-      - "*"
+      # Match v* but exclude chart-tag prefixes (chart/v*) which the
+      # chart release workflow handles separately.
+      - "v*"
 
 permissions:
   contents: write
@@ -13,15 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           version: '~> v2'
           args: release --clean

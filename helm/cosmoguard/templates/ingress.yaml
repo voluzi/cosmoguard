@@ -1,0 +1,82 @@
+{{- include "cosmoguard.exposureValidation" . -}}
+{{- if .Values.ingress.enabled -}}
+{{- $fullName := include "cosmoguard.fullname" . -}}
+{{- $lcd := .Values.ingress.lcd -}}
+{{- $rpc := .Values.ingress.rpc -}}
+{{- $evmRpc := .Values.ingress.evmRpc -}}
+{{- $evmRpcWs := .Values.ingress.evmRpcWs -}}
+{{- $hasAny := or (gt (len $lcd.hosts) 0) (gt (len $rpc.hosts) 0) -}}
+{{- if .Values.config.enableEvm -}}
+{{- $hasAny = or $hasAny (gt (len $evmRpc.hosts) 0) (gt (len $evmRpcWs.hosts) 0) -}}
+{{- end -}}
+{{- if $hasAny }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $h := $lcd.hosts }}
+    - host: {{ $h | quote }}
+      http:
+        paths:
+          - path: {{ $lcd.path }}
+            pathType: {{ $lcd.pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $.Values.service.lcdPort }}
+    {{- end }}
+    {{- range $h := $rpc.hosts }}
+    - host: {{ $h | quote }}
+      http:
+        paths:
+          - path: {{ $rpc.path }}
+            pathType: {{ $rpc.pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $.Values.service.rpcPort }}
+    {{- end }}
+    {{- if $.Values.config.enableEvm }}
+    {{- range $h := $evmRpc.hosts }}
+    - host: {{ $h | quote }}
+      http:
+        paths:
+          - path: {{ $evmRpc.path }}
+            pathType: {{ $evmRpc.pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $.Values.service.evmRpcPort | default $.Values.config.evmRpcPort }}
+    {{- end }}
+    {{- range $h := $evmRpcWs.hosts }}
+    - host: {{ $h | quote }}
+      http:
+        paths:
+          - path: {{ $evmRpcWs.path }}
+            pathType: {{ $evmRpcWs.pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $.Values.service.evmRpcWsPort | default $.Values.config.evmRpcWsPort }}
+    {{- end }}
+    {{- end }}
+{{- end -}}
+{{- end -}}

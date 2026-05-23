@@ -5,111 +5,149 @@
 [![Docker Builds](https://github.com/voluzi/cosmoguard/actions/workflows/docker.yml/badge.svg)](https://github.com/voluzi/cosmoguard/actions/workflows/docker.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/voluzi/cosmoguard/blob/main/LICENSE.md)
 
-## Introduction
-**CosmoGuard** is a specialized firewall designed for Cosmos nodes. It offers fine-grained control over API access by allowing node administrators to manage access at the API endpoint level, rather than just by port. Additionally, it features a caching mechanism to optimize performance by caching responses for specified endpoints.
+CosmoGuard is a security-focused proxy + cache + auth gateway in front of
+Cosmos-SDK nodes. It gates access at the API-endpoint level (not just by
+port), caches deterministic responses, throttles abusive traffic, fans
+out to multiple upstream nodes with active healthchecks, and authenticates
+clients via API keys / JWT / external validators.
 
-## Key Features
-- **Endpoint-Level Access Control**: Control access to specific API endpoints across all supported APIs:
-    - Tendermint `RPC` (including `JSON-RPC` and `WebSockets`)
-    - Cosmos API
-    - `gRPC`
-    - EVM `JSON-RPC` (including `WebSockets`)
-- **Wildcard support**: Use wildcards in CosmoGuard rules to define broad or specific access control:
-    - `*` matches any single component in a path.
-    - `**` matches multiple components, allowing for more flexible rules.
-- **Caching**: Define caching strategies for each endpoint to improve performance (`gRPC` not supported). Two caching backends are currently supported:
-    - **In-Memory**: Default caching mechanism, storing data in memory.
-    - **Redis**: For distributed caching across multiple instances.
-- **Rule Prioritization**: CosmoGuard rules can be prioritized using an integer value, with lower numbers indicating higher priority. By default, rules have a priority of 1000, but this can be adjusted to ensure specific rules are evaluated first.
-- **WebSocket Connection Management**: CosmoGuard maintains a limited number of WebSocket connections to the node (default is 10). This helps to optimize node resource usage by offloading the handling of thousands of WebSocket connections to CosmoGuard.
-- **Hot-Reloading of Configuration**: The configuration file, specifically CosmoGuard rules, can be updated without restarting the application. Changes to the configuration file trigger hot-reloading, recompiling and applying the new rules on-the-fly.
+The current major version is **v4**. See the
+[release notes](https://github.com/voluzi/cosmoguard/releases) for what
+changed from v3; existing v3 configs continue to work — run
+`cosmoguard --migrate-config` to rewrite them in v4 form when ready.
 
+## Highlights
+
+- **Endpoint-level access control** across every Cosmos surface:
+  Tendermint RPC (HTTP + JSON-RPC + WebSocket), Cosmos LCD/REST, gRPC
+  (Query), and EVM RPC + WS.
+- **Expressive rule schema** (v4): combine `all`/`any`/`none` predicates
+  over method, path, query, headers, source IP/CIDR. Globs supported on
+  every value.
+- **Response caching** with per-rule namespacing, content-type
+  preservation, configurable header allowlists. Backed by an embedded
+  olric distributed cache with an in-process L1 — single binary,
+  no external dependency, shared automatically across replicas when
+  cluster mode is on.
+- **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
+  identity` scopes. Buckets are sharded across replicas through the
+  same olric runtime in cluster mode, so configured rates stay correct
+  under HPA without an external store.
+- **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
+  token introspection, and an external-validator method for Allora-
+  style developer portals. Credential headers are always stripped
+  before forwarding upstream.
+- **CORS** owned by cosmoguard, not the upstream — preflight handled
+  directly; upstream's CORS headers are stripped and replaced.
+- **Multi-upstream nodes** with active healthchecks, weighted round-
+  robin, and per-upstream circuit breakers. `/readyz` reflects pool
+  health.
+- **Hardened defaults**: HTTP timeouts, request body caps, JSON-RPC
+  batch size caps, WS origin allowlist, atomic-fail-safe config reload,
+  no `glob.MustCompile` panics.
+- **Production polish**: graceful shutdown on SIGTERM, `cosmoguard
+  --validate` for CI gates, `--migrate-config` for v3→v4 rewrites,
+  `/healthz` / `/readyz` / `/info` / `/metrics` for k8s probes and
+  Prometheus.
+- **Hot-reload** of config rules without dropping in-flight requests.
 
 ## Installation
 
 ### Prerequisites
-- **Dependencies**:
-    - **Go 1.22**
+- Go 1.25+ (for building from source).
 
-### Installation Steps
+### Docker
 
-#### Use Docker
-
-An official docker image is available. You can use it by mounting config file at the root path (or use `-config` flag if you want to mount it somewhere else):
 ```bash
-$ docker run -it --name cosmoguard -v /path/to/config/file.yaml:/root/cosmoguard.yaml ghcr.io/voluzi/cosmoguard --help
-Usage of cosmoguard:
-  -config string
-    	Path to configuration file. (default "/root/cosmoguard.yaml")
-  -log-format string
-    	log format (either json or text) (default "json")
-  -log-level string
-    	log level. (default "info")
-  -version
-    	print cosmoguard version
+docker run -it --name cosmoguard \
+  -v /path/to/cosmoguard.yaml:/etc/cosmoguard/cosmoguard.yaml \
+  ghcr.io/voluzi/cosmoguard \
+  --config /etc/cosmoguard/cosmoguard.yaml
 ```
 
-#### Build from source
-1. Clone the repo and install using Makefile:
+### Helm (k8s)
+
+The repo ships a Helm chart at `helm/cosmoguard/`:
+
 ```bash
-$ git clone https://github.com/voluzi/cosmoguard.git
-$ cd cosmoguard
-$ make install
+helm upgrade --install cosmoguard ./helm/cosmoguard \
+  --set config.nodes[0].host=cosmos-node.default.svc
 ```
 
-2. Check installation (ensure `~/go/bin` is in your `PATH`):
+See `helm/cosmoguard/README.md` for cluster-mode + HPA setup.
+
+### Build from source
+
 ```bash
-$ cosmoguard --help
-Usage of cosmoguard:
-  -config string
-    	Path to configuration file. (default "$HOME/cosmoguard.yaml")
-  -log-format string
-    	log format (either json or text) (default "json")
-  -log-level string
-    	log level. (default "info")
-  -version
-    	print cosmoguard version
+git clone https://github.com/voluzi/cosmoguard.git
+cd cosmoguard
+make install
 ```
 
-## Usage Instructions
+## Quick start
 
-### Configuration File
-
-The configuration file contains all configurations and cosmoguard rules to be applied. Hot-reloading is active for cosmoguard rules, so that any changes are applied on-the-fly.
-All fields are optional, so an empty configuration file is enough to start, but the default is to have no cosmoguard rules (blocks everything).
-
-An example to only allow querying node status on both `RPC` and `JSON-RPC`, and cache the response for 10 seconds, would be:
+Minimal config — allow `/status` on Tendermint RPC and cache for 10s:
 
 ```yaml
+nodes:
+  - host: 127.0.0.1
+    rpcPort: 26657
+    lcdPort: 1317
+    grpcPort: 9090
+
 cache:
   ttl: 10s
 
 rpc:
   rules:
     - action: allow
-      paths:
-        - /status
-      methods:
-        - GET
+      match:
+        path: /status
+        methods: [GET]
       cache:
         enable: true
 
   jsonrpc:
     rules:
       - action: allow
-        methods: [ "status" ]
+        methods: [status]
         cache:
           enable: true
 ```
 
-Refer to [Configuration](./CONFIG.md) to see all configuration options and their defaults.
+A fuller example with multi-upstream, auth, CORS, and rate limiting is
+in [`example.config.yml`](./example.config.yml).
 
-### Starting CosmoGuard
-To start CosmoGuard, use the following command:
+See [CONFIG.md](./CONFIG.md) for the complete reference.
+
+## Validate + run
+
+```sh
+# Pre-deploy / CI check: parse + compile the config without binding ports.
+cosmoguard --config /etc/cosmoguard/cosmoguard.yaml --validate
+
+# Rewrite a v3 config in v4 form (the original is backed up to .v3.bak).
+cosmoguard --config /etc/cosmoguard/cosmoguard.yaml --migrate-config
+
+# Run cosmoguard.
+cosmoguard --config /etc/cosmoguard/cosmoguard.yaml
 ```
-$ cosmoguard -config /path/to/config/file.yaml
-```
+
+## Compatibility
+
+CosmoGuard is designed as a drop-in stand-in for a direct Cosmos node
+connection. Any request that worked against a bare Tendermint/Cosmos/
+EVM node returns a byte-identical response through cosmoguard when
+allowed. There are five intentional v4 behavioral changes to review
+before upgrading (default-deny on WS cross-origin, cosmoguard-owned
+CORS, content-type fidelity on cache hits, Prometheus label cleanup,
+no force-allowed gRPC reflection).
+
+A compatibility test suite recordable via `scripts/record-golden.sh`
+captures live-node responses and replays them through cosmoguard,
+asserting byte-identical relay.
 
 ## License
 
-Unless a file notes otherwise, it will fall under the [MIT License](./LICENSE.md). 
+Unless a file notes otherwise, it falls under the
+[MIT License](./LICENSE.md).

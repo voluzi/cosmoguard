@@ -1,0 +1,45 @@
+{{- if not .Values.existingConfigMap -}}
+{{- /*
+Render cosmoguard's YAML from .Values.config, with two transforms:
+  - cluster enabled: strip the chart-only `enable` key from the
+    cluster block, auto-fill bindAddr ($POD_IP) and discovery.dns.host
+    (peer service FQDN) when unset.
+  - cluster disabled: drop the cluster block entirely so cosmoguard
+    runs olric in embedded loopback mode.
+*/ -}}
+{{- $cfg := deepCopy .Values.config -}}
+{{- if eq (include "cosmoguard.clusterEnabled" .) "true" -}}
+{{- $cache := index $cfg "cache" -}}
+{{- $cluster := index $cache "cluster" -}}
+{{- $_ := unset $cluster "enable" -}}
+{{- $bindAddr := index $cluster "bindAddr" | default "" -}}
+{{- if eq $bindAddr "" -}}
+{{- $_ := set $cluster "bindAddr" "${POD_IP}" -}}
+{{- end -}}
+{{- $disc := index $cluster "discovery" | default (dict) -}}
+{{- $mode := index $disc "mode" | default "" -}}
+{{- if eq $mode "dns" -}}
+{{- $dns := index $disc "dns" | default (dict) -}}
+{{- $host := index $dns "host" | default "" -}}
+{{- if eq $host "" -}}
+{{- $_ := set $dns "host" (include "cosmoguard.discoveryHost" .) -}}
+{{- $_ := set $disc "dns" $dns -}}
+{{- $_ := set $cluster "discovery" $disc -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $cache "cluster" $cluster -}}
+{{- $_ := set $cfg "cache" $cache -}}
+{{- else -}}
+{{- $cache := index $cfg "cache" -}}
+{{- $_ := unset $cache "cluster" -}}
+{{- $_ := set $cfg "cache" $cache -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cosmoguard.fullname" . }}
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+data:
+  cosmoguard.yaml: |
+{{ toYaml $cfg | indent 4 }}
+{{- end -}}

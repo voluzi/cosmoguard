@@ -1,0 +1,19 @@
+apiVersion: v2
+name: cosmoguard
+description: Cosmos node firewall + cache + auth gateway
+type: application
+# Track cosmoguard's app version. Bump this together with the binary tag.
+version: 0.1.0
+appVersion: 4.0.0
+kubeVersion: ">=1.24.0"
+home: https://github.com/voluzi/cosmoguard
+sources:
+  - https://github.com/voluzi/cosmoguard
+keywords:
+  - cosmos
+  - blockchain
+  - proxy
+  - firewall
+  - tendermint
+maintainers:
+  - name: voluzi

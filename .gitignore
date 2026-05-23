@@ -6,3 +6,7 @@ test
 dist
 /cosmoguard
 .DS_Store
+.local/
+local.config.yml
+coverage.out
+bench/

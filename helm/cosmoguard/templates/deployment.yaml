@@ -1,0 +1,126 @@
+{{- include "cosmoguard.clusterValidation" . -}}
+{{- if eq (default "Deployment" .Values.kind) "Deployment" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cosmoguard.fullname" . }}
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "cosmoguard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # No checksum/config: cosmoguard hot-reloads its config via
+        # fsnotify, so ConfigMap edits must NOT trigger a pod
+        # rollout. Runtime-immutable edits (cluster topology) are
+        # rejected by tryReload with a dashboard error row.
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "cosmoguard.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # Cosmoguard's main.go drains in-flight requests up to
+      # shutdownGrace (30s) on SIGTERM. Match that here so K8s
+      # doesn't SIGKILL the pod mid-drain. Configurable for slower
+      # WS subscribers via .Values.terminationGracePeriodSeconds.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 35 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "cosmoguard.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cosmoguard
+          image: {{ include "cosmoguard.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/cosmoguard/cosmoguard.yaml
+          ports:
+            - name: lcd
+              containerPort: {{ .Values.config.lcdPort }}
+              protocol: TCP
+            - name: rpc
+              containerPort: {{ .Values.config.rpcPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.config.grpcPort }}
+              protocol: TCP
+            {{- if .Values.config.enableEvm }}
+            - name: evm-rpc
+              containerPort: {{ .Values.config.evmRpcPort }}
+              protocol: TCP
+            - name: evm-rpc-ws
+              containerPort: {{ .Values.config.evmRpcWsPort }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.config.metrics.enable }}
+            - name: metrics
+              containerPort: {{ .Values.config.metrics.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.config.dashboard.enable }}
+            - name: dashboard
+              containerPort: {{ .Values.config.dashboard.port }}
+              protocol: TCP
+            {{- end }}
+            {{- include "cosmoguard.clusterContainerPorts" . | nindent 12 }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- $clusterOn := eq (include "cosmoguard.clusterEnabled" .) "true" }}
+          {{- if or .Values.env $clusterOn }}
+          env:
+            {{- include "cosmoguard.podIdentityEnv" . | nindent 12 }}
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- end }}
+          {{- /*
+            Probes hit /healthz and /readyz on the metrics port. When
+            metrics is disabled the listener isn't bound, so rendering
+            probes that target `port: metrics` crashloops the pod with
+            "connection refused". Gate the probes on the same flag that
+            gates the listener.
+          */}}
+          {{- if .Values.config.metrics.enable }}
+          livenessProbe: {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe: {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cosmoguard
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "cosmoguard.configMapName" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end -}}

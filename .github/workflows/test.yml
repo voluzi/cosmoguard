@@ -1,18 +1,51 @@
 name: Test
 
-on: [ push ]
+on: [push]
 
 jobs:
   test:
+    name: go test (race + cover)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Setup go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          cache: true
 
-      - name: Test
-        run: make test
+      - name: vet
+        run: go vet ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: "latest"
+          install-go: false
+
+      - name: test (race + coverage)
+        run: make test-cover
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: warn
+
+  fuzz:
+    name: short fuzz pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Cap each target at 10s so a regular PR run takes <1 min total.
+      # Run nightly with FUZZTIME=5m for deeper coverage.
+      - name: fuzz
+        run: make fuzz FUZZTIME=10s
