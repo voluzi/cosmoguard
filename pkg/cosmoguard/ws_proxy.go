@@ -431,8 +431,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 			// On deny, reply with the JSON-RPC error and stop (the
 			// frame is neither cached nor forwarded).
 			if vok, code, reason := p.policyVerdict(request, rule, identity, source, limitersSnap); !vok {
-				if err := client.SendMsg(ErrorResponse(request, code, reason, nil)); err != nil {
-					return err
+				// Notifications (no id) get no response, even on deny (§4.1).
+				if request.ID != nil {
+					if err := client.SendMsg(ErrorResponse(request, code, reason, nil)); err != nil {
+						return err
+					}
 				}
 				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, ruleID, startTime, "request denied (policy)")
 				return nil
@@ -491,6 +494,16 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					}
 				}
 
+				// Notifications (no id) get no response frame, even though
+				// the upstream round trip happened (JSON-RPC 2.0 §4.1).
+				// Subscription frames always carry an id, so they're
+				// unaffected. Nothing is cached for a notification either —
+				// the cached entry would later be replayed to a real call.
+				if request.ID == nil {
+					p.recordOutcome(request, source, cacheMiss, RuleActionAllow, ruleID, startTime, "request allowed")
+					return nil
+				}
+
 				if err = client.SendMsg(res); err != nil {
 					return err
 				}
@@ -520,8 +533,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					Method:   request.Method,
 					RuleTag:  ruleID,
 				})
-				if err := client.SendMsg(UnauthorizedResponse(request)); err != nil {
-					return err
+				// A denied notification still gets no response (§4.1).
+				if request.ID != nil {
+					if err := client.SendMsg(UnauthorizedResponse(request)); err != nil {
+						return err
+					}
 				}
 				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, ruleID, startTime, "request denied")
 				return nil
@@ -565,8 +581,12 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 			}
 		}
 
-		if err = client.SendMsg(res); err != nil {
-			return err
+		// Notification (no id) → no response frame even on default-allow
+		// (JSON-RPC 2.0 §4.1). Subscriptions always carry an id.
+		if request.ID != nil {
+			if err = client.SendMsg(res); err != nil {
+				return err
+			}
 		}
 
 	} else {
@@ -576,8 +596,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 			SourceIP: source,
 			Method:   request.Method,
 		})
-		if err := client.SendMsg(UnauthorizedResponse(request)); err != nil {
-			return err
+		// A denied notification still gets no response (§4.1).
+		if request.ID != nil {
+			if err := client.SendMsg(UnauthorizedResponse(request)); err != nil {
+				return err
+			}
 		}
 	}
 
