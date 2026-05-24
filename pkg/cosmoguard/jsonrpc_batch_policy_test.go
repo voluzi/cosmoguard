@@ -425,3 +425,74 @@ func TestHandleHttpBatch_UnmatchedDefaultAllowHonoursDefaultRequire(t *testing.T
 		t.Fatalf("unmatched anonymous must get -32001 auth deny, got %v", arr[0])
 	}
 }
+
+// TestHandleHttpBatch_NotificationCacheHitNoResponse is the regression
+// test for the notification cache-hit leak: the cache key ignores id, so
+// a prior id-bearing call can prime an entry; a later notification (no
+// id) with the same method/params hits that entry but must still get NO
+// response (JSON-RPC 2.0 §4.1).
+func TestHandleHttpBatch_NotificationCacheHitNoResponse(t *testing.T) {
+	h := &JsonRpcHandler{
+		log:           log.WithField("t", "jsonrpc-batch"),
+		cgDashboard:   newDashboardObservability(),
+		section:       "rpc.jsonrpc",
+		cache:         alwaysHitCache{}, // every lookup is a hit
+		defaultAction: RuleActionDeny,
+	}
+	h.rules = []*JsonRpcRule{{
+		Tag:    "q",
+		Action: RuleActionAllow,
+		Cache:  &RuleCache{Enable: true, TTL: time.Minute},
+	}}
+
+	batch := JsonRpcMsgs{
+		{Version: "2.0", ID: float64(1), Method: "q"}, // call → cached result
+		{Version: "2.0", Method: "q"},                 // notification → no response
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	next := func(http.ResponseWriter, *http.Request) {
+		t.Fatal("cache hit must not reach upstream")
+	}
+
+	h.handleHttpBatch(batch, w, r, next, time.Now())
+
+	var arr []map[string]any
+	if err := stdjson.Unmarshal(w.Body.Bytes(), &arr); err != nil {
+		t.Fatalf("batch response not a JSON array: %v (%s)", err, w.Body.String())
+	}
+	if len(arr) != 1 {
+		t.Fatalf("expected exactly 1 response (call only; notification suppressed), got %d (%s)", len(arr), w.Body.String())
+	}
+	if id, _ := arr[0]["id"].(float64); id != 1 {
+		t.Fatalf("the single response must be the id=1 call, got id=%v", arr[0]["id"])
+	}
+}
+
+// TestHandleHttpSingle_NotificationCacheHitNoResponse mirrors the above
+// for the single-request path: a notification cache hit writes no body.
+func TestHandleHttpSingle_NotificationCacheHitNoResponse(t *testing.T) {
+	h := &JsonRpcHandler{
+		log:           log.WithField("t", "jsonrpc-single"),
+		cgDashboard:   newDashboardObservability(),
+		section:       "rpc.jsonrpc",
+		cache:         alwaysHitCache{},
+		defaultAction: RuleActionDeny,
+	}
+	h.rules = []*JsonRpcRule{{
+		Tag:    "q",
+		Action: RuleActionAllow,
+		Cache:  &RuleCache{Enable: true, TTL: time.Minute},
+	}}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	next := func(http.ResponseWriter, *http.Request) { t.Fatal("cache hit must not reach upstream") }
+
+	// Notification: no id.
+	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r, next, time.Now())
+
+	if w.Body.Len() != 0 {
+		t.Fatalf("notification cache hit must write no response body, got %q", w.Body.String())
+	}
+}

@@ -620,7 +620,12 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 					// double the RTT on every hit.
 					res, err := h.cache.Get(r.Context(), hash)
 					if err == nil {
-						h.writeSingleResponse(w, res.CloneWithID(request.ID))
+						// Notifications (no id) get no response, even on a
+						// cache hit — the key ignores id, so a prior call
+						// could have primed this entry (JSON-RPC 2.0 §4.1).
+						if request.ID != nil {
+							h.writeSingleResponse(w, res.CloneWithID(request.ID))
+						}
 						h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
 						return
 					}
@@ -856,7 +861,14 @@ RequestsLoop:
 					res, err := h.cache.Get(r.Context(), hash)
 					if err == nil {
 						cacheHits++
-						responses.AddResponse(req, res)
+						// Notifications (no id) get no response, even on a
+						// cache hit. The cache key ignores id, so a prior
+						// id-bearing call with the same method/params can
+						// have primed this entry — appending it here would
+						// reply to a notification (JSON-RPC 2.0 §4.1).
+						if req.ID != nil {
+							responses.AddResponse(req, res)
+						}
 						h.recordBatchItem(r, req, cacheHit, "request in batch allowed")
 						continue RequestsLoop
 					}

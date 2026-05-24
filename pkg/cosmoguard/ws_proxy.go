@@ -461,8 +461,13 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					// partition hit paid two RTTs to find one entry.
 					res, err := p.cache.Get(context.Background(), hash)
 					if err == nil {
-						if err = client.SendMsg(res.CloneWithID(request.ID)); err != nil {
-							return err
+						// Notifications (no id) get no response, even on a
+						// cache hit — the key ignores id, so a prior call
+						// could have primed this entry (JSON-RPC 2.0 §4.1).
+						if request.ID != nil {
+							if err = client.SendMsg(res.CloneWithID(request.ID)); err != nil {
+								return err
+							}
 						}
 						p.recordOutcome(request, source, cacheHit, RuleActionAllow, ruleID, startTime, "request allowed")
 						return nil
