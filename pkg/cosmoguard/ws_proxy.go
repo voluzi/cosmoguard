@@ -560,8 +560,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					Section: p.section, Reason: "auth",
 					SourceIP: source, Method: request.Method,
 				})
-				if err := client.SendMsg(ErrorResponse(request, -32001, reason, nil)); err != nil {
-					return err
+				// Notification (no id) → no response frame, even on deny (§4.1).
+				if request.ID != nil {
+					if err := client.SendMsg(ErrorResponse(request, -32001, reason, nil)); err != nil {
+						return err
+					}
 				}
 				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, "default", startTime, "request denied (auth)")
 				return nil

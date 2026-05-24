@@ -496,3 +496,55 @@ func TestHandleHttpSingle_NotificationCacheHitNoResponse(t *testing.T) {
 		t.Fatalf("notification cache hit must write no response body, got %q", w.Body.String())
 	}
 }
+
+// TestHandleHttpSingle_DeniedNotificationNoResponse pins §4.1 on the
+// single-request deny paths: a denied notification (no id) writes no
+// response body, across rule-deny, per-rule auth deny, and default-deny.
+func TestHandleHttpSingle_DeniedNotificationNoResponse(t *testing.T) {
+	mk := func() *JsonRpcHandler {
+		return &JsonRpcHandler{
+			log:         log.WithField("t", "jsonrpc-single"),
+			cgDashboard: newDashboardObservability(),
+			section:     "rpc.jsonrpc",
+		}
+	}
+
+	t.Run("rule deny", func(t *testing.T) {
+		h := mk()
+		h.rules = []*JsonRpcRule{{Tag: "q", Action: RuleActionDeny}}
+		h.defaultAction = RuleActionAllow
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r,
+			func(http.ResponseWriter, *http.Request) {}, time.Now())
+		if w.Body.Len() != 0 {
+			t.Fatalf("rule-denied notification must write no body, got %q", w.Body.String())
+		}
+	})
+
+	t.Run("default deny", func(t *testing.T) {
+		h := mk()
+		h.defaultAction = RuleActionDeny // no rules → unmatched → default deny
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r,
+			func(http.ResponseWriter, *http.Request) {}, time.Now())
+		if w.Body.Len() != 0 {
+			t.Fatalf("default-denied notification must write no body, got %q", w.Body.String())
+		}
+	})
+
+	t.Run("per-rule auth deny", func(t *testing.T) {
+		h := mk()
+		h.auth = authenticatorWithDefaultRequire(t)
+		h.rules = []*JsonRpcRule{{Tag: "q", Action: RuleActionAllow, Auth: &RuleAuthConfig{Scopes: []string{"admin"}}}}
+		h.defaultAction = RuleActionDeny
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/", nil) // anonymous
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r,
+			func(http.ResponseWriter, *http.Request) {}, time.Now())
+		if w.Body.Len() != 0 {
+			t.Fatalf("auth-denied notification must write no body, got %q", w.Body.String())
+		}
+	})
+}

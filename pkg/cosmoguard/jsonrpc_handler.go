@@ -556,8 +556,12 @@ func (h *JsonRpcHandler) enforceJsonRpcRulePolicy(w http.ResponseWriter, r *http
 		status = http.StatusTooManyRequests
 		logMsg = "request denied (rate)"
 	}
-	body, _ := ErrorResponse(request, code, reason, nil).Marshal()
-	WriteData(w, status, body, "Content-Type", "application/json")
+	// Notifications (no id) get no response, even on deny (JSON-RPC 2.0
+	// §4.1) — matches the batch and WS deny paths.
+	if request.ID != nil {
+		body, _ := ErrorResponse(request, code, reason, nil).Marshal()
+		WriteData(w, status, body, "Content-Type", "application/json")
+	}
 	h.recordSingle(r, request, "", RuleActionDeny, startTime, logMsg)
 	return false
 }
@@ -649,7 +653,10 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 					Method:   request.Method,
 					RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
 				})
-				h.writeSingleResponse(w, UnauthorizedResponse(request))
+				// Notifications (no id) get no response, even on deny (§4.1).
+				if request.ID != nil {
+					h.writeSingleResponse(w, UnauthorizedResponse(request))
+				}
 				h.recordSingle(r, request, cacheMiss, RuleActionDeny, startTime, "request denied")
 				return
 
@@ -669,8 +676,11 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 		// Even on default-allow, an unmatched method must clear the
 		// global auth.defaultRequire gate (no rule opted it out).
 		if ok, code, reason := h.jsonRpcDefaultAuthVerdict(r, request); !ok {
-			body, _ := ErrorResponse(request, code, reason, nil).Marshal()
-			WriteData(w, http.StatusUnauthorized, body, "Content-Type", "application/json")
+			// Notification (no id) → no response, even on deny (§4.1).
+			if request.ID != nil {
+				body, _ := ErrorResponse(request, code, reason, nil).Marshal()
+				WriteData(w, http.StatusUnauthorized, body, "Content-Type", "application/json")
+			}
 			h.recordSingle(r, request, "", RuleActionDeny, startTime, "request denied (auth)")
 			return
 		}
@@ -683,7 +693,10 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 			SourceIP: GetSourceIP(r),
 			Method:   request.Method,
 		})
-		h.writeSingleResponse(w, UnauthorizedResponse(request))
+		// Notifications (no id) get no response, even on deny (§4.1).
+		if request.ID != nil {
+			h.writeSingleResponse(w, UnauthorizedResponse(request))
+		}
 		h.recordSingle(r, request, cacheMiss, RuleActionDeny, startTime, "request denied")
 	}
 }
