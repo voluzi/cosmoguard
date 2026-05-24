@@ -52,7 +52,7 @@ func compileOriginAllowlist(patterns []string) (func(*http.Request) bool, error)
 			// `/` and `.` as separators: `*` stops at slash and at label
 			// boundaries, so `https://*.example.com` matches subdomains
 			// only, never `https://evil.com/x.example.com`.
-			g, err := glob.Compile(pl, '/', '.')
+			g, err := compileGlob(pl, '/', '.')
 			if err != nil {
 				return nil, err
 			}

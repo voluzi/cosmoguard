@@ -11,6 +11,26 @@ import (
 	"github.com/gobwas/glob"
 )
 
+// maxGlobPatternLen bounds the length of any operator-supplied glob
+// pattern. gobwas/glob compilation is super-linear in the number of
+// character classes / alternations (e.g. "?[a-z]" repeated ~160 times,
+// under 1 KB, already takes 200+ ms) — a config-time denial-of-service
+// surface that froze a CI fuzz run. Real rule patterns (paths, methods,
+// query/header values, origins) are tens of characters; 256 bytes is
+// generous headroom over any legitimate value while bounding worst-case
+// compile time to well under a millisecond.
+const maxGlobPatternLen = 256
+
+// compileGlob wraps glob.Compile with a length guard so a pathological
+// pattern fails config load with a clear error instead of pinning a CPU
+// at compile time. All validating compile sites route through this.
+func compileGlob(pattern string, separators ...rune) (glob.Glob, error) {
+	if len(pattern) > maxGlobPatternLen {
+		return nil, fmt.Errorf("glob pattern too long (%d bytes; max %d)", len(pattern), maxGlobPatternLen)
+	}
+	return glob.Compile(pattern, separators...)
+}
+
 // MatchTree is the v4 rule-matching primitive. A tree node is either a
 // combinator (all/any/none of its children) or a leaf with one or more
 // atomic predicates. A MatchTree is permitted to have BOTH child
@@ -134,7 +154,7 @@ func (m *MatchTree) Compile() error {
 			paths = append([]string{m.Path}, paths...)
 		}
 		for _, p := range paths {
-			g, err := glob.Compile(p, '/')
+			g, err := compileGlob(p, '/')
 			if err != nil {
 				return fmt.Errorf("path %q: %w", p, err)
 			}
@@ -211,7 +231,7 @@ func compilePredicate(v string, legacyV3 bool) (predicate, error) {
 		}
 	}
 	if strings.ContainsAny(v, "*?[") {
-		g, err := glob.Compile(v)
+		g, err := compileGlob(v)
 		if err != nil {
 			return predicate{}, err
 		}

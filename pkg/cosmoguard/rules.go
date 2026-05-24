@@ -385,7 +385,7 @@ func (r *JsonRpcRule) Compile() error {
 	if len(r.Methods) > 0 {
 		r.MethodGlobs = make([]glob.Glob, 0, len(r.Methods))
 		for _, p := range r.Methods {
-			g, err := glob.Compile(p)
+			g, err := compileGlob(p)
 			if err != nil {
 				return fmt.Errorf("jsonrpc rule (priority %d) method %q: %w", r.Priority, p, err)
 			}
@@ -397,7 +397,7 @@ func (r *JsonRpcRule) Compile() error {
 			r.ParamsMap = len(paramsMap) > 0
 			for key, v := range paramsMap {
 				if value, ok := v.(string); ok {
-					g, err := glob.Compile(value, '/')
+					g, err := compileGlob(value, '/')
 					if err != nil {
 						return fmt.Errorf("jsonrpc rule (priority %d) params[%q]=%q: %w", r.Priority, key, value, err)
 					}
@@ -409,7 +409,7 @@ func (r *JsonRpcRule) Compile() error {
 			r.ParamsSlice = len(paramsSlice) > 0
 			for i, v := range paramsSlice {
 				if value, ok := v.(string); ok {
-					g, err := glob.Compile(value, '/')
+					g, err := compileGlob(value, '/')
 					if err != nil {
 						return fmt.Errorf("jsonrpc rule (priority %d) params[%d]=%q: %w", r.Priority, i, value, err)
 					}
@@ -590,7 +590,7 @@ func (r *GrpcRule) Compile() error {
 	if len(r.Methods) > 0 {
 		r.MethodGlobs = make([]glob.Glob, 0, len(r.Methods))
 		for _, p := range r.Methods {
-			g, err := glob.Compile(p, '/')
+			g, err := compileGlob(p, '/')
 			if err != nil {
 				return fmt.Errorf("grpc rule (priority %d) method %q: %w", r.Priority, p, err)
 			}
