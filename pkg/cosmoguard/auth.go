@@ -27,6 +27,21 @@ type Identity struct {
 	// "api-key", "jwt", "introspection", "external-validator". Useful for
 	// audit logs.
 	Method string
+	// Degraded marks an identity minted because an auth backend (external
+	// validator / introspection) was unreachable and the operator chose
+	// fail-open. Authorize honours it unconditionally so a backend outage
+	// doesn't turn fail-open into fail-closed on protected routes. Never
+	// set for a verified credential.
+	Degraded bool
+}
+
+// degradedIdentity is the synthetic identity an auth method returns when
+// its backend is unreachable and failureMode is fail-open. It carries no
+// real scopes — Authorize short-circuits to "allowed" on the Degraded
+// flag rather than matching scopes/identities, so the operator's
+// availability-over-strictness choice holds across every gate.
+func degradedIdentity(method string) *Identity {
+	return &Identity{Name: "degraded", Method: method + "-degraded", Degraded: true}
 }
 
 // ReplayProtectionConfig opts in to JWT replay protection. When
@@ -336,9 +351,34 @@ func (a *Authenticator) StripCredentialHeaders(h http.Header) {
 	}
 }
 
+// CredentialHeaderNames returns every header/metadata name the configured
+// auth methods consume. Non-HTTP transports (gRPC metadata) use this to
+// strip credentials before forwarding upstream, since they can't use the
+// http.Header-based StripCredentialHeaders. nil-safe.
+func (a *Authenticator) CredentialHeaderNames() []string {
+	if a == nil {
+		return nil
+	}
+	var names []string
+	for _, m := range a.methods {
+		names = append(names, m.HeadersToStrip()...)
+	}
+	return names
+}
+
 // Authorize evaluates the per-rule auth gate against the resolved identity.
 // Returns (allowed, denyReason). denyReason is empty on allow.
 func (a *Authenticator) Authorize(rule *RuleAuthConfig, id *Identity) (bool, string) {
+	// Fail-open degraded identity (auth backend unreachable, operator
+	// chose availability) relaxes AUTHENTICATION availability ONLY: a
+	// degraded id is non-anonymous and so satisfies "require auth" /
+	// defaultRequire below, keeping traffic flowing during an outage. It
+	// deliberately does NOT short-circuit AUTHORIZATION — it carries no
+	// scopes and a non-allowlisted name, so a rule naming specific
+	// scopes/identities still fails closed via the matching below. The
+	// backend that would prove those claims is exactly what's down;
+	// granting them during the outage would be a silent privilege
+	// escalation.
 	requires := a.defaultReq
 	if rule != nil && rule.Require != nil {
 		requires = *rule.Require

@@ -122,7 +122,11 @@ func (m *introspectionMethod) Resolve(r *http.Request) (*Identity, error) {
 	id, err := m.introspect(r, raw)
 	if err != nil {
 		if m.failOpen {
-			return nil, nil
+			// Fail-open: IdP unreachable, operator chose availability.
+			// Return a degraded identity the auth gate honours rather
+			// than nil (which reads as anonymous and fails closed on
+			// protected routes). Not cached — the next request retries.
+			return degradedIdentity("introspection"), nil
 		}
 		return nil, err
 	}

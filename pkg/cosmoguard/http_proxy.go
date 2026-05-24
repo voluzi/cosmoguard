@@ -486,11 +486,16 @@ func (p *HttpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Middlewares enrich the context; pick up the latest copy.
 	r = req.r
 
-	// Endpoint handlers (JSON-RPC, EVM-WS, etc.) take over only when
-	// no HTTP rule matched AND the gates passed — an operator can
-	// still override by writing an explicit HTTP rule for POST / or
-	// GET /websocket.
-	if !decision.Stop && matchedRule == nil {
+	// Endpoint handlers (JSON-RPC POST /, EVM-WS GET /websocket) run once
+	// the gate has passed — for the no-rule-matched case AND for an
+	// explicit ALLOW rule on the endpoint path. The latter is the
+	// documented way to opt the connection out of HTTP-level auth (e.g.
+	// `POST /` with auth.require:false) while delegating per-method
+	// decisions to the JSON-RPC rules; routing it to the generic HTTP
+	// allow path instead would bypass JSON-RPC method rules, per-method
+	// auth/rate limits, and caching. A DENY rule (or a Stopped gate)
+	// short-circuits before dispatch.
+	if !decision.Stop && (matchedRule == nil || matchedRule.Action == RuleActionAllow) {
 		for _, handler := range p.endpointHandlers {
 			for _, e := range handler.Endpoints {
 				if e.Method == r.Method && e.Path == r.URL.Path {

@@ -236,17 +236,24 @@ func (w *StatusOnlyWriter) GetStatusCode() int { return w.statusCode }
 func GetSourceIP(r *http.Request) string {
 	if remotePeerTrusted(r.RemoteAddr) {
 		if v := r.Header.Get("X-Real-Ip"); v != "" {
-			return v
+			return stripPort(strings.TrimSpace(v))
 		}
 		if v := r.Header.Get("X-Forwarded-For"); v != "" {
 			// First hop only — strip everything after the first comma.
 			if i := strings.IndexByte(v, ','); i >= 0 {
-				return strings.TrimSpace(v[:i])
+				return stripPort(strings.TrimSpace(v[:i]))
 			}
-			return strings.TrimSpace(v)
+			return stripPort(strings.TrimSpace(v))
 		}
 	}
-	return r.RemoteAddr
+	// Host-only: r.RemoteAddr carries the ephemeral source port, which
+	// would give every TCP connection from the same client a distinct
+	// per-IP rate-limit bucket and break sourceIP/CIDR matching unless
+	// every caller remembered to strip it. Return the canonical IP so
+	// policy decisions are stable; the port is not useful for any
+	// per-client policy. stripPort is idempotent, so callers that still
+	// wrap this in stripPort() are unaffected.
+	return stripPort(r.RemoteAddr)
 }
 
 func WriteData(w http.ResponseWriter, code int, data []byte, headers ...string) {

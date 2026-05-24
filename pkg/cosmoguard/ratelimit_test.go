@@ -212,3 +212,23 @@ func TestRateLimitKey_CompoundFallsBackOnAnonymous(t *testing.T) {
 	k := rateLimitKey(RateLimitScopeCompound, 13, r, "")
 	assert.Assert(t, strings.Contains(k, "3.3.3.3"), "anonymous compound should be per-IP: %s", k)
 }
+
+// TestRateLimitScopeValidation is the regression test for silent
+// acceptance of a misspelled rateLimit.scope: an unknown scope must fail
+// rule compilation rather than degrade to a single global bucket at
+// request time. Known scopes (and empty) compile cleanly.
+func TestRateLimitScopeValidation(t *testing.T) {
+	bad := (&HttpRule{RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: "per_identity"}}).Compile()
+	assert.Assert(t, bad != nil, "misspelled scope must fail Compile")
+
+	for _, s := range []RateLimitScope{"", RateLimitScopeGlobal, RateLimitScopePerIP, RateLimitScopePerIdentity, RateLimitScopeCompound} {
+		err := (&HttpRule{RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: s}}).Compile()
+		assert.NilError(t, err, "scope %q must compile", s)
+	}
+
+	// Same enforcement on the JSON-RPC and gRPC rule compilers.
+	assert.Assert(t, (&JsonRpcRule{RateLimit: &RateLimitConfig{Scope: "bogus"}}).Compile() != nil,
+		"jsonrpc: misspelled scope must fail Compile")
+	assert.Assert(t, (&GrpcRule{RateLimit: &RateLimitConfig{Scope: "bogus"}}).Compile() != nil,
+		"grpc: misspelled scope must fail Compile")
+}

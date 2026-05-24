@@ -342,7 +342,7 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 	h.rulesMutex.Unlock()
 
 	if h.wsProxy != nil {
-		h.wsProxy.SetRules(rules, defaultAction)
+		h.wsProxy.SetRules(rules, defaultAction, newLimiters)
 	}
 
 	for fp, l := range old {
@@ -453,32 +453,42 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 	h.handleHttpBatch(requests, w, r, next, startTime)
 }
 
-// enforceJsonRpcRulePolicy runs the matched rule's auth + rate-limit
-// gates. Returns true to let the handler proceed; returns false (after
-// writing the response and recording the deny) when the request is
-// blocked. Identity is pulled from the HTTP request context — the
-// gate chain in HttpProxy.ServeHTTP resolved it once for the
-// connection.
-func (h *JsonRpcHandler) enforceJsonRpcRulePolicy(w http.ResponseWriter, r *http.Request,
-	request *JsonRpcMsg, rule *JsonRpcRule, limiters map[uint64]RateLimiter, startTime time.Time) bool {
+// jsonRpcPolicyVerdict runs the matched rule's per-rule auth +
+// rate-limit checks against the resolved identity and records any deny
+// on the dashboard. It writes NO response — callers emit it in their
+// own shape (the single path as a standalone HTTP body, the batch path
+// as one element of the response array). Returning ok=true lets the
+// caller proceed; ok=false carries the JSON-RPC error code (-32001 auth
+// / -32005 rate) + human reason. Shared between the single and batch
+// paths so the batch path cannot drift from the single path's policy —
+// the drift that let a denied call slip through inside a batch.
+//
+// Identity is pulled from the HTTP request context — the gate chain in
+// HttpProxy.ServeHTTP resolved it once for the connection.
+func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcMsg,
+	rule *JsonRpcRule, limiters map[uint64]RateLimiter) (ok bool, code int, reason string) {
 	var id *Identity
-	if hr, ok := r.Context().Value(identityCtxKey{}).(*Identity); ok {
+	if hr, found := r.Context().Value(identityCtxKey{}).(*Identity); found {
 		id = hr
 	}
-	if h.auth != nil && rule.Auth != nil {
-		if ok, reason := h.auth.Authorize(rule.Auth, id); !ok {
+	// Always Authorize when auth is enabled, even if the rule omits an
+	// auth: block — Authorize(nil, id) applies the global
+	// auth.defaultRequire. Guarding on rule.Auth != nil would let a
+	// JSON-RPC method rule without an auth block be served anonymously
+	// under defaultRequire (when the fronting HTTP rule opted out with
+	// require:false). Authorize(nil, id) is a pass-through when
+	// defaultRequire is off, so no-auth deployments are unaffected.
+	if h.auth != nil {
+		if authOK, why := h.auth.Authorize(rule.Auth, id); !authOK {
 			h.cgDashboard.RecordDeny(DenyRecord{
 				Section: h.section, Reason: "auth",
 				SourceIP: GetSourceIP(r), Method: request.Method,
 				RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
 			})
-			body, _ := ErrorResponse(request, -32001, reason, nil).Marshal()
-			WriteData(w, http.StatusUnauthorized, body, "Content-Type", "application/json")
-			h.recordSingle(r, request, "", RuleActionDeny, startTime, "request denied (auth)")
-			return false
+			return false, -32001, why
 		}
 	}
-	if l, ok := limiters[rule.Fingerprint]; ok && l != nil {
+	if l, found := limiters[rule.Fingerprint]; found && l != nil {
 		idName := ""
 		if id != nil {
 			idName = id.Name
@@ -493,13 +503,57 @@ func (h *JsonRpcHandler) enforceJsonRpcRulePolicy(w http.ResponseWriter, r *http
 				SourceIP: GetSourceIP(r), Method: request.Method,
 				RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
 			})
-			body, _ := ErrorResponse(request, -32005, "rate limit exceeded", nil).Marshal()
-			WriteData(w, http.StatusTooManyRequests, body, "Content-Type", "application/json")
-			h.recordSingle(r, request, "", RuleActionDeny, startTime, "request denied (rate)")
-			return false
+			return false, -32005, "rate limit exceeded"
 		}
 	}
-	return true
+	return true, 0, ""
+}
+
+// jsonRpcDefaultAuthVerdict applies the global auth.defaultRequire to an
+// unmatched method (no JsonRpcRule covered it) on a default-allow path.
+// Without this, when the fronting HTTP endpoint opts out of auth
+// (POST / with require:false) an anonymous caller could invoke any
+// method not named by a rule under rpc.jsonrpc.default:allow. Mirrors the
+// gRPC no-match default gate. Returns ok + the JSON-RPC deny code/reason;
+// pass-through when auth is disabled or defaultRequire is off. Records
+// the deny.
+func (h *JsonRpcHandler) jsonRpcDefaultAuthVerdict(r *http.Request, request *JsonRpcMsg) (ok bool, code int, reason string) {
+	if h.auth == nil {
+		return true, 0, ""
+	}
+	var id *Identity
+	if hr, found := r.Context().Value(identityCtxKey{}).(*Identity); found {
+		id = hr
+	}
+	if authOK, why := h.auth.Authorize(nil, id); !authOK {
+		h.cgDashboard.RecordDeny(DenyRecord{
+			Section: h.section, Reason: "auth",
+			SourceIP: GetSourceIP(r), Method: request.Method,
+		})
+		return false, -32001, why
+	}
+	return true, 0, ""
+}
+
+// enforceJsonRpcRulePolicy is the single-request wrapper around
+// jsonRpcPolicyVerdict: it writes the deny response + records the
+// outcome and returns false when blocked, true to proceed.
+func (h *JsonRpcHandler) enforceJsonRpcRulePolicy(w http.ResponseWriter, r *http.Request,
+	request *JsonRpcMsg, rule *JsonRpcRule, limiters map[uint64]RateLimiter, startTime time.Time) bool {
+	ok, code, reason := h.jsonRpcPolicyVerdict(r, request, rule, limiters)
+	if ok {
+		return true
+	}
+	status := http.StatusUnauthorized
+	logMsg := "request denied (auth)"
+	if code == -32005 {
+		status = http.StatusTooManyRequests
+		logMsg = "request denied (rate)"
+	}
+	body, _ := ErrorResponse(request, code, reason, nil).Marshal()
+	WriteData(w, status, body, "Content-Type", "application/json")
+	h.recordSingle(r, request, "", RuleActionDeny, startTime, logMsg)
+	return false
 }
 
 func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWriter, r *http.Request,
@@ -550,7 +604,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 				// Match the WS guard so an operator who toggles
 				// cache.enable on a `method: "*"` rule cannot footgun
 				// either transport.
-				cacheable := rule.Cache != nil && !hasSubscriptionMethod(request)
+				cacheable := rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
 				if cacheable {
 					// Single round-trip lookup; ErrNotFound = miss,
 					// other errors are backend failures that we log
@@ -601,6 +655,14 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 	// dashboard's unmatched panel surfaces it for the operator.
 	h.cgDashboard.RecordUnmatched(h.section, request.Method, "")
 	if defaultActionSnap == RuleActionAllow {
+		// Even on default-allow, an unmatched method must clear the
+		// global auth.defaultRequire gate (no rule opted it out).
+		if ok, code, reason := h.jsonRpcDefaultAuthVerdict(r, request); !ok {
+			body, _ := ErrorResponse(request, code, reason, nil).Marshal()
+			WriteData(w, http.StatusUnauthorized, body, "Content-Type", "application/json")
+			h.recordSingle(r, request, "", RuleActionDeny, startTime, "request denied (auth)")
+			return
+		}
 		next(w, r)
 		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 	} else {
@@ -625,7 +687,19 @@ func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *htt
 		return
 	}
 
-	res, _, _ := ParseJsonRpcMessage(b)
+	res, _, perr := ParseJsonRpcMessage(b)
+	if perr != nil || res == nil {
+		// Upstream returned a body that isn't a valid JSON-RPC message
+		// (e.g. an HTML 502 / plain-text error during an outage). The
+		// client already received the raw bytes via the response tee;
+		// do NOT cache — storing a zero-value message would replay a
+		// synthetic invalid JSON-RPC response from cache until the TTL
+		// expires, even after the upstream recovers.
+		if perr != nil {
+			h.log.Warnf("upstream returned unparseable JSON-RPC; skipping cache: %v", perr)
+		}
+		return
+	}
 
 	// Capture any trailing whitespace (typically "\n" from Cosmos /
 	// EVM JSON-RPC servers) so cache-hit replays remain byte-identical
@@ -685,6 +759,7 @@ func (h *JsonRpcHandler) handleHttpBatch(requests JsonRpcMsgs, w http.ResponseWr
 	h.rulesMutex.RLock()
 	rulesSnap := h.rules
 	defaultActionSnap := h.defaultAction
+	limitersSnap := h.limiters
 	h.rulesMutex.RUnlock()
 
 RequestsLoop:
@@ -695,6 +770,14 @@ RequestsLoop:
 			// No rules at all — every batch item is unmatched.
 			h.cgDashboard.RecordUnmatched(h.section, req.Method, "")
 			if defaultActionSnap == RuleActionAllow {
+				if ok, code, reason := h.jsonRpcDefaultAuthVerdict(r, req); !ok {
+					denied++
+					if req.ID != nil {
+						responses.AddResponse(req, ErrorResponse(req, code, reason, nil))
+					}
+					h.recordBatchItem(r, req, "", "request in batch denied (auth)")
+					continue RequestsLoop
+				}
 				responses.AddPending(req)
 				allowed++
 				h.recordBatchItem(r, req, cacheMiss, "request in batch allowed")
@@ -705,7 +788,11 @@ RequestsLoop:
 					SourceIP: GetSourceIP(r),
 					Method:   req.Method,
 				})
-				responses.Deny(req)
+				// Notifications (no id) get no response, even on denial
+				// (JSON-RPC 2.0 §4.1).
+				if req.ID != nil {
+					responses.Deny(req)
+				}
 				denied++
 				h.recordBatchItem(r, req, "", "request in batch denied")
 			}
@@ -714,18 +801,37 @@ RequestsLoop:
 		for _, rule := range rulesSnap {
 			match := rule.Match(req)
 			if match {
+				// Per-rule auth + rate-limit gate, identical to the
+				// single-request path (jsonRpcPolicyVerdict). Without
+				// this, a method matching an allow rule that carries
+				// auth scopes/identities or a rateLimit could be
+				// invoked — or served from cache — inside a batch by a
+				// caller that would be denied as a single request.
+				if vok, code, reason := h.jsonRpcPolicyVerdict(r, req, rule, limitersSnap); !vok {
+					denied++
+					// Notifications (no id) get NO response, even on
+					// denial, per JSON-RPC 2.0 §4.1. Emit the error only
+					// for id-bearing calls.
+					if req.ID != nil {
+						responses.AddResponse(req, ErrorResponse(req, code, reason, nil))
+					}
+					h.recordBatchItem(r, req, "", "request in batch denied (policy)")
+					continue RequestsLoop
+				}
 				switch rule.Action {
 				case RuleActionAllow:
 					allowed++
 
-					// Subscription methods bypass the cache for the same
-					// reason as the single / WS paths — a cached
-					// subscribe / unsubscribe response replays an
-					// upstream subscription id (or success token) into
-					// a different client's request. Short-circuit to
-					// AddPending so the request still hits the upstream
-					// and the response is not stored.
-					if hasSubscriptionMethod(req) {
+					// Forward without touching the cache when the rule
+					// doesn't enable caching (no cache: block, or
+					// cache.enable: false — an operator must be able to
+					// turn caching off without deleting the block) OR the
+					// method is a subscription (a cached subscribe /
+					// unsubscribe response would replay an upstream
+					// subscription id / success token into a different
+					// client's request). AddPending hits the upstream and
+					// stores nothing.
+					if rule.Cache == nil || !rule.Cache.Enable || hasSubscriptionMethod(req) {
 						responses.AddPending(req)
 						cacheMisses++
 						h.recordBatchItem(r, req, cacheMiss, "request in batch allowed")
@@ -767,7 +873,11 @@ RequestsLoop:
 						RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
 					})
 					h.recordBatchItem(r, req, "", "request in batch denied")
-					responses.Deny(req)
+					// Notification (no id) → no response, even on denial
+					// (JSON-RPC 2.0 §4.1).
+					if req.ID != nil {
+						responses.Deny(req)
+					}
 					continue RequestsLoop
 
 				default:
@@ -780,6 +890,14 @@ RequestsLoop:
 		// section's unmatched counter.
 		h.cgDashboard.RecordUnmatched(h.section, req.Method, "")
 		if defaultActionSnap == RuleActionAllow {
+			if ok, code, reason := h.jsonRpcDefaultAuthVerdict(r, req); !ok {
+				denied++
+				if req.ID != nil {
+					responses.AddResponse(req, ErrorResponse(req, code, reason, nil))
+				}
+				h.recordBatchItem(r, req, "", "request in batch denied (auth)")
+				continue RequestsLoop
+			}
 			responses.AddPending(req)
 			allowed++
 			h.recordBatchItem(r, req, "", "request in batch allowed")
@@ -790,7 +908,11 @@ RequestsLoop:
 				SourceIP: GetSourceIP(r),
 				Method:   req.Method,
 			})
-			responses.Deny(req)
+			// Notifications (no id) get no response, even on denial
+			// (JSON-RPC 2.0 §4.1).
+			if req.ID != nil {
+				responses.Deny(req)
+			}
 			denied++
 			h.recordBatchItem(r, req, "", "request in batch denied")
 		}
@@ -802,34 +924,39 @@ RequestsLoop:
 		h.log.Debug("getting from upstream")
 		upstreamResponses, err := h.getResponsesFromUpstream(r, pendingRequests, next)
 		if err != nil {
+			// Don't fail the whole batch with a non-JSON 500: that breaks
+			// batch semantics and discards cache hits already resolved
+			// above. Leave upstreamResponses unset; FillUnansweredCalls
+			// below turns each still-pending call into a per-item
+			// JSON-RPC error while answered/cached items are preserved.
 			h.log.Errorf("error getting responses from upstream: %v", err)
-			WriteError(w, http.StatusInternalServerError, "error getting responses from upstream")
-			return
-		}
-		if len(upstreamResponses) == len(pendingRequests) {
+		} else {
+			// Correlate by id (Set) — per JSON-RPC 2.0 batch responses
+			// match by id, not position; notifications get none.
 			responses.Set(pendingRequests, upstreamResponses)
 			if err = responses.StoreInCache(h.cache, func(ruleTag, method string) {
 				h.cgDashboard.RecordCardinality(h.section, ruleTag, method)
 			}); err != nil {
 				h.log.Errorf("error caching responses: %v", err)
 			}
-		} else {
-			// Count mismatch: upstream returned a different number of
-			// responses than we sent. Per JSON-RPC 2.0 §6, batched
-			// responses correlate by ID, not by position; a partial
-			// upstream response would leave Pending entries
-			// unserialized → silently dropped from the client-facing
-			// payload. Fail the whole batch loudly instead.
-			h.log.WithFields(map[string]interface{}{
-				"sent":     len(pendingRequests),
-				"received": len(upstreamResponses),
-			}).Errorf("jsonrpc batch upstream count mismatch")
-			WriteError(w, http.StatusBadGateway, "upstream returned mismatched batch response count")
-			return
 		}
+		// Any id-bearing call still without a response — upstream errored
+		// or omitted it — becomes a per-item JSON-RPC error so the batch
+		// stays a valid JSON array and answered calls / cache hits are
+		// preserved (replaces the old whole-batch 500/502). Notifications
+		// (no id) are left out per JSON-RPC 2.0 §4.1.
+		responses.FillUnansweredCalls()
 	}
 
-	b, err := responses.GetFinal().Marshal()
+	// Per JSON-RPC 2.0 §6, a batch that yields no Response objects (e.g.
+	// all notifications) MUST return nothing rather than an empty array —
+	// reply 200 with an empty body.
+	final := responses.GetFinal()
+	if len(final) == 0 {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	b, err := final.Marshal()
 	if err != nil {
 		h.log.Errorf("error marshalling response: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)

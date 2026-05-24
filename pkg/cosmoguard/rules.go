@@ -150,6 +150,9 @@ func (r *HttpRule) String() string {
 // Always reinitializes state so calling Compile twice produces a clean
 // result.
 func (r *HttpRule) Compile() error {
+	if err := r.RateLimit.validate(); err != nil {
+		return err
+	}
 	// Build a fresh effective match tree on every Compile call so two
 	// compiles in a row produce identical state (idempotent).
 	em := &MatchTree{}
@@ -371,6 +374,9 @@ func (r *JsonRpcRule) String() string {
 // on each call so a previously-compiled rule whose Params changed doesn't
 // retain stale entries.
 func (r *JsonRpcRule) Compile() error {
+	if err := r.RateLimit.validate(); err != nil {
+		return err
+	}
 	r.MethodGlobs = nil
 	r.ParamsGlobs = map[string]glob.Glob{}
 	r.ParamsMap = false
@@ -577,6 +583,9 @@ func (r *GrpcRule) String() string {
 // Compile validates and materializes glob fields. Reinitializes on each call.
 // Also computes Fingerprint for per-rule cache-key namespacing.
 func (r *GrpcRule) Compile() error {
+	if err := r.RateLimit.validate(); err != nil {
+		return err
+	}
 	r.MethodGlobs = nil
 	if len(r.Methods) > 0 {
 		r.MethodGlobs = make([]glob.Glob, 0, len(r.Methods))

@@ -163,13 +163,13 @@ func TestGetSourceIP(t *testing.T) {
 			name:       "fallback to RemoteAddr",
 			headers:    map[string]string{},
 			remoteAddr: "5.6.7.8:1234",
-			expected:   "5.6.7.8:1234",
+			expected:   "5.6.7.8", // host-only: ephemeral port stripped for stable per-IP policy
 		},
 		{
 			name:       "empty headers fallback",
 			headers:    map[string]string{"X-Real-Ip": "", "X-Forwarded-For": ""},
 			remoteAddr: "192.168.1.1:8080",
-			expected:   "192.168.1.1:8080",
+			expected:   "192.168.1.1", // host-only
 		},
 		{
 			// X-Forwarded-For chain: "client, lb-1, lb-2" — return just
@@ -220,7 +220,7 @@ func TestGetSourceIP_DefaultDeny(t *testing.T) {
 	req.Header.Set("X-Real-Ip", "1.2.3.4")
 	req.Header.Set("X-Forwarded-For", "9.9.9.9")
 
-	if got := GetSourceIP(req); got != "5.6.7.8:1234" {
+	if got := GetSourceIP(req); got != "5.6.7.8" {
 		t.Fatalf("default-deny must ignore client-supplied headers, got %q", got)
 	}
 }
@@ -248,7 +248,7 @@ func TestGetSourceIP_TrustedPeerHonored(t *testing.T) {
 	r2 := httptest.NewRequest(http.MethodGet, "/", nil)
 	r2.RemoteAddr = "8.8.8.8:55555"
 	r2.Header.Set("X-Real-Ip", "1.2.3.4")
-	if got := GetSourceIP(r2); got != "8.8.8.8:55555" {
+	if got := GetSourceIP(r2); got != "8.8.8.8" {
 		t.Fatalf("untrusted peer must ignore X-Real-Ip, got %q", got)
 	}
 }
@@ -397,5 +397,33 @@ func BenchmarkResponseWriterWrapper(b *testing.B) {
 		wrapper.WriteHeader(http.StatusOK)
 		wrapper.Write(data)
 		wrapper.GetWrittenBytes()
+	}
+}
+
+// TestGetSourceIP_StripsPort pins the host-only guarantee: GetSourceIP
+// never returns an ephemeral source port, so per-IP rate-limit buckets
+// and sourceIP/CIDR matching are stable across TCP connections — whether
+// the IP comes from RemoteAddr or a trusted-proxy header that included a
+// port.
+func TestGetSourceIP_StripsPort(t *testing.T) {
+	prev := trustedProxies.Load()
+	if err := SetTrustedProxies([]string{"10.0.0.0/8"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	// RemoteAddr fallback (untrusted headers): host only.
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "203.0.113.9:44321"
+	if got := GetSourceIP(r); got != "203.0.113.9" {
+		t.Fatalf("RemoteAddr fallback must be host-only, got %q", got)
+	}
+
+	// Trusted proxy supplies X-Real-Ip WITH a port → still host-only.
+	r2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r2.RemoteAddr = "10.1.2.3:55555"
+	r2.Header.Set("X-Real-Ip", "203.0.113.9:7000")
+	if got := GetSourceIP(r2); got != "203.0.113.9" {
+		t.Fatalf("X-Real-Ip with port must be host-only, got %q", got)
 	}
 }

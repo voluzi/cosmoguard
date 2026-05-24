@@ -897,6 +897,31 @@ func (f *CosmoGuard) tryReload() {
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
 	}
+	// enableEvm is wired ONCE at startup: when it's false the EVM
+	// proxies/handlers are never constructed (left nil). Accepting a
+	// flip here would make applyRulesLocked's EVM branch dereference
+	// those nil servers and panic the watcher goroutine. Treat it as
+	// runtime-immutable, same as cache topology — reject and surface it.
+	if f.cfg.EnableEvm != newCfg.EnableEvm {
+		err := fmt.Errorf("enableEvm change requires a process restart (running=%v, new=%v)", f.cfg.EnableEvm, newCfg.EnableEvm)
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	// The Authenticator (identities, methods, defaultRequire, replay
+	// store, JWKS refreshers) is built ONCE at startup and wired into
+	// every proxy/handler. A reload swaps f.cfg but does not rebuild it,
+	// so accepting auth edits here would report success while still
+	// authenticating against the OLD identities/keys — a silent key-
+	// rotation / revocation failure. Treat the global auth block as
+	// runtime-immutable and reject the change (per-rule `auth:` on
+	// individual rules still hot-reloads, since it lives in the rules).
+	if !reflect.DeepEqual(f.cfg.Auth, newCfg.Auth) {
+		err := fmt.Errorf("auth config change requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
 	before := f.ruleFingerprintsLocked()
 	f.cfg = newCfg
 	f.applyRulesLocked()

@@ -353,6 +353,36 @@ func (l *JsonRpcResponses) GetPendingRequests() JsonRpcMsgs {
 	return requests
 }
 
+// UnansweredCalls counts request slots that carry an `id` (i.e. calls,
+// not notifications) but still have no response. After Set has
+// correlated upstream responses by id, a non-zero count means a real
+// call was left unanswered and would be silently dropped from the
+// client payload — the caller should fail the batch loudly. Notifications
+// (no `id`) legitimately have no response and are not counted.
+func (l *JsonRpcResponses) UnansweredCalls() int {
+	n := 0
+	for _, r := range *l {
+		if r.Response == nil && r.Request != nil && r.Request.ID != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// FillUnansweredCalls replaces every still-pending id-bearing call (a
+// slot with no Response) with a JSON-RPC internal error. Used after Set
+// (or an upstream failure) so a batch where the upstream errored or
+// omitted some responses still returns a valid array — answered calls
+// and cache hits are preserved. Notifications (no id) are left untouched
+// (they get no response per JSON-RPC 2.0 §4.1).
+func (l *JsonRpcResponses) FillUnansweredCalls() {
+	for _, r := range *l {
+		if r.Response == nil && r.Request != nil && r.Request.ID != nil {
+			r.Response = ErrorResponse(r.Request, -32603, "upstream error", nil)
+		}
+	}
+}
+
 func (l *JsonRpcResponses) GetFinal() JsonRpcMsgs {
 	responses := make(JsonRpcMsgs, 0)
 	for _, r := range *l {

@@ -247,3 +247,32 @@ func TestPrepareConfig_RejectsIncompatibleScheme(t *testing.T) {
 		})
 	}
 }
+
+// TestUpstreamHTTPURL_IPv6HostBracketed is the regression test for the
+// IPv6 host bug: a bare IPv6 literal must be bracketed before the port so
+// url.Parse yields a usable host (AAAA-discovered / IPv6 upstreams).
+func TestUpstreamHTTPURL_IPv6HostBracketed(t *testing.T) {
+	n := NodeConfig{Host: "fd00::1", LcdPort: 1317}
+	u, err := upstreamHTTPURL(n, serviceLCD)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if u.Host != "[fd00::1]:1317" {
+		t.Fatalf("host=%q want [fd00::1]:1317", u.Host)
+	}
+	if u.Hostname() != "fd00::1" {
+		t.Fatalf("hostname=%q want fd00::1", u.Hostname())
+	}
+}
+
+// TestNodeWSURL_IPv6HostBracketed — same bracketing on the WS builder.
+func TestNodeWSURL_IPv6HostBracketed(t *testing.T) {
+	n := NodeConfig{Host: "fd00::1", RpcPort: 26657}
+	u, err := nodeWSURL(n, serviceRPC)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if u.Host != "[fd00::1]:26657" {
+		t.Fatalf("host=%q want [fd00::1]:26657", u.Host)
+	}
+}

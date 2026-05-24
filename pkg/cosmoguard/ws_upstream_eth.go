@@ -90,7 +90,15 @@ func (u *UpstreamConnManagerEth) Run(log *Entry) error {
 				continue
 			}
 			u.failedReconnects.Store(0)
-			u.resetAll()
+			// Reset only the per-connection response map. The
+			// subscription maps (subByParam / subByID) MUST survive the
+			// reconnect: reSubmitSubscriptionsOnClient reads subByParam to
+			// know what to re-issue. Wiping them here (the old resetAll)
+			// left an empty map, so client subscriptions were silently
+			// never re-established after an EVM WS reconnect. The new
+			// upstream subscription IDs are rewritten into subByID as each
+			// param is re-subscribed below.
+			u.resetConnectionState()
 			cli = u.curClient()
 			// See cosmos manager: resubmit must run off Run so it can
 			// read its own subscribe response.
@@ -362,9 +370,17 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 	return nil
 }
 
-func (u *UpstreamConnManagerEth) resetAll() {
+// resetConnectionState clears the per-connection in-flight response map
+// AND the upstream-subscription-ID index (subByID): both are scoped to
+// the dead connection — response channels will never be fulfilled, and
+// the new connection mints fresh eth_subscribe IDs. subByParam is
+// deliberately PRESERVED: it is the source of truth for which params
+// must be re-subscribed on the new connection
+// (reSubmitSubscriptionsOnClient reads it). Wiping subByParam here — the
+// old resetAll behaviour — left an empty map, so client subscriptions
+// were silently never re-established after an EVM WS reconnect.
+func (u *UpstreamConnManagerEth) resetConnectionState() {
 	u.subMux.Lock()
-	u.subByParam = make(map[string]string)
 	u.subByID = make(map[string]string)
 	u.subMux.Unlock()
 
@@ -374,8 +390,11 @@ func (u *UpstreamConnManagerEth) resetAll() {
 }
 
 func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
-	// Snapshot under subMux so we don't race with concurrent
-	// Subscribe/Unsubscribe callers from the pool.
+	// Snapshot under subMux so we don't range over the map while
+	// subscribeWithIDOnClient writes to it. subByParam survived the
+	// reconnect (see resetConnectionState); each param is re-issued on
+	// the new client, and subscribeWithIDOnClient rewrites subByParam /
+	// subByID with the new upstream subscription ID.
 	u.subMux.Lock()
 	pending := make([]string, 0, len(u.subByParam))
 	for param := range u.subByParam {
@@ -391,9 +410,6 @@ func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsCli
 		u.log.WithFields(map[string]interface{}{
 			"param": param,
 		}).Debug("re-submitting subscription")
-		if u.HasSubscription(param) {
-			continue
-		}
 		id := u.IdGen.ID()
 		if _, err := u.subscribeWithIDOnClient(cli, id, param); err != nil {
 			return err

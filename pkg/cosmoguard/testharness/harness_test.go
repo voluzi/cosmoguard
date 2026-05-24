@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -376,5 +377,63 @@ func TestHarness_JSONRPCNullID(t *testing.T) {
 		assert.Equal(t, string(id), "null")
 	case <-time.After(time.Second):
 		t.Fatal("handler never received request")
+	}
+}
+
+// TestHarness_JSONRPCDispatchUnderHTTPAllowRule is the regression test
+// for the endpoint-dispatch bypass: an explicit HTTP `POST /` allow rule
+// (the documented way to opt the connection out of HTTP-level auth and
+// delegate to JSON-RPC method rules) must NOT route the request to the
+// generic HTTP allow path. The JSON-RPC handler must still run so a
+// per-method deny rule applies. Before the fix, the matched HTTP rule
+// suppressed endpoint dispatch and the call was forwarded upstream.
+func TestHarness_JSONRPCDispatchUnderHTTPAllowRule(t *testing.T) {
+	cfg := &cosmoguard.Config{
+		Host:    "127.0.0.1",
+		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
+		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
+		RPC: cosmoguard.RpcConfig{
+			Default: cosmoguard.RuleActionAllow,
+			// HTTP-level allow rule on the JSON-RPC endpoint path.
+			Rules: []*cosmoguard.HttpRule{
+				{Paths: []string{"/"}, Methods: []string{"POST"}, Action: cosmoguard.RuleActionAllow},
+			},
+			JsonRpc: cosmoguard.JsonRpcConfig{
+				Default: cosmoguard.RuleActionAllow,
+				// Per-method deny — only enforced if the JSON-RPC handler runs.
+				Rules: []*cosmoguard.JsonRpcRule{
+					{Methods: []string{"secret"}, Action: cosmoguard.RuleActionDeny},
+				},
+			},
+		},
+		GRPC: cosmoguard.GrpcConfig{Default: cosmoguard.RuleActionDeny},
+	}
+
+	h := testharness.New(t,
+		testharness.WithConfig(cfg),
+		testharness.WithJSONRPCMethod("secret",
+			func(req testharness.JSONRPCRequest) (any, *testharness.JSONRPCError) {
+				// If this runs, the JSON-RPC deny rule was bypassed.
+				return map[string]any{"ok": true}, nil
+			},
+		),
+	)
+
+	resp := h.JSONRPCRequest(t, 1, "secret", nil)
+	// The JSON-RPC method-deny must have applied: the response must NOT
+	// carry the upstream success result.
+	if strings.Contains(string(resp.Body), `"ok"`) {
+		t.Fatalf("JSON-RPC method deny was bypassed — upstream result leaked: %s", resp.Body)
+	}
+	var out struct {
+		Error  *struct{ Code int } `json:"error"`
+		Result json.RawMessage     `json:"result"`
+	}
+	if err := json.Unmarshal(resp.Body, &out); err != nil {
+		t.Fatalf("parse jsonrpc response: %v\nbody: %s", err, resp.Body)
+	}
+	if out.Error == nil {
+		t.Fatalf("expected a JSON-RPC error (method denied), got: %s", resp.Body)
 	}
 }

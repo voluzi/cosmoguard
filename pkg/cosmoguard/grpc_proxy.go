@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/olric-data/olric"
@@ -27,6 +28,10 @@ import (
 // back to per-ip when no identity is resolved.
 func grpcRateLimitKey(scope RateLimitScope, fingerprint uint64, source, identity string) string {
 	prefix := strconv.FormatUint(fingerprint, 16)
+	// Normalise the source to a bare IP (gRPC passes peer host:port,
+	// JSON-RPC passes an already-bare IP) so per-ip / compound buckets
+	// key on the client IP rather than the ephemeral connection port.
+	ip := stripPort(source)
 	switch scope {
 	case RateLimitScopeGlobal:
 		return prefix + ":global"
@@ -34,9 +39,17 @@ func grpcRateLimitKey(scope RateLimitScope, fingerprint uint64, source, identity
 		if identity != "" {
 			return prefix + ":id:" + identity
 		}
-		return prefix + ":ip:" + source
+		return prefix + ":ip:" + ip
+	case RateLimitScopeCompound:
+		// identity+IP together: one identity across many IPs gets
+		// independent budgets; anonymous callers fall back to per-IP.
+		// Mirrors rateLimitKey so gRPC + JSON-RPC honour compound.
+		if identity != "" {
+			return prefix + ":compound:" + identity + "|" + ip
+		}
+		return prefix + ":ip:" + ip
 	default: // per-ip
-		return prefix + ":ip:" + source
+		return prefix + ":ip:" + ip
 	}
 }
 
@@ -273,18 +286,27 @@ func (p *GrpcProxy) SetRules(rules []*GrpcRule, defaultAction RuleAction) {
 	}
 }
 
-func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context, *grpc.ClientConn, error) {
+// enforcePolicy runs the auth + per-rule auth + rate-limit + rule-action
+// decision for method and returns the outgoing context (inbound metadata
+// MINUS the stripped credentials) when the call is allowed, or a gRPC
+// status error when it is denied. It deliberately does NOT select an
+// upstream — picking is the caller's job (Handle for the transparent
+// forwarder; the cache handler only on a miss). Conflating the two made
+// a cacheable method's policy check burn a round-robin Pick (skewing
+// load to one backend) and forwarded credentials upstream.
+func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.Context, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 
-	// The per-RPC span is started by cachingStreamHandler (the outermost
-	// stream handler) so its lifetime covers the full RPC. Here we just
-	// fetch the live span from ctx to annotate it for deny / no-upstream
-	// outcomes. If no span is on ctx (defensive: should not happen now
-	// that cachingStreamHandler wraps every RPC) SpanFromContext returns
-	// a no-op span — span.SetStatus is safe to call.
+	// The per-RPC span is started by cachingStreamHandler so its lifetime
+	// covers the full RPC; here we just annotate it for deny outcomes.
 	span := trace.SpanFromContext(ctx)
+	markErrSpan := func(reason string) { span.SetStatus(otelcodes.Error, reason) }
 
-	outCtx := metadata.NewOutgoingContext(ctx, md.Copy())
+	// outMD is the metadata forwarded upstream. Credentials are removed
+	// from it after a successful Resolve (below) so API keys / JWTs never
+	// reach the upstream node — the gRPC equivalent of the HTTP layer's
+	// StripCredentialHeaders.
+	outMD := md.Copy()
 
 	var source string
 	if pr, ok := peer.FromContext(ctx); ok {
@@ -294,14 +316,6 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 	// gRPC reflection is gated like any other method — operators who
 	// need it must explicitly allow /grpc.reflection.* via a rule.
 
-	// markErrSpan flags the span as failed so deny / no-upstream
-	// outcomes don't render as green successes in Jaeger / Tempo.
-	markErrSpan := func(reason string) {
-		span.SetStatus(otelcodes.Error, reason)
-	}
-
-	// Auth gate. Resolves identity from gRPC metadata once; the
-	// resolved id is reused by per-rule auth checks below.
 	var id *Identity
 	if p.auth != nil {
 		synthReq := synthRequestFromGrpcMD(md)
@@ -314,20 +328,23 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 					SourceIP: source, Method: method,
 				})
 				markErrSpan("auth: " + err.Error())
-				return ctx, nil, status.Error(codes.Unauthenticated, err.Error())
+				return ctx, status.Error(codes.Unauthenticated, err.Error())
 			}
 			markErrSpan("auth error")
-			return ctx, nil, status.Error(codes.Unauthenticated, "authentication failed")
+			return ctx, status.Error(codes.Unauthenticated, "authentication failed")
 		}
-		if ok, reason := p.auth.Authorize(nil, id); !ok {
-			p.cgDashboard.RecordDeny(DenyRecord{
-				Section: p.section, Reason: "auth",
-				SourceIP: source, Method: method,
-			})
-			markErrSpan("auth: " + reason)
-			return ctx, nil, status.Error(codes.Unauthenticated, reason)
+		// Strip the configured credential metadata (gRPC keys are
+		// lower-cased) so it is never forwarded upstream.
+		for _, name := range p.auth.CredentialHeaderNames() {
+			delete(outMD, strings.ToLower(name))
 		}
+		// NOTE: the global auth.defaultRequire gate is applied per-rule
+		// (and on the no-match default path) below, NOT here — matching
+		// the HTTP ordering so a rule with auth.require:false can opt a
+		// public method out. A forged/replayed credential is still
+		// rejected above regardless of any rule.
 	}
+	outCtx := metadata.NewOutgoingContext(ctx, outMD)
 
 	p.rulesMutex.RLock()
 	defer p.rulesMutex.RUnlock()
@@ -335,10 +352,11 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 		if !rule.Match(method) {
 			continue
 		}
-		// Per-rule auth: if the matched rule names scopes/identities
-		// or sets require, the resolved identity must satisfy it
-		// regardless of the global default.
-		if p.auth != nil && rule.Auth != nil {
+		// Per-rule auth, applied for every matched rule when auth is
+		// enabled. rule.Auth may be nil → Authorize falls back to the
+		// global auth.defaultRequire, so a rule can opt out
+		// (auth.require:false) or tighten (scopes/identities).
+		if p.auth != nil {
 			if ok, reason := p.auth.Authorize(rule.Auth, id); !ok {
 				p.cgDashboard.RecordDeny(DenyRecord{
 					Section: p.section, Reason: "auth",
@@ -346,12 +364,10 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
 				})
 				markErrSpan("auth: " + reason)
-				return ctx, nil, status.Error(codes.Unauthenticated, reason)
+				return ctx, status.Error(codes.Unauthenticated, reason)
 			}
 		}
-		// Per-rule rate-limit: token bucket keyed by scope. Identity
-		// name falls back to source IP for anonymous callers (matches
-		// HttpProxy.rateLimitKey behaviour).
+		// Per-rule rate-limit: token bucket keyed by scope.
 		if l, ok := p.limiters[rule.Fingerprint]; ok && l != nil {
 			idName := ""
 			if id != nil {
@@ -361,8 +377,7 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 			allowed, retryAfter, rlErr := l.Allow(ctx, key)
 			if rlErr != nil {
 				// Fail-open on limiter transport error so an olric
-				// blip doesn't take down traffic; the deny path
-				// covers actual budget exhaustion.
+				// blip doesn't take down traffic.
 				p.log.WithError(rlErr).Warn("grpc rate limiter error; allowing")
 			} else if !allowed {
 				p.cgDashboard.RecordDeny(DenyRecord{
@@ -375,7 +390,7 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 				if retryAfter > 0 {
 					_, _ = st.WithDetails() // placeholder if we ever want RetryInfo proto
 				}
-				return ctx, nil, st.Err()
+				return ctx, st.Err()
 			}
 		}
 		switch rule.Action {
@@ -383,12 +398,7 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 			p.log.WithFields(map[string]interface{}{
 				"method": method, "source": source, "action": "allow",
 			}).Info("request allowed")
-			up := p.pool.Pick()
-			if up == nil {
-				markErrSpan("no upstream available")
-				return ctx, nil, status.Error(codes.Unavailable, "no upstream available")
-			}
-			return outCtx, up.conn, nil
+			return outCtx, nil
 
 		case RuleActionDeny:
 			p.log.WithFields(map[string]interface{}{
@@ -402,7 +412,7 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 				RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
 			})
 			markErrSpan("denied by rule")
-			return ctx, nil, status.Errorf(codes.Unavailable, "Unauthorized")
+			return ctx, status.Errorf(codes.Unavailable, "Unauthorized")
 
 		default:
 			log.Errorf("unrecognized rule action %q", rule.Action)
@@ -411,24 +421,28 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 
 	// No rule matched — record (method, "") under the gRPC section.
 	p.cgDashboard.RecordUnmatched(p.section, method, "")
+	// Apply the global auth.defaultRequire to unmatched methods (no rule
+	// opted them out). Authorize(nil, id) is a pass-through when
+	// defaultRequire is off.
+	if p.auth != nil {
+		if ok, reason := p.auth.Authorize(nil, id); !ok {
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section: p.section, Reason: "auth",
+				SourceIP: source, Method: method,
+			})
+			markErrSpan("auth: " + reason)
+			return ctx, status.Error(codes.Unauthenticated, reason)
+		}
+	}
 	if p.defaultAction == RuleActionAllow {
 		p.log.WithFields(map[string]interface{}{
-			"method": method,
-			"source": source,
-			"action": "allow",
+			"method": method, "source": source, "action": "allow",
 		}).Info("request allowed")
-		up := p.pool.Pick()
-		if up == nil {
-			markErrSpan("no upstream available")
-			return ctx, nil, status.Error(codes.Unavailable, "no upstream available")
-		}
-		return outCtx, up.conn, nil
+		return outCtx, nil
 	}
 	markErrSpan("denied by default action")
 	p.log.WithFields(map[string]interface{}{
-		"method": method,
-		"source": source,
-		"action": "deny",
+		"method": method, "source": source, "action": "deny",
 	}).Info("request denied")
 	p.cgDashboard.RecordDeny(DenyRecord{
 		Section:  p.section,
@@ -436,5 +450,21 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 		SourceIP: source,
 		Method:   method,
 	})
-	return ctx, nil, status.Errorf(codes.Unavailable, "Unauthorized")
+	return ctx, status.Errorf(codes.Unavailable, "Unauthorized")
+}
+
+// Handle is the StreamDirector for the transparent forwarder: enforce
+// policy, then select an upstream. The cache path calls enforcePolicy
+// directly and picks only on a miss, so it never burns a pick on a hit.
+func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context, *grpc.ClientConn, error) {
+	outCtx, err := p.enforcePolicy(ctx, method)
+	if err != nil {
+		return ctx, nil, err
+	}
+	up := p.pool.Pick()
+	if up == nil {
+		trace.SpanFromContext(ctx).SetStatus(otelcodes.Error, "no upstream available")
+		return ctx, nil, status.Error(codes.Unavailable, "no upstream available")
+	}
+	return outCtx, up.conn, nil
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"net/http"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/olric-data/olric"
 	"golang.org/x/time/rate"
 )
@@ -36,6 +36,23 @@ const (
 	// from many IPs. On anonymous traffic it degrades to per-IP.
 	RateLimitScopeCompound RateLimitScope = "compound"
 )
+
+// validate rejects an unknown rateLimit.scope at config-compile time
+// rather than letting a typo (e.g. "per_identity") silently fall through
+// to the global bucket at request time — which would throttle every
+// caller of the rule. Empty is allowed (creasty/defaults fills "per-ip").
+// nil-safe so callers can invoke it unconditionally.
+func (c *RateLimitConfig) validate() error {
+	if c == nil {
+		return nil
+	}
+	switch c.Scope {
+	case "", RateLimitScopeGlobal, RateLimitScopePerIP, RateLimitScopePerIdentity, RateLimitScopeCompound:
+		return nil
+	default:
+		return fmt.Errorf("rateLimit.scope %q is invalid (want one of: global, per-ip, per-identity, compound)", c.Scope)
+	}
+}
 
 // RateLimitConfig is the YAML-facing shape attached to a rule (or, in the
 // future, the global section).
@@ -188,31 +205,54 @@ func NewRateLimiter(cfg RateLimitConfig, olricClient *olric.EmbeddedClient, keys
 	// the doc-comment above so a programmatic embedder doesn't
 	// believe their multi-replica setup is enforcing a cluster-
 	// wide quota by accident.
+	buckets := ttlcache.New[string, *rate.Limiter](
+		ttlcache.WithTTL[string, *rate.Limiter](memoryRateLimiterBucketTTL),
+		ttlcache.WithCapacity[string, *rate.Limiter](memoryRateLimiterMaxBuckets),
+	)
+	// Deliberately no go buckets.Start(): the capacity cap evicts on
+	// Set (synchronous) and the TTL is honoured lazily on Get, so memory
+	// is bounded without a background goroutine — which would otherwise
+	// leak for every limiter a caller builds and abandons.
 	return &memoryRateLimiter{
-		buckets: map[string]*rate.Limiter{},
+		buckets: buckets,
 		rate:    rate.Limit(cfg.Rate.PerSecond),
 		burst:   burst,
 	}, nil
 }
 
+// memoryRateLimiterMaxBuckets caps the number of live per-key token
+// buckets and memoryRateLimiterBucketTTL ages out idle ones. Together
+// they bound the single-replica limiter's memory so a flood of distinct
+// keys (port scan, DDoS from many IPs, or many identities) can't grow
+// the bucket set without limit and OOM the process. The cap is the hard
+// bound (eviction happens on Set); the TTL trims idle keys on access.
+const (
+	memoryRateLimiterBucketTTL  = 10 * time.Minute
+	memoryRateLimiterMaxBuckets = 100_000
+)
+
 // memoryRateLimiter is the single-replica in-process limiter. One token
-// bucket per key (most commonly per source IP). Buckets stay in the map
-// indefinitely; for cosmoguard's bounded distinct-key cardinality this is
-// fine. If unbounded distinct IPs ever become a concern, a TTL cleanup
-// loop can be added.
+// bucket per key (most commonly per source IP), stored in a bounded TTL
+// cache so idle keys are evicted and the live-bucket count is capped.
 type memoryRateLimiter struct {
 	mu      sync.Mutex
-	buckets map[string]*rate.Limiter
+	buckets *ttlcache.Cache[string, *rate.Limiter]
 	rate    rate.Limit
 	burst   int
 }
 
 func (l *memoryRateLimiter) Allow(_ context.Context, key string) (bool, time.Duration, error) {
+	// Lock only the get-or-create so two requests for a brand-new key
+	// don't build two buckets. rate.Limiter is concurrency-safe, so the
+	// Allow/Reserve runs outside the lock. Get extends the bucket's TTL
+	// on hit, keeping active keys resident while idle ones age out.
 	l.mu.Lock()
-	b, ok := l.buckets[key]
-	if !ok {
+	var b *rate.Limiter
+	if item := l.buckets.Get(key); item != nil {
+		b = item.Value()
+	} else {
 		b = rate.NewLimiter(l.rate, l.burst)
-		l.buckets[key] = b
+		l.buckets.Set(key, b, ttlcache.DefaultTTL)
 	}
 	l.mu.Unlock()
 	if b.Allow() {
@@ -256,7 +296,3 @@ func rateLimitKey(scope RateLimitScope, ruleFingerprint uint64, r *http.Request,
 		return prefix + ":global"
 	}
 }
-
-// _ unused import guard, kept for clarity that fnv is reserved for future
-// per-key compression if cardinality ever becomes a Redis-memory issue.
-var _ = fnv.New64a

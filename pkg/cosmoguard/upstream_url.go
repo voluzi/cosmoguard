@@ -89,7 +89,10 @@ func upstreamHTTPURL(n NodeConfig, service string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	return url.Parse(fmt.Sprintf("%s://%s:%d", scheme, n.Host, port))
+	// net.JoinHostPort brackets IPv6 literals (fd00::1 → [fd00::1]:port);
+	// a bare fmt "%s:%d" would emit an unparseable host for AAAA-discovered
+	// or IPv6-configured upstreams.
+	return url.Parse(fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(n.Host, fmt.Sprintf("%d", port))))
 }
 
 // nodeWSURL returns the WebSocket upstream URL for a WS-shaped service
@@ -125,7 +128,10 @@ func nodeWSURL(n NodeConfig, service string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	return url.Parse(fmt.Sprintf("%s://%s:%d", scheme, n.Host, port))
+	// net.JoinHostPort brackets IPv6 literals (fd00::1 → [fd00::1]:port);
+	// a bare fmt "%s:%d" would emit an unparseable host for AAAA-discovered
+	// or IPv6-configured upstreams.
+	return url.Parse(fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(n.Host, fmt.Sprintf("%d", port))))
 }
 
 // upstreamGRPCTarget returns the gRPC dial target ("host:port") plus the

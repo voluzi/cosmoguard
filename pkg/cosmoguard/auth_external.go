@@ -167,9 +167,14 @@ func (m *externalValidatorMethod) Resolve(r *http.Request) (*Identity, error) {
 	id, err := m.validateUpstream(r.Context(), raw)
 	if err != nil {
 		if m.failOpen {
-			// Fail-open: log + allow as anonymous. We deliberately do NOT
-			// cache the failure so the next request retries the validator.
-			return nil, nil
+			// Fail-open: the validator is unreachable and the operator
+			// chose availability over strict verification. Return a
+			// degraded identity the auth gate honours unconditionally
+			// (see Authorize) rather than nil — nil reads as "anonymous"
+			// and the gate would deny every protected route, turning
+			// fail-open into fail-closed. Not cached, so the next request
+			// retries the validator.
+			return degradedIdentity("external-validator"), nil
 		}
 		return nil, err
 	}

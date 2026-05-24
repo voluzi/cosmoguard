@@ -390,3 +390,121 @@ lcd:
 		"writing the config file should trigger a reload")
 	assert.Equal(t, swapped.LCD.Rules[0].Paths[0], "/v2")
 }
+
+// TestTryReload_RejectsEnableEvmToggle is the regression test for the
+// hot-reload EVM-toggle panic: an instance started with enableEvm:false
+// never builds the EVM proxies, so accepting a reload that flips it on
+// would make applyRulesLocked dereference nil EVM servers and crash the
+// watcher. The reload must be rejected (cfg unchanged, recorded failed),
+// not panic.
+func TestTryReload_RejectsEnableEvmToggle(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+
+	// One header → stable ports, so the only delta is the EVM flip.
+	header := portYAMLHeader(t)
+	base := header + `
+lcd:
+  default: allow
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(base), 0644))
+
+	cg, err := NewFromFile(cfgPath)
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
+	assert.Equal(t, cg.cfg.EnableEvm, false)
+	originalCfgPtr := cg.cfg
+
+	flipped := header + `
+enableEvm: true
+lcd:
+  default: allow
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(flipped), 0644))
+
+	cg.tryReload() // must not panic
+
+	assert.Equal(t, cg.cfg, originalCfgPtr,
+		"enableEvm flip must be rejected: cfg pointer unchanged")
+	assert.Equal(t, cg.cfg.EnableEvm, false)
+	status := cg.dashboard.lastReload
+	assert.Assert(t, status != nil)
+	assert.Equal(t, status.Success, false,
+		"enableEvm toggle reload must be recorded as failed")
+}
+
+// authReloadYAML builds a config with an auth block + one LCD rule path,
+// so the auth-immutability tests can vary auth vs rules independently.
+func authReloadYAML(header, identities, rulePath string) string {
+	return header + `
+auth:
+  enable: true
+  methods:
+    - type: api-key
+      header: x-api-key
+  identities:
+` + identities + `
+lcd:
+  default: allow
+  rules:
+    - priority: 100
+      action: allow
+      paths: [` + rulePath + `]
+      methods: [GET]
+`
+}
+
+// TestTryReload_RejectsAuthChange is the regression test for the auth
+// hot-reload gap: the Authenticator is built once at startup, so a reload
+// that changes the global auth block (e.g. adds/removes an identity) must
+// be rejected — accepting it would report success while still
+// authenticating against the old credentials.
+func TestTryReload_RejectsAuthChange(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+	header := portYAMLHeader(t)
+
+	oneID := "    - name: a\n      apiKey: key-a\n      scopes: [read]\n"
+	twoIDs := oneID + "    - name: b\n      apiKey: key-b\n      scopes: [read]\n"
+
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(authReloadYAML(header, oneID, "/v1")), 0644))
+	cg, err := NewFromFile(cfgPath)
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
+	originalCfgPtr := cg.cfg
+
+	// Add a second identity → auth block changed → reject.
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(authReloadYAML(header, twoIDs, "/v1")), 0644))
+	cg.tryReload()
+
+	assert.Equal(t, cg.cfg, originalCfgPtr, "auth change must be rejected: cfg pointer unchanged")
+	status := cg.dashboard.lastReload
+	assert.Assert(t, status != nil)
+	assert.Equal(t, status.Success, false, "auth change reload must be recorded as failed")
+}
+
+// TestTryReload_AcceptsRuleChangeWithAuthUnchanged guards against the
+// auth-immutability check over-rejecting: when the auth block is
+// byte-for-byte unchanged, a rule-only edit must still hot-reload.
+func TestTryReload_AcceptsRuleChangeWithAuthUnchanged(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+	header := portYAMLHeader(t)
+	oneID := "    - name: a\n      apiKey: key-a\n      scopes: [read]\n"
+
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(authReloadYAML(header, oneID, "/v1")), 0644))
+	cg, err := NewFromFile(cfgPath)
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
+
+	// Same auth, different rule path → must be accepted.
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(authReloadYAML(header, oneID, "/v2")), 0644))
+	cg.tryReload()
+
+	assert.Equal(t, cg.cfg.LCD.Rules[0].Paths[0], "/v2",
+		"rule-only reload must apply even with an (unchanged) auth block present")
+	status := cg.dashboard.lastReload
+	assert.Assert(t, status != nil)
+	assert.Equal(t, status.Success, true,
+		"unchanged auth must not trip the auth-immutability rejection")
+}

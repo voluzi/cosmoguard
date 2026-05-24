@@ -47,6 +47,12 @@ type JsonRpcWebSocketProxy struct {
 	// dashboard's Live-traffic feed. nil-safe.
 	cgRequestLog *requestLog
 
+	// limiters maps a rule's Fingerprint to its token-bucket, forwarded
+	// from JsonRpcHandler.SetRules so per-rule rate limits apply to WS
+	// frames the same way they do on the HTTP single/batch paths. Read
+	// under rulesMutex.
+	limiters map[uint64]RateLimiter
+
 	// conns is the live registry of connected clients, keyed by client
 	// pointer. Written once per connection lifecycle (register on
 	// upgrade, deregister on close) — never on the per-frame hot path.
@@ -139,12 +145,55 @@ func (p *JsonRpcWebSocketProxy) Run(log *Entry) error {
 	return p.broker.Start(p.log)
 }
 
-func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction RuleAction) {
+func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction RuleAction, limiters map[uint64]RateLimiter) {
 	p.rulesMutex.Lock()
 	defer p.rulesMutex.Unlock()
 
 	p.rules = rules
 	p.defaultAction = defaultAction
+	p.limiters = limiters
+}
+
+// policyVerdict runs the matched rule's per-rule auth + rate-limit
+// checks against the connection's resolved identity, recording any deny.
+// Writes nothing — handleRequest emits the JSON-RPC error frame. Mirrors
+// the HTTP path's jsonRpcPolicyVerdict so WS frames can't bypass per-rule
+// scopes/identities or rate limits that the HTTP single/batch paths
+// enforce. The global auth.defaultRequire gate already ran on the WS
+// upgrade request (HttpProxy gate chain), so this covers per-rule policy.
+func (p *JsonRpcWebSocketProxy) policyVerdict(request *JsonRpcMsg, rule *JsonRpcRule, identity *Identity, source string, limiters map[uint64]RateLimiter) (ok bool, code int, reason string) {
+	// Always Authorize when auth is enabled (rule.Auth may be nil →
+	// Authorize applies the global auth.defaultRequire); a nil-guard
+	// would let a WS rule without an auth block bypass defaultRequire.
+	if p.auth != nil {
+		if authOK, why := p.auth.Authorize(rule.Auth, identity); !authOK {
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section: p.section, Reason: "auth",
+				SourceIP: source, Method: request.Method,
+				RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+			})
+			return false, -32001, why
+		}
+	}
+	if l, found := limiters[rule.Fingerprint]; found && l != nil {
+		idName := ""
+		if identity != nil {
+			idName = identity.Name
+		}
+		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
+		allowed, _, rlErr := l.Allow(context.Background(), key)
+		if rlErr != nil {
+			p.log.WithError(rlErr).Warn("ws rate limiter error; allowing")
+		} else if !allowed {
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section: p.section, Reason: "rate_limit",
+				SourceIP: source, Method: request.Method,
+				RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+			})
+			return false, -32005, "rate limit exceeded"
+		}
+	}
+	return true, 0, ""
 }
 
 func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
@@ -175,8 +224,14 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 
 	source := GetSourceIP(r)
 	identity := ""
+	// idObj is the connection-level identity resolved by the HTTP gate
+	// chain during the WS upgrade. The same identity applies to every
+	// frame on this connection; per-rule auth/rate-limit checks below
+	// evaluate against it.
+	var idObj *Identity
 	if id, ok := r.Context().Value(identityCtxKey{}).(*Identity); ok && id != nil {
 		identity = id.Name
+		idObj = id
 	}
 	connectedAt := time.Now()
 	p.registerConn(client, source, identity, connectedAt)
@@ -205,7 +260,7 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 			break
 		}
 
-		if err := p.handleRequest(client, req, GetSourceIP(r)); err != nil {
+		if err := p.handleRequest(client, req, source, idObj); err != nil {
 			p.log.Errorf("error handling request: %v", err)
 			continue
 		}
@@ -351,13 +406,14 @@ func (p *JsonRpcWebSocketProxy) recordOutcome(request *JsonRpcMsg, source, cache
 	}
 }
 
-func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *JsonRpcMsg, source string) error {
+func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *JsonRpcMsg, source string, identity *Identity) error {
 	// Snapshot rules under a short RLock instead of holding it
 	// across the broker call (network I/O). Mirrors the http_proxy
 	// pattern; SetRules' Lock no longer stalls on in-flight WS frames.
 	p.rulesMutex.RLock()
 	rulesSnap := p.rules
 	defaultActionSnap := p.defaultAction
+	limitersSnap := p.limiters
 	p.rulesMutex.RUnlock()
 
 	startTime := time.Now()
@@ -369,6 +425,18 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 		match := rule.Match(request)
 		if match {
 			ruleID := ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
+			// Per-rule auth + rate-limit gate, mirroring the HTTP
+			// single/batch paths. Without this a WS client could
+			// bypass scopes/identities or rate limits frame-by-frame.
+			// On deny, reply with the JSON-RPC error and stop (the
+			// frame is neither cached nor forwarded).
+			if vok, code, reason := p.policyVerdict(request, rule, identity, source, limitersSnap); !vok {
+				if err := client.SendMsg(ErrorResponse(request, code, reason, nil)); err != nil {
+					return err
+				}
+				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, ruleID, startTime, "request denied (policy)")
+				return nil
+			}
 			switch rule.Action {
 			case RuleActionAllow:
 				// Subscription methods MUST NOT round-trip the cache.
@@ -382,7 +450,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				// than a config-time reject because rule.matches() is
 				// pattern-based and may straddle subscription and
 				// non-subscription methods.
-				cacheable := rule.Cache != nil && !hasSubscriptionMethod(request)
+				cacheable := rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
 				if cacheable {
 					// Single round-trip lookup: ErrNotFound is the miss
 					// signal, any other error is a backend failure that
@@ -462,6 +530,22 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 	// No rule matched — note the unmatched method, then apply default.
 	p.cgDashboard.RecordUnmatched(p.section, request.Method, "")
 	if defaultActionSnap == RuleActionAllow {
+		// Even on default-allow, an unmatched method must clear the
+		// global auth.defaultRequire gate (no rule opted it out) —
+		// mirrors the HTTP single/batch no-match paths.
+		if p.auth != nil {
+			if ok, reason := p.auth.Authorize(nil, identity); !ok {
+				p.cgDashboard.RecordDeny(DenyRecord{
+					Section: p.section, Reason: "auth",
+					SourceIP: source, Method: request.Method,
+				})
+				if err := client.SendMsg(ErrorResponse(request, -32001, reason, nil)); err != nil {
+					return err
+				}
+				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, "default", startTime, "request denied (auth)")
+				return nil
+			}
+		}
 		var res *JsonRpcMsg
 		var err error
 		if hasSubscriptionMethod(request) {

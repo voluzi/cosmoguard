@@ -6,6 +6,32 @@ import (
 	"testing"
 )
 
+// TestMWAuthGate_NilRuleAuthEnforcesDefaultRequire is the regression
+// test for the default-require bypass: a matched rule that omits an
+// `auth:` block (ruleAuth → nil) must still fall back to the global
+// auth.defaultRequire policy. An anonymous caller is denied; a resolved
+// identity passes.
+func TestMWAuthGate_NilRuleAuthEnforcesDefaultRequire(t *testing.T) {
+	a := authenticatorWithDefaultRequire(t) // defaultRequire = true
+	nilRuleAuth := func(Request) *RuleAuthConfig { return nil }
+	allow := func(Request) Decision { return Decision{} }
+
+	// Anonymous (no identity) + nil rule auth → must be denied 401.
+	anon := newHTTPRequest(httptest.NewRequest(http.MethodGet, "http://x/", nil))
+	dec := MWAuthGate(a, nilRuleAuth)(anon, allow)
+	if !dec.Stop || dec.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("anonymous + defaultRequire: expected 401 stop, got %+v", dec)
+	}
+
+	// A resolved (non-anonymous) identity + nil rule auth → allowed.
+	authed := newHTTPRequest(httptest.NewRequest(http.MethodGet, "http://x/", nil))
+	authed.SetIdentity(&Identity{Name: "test-client", Method: "api-key", Scopes: []string{"read"}})
+	dec = MWAuthGate(a, nilRuleAuth)(authed, allow)
+	if dec.Stop {
+		t.Fatalf("authenticated + nil rule auth: expected pass, got %+v", dec)
+	}
+}
+
 // TestChain_OrderAndShortCircuit: middlewares run outer-to-inner;
 // a Stop decision halts the chain at the level it fires from.
 func TestChain_OrderAndShortCircuit(t *testing.T) {

@@ -12,7 +12,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -139,18 +138,15 @@ func cachingStreamHandler(
 		}
 
 		// Cacheable methods MUST still pass the full policy gate before
-		// we touch the cache. The transparent path runs auth + per-rule
-		// auth + rate-limit inside the director (Handle); the cache path
-		// used to skip it, so any cacheable method could be read by
-		// unauthenticated or over-budget callers on both hits and misses.
-		// Run the same director here and honour its decision before any
-		// cache lookup or upstream forward. Handle re-matches rules in
-		// priority order, so a higher-priority deny rule is enforced even
-		// though findMatchingAllowRule only scanned for an allow. The
-		// returned ctx/conn are intentionally discarded — the miss path
-		// below re-derives both, and Pick() is side-effect-free so the
-		// extra selection is harmless.
-		if _, _, gateErr := p.Handle(stream.Context(), method); gateErr != nil {
+		// we touch the cache. enforcePolicy runs auth + per-rule auth +
+		// rate-limit (re-matching rules in priority order, so a
+		// higher-priority deny is enforced even though findMatchingAllowRule
+		// only scanned for an allow) and returns the upstream context with
+		// credentials stripped. Crucially it does NOT pick an upstream —
+		// so a cache hit burns no round-robin selection, and on a miss we
+		// Pick exactly once below.
+		outCtx, gateErr := p.enforcePolicy(stream.Context(), method)
+		if gateErr != nil {
 			return gateErr
 		}
 
@@ -169,12 +165,10 @@ func cachingStreamHandler(
 			return stream.SendMsg(&rawFrame{Payload: cached})
 		}
 
-		// Forward to upstream via grpc.Invoke with our codec.
-		// Propagate inbound metadata so upstream sees the same auth /
-		// trace headers. The picked upstream's in-flight counter is
-		// bumped around the Invoke so least-conn observes the load.
-		md, _ := metadata.FromIncomingContext(stream.Context())
-		outCtx := metadata.NewOutgoingContext(stream.Context(), md.Copy())
+		// Forward to upstream via grpc.Invoke with our codec, reusing the
+		// credential-stripped outgoing context from enforcePolicy. The
+		// picked upstream's in-flight counter is bumped around the Invoke
+		// so least-conn observes the load.
 		var resp rawFrame
 		upstream := p.pool.Pick()
 		if upstream == nil {

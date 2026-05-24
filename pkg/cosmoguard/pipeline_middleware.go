@@ -101,19 +101,24 @@ func MWIdentityResolve(auth *Authenticator, httpReq func(Request) *http.Request)
 type identityCtxKey struct{}
 
 // MWAuthGate checks a rule's auth requirement against the resolved
-// identity. Requires a per-call accessor that returns the rule's
+// identity. The per-call accessor returns the matched rule's
 // RuleAuthConfig (rules are protocol-specific so this can't be a
-// global). When fn returns nil, the gate is skipped.
+// global), or nil when the matched rule omits an `auth:` block or no
+// rule matched.
+//
+// A nil rule-auth does NOT skip the gate: it falls back to the global
+// auth.defaultRequire policy via Authorize(nil, id). Returning early on
+// nil used to let an unauthenticated request reach an allowed route
+// whenever the rule omitted `auth:`, defeating fail-closed
+// defaultRequire unless every rule repeated `auth.require: true`. When
+// defaultRequire is unset, Authorize(nil, id) is a pass-through, so the
+// no-auth-configured deployment is unaffected.
 func MWAuthGate(auth *Authenticator, ruleAuth func(Request) *RuleAuthConfig) Middleware {
 	return func(req Request, next Next) Decision {
 		if auth == nil {
 			return next(req)
 		}
-		ra := ruleAuth(req)
-		if ra == nil {
-			return next(req)
-		}
-		ok, reason := auth.Authorize(ra, req.Identity())
+		ok, reason := auth.Authorize(ruleAuth(req), req.Identity())
 		if !ok {
 			return Decision{Stop: true, Action: "deny", HTTPStatus: http.StatusUnauthorized, Reason: reason}
 		}
