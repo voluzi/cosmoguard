@@ -20,6 +20,10 @@ type Cache[K comparable, V any] interface {
 	Set(ctx context.Context, key K, value V, ttl time.Duration) error
 	Get(ctx context.Context, key K) (V, error)
 	Has(ctx context.Context, key K) (bool, error)
+	// Close releases any resources held by the cache. For the in-memory
+	// backend this stops the TTL expiration goroutine. Calling Close on a
+	// cache that's already closed is safe (idempotent).
+	Close() error
 }
 
 func EncodeValue(value any) ([]byte, error) {
