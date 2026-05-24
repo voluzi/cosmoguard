@@ -536,26 +536,9 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteDirector func(*http.
 			}
 			probeTarget = pt
 		}
-		// Normalize the operator-supplied path via url.URL so a
-		// missing leading "/" (e.g. "status" instead of "/status")
-		// doesn't silently produce "https://hostpath", and a
-		// path embedding a query string is parsed into RawQuery
-		// instead of pasted as a literal substring of the URL
-		// path. Resolves to the empty string when Path is empty,
-		// matching the upstream's root.
-		probeURL := url.URL{Scheme: probeTarget.Scheme, Host: probeTarget.Host}
-		if p := n.Healthcheck.Path; p != "" {
-			if !strings.HasPrefix(p, "/") {
-				p = "/" + p
-			}
-			if i := strings.IndexByte(p, '?'); i >= 0 {
-				probeURL.Path = p[:i]
-				probeURL.RawQuery = p[i+1:]
-			} else {
-				probeURL.Path = p
-			}
-		}
-		u.probeAddr = probeURL.String()
+		// Shared with the gRPC pool builder so both normalize the
+		// operator-supplied path identically (leading slash, query split).
+		u.probeAddr = healthcheckProbeURL(probeTarget.Scheme, probeTarget.Host, n.Healthcheck.Path)
 	}
 	if n.CircuitBreaker.IsEnabled() {
 		u.cbConfig = n.CircuitBreaker

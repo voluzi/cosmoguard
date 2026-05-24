@@ -310,7 +310,10 @@ func buildGrpcUpstream(n NodeConfig) (*GrpcUpstream, error) {
 			_ = conn.Close()
 			return nil, fmt.Errorf("healthcheck.service=%q: %w", hs, err)
 		}
-		u.probeAddr = probeTarget.Scheme + "://" + probeTarget.Host + n.Healthcheck.Path
+		// Normalize via the shared helper (NOT string concatenation) so a
+		// path without a leading slash ("status") doesn't yield
+		// "http://host:portstatus" and fail every probe.
+		u.probeAddr = healthcheckProbeURL(probeTarget.Scheme, probeTarget.Host, n.Healthcheck.Path)
 	}
 	if n.CircuitBreaker.IsEnabled() {
 		u.cbConfig = n.CircuitBreaker

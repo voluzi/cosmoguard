@@ -146,3 +146,53 @@ func TestGrpcPool_CloseBeforeStartIsCleanNoLeak(t *testing.T) {
 			"baseline=%d final=%d (delta=%d)", baseline, final, final-baseline)
 	}
 }
+
+// TestBuildGrpcUpstream_NormalizesUnslashedHealthcheckPath is the
+// regression test for the gRPC probe-URL bug: a healthcheck path without
+// a leading slash ("status") must produce a valid "http://host:port/status"
+// probe URL, not the string-concatenated "http://host:portstatus" that
+// fails parsing and falsely marks the gRPC pool unhealthy.
+func TestBuildGrpcUpstream_NormalizesUnslashedHealthcheckPath(t *testing.T) {
+	hcEnabled := true
+	node := NodeConfig{
+		Name:     "g",
+		Host:     "node-a",
+		RpcPort:  26657,
+		GrpcPort: 1,
+		Healthcheck: &NodeHealthcheckConfig{
+			Enable:         &hcEnabled,
+			Path:           "status", // no leading slash
+			Service:        "rpc",
+			Interval:       time.Second,
+			Timeout:        time.Second,
+			UnhealthyAfter: 1,
+			HealthyAfter:   1,
+		},
+	}
+	u, err := buildGrpcUpstream(node)
+	if err != nil {
+		t.Fatalf("buildGrpcUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = u.conn.Close() })
+
+	if u.probeAddr != "http://node-a:26657/status" {
+		t.Fatalf("unslashed healthcheck path must normalize to http://node-a:26657/status, got %q", u.probeAddr)
+	}
+}
+
+// TestHealthcheckProbeURL pins the shared normalizer used by both pool
+// builders: leading-slash insertion, query-string splitting, and the
+// empty-path root case.
+func TestHealthcheckProbeURL(t *testing.T) {
+	cases := []struct{ scheme, host, path, want string }{
+		{"http", "h:1", "status", "http://h:1/status"},
+		{"http", "h:1", "/status", "http://h:1/status"},
+		{"https", "h:1", "/health?verbose=1", "https://h:1/health?verbose=1"},
+		{"http", "h:1", "", "http://h:1"},
+	}
+	for _, c := range cases {
+		if got := healthcheckProbeURL(c.scheme, c.host, c.path); got != c.want {
+			t.Fatalf("healthcheckProbeURL(%q,%q,%q) = %q, want %q", c.scheme, c.host, c.path, got, c.want)
+		}
+	}
+}

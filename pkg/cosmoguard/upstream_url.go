@@ -57,6 +57,31 @@ func parseUpstreamOverride(raw string) (*url.URL, error) {
 
 // upstreamHTTPURL returns the upstream URL for an HTTP-shaped service
 // (lcd / rpc / evm_rpc). Honors per-service URL overrides first, then
+// healthcheckProbeURL builds the GET URL for an active healthcheck from
+// a probe target (scheme+host) and the operator-supplied path. The path
+// is normalized through url.URL so a missing leading "/" (e.g. "status"
+// instead of "/status") doesn't produce "http://hoststatus", and a path
+// carrying a query string is split into RawQuery instead of being pasted
+// as a literal path substring. An empty path resolves to the upstream's
+// root. Shared by the HTTP and gRPC pool builders so both normalize
+// identically (the gRPC builder previously string-concatenated the path
+// and broke probes for unslashed paths).
+func healthcheckProbeURL(scheme, host, path string) string {
+	u := url.URL{Scheme: scheme, Host: host}
+	if path != "" {
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		if i := strings.IndexByte(path, '?'); i >= 0 {
+			u.Path = path[:i]
+			u.RawQuery = path[i+1:]
+		} else {
+			u.Path = path
+		}
+	}
+	return u.String()
+}
+
 // the node's TLS flag, then defaults to plaintext http.
 //
 // The returned URL has Scheme + Host populated; Path is left empty
