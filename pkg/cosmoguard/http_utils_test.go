@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,7 @@ import (
 func TestReusableReader(t *testing.T) {
 	t.Run("read content multiple times", func(t *testing.T) {
 		original := "hello world"
-		reader := ReusableReader(io.NopCloser(strings.NewReader(original)))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader(original)))
 
 		// First read
 		content1, err := io.ReadAll(reader)
@@ -33,13 +34,13 @@ func TestReusableReader(t *testing.T) {
 	})
 
 	t.Run("close returns nil", func(t *testing.T) {
-		reader := ReusableReader(io.NopCloser(strings.NewReader("test")))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader("test")))
 		err := reader.Close()
 		assert.NilError(t, err)
 	})
 
 	t.Run("empty content", func(t *testing.T) {
-		reader := ReusableReader(io.NopCloser(strings.NewReader("")))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader("")))
 
 		content, err := io.ReadAll(reader)
 		assert.NilError(t, err)
@@ -48,7 +49,7 @@ func TestReusableReader(t *testing.T) {
 
 	t.Run("large content", func(t *testing.T) {
 		original := strings.Repeat("abcdefghij", 10000) // 100KB
-		reader := ReusableReader(io.NopCloser(strings.NewReader(original)))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader(original)))
 
 		content1, err := io.ReadAll(reader)
 		assert.NilError(t, err)
@@ -343,7 +344,7 @@ func TestWriteError(t *testing.T) {
 
 func TestReusableReader_PartialReads(t *testing.T) {
 	original := "hello world this is a test"
-	reader := ReusableReader(io.NopCloser(strings.NewReader(original)))
+	reader, _ := ReusableReader(io.NopCloser(strings.NewReader(original)))
 
 	// Read in chunks
 	buf := make([]byte, 5)
@@ -381,7 +382,7 @@ func BenchmarkReusableReader(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		reader := ReusableReader(io.NopCloser(bytes.NewReader(data)))
+		reader, _ := ReusableReader(io.NopCloser(bytes.NewReader(data)))
 		io.ReadAll(reader)
 		io.ReadAll(reader) // Second read
 	}
@@ -425,5 +426,46 @@ func TestGetSourceIP_StripsPort(t *testing.T) {
 	r2.Header.Set("X-Real-Ip", "203.0.113.9:7000")
 	if got := GetSourceIP(r2); got != "203.0.113.9" {
 		t.Fatalf("X-Real-Ip with port must be host-only, got %q", got)
+	}
+}
+
+// errReader is an io.ReadCloser that returns an error after yielding
+// some bytes — models http.MaxBytesReader tripping mid-drain.
+type errReader struct {
+	data []byte
+	err  error
+	pos  int
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	if e.pos < len(e.data) {
+		n := copy(p, e.data[e.pos:])
+		e.pos += n
+		return n, nil
+	}
+	return 0, e.err
+}
+func (e *errReader) Close() error { return nil }
+
+// TestReusableReader_SurfacesDrainError is the regression test for the
+// body-cap bypass: ReusableReader must return the underlying read error
+// (e.g. MaxBytesReader's MaxBytesError) so callers reject oversized
+// bodies instead of proceeding with the truncated bytes.
+func TestReusableReader_SurfacesDrainError(t *testing.T) {
+	want := errors.New("http: request body too large")
+	_, err := ReusableReader(&errReader{data: []byte("partial"), err: want})
+	if !errors.Is(err, want) {
+		t.Fatalf("ReusableReader must surface the drain error, got %v", err)
+	}
+
+	// A clean body still returns nil error and is fully readable twice.
+	rr, err := ReusableReader(io.NopCloser(strings.NewReader("hello")))
+	if err != nil {
+		t.Fatalf("clean body must not error, got %v", err)
+	}
+	b1, _ := io.ReadAll(rr)
+	b2, _ := io.ReadAll(rr)
+	if string(b1) != "hello" || string(b2) != "hello" {
+		t.Fatalf("reusable reads mismatch: %q %q", b1, b2)
 	}
 }

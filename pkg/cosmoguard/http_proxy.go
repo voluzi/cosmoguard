@@ -686,8 +686,15 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 		// Caching is active for this rule. We need the body twice (once to
 		// compute the cache hash, once to forward upstream on a miss), so
 		// wrap it with ReusableReader. This is the ONLY path that pays the
-		// double-buffering cost.
-		r.Body = ReusableReader(r.Body)
+		// double-buffering cost. A drain error here is the MaxBytesReader
+		// cap tripping (oversized chunked / mismatched Content-Length) —
+		// reject with 413 rather than caching/forwarding a truncated body.
+		rr, rerr := ReusableReader(r.Body)
+		if rerr != nil {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = rr
 		hash, err := p.getRequestHash(r, fingerprint)
 		if err != nil {
 			// We could not get the hash, but we can still serve the request

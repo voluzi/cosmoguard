@@ -104,9 +104,15 @@ type reusableReader struct {
 	backBuf *bytes.Buffer
 }
 
-func ReusableReader(r io.ReadCloser) io.ReadCloser {
+func ReusableReader(r io.ReadCloser) (io.ReadCloser, error) {
 	readBuf := bytes.Buffer{}
-	_, _ = readBuf.ReadFrom(r) // Error is intentionally ignored as we proceed with whatever was read
+	// Surface the drain error (notably http.MaxBytesReader's
+	// MaxBytesError) instead of swallowing it: a request that exceeds
+	// server.maxRequestBody without an honest Content-Length is only
+	// caught here on the buffering paths (cacheable HTTP rules,
+	// JSON-RPC). Returning the error lets callers reject with 413
+	// instead of parsing/forwarding the truncated body.
+	_, err := readBuf.ReadFrom(r)
 	_ = r.Close()
 	backBuf := bytes.Buffer{}
 
@@ -114,7 +120,7 @@ func ReusableReader(r io.ReadCloser) io.ReadCloser {
 		io.TeeReader(&readBuf, &backBuf),
 		&readBuf,
 		&backBuf,
-	}
+	}, err
 }
 
 func (r reusableReader) Close() error {

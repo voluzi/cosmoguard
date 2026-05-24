@@ -87,12 +87,15 @@ spec:
           {{- with .Values.containerSecurityContext }}
           securityContext: {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- $clusterOn := eq (include "cosmoguard.clusterEnabled" .) "true" }}
+          {{- if or .Values.env $clusterOn }}
           env:
             {{- include "cosmoguard.podIdentityEnv" . | nindent 12 }}
             {{- range $k, $v := .Values.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+          {{- end }}
           {{- if .Values.existingSecret }}
           envFrom:
             - secretRef:

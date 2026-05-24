@@ -382,12 +382,18 @@ func (h *JsonRpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 
 func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 	next func(http.ResponseWriter, *http.Request), startTime time.Time) {
-	var err error
-	r.Body = ReusableReader(r.Body)
+	// The body was wrapped in http.MaxBytesReader by HttpProxy.ServeHTTP
+	// before this handler runs. ReusableReader drains it now; a drain
+	// error is the body-size cap tripping (oversized chunked / mismatched
+	// Content-Length), which must be rejected with 413 rather than
+	// parsing the truncated payload.
+	rr, rerr := ReusableReader(r.Body)
+	if rerr != nil {
+		WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	r.Body = rr
 
-	// Get jsonrpc requests from body. The body was already wrapped in
-	// http.MaxBytesReader by HttpProxy.ServeHTTP before this handler runs,
-	// so oversized bodies surface here as a read error (treated as 400).
 	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "bad request")
