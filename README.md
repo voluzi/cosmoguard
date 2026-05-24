@@ -34,9 +34,9 @@ changed from v3; existing v3 configs continue to work — run
   same olric runtime in cluster mode, so configured rates stay correct
   under HPA without an external store.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
-  token introspection, and an external-validator method for Allora-
-  style developer portals. Credential headers are always stripped
-  before forwarding upstream.
+  token introspection, and an external-validator method for
+  developer-portal style credential checks. Credential headers are
+  always stripped before forwarding upstream.
 - **CORS** owned by cosmoguard, not the upstream — preflight handled
   directly; upstream's CORS headers are stripped and replaced.
 - **Multi-upstream nodes** with active healthchecks, weighted round-
@@ -50,6 +50,12 @@ changed from v3; existing v3 configs continue to work — run
   `/healthz` / `/readyz` / `/info` / `/metrics` for k8s probes and
   Prometheus.
 - **Hot-reload** of config rules without dropping in-flight requests.
+- **Live observability dashboard**: a read-only UI with per-protocol
+  traffic, cache hit rates, rule/identity views, recent denials,
+  unmatched endpoints, a live request feed, and a WebSocket
+  connection/subscription panel. In cluster mode it fans out across
+  peers for a single cluster-wide view. OpenTelemetry tracing and
+  Prometheus metrics round out the surface.
 
 ## Installation
 
