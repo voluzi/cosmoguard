@@ -885,6 +885,21 @@ func (f *CosmoGuard) WatchConfigFile() error {
 // negligible.
 func (f *CosmoGuard) tryReload() {
 	slog.Info("reloading config file", "file", f.cfgFile)
+	// PrepareConfig (inside ReadConfigFromFile) calls SetTrustedProxies,
+	// which mutates the process-global source-IP trust list as a side
+	// effect — BEFORE we know whether the reload will be accepted. If a
+	// restart-required guard below rejects the reload, that global must
+	// not retain the rejected file's trust list (it would silently change
+	// per-IP rate limits, sourceIP rule predicates, and audit source
+	// addresses). Snapshot now and restore on any non-accepted exit.
+	prevTrusted := snapshotTrustedProxies()
+	accepted := false
+	defer func() {
+		if !accepted {
+			restoreTrustedProxies(prevTrusted)
+		}
+	}()
+
 	newCfg, err := ReadConfigFromFile(f.cfgFile)
 	if err != nil {
 		slog.Error("config reload failed; keeping previous config", "error", err)
@@ -950,6 +965,9 @@ func (f *CosmoGuard) tryReload() {
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
 	}
+	// Reload accepted: keep the new trusted-proxy list PrepareConfig
+	// already published (the deferred restore is now a no-op).
+	accepted = true
 	before := f.ruleFingerprintsLocked()
 	f.cfg = newCfg
 	f.applyRulesLocked()

@@ -65,6 +65,15 @@ func SetTrustedProxies(cidrs []string) error {
 	return nil
 }
 
+// snapshotTrustedProxies returns the current live trusted-proxy list
+// pointer; restoreTrustedProxies puts it back. Used by the config
+// reloader to undo PrepareConfig's SetTrustedProxies side effect when a
+// reload is ultimately rejected — otherwise a rejected config's trust
+// list would leak into live source-IP decisions.
+func snapshotTrustedProxies() *[]*net.IPNet { return trustedProxies.Load() }
+
+func restoreTrustedProxies(prev *[]*net.IPNet) { trustedProxies.Store(prev) }
+
 // remotePeerTrusted reports whether r.RemoteAddr falls inside the
 // configured trustedProxies allowlist. Empty allowlist → always
 // false (default-deny).

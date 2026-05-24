@@ -577,3 +577,63 @@ nodes:
 	assert.Assert(t, status != nil)
 	assert.Equal(t, status.Success, true, "unchanged nodes must not trip the topology rejection")
 }
+
+// TestTryReload_RejectedReloadRestoresTrustedProxies is the regression
+// test for the trusted-proxy leak: a reload that trips a restart-required
+// guard (here a nodes: change) must NOT leave the rejected file's
+// server.trustedProxies published in the process-global trust list —
+// PrepareConfig sets it as a side effect before the guard runs, so the
+// reloader must restore the prior list on rejection.
+func TestTryReload_RejectedReloadRestoresTrustedProxies(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+	header := portYAMLHeader(t)
+
+	base := header + `
+server:
+  trustedProxies: ["10.0.0.0/8"]
+nodes:
+  - name: a
+    host: node-a
+    rpcPort: 26657
+lcd:
+  default: allow
+`
+	// Restore the process-global trusted-proxy list after the test so it
+	// doesn't bleed into other tests (New() publishes 10.0.0.0/8 below).
+	prevTrusted := snapshotTrustedProxies()
+	t.Cleanup(func() { restoreTrustedProxies(prevTrusted) })
+
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(base), 0644))
+	cg, err := NewFromFile(cfgPath)
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
+
+	// Baseline: 10.x is trusted, 192.168.x is not.
+	assert.Equal(t, remotePeerTrusted("10.1.2.3:5555"), true)
+	assert.Equal(t, remotePeerTrusted("192.168.1.1:5555"), false)
+
+	// Rejected reload: changes BOTH trustedProxies and nodes (the latter
+	// trips the restart-required guard).
+	rejected := header + `
+server:
+  trustedProxies: ["192.168.0.0/16"]
+nodes:
+  - name: a
+    host: node-CHANGED
+    rpcPort: 26657
+lcd:
+  default: allow
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(rejected), 0644))
+	cg.tryReload()
+
+	// Reload was rejected, so the trust list must be UNCHANGED.
+	status := cg.dashboard.lastReload
+	assert.Assert(t, status != nil)
+	assert.Equal(t, status.Success, false, "nodes change must reject the reload")
+	assert.Equal(t, remotePeerTrusted("10.1.2.3:5555"), true,
+		"rejected reload must not drop the original trusted-proxy list")
+	assert.Equal(t, remotePeerTrusted("192.168.1.1:5555"), false,
+		"rejected reload must not publish the new file's trusted-proxy list")
+}
