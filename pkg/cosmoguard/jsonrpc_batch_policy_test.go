@@ -548,3 +548,68 @@ func TestHandleHttpSingle_DeniedNotificationNoResponse(t *testing.T) {
 		}
 	})
 }
+
+// TestHandleHttpBatch_OversizedUpstreamResponseRejected is the regression
+// test for the batch response-cap-before-buffering bug: a rogue upstream
+// returning more than the cap must be rejected via the capped writer
+// (which stops buffering at the limit) rather than fully buffering then
+// length-checking. We assert the batch fails with 502 rather than
+// returning the giant body.
+func TestHandleHttpBatch_OversizedUpstreamResponseRejected(t *testing.T) {
+	h := &JsonRpcHandler{
+		log:           log.WithField("t", "jsonrpc-batch"),
+		cgDashboard:   newDashboardObservability(),
+		section:       "rpc.jsonrpc",
+		defaultAction: RuleActionAllow,
+	}
+	batch := JsonRpcMsgs{{Version: "2.0", ID: float64(1), Method: "a"}}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	// Upstream streams way over the 32 MiB cap in chunks; the capped
+	// writer must stop buffering and the batch must fail.
+	chunk := make([]byte, 1<<20) // 1 MiB
+	next := func(uw http.ResponseWriter, _ *http.Request) {
+		for i := 0; i < 40; i++ { // 40 MiB > 32 MiB cap
+			_, _ = uw.Write(chunk)
+		}
+	}
+
+	h.handleHttpBatch(batch, w, r, next, time.Now())
+
+	// The oversized response is rejected by the capped writer →
+	// getResponsesFromUpstream errors → the id-bearing call comes back as
+	// a per-item -32603 error in a valid 200 array (not the giant body).
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected a valid 200 batch array, got %d", w.Code)
+	}
+	if w.Body.Len() > 1<<20 {
+		t.Fatalf("oversized upstream body must NOT be returned to the client (got %d bytes)", w.Body.Len())
+	}
+	var arr []map[string]any
+	if err := stdjson.Unmarshal(w.Body.Bytes(), &arr); err != nil {
+		t.Fatalf("batch response must be a JSON array: %v", err)
+	}
+	if len(arr) != 1 {
+		t.Fatalf("expected 1 per-item error, got %d", len(arr))
+	}
+	if e, ok := arr[0]["error"].(map[string]any); !ok || int(e["code"].(float64)) != -32603 {
+		t.Fatalf("oversized upstream → id call must be a -32603 error, got %v", arr[0])
+	}
+}
+
+// TestCappedResponseWriter pins the writer: under-limit buffers fully,
+// over-limit flags overflow and truncates at the cap.
+func TestCappedResponseWriter(t *testing.T) {
+	w := newCappedResponseWriter(10)
+	n, _ := w.Write([]byte("hello")) // 5 ≤ 10
+	if n != 5 || w.overflowed {
+		t.Fatalf("under-limit write: n=%d overflow=%v", n, w.overflowed)
+	}
+	n, _ = w.Write([]byte("worldXXXX")) // pushes past 10
+	if n != 9 || !w.overflowed {
+		t.Fatalf("over-limit write must report full len + overflow: n=%d overflow=%v", n, w.overflowed)
+	}
+	if w.buf.Len() != 10 {
+		t.Fatalf("buffer must be capped at 10, got %d", w.buf.Len())
+	}
+}

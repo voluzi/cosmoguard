@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"sync"
 	"time"
@@ -1024,29 +1023,65 @@ func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, req
 	req.Body = io.NopCloser(bytes.NewReader(b))
 	req.ContentLength = int64(len(b))
 
-	w := httptest.NewRecorder()
-	next(w, req)
-	res := w.Result()
-
-	// Cap how much of the upstream response we'll buffer before
-	// parsing — without this, a pathological / malicious upstream
-	// returning gigabytes to a single batch fills the recorder's
-	// bytes.Buffer and OOMs the proxy. The request side already
-	// caps inbound bodies via http.MaxBytesReader; this is the
-	// symmetric guard for the response side. 32 MiB is generous
-	// for any legitimate Cosmos / EVM batch response while
-	// preventing unbounded memory growth from one rogue upstream.
+	// Cap how much of the upstream response we buffer — without this a
+	// pathological / malicious upstream returning gigabytes to a single
+	// batch OOMs the proxy. Use a capped writer that stops buffering once
+	// the limit is exceeded, so the cap is enforced DURING next() rather
+	// than after the whole body is already in memory (a bare
+	// httptest.ResponseRecorder buffers everything first). 32 MiB is
+	// generous for any legitimate Cosmos / EVM batch response. Mirrors
+	// the inbound http.MaxBytesReader guard on the response side.
 	const maxUpstreamBatchResponse = 32 << 20
-	b, err = io.ReadAll(io.LimitReader(res.Body, maxUpstreamBatchResponse+1))
-	if err != nil {
-		return nil, fmt.Errorf("error reading body from upstream response: %v", err)
-	}
-	if int64(len(b)) > maxUpstreamBatchResponse {
+	w := newCappedResponseWriter(maxUpstreamBatchResponse)
+	next(w, req)
+	if w.overflowed {
 		return nil, fmt.Errorf("upstream batch response exceeded %d bytes (cap)", maxUpstreamBatchResponse)
 	}
+	b = w.buf.Bytes()
 	single, responses, _ := ParseJsonRpcMessage(b)
 	if len(responses) == 0 && single != nil {
 		responses = JsonRpcMsgs{single}
 	}
 	return responses, nil
+}
+
+// cappedResponseWriter is an http.ResponseWriter that buffers the body up
+// to a byte cap and then stops, flagging overflow. Used for the JSON-RPC
+// batch upstream call so a rogue upstream returning an enormous body
+// can't grow an unbounded in-memory buffer (the OOM a bare
+// httptest.ResponseRecorder would allow): once the cap is hit we stop
+// copying bytes and report overflow to the caller, which fails the batch.
+type cappedResponseWriter struct {
+	header     http.Header
+	buf        bytes.Buffer
+	limit      int
+	written    int
+	overflowed bool
+}
+
+func newCappedResponseWriter(limit int) *cappedResponseWriter {
+	return &cappedResponseWriter{header: make(http.Header), limit: limit}
+}
+
+func (w *cappedResponseWriter) Header() http.Header { return w.header }
+
+func (w *cappedResponseWriter) WriteHeader(int) {}
+
+func (w *cappedResponseWriter) Write(p []byte) (int, error) {
+	if w.overflowed {
+		// Pretend success so the upstream handler keeps draining its
+		// source instead of erroring; we've already decided to fail the
+		// batch and won't use any further bytes.
+		return len(p), nil
+	}
+	remaining := w.limit - w.written
+	if len(p) > remaining {
+		w.buf.Write(p[:remaining])
+		w.written += remaining
+		w.overflowed = true
+		return len(p), nil
+	}
+	n, err := w.buf.Write(p)
+	w.written += n
+	return n, err
 }
