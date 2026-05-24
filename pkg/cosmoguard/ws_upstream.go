@@ -5,8 +5,6 @@ import (
 	"net/url"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/voluzi/cosmoguard/pkg/util"
 )
 
@@ -15,6 +13,17 @@ const (
 	connectTimeout     = 10 * time.Second
 	connectRetryPeriod = 5 * time.Second
 	responseTimeout    = 10 * time.Second
+
+	// upstreamWSReadLimit caps any single inbound frame from an upstream
+	// WS endpoint. gorilla/websocket defaults to "no limit", so without
+	// this an upstream sending a multi-GB frame (misbehaving node,
+	// compromised endpoint, buggy custom build) would balloon the heap
+	// with one allocation. 16 MiB is generous for every realistic
+	// subscription payload — Cosmos NewBlock messages on busy mainnets
+	// run a few MB, EVM eth_subscribe logs returns are typically <1 MB —
+	// while leaving an order-of-magnitude headroom over normal traffic
+	// and bounding worst-case abuse at a value the proxy can absorb.
+	upstreamWSReadLimit int64 = 16 << 20
 )
 
 var (
@@ -24,9 +33,19 @@ var (
 type UpstreamConnManagerConstructor func(url.URL, *util.UniqueID, func(msg *JsonRpcMsg)) UpstreamConnManager
 
 type UpstreamConnManager interface {
-	Run(*log.Entry) error
+	Run(*Entry) error
 	MakeRequest(*JsonRpcMsg) (*JsonRpcMsg, error)
 	HasSubscription(string) bool
 	Subscribe(string) (string, error)
 	Unsubscribe(string) error
+	// IsHealthy reports whether the underlying WS connection is in a
+	// usable state. Returns false when the connection is closed, nil,
+	// or stuck in reconnect backoff. Used by the pool's subscription
+	// migrator to detect dead backends so it can re-route their
+	// subscriptions onto a survivor connection.
+	IsHealthy() bool
+	// Stop ends the Run goroutine and closes the live WS connection,
+	// if any. Idempotent. Called from UpstreamPool.Stop during
+	// CosmoGuard.Shutdown so we don't leak the Run goroutines.
+	Stop()
 }

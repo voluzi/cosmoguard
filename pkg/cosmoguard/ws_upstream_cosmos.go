@@ -7,20 +7,24 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
 )
 
 type UpstreamConnManagerCosmos struct {
-	client *JsonRpcWsClient
-	url    url.URL
-	dialer *websocket.Dialer
-	log    *log.Entry
-	IdGen  *util.UniqueID
+	// clientMu guards `client` against the Run goroutine's reconnect
+	// reassignment vs concurrent makeRequestWithID readers. RW so the
+	// happy path (read for nil/IsClosed) doesn't block on itself.
+	clientMu sync.RWMutex
+	client   *JsonRpcWsClient
+	url      url.URL
+	dialer   *websocket.Dialer
+	log      *Entry
+	IdGen    *util.UniqueID
 
 	respMap map[string]chan *JsonRpcMsg
 	respMux sync.Mutex
@@ -29,6 +33,42 @@ type UpstreamConnManagerCosmos struct {
 	subByID               map[string]string
 	subByParam            map[string]string
 	subMux                sync.Mutex
+
+	// failedReconnects counts consecutive Dial failures. Reset to 0 on
+	// any successful connect. Read by IsHealthy so the pool's
+	// migration loop can see "stuck" connections and re-route their
+	// subscriptions to a survivor.
+	failedReconnects atomic.Int32
+
+	// stopped is the shutdown flag set by Stop(). The Run loop checks
+	// it before each reconnect attempt so a dead-backend goroutine
+	// doesn't survive CosmoGuard.Shutdown.
+	stopped atomic.Bool
+	// stopCh is closed by Stop() so the reconnect-backoff sleep wakes
+	// up immediately instead of parking the goroutine for up to
+	// connectRetryPeriod past shutdown. Lazily allocated to avoid
+	// breaking direct &UpstreamConnManagerCosmos{} literal uses.
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	initOnce sync.Once
+}
+
+// initStopCh is called by Run before the loop starts and again by
+// Stop, idempotently allocating stopCh. Done this way (instead of in
+// the constructor) so existing call sites that build the struct via
+// a literal don't get a nil channel.
+func (u *UpstreamConnManagerCosmos) initStopCh() {
+	u.initOnce.Do(func() {
+		u.stopCh = make(chan struct{})
+	})
+}
+
+// curClient returns the currently-attached WS client under
+// clientMu.RLock. nil when there's no live connection.
+func (u *UpstreamConnManagerCosmos) curClient() *JsonRpcWsClient {
+	u.clientMu.RLock()
+	defer u.clientMu.RUnlock()
+	return u.client
 }
 
 func CosmosUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMessage func(msg *JsonRpcMsg)) UpstreamConnManager {
@@ -46,28 +86,62 @@ func CosmosUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscription
 	}
 }
 
-func (u *UpstreamConnManagerCosmos) Run(log *log.Entry) error {
+func (u *UpstreamConnManagerCosmos) Run(log *Entry) error {
 	u.log = log
+	u.initStopCh()
 	for {
-		if u.client == nil || u.client.IsClosed() {
+		if u.stopped.Load() {
+			return nil
+		}
+		cli := u.curClient()
+		if cli == nil || cli.IsClosed() {
 			if err := u.connect(); err != nil {
 				u.log.Errorf("error connecting: %v", err)
-				time.Sleep(connectRetryPeriod)
+				u.failedReconnects.Add(1)
+				// Interruptible sleep so Stop() takes effect
+				// immediately instead of parking this goroutine
+				// for up to connectRetryPeriod past shutdown.
+				select {
+				case <-u.stopCh:
+					return nil
+				case <-time.After(connectRetryPeriod):
+				}
 				continue
 			}
-			if err := u.reSubmitSubscriptions(); err != nil {
-				u.log.Errorf("error re-submitting subscriptions: %v", err)
-				u.client.Close()
-				continue
-			}
+			u.failedReconnects.Store(0)
+			cli = u.curClient()
+			// Resubmit must run off the Run goroutine: Run is the only
+			// reader on the socket, so if it blocked waiting on the
+			// subscribe response (the old behaviour) the response could
+			// never be received — every reconnect ended in a 10 s
+			// timeout. The goroutine captures the newly-connected client
+			// so a fast subsequent reconnect can't redirect its calls
+			// to a different connection.
+			go func(cli *JsonRpcWsClient) {
+				if err := u.reSubmitSubscriptionsOnClient(cli); err != nil {
+					u.log.Errorf("error re-submitting subscriptions: %v", err)
+					_ = cli.Close()
+				}
+			}(cli)
 		}
-		msg, err := u.client.ReceiveMsg()
+		if cli == nil {
+			continue
+		}
+		msg, err := cli.ReceiveMsg()
 		if err != nil {
 			if errors.Is(err, ErrClosed) {
 				u.log.Errorf("websocket closed: %v", err)
-				u.client.Close()
+				cli.Close()
 			} else {
 				u.log.Errorf("error receiving message from upstream: %v", err)
+				// Don't busy-loop on persistent parse errors —
+				// brief sleep mirrors the connect-retry backoff,
+				// interruptible by Stop().
+				select {
+				case <-u.stopCh:
+					return nil
+				case <-time.After(connectRetryPeriod / 10):
+				}
 			}
 			continue
 		}
@@ -75,12 +149,36 @@ func (u *UpstreamConnManagerCosmos) Run(log *log.Entry) error {
 	}
 }
 
+// IsHealthy reports usable-connection state. Healthy = the WS client
+// exists, isn't closed, and hasn't accumulated multiple consecutive
+// connect failures (so a backend in repeated reconnect backoff is
+// flagged unhealthy and the pool can migrate its subscriptions).
+func (u *UpstreamConnManagerCosmos) IsHealthy() bool {
+	cli := u.curClient()
+	if cli == nil || cli.IsClosed() {
+		return false
+	}
+	return u.failedReconnects.Load() < unhealthyAfterFailedReconnects
+}
+
+// unhealthyAfterFailedReconnects is the consecutive-failure threshold
+// past which a connection is considered "stuck" rather than briefly
+// flaky. ~3 × connectRetryPeriod (15s) gives the network a chance to
+// recover before the migrator starts moving subscriptions around.
+const unhealthyAfterFailedReconnects = 3
+
 func (u *UpstreamConnManagerCosmos) connect() error {
 	u.log.Debug("connecting to upstream websocket")
 	conn, _, err := u.dialer.Dial(u.url.String(), nil)
 	if err == nil {
 		u.log.Info("upstream websocket connected")
+		// Cap inbound frame size before any read can land — gorilla's
+		// default is unbounded. See upstreamWSReadLimit's doc comment
+		// in ws_upstream.go for the size rationale.
+		conn.SetReadLimit(upstreamWSReadLimit)
+		u.clientMu.Lock()
 		u.client = NewJsonRpcWsClient(conn)
+		u.clientMu.Unlock()
 	}
 	return err
 }
@@ -103,8 +201,12 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(msg *JsonRpcMsg) {
 		return
 	}
 
-	// Let's first check if it's a response to a request
+	// Let's first check if it's a response to a request. Read under
+	// respMux so we don't race with concurrent writers in
+	// makeRequestWithID.
+	u.respMux.Lock()
 	wc, ok := u.respMap[msgID]
+	u.respMux.Unlock()
 	if ok {
 		u.log.WithField("ID", msgID).Debug("got response for request")
 		wc <- msg
@@ -112,8 +214,11 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(msg *JsonRpcMsg) {
 		return
 	}
 
-	// Otherwise let's check if it's a cosmos subscription notification
+	// Otherwise let's check if it's a cosmos subscription notification.
+	// Same locking story for subByID.
+	u.subMux.Lock()
 	param, ok := u.subByID[msgID]
+	u.subMux.Unlock()
 	if ok {
 		u.log.WithFields(map[string]interface{}{
 			"ID":    msgID,
@@ -127,10 +232,18 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(msg *JsonRpcMsg) {
 }
 
 func (u *UpstreamConnManagerCosmos) makeRequestWithID(id string, req *JsonRpcMsg) (*JsonRpcMsg, error) {
+	return u.makeRequestWithIDOnClient(u.curClient(), id, req)
+}
+
+// makeRequestWithIDOnClient drives a single round-trip over an explicitly
+// chosen client. The resubmit-after-reconnect path uses this so it stays
+// bound to the freshly-connected socket even if Run reconnects again
+// underneath it. The select wakes on the client's Closed() channel so a
+// disconnect cancels the wait instead of stalling for responseTimeout.
+func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClient, id string, req *JsonRpcMsg) (*JsonRpcMsg, error) {
 	request := req.CloneWithID(id)
 
-	// Check if client is connected before attempting to send
-	if u.client == nil || u.client.IsClosed() {
+	if cli == nil || cli.IsClosed() {
 		return nil, ErrClosed
 	}
 
@@ -145,13 +258,20 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithID(id string, req *JsonRpcMsg
 		"ID":     id,
 		"method": request.Method,
 	}).Debug("submitting request")
-	if err := u.client.SendMsg(request); err != nil {
+	if err := cli.SendMsg(request); err != nil {
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
 		return nil, err
 	}
 
+	// Stoppable timer (not time.After) so the happy path frees the
+	// runtime timer slot immediately instead of leaving it parked
+	// for the full responseTimeout window. On a hot subscription
+	// workload time.After accumulates thousands of zombie timers,
+	// costing both memory and timer-heap rebalance CPU.
+	timeout := time.NewTimer(responseTimeout)
+	defer timeout.Stop()
 	select {
 	case response := <-respChan:
 		u.respMux.Lock()
@@ -161,7 +281,13 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithID(id string, req *JsonRpcMsg
 		response.ID = req.ID
 		return response, nil
 
-	case <-time.After(responseTimeout):
+	case <-cli.Closed():
+		u.respMux.Lock()
+		delete(u.respMap, id)
+		u.respMux.Unlock()
+		return nil, ErrClosed
+
+	case <-timeout.C:
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
@@ -178,6 +304,8 @@ func (u *UpstreamConnManagerCosmos) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, e
 }
 
 func (u *UpstreamConnManagerCosmos) HasSubscription(param string) bool {
+	u.subMux.Lock()
+	defer u.subMux.Unlock()
 	_, ok := u.subByParam[param]
 	return ok
 }
@@ -194,7 +322,13 @@ func (u *UpstreamConnManagerCosmos) Subscribe(param string) (string, error) {
 }
 
 func (u *UpstreamConnManagerCosmos) subscribeWithID(id string, param string) error {
-	// Send subscribe request
+	return u.subscribeWithIDOnClient(u.curClient(), id, param)
+}
+
+// subscribeWithIDOnClient binds the subscribe round-trip to an explicit
+// client so the resubmit-after-reconnect path can't get redirected to a
+// new connection mid-flight.
+func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string) error {
 	msg := &JsonRpcMsg{
 		Version: jsonRpcVersion,
 		ID:      id,
@@ -202,7 +336,7 @@ func (u *UpstreamConnManagerCosmos) subscribeWithID(id string, param string) err
 		Params:  []interface{}{param},
 	}
 
-	_, err := u.makeRequestWithID(id, msg)
+	_, err := u.makeRequestWithIDOnClient(cli, id, msg)
 	if err != nil {
 		u.IdGen.Release(id)
 		return err
@@ -254,17 +388,45 @@ func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
 	return nil
 }
 
-func (u *UpstreamConnManagerCosmos) reSubmitSubscriptions() error {
-	if len(u.subByParam) > 0 {
-		u.log.Info("re-submitting subscriptions")
-		for param, id := range u.subByParam {
-			u.log.WithFields(map[string]interface{}{
-				"ID":    id,
-				"param": param,
-			}).Debug("re-submitting subscription")
-			if err := u.subscribeWithID(id, param); err != nil {
-				return err
-			}
+// Stop signals the Run loop to exit and closes the live WS client.
+// Idempotent. After Stop returns, the loop will exit at its next
+// iteration; in-flight ReceiveMsg unblocks because Close() forces
+// it to surface ErrClosed.
+func (u *UpstreamConnManagerCosmos) Stop() {
+	u.stopOnce.Do(func() {
+		u.initStopCh()
+		u.stopped.Store(true)
+		close(u.stopCh)
+		u.clientMu.Lock()
+		if u.client != nil {
+			u.client.Close()
+		}
+		u.clientMu.Unlock()
+	})
+}
+
+func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
+	// Snapshot under subMux so we don't range over the map while
+	// subscribeWithID writes to it (which would also deadlock once
+	// subscribeWithID started taking subMux).
+	u.subMux.Lock()
+	pending := make(map[string]string, len(u.subByParam))
+	for param, id := range u.subByParam {
+		pending[param] = id
+	}
+	u.subMux.Unlock()
+
+	if len(pending) == 0 {
+		return nil
+	}
+	u.log.Info("re-submitting subscriptions")
+	for param, id := range pending {
+		u.log.WithFields(map[string]interface{}{
+			"ID":    id,
+			"param": param,
+		}).Debug("re-submitting subscription")
+		if err := u.subscribeWithIDOnClient(cli, id, param); err != nil {
+			return err
 		}
 	}
 	return nil
