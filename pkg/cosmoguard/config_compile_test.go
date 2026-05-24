@@ -508,3 +508,72 @@ func TestTryReload_AcceptsRuleChangeWithAuthUnchanged(t *testing.T) {
 	assert.Equal(t, status.Success, true,
 		"unchanged auth must not trip the auth-immutability rejection")
 }
+
+// TestTryReload_RejectsNodesChange is the regression test for the
+// upstream-topology hot-reload gap: pools are built once at startup from
+// cfg.Nodes, so a reload that changes nodes: must be rejected
+// (restart-required) rather than reported successful while traffic keeps
+// going to the old upstream set.
+func TestTryReload_RejectsNodesChange(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+	header := portYAMLHeader(t)
+
+	base := header + `
+nodes:
+  - name: a
+    host: node-a
+    rpcPort: 26657
+lcd:
+  default: allow
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(base), 0644))
+	cg, err := NewFromFile(cfgPath)
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
+	originalCfgPtr := cg.cfg
+
+	// Change the upstream host → topology change → reject.
+	changed := header + `
+nodes:
+  - name: a
+    host: node-b
+    rpcPort: 26657
+lcd:
+  default: allow
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(changed), 0644))
+	cg.tryReload()
+
+	assert.Equal(t, cg.cfg, originalCfgPtr, "nodes change must be rejected: cfg pointer unchanged")
+	status := cg.dashboard.lastReload
+	assert.Assert(t, status != nil)
+	assert.Equal(t, status.Success, false, "nodes change reload must be recorded as failed")
+}
+
+// TestTryReload_AcceptsRuleChangeWithNodesUnchanged guards the nodes:
+// immutability check against over-rejecting: a rule-only edit (nodes:
+// byte-for-byte unchanged) must still hot-reload.
+func TestTryReload_AcceptsRuleChangeWithNodesUnchanged(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+	header := portYAMLHeader(t)
+	node := `
+nodes:
+  - name: a
+    host: node-a
+    rpcPort: 26657
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(header+node+"lcd:\n  default: allow\n  rules:\n    - priority: 100\n      action: allow\n      paths: [/v1]\n      methods: [GET]\n"), 0644))
+	cg, err := NewFromFile(cfgPath)
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
+
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(header+node+"lcd:\n  default: allow\n  rules:\n    - priority: 200\n      action: allow\n      paths: [/v2]\n      methods: [GET]\n"), 0644))
+	cg.tryReload()
+
+	assert.Equal(t, cg.cfg.LCD.Rules[0].Paths[0], "/v2", "rule-only reload must apply with an unchanged nodes block")
+	status := cg.dashboard.lastReload
+	assert.Assert(t, status != nil)
+	assert.Equal(t, status.Success, true, "unchanged nodes must not trip the topology rejection")
+}

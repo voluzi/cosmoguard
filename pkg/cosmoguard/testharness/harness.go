@@ -119,54 +119,69 @@ func New(t *testing.T, opts ...Option) *Harness {
 		opt.apply(h)
 	}
 
-	// Pick free ports for cosmoguard up-front; the resulting addresses are
-	// baked into the Config before cosmoguard binds.
-	lcdPort := freePort(t)
-	rpcPort := freePort(t)
-	grpcPort := freePort(t)
-	evmRpcPort := freePort(t)
-	evmRpcWsPort := freePort(t)
-
 	if h.cfg == nil {
 		h.cfg = defaultHarnessConfig()
 	}
 
-	h.cfg.Host = "127.0.0.1"
-	h.cfg.LcdPort = lcdPort
-	h.cfg.RpcPort = rpcPort
-	h.cfg.GrpcPort = grpcPort
-	h.cfg.EvmRpcPort = evmRpcPort
-	h.cfg.EvmRpcWsPort = evmRpcWsPort
-	// IMPORTANT: writes to h.cfg.Node MUST precede cosmoguard.New
-	// below — PrepareConfig promotes Node into Nodes[0] and then
-	// zeros out Node, so a post-New write here would land on the
-	// zeroed singular field and be silently lost.
-	//
-	// Skip the singular-Node defaults entirely when the test
-	// pre-populated cfg.Nodes via WithConfig: the multi-upstream
-	// tests provide their own pool and PrepareConfig now rejects
-	// configs that set both `node:` (v3) and `nodes:` (v4).
-	// Without this guard the harness would inject a v3-shape Node
-	// alongside the test's v4 Nodes and trigger that error.
-	if len(h.cfg.Nodes) == 0 {
-		h.cfg.Node.Host = h.Upstream.Host()
-		h.cfg.Node.LcdPort = h.Upstream.LCDPort()
-		h.cfg.Node.RpcPort = h.Upstream.RPCPort()
-		h.cfg.Node.GrpcPort = h.Upstream.GRPCPort()
-		h.cfg.Node.EvmRpcPort = h.Upstream.RPCPort()   // share with RPC for now
-		h.cfg.Node.EvmRpcWsPort = h.Upstream.RPCPort() // ditto
-	}
+	// Ports are chosen via freePort (bind :0, read the port, close).
+	// That's inherently racy: between the close and cosmoguard.New
+	// re-binding, a parallel test or the OS can grab the same port,
+	// surfacing as "bind: address already in use". Retry the whole
+	// port-assign + New with fresh ports a few times so the suite is
+	// robust under -parallel load instead of flaking. Declared here so
+	// the post-New URL builders can read the final values.
+	var lcdPort, rpcPort, grpcPort, evmRpcPort, evmRpcWsPort int
+	var cg *cosmoguard.CosmoGuard
+	for attempt := 0; ; attempt++ {
+		lcdPort = freePort(t)
+		rpcPort = freePort(t)
+		grpcPort = freePort(t)
+		evmRpcPort = freePort(t)
+		evmRpcWsPort = freePort(t)
 
-	if h.cfg.Metrics.Enable {
-		h.cfg.Metrics.Port = freePort(t)
-	}
-	if h.cfg.Dashboard.IsEnabled() {
-		h.cfg.Dashboard.Port = freePort(t)
-	}
+		h.cfg.Host = "127.0.0.1"
+		h.cfg.LcdPort = lcdPort
+		h.cfg.RpcPort = rpcPort
+		h.cfg.GrpcPort = grpcPort
+		h.cfg.EvmRpcPort = evmRpcPort
+		h.cfg.EvmRpcWsPort = evmRpcWsPort
+		// IMPORTANT: writes to h.cfg.Node MUST precede cosmoguard.New
+		// below — PrepareConfig promotes Node into Nodes[0] and then
+		// zeros out Node, so a post-New write here would land on the
+		// zeroed singular field and be silently lost. Re-applied each
+		// retry iteration because the prior New zeroed Node.
+		//
+		// Skip the singular-Node defaults entirely when the test
+		// pre-populated cfg.Nodes via WithConfig: the multi-upstream
+		// tests provide their own pool and PrepareConfig now rejects
+		// configs that set both `node:` (v3) and `nodes:` (v4).
+		if len(h.cfg.Nodes) == 0 {
+			h.cfg.Node.Host = h.Upstream.Host()
+			h.cfg.Node.LcdPort = h.Upstream.LCDPort()
+			h.cfg.Node.RpcPort = h.Upstream.RPCPort()
+			h.cfg.Node.GrpcPort = h.Upstream.GRPCPort()
+			h.cfg.Node.EvmRpcPort = h.Upstream.RPCPort()   // share with RPC for now
+			h.cfg.Node.EvmRpcWsPort = h.Upstream.RPCPort() // ditto
+		}
 
-	cg, err := cosmoguard.New(h.cfg)
-	if err != nil {
-		t.Fatalf("harness: cosmoguard.New: %v", err)
+		if h.cfg.Metrics.Enable {
+			h.cfg.Metrics.Port = freePort(t)
+		}
+		if h.cfg.Dashboard.IsEnabled() {
+			h.cfg.Dashboard.Port = freePort(t)
+		}
+
+		var nerr error
+		cg, nerr = cosmoguard.New(h.cfg)
+		if nerr == nil {
+			break
+		}
+		// Retry only the racy "port got taken between freePort and bind"
+		// case; anything else is a real config/setup error.
+		if attempt < 4 && strings.Contains(nerr.Error(), "address already in use") {
+			continue
+		}
+		t.Fatalf("harness: cosmoguard.New: %v", nerr)
 	}
 	h.CosmoGuard = cg
 

@@ -175,6 +175,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 	rewriteDirector := func(r *http.Request) {
 		if proxy.auth != nil {
 			proxy.auth.StripCredentialHeaders(r.Header)
+			proxy.auth.StripCredentialQuery(r)
 		}
 	}
 

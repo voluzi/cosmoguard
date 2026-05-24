@@ -272,7 +272,7 @@ type rawStreamDirector func(ctx context.Context, fullMethodName string) (context
 //     upstream trailer to the inbound stream before returning.
 func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 	streamDesc := &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}
-	return func(_ any, serverStream grpc.ServerStream) error {
+	return func(_ any, serverStream grpc.ServerStream) (retErr error) {
 		method, ok := grpc.MethodFromServerStream(serverStream)
 		if !ok {
 			return status.Errorf(codes.Internal, "rawTransparentHandler: missing method on server stream")
@@ -280,6 +280,19 @@ func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 		outCtx, backendConn, err := director(serverStream.Context(), method)
 		if err != nil {
 			return err
+		}
+
+		// Account in-flight load + record the call outcome on the SAME
+		// upstream the director picked, so transparent (non-cached) gRPC
+		// traffic drives least-conn selection and the circuit breaker —
+		// previously only the cache-miss Invoke path did. nil-safe when
+		// no upstream was stashed (e.g. a non-GrpcProxy director in tests).
+		if up := upstreamFromCtx(outCtx); up != nil {
+			up.inFlight.Add(1)
+			defer func() {
+				up.inFlight.Add(-1)
+				up.RecordOutcome(retErr == nil)
+			}()
 		}
 
 		clientCtx, clientCancel := context.WithCancel(outCtx)

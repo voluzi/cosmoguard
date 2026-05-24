@@ -1,6 +1,9 @@
 package cosmoguard
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+)
 
 // TestAuthorize_DegradedIdentity pins the two-sided fail-open contract
 // for a degraded identity (minted when an auth backend is unreachable and
@@ -50,5 +53,49 @@ func TestAuthorize_DegradedIdentity(t *testing.T) {
 	plain := &Identity{Name: "u", Method: "api-key", Scopes: []string{"read"}}
 	if ok, _ := a.Authorize(&RuleAuthConfig{Scopes: []string{"admin"}}, plain); ok {
 		t.Fatal("non-degraded identity missing the required scope must be denied")
+	}
+}
+
+// TestStripCredentialQuery is the regression test for the query-string
+// API-key leak: when an api-key method authenticates from ?api_key=...,
+// StripCredentialQuery must remove that param from the outbound URL so
+// the credential is not forwarded upstream. Non-credential params are
+// preserved.
+func TestStripCredentialQuery(t *testing.T) {
+	cfg := &AuthConfig{
+		Enable: true,
+		Methods: []AuthMethodConfig{{
+			Type:       "api-key",
+			Header:     "x-api-key",
+			QueryParam: "api_key",
+		}},
+		Identities: []IdentityConfig{{Name: "c", APIKey: "secret", Scopes: []string{"read"}}},
+	}
+	a, err := NewAuthenticator(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	r, _ := http.NewRequest(http.MethodGet, "http://x/cosmos/foo?api_key=secret&height=42", nil)
+	a.StripCredentialQuery(r)
+
+	q := r.URL.Query()
+	if q.Has("api_key") {
+		t.Fatalf("api_key must be stripped from outbound URL, got %q", r.URL.RawQuery)
+	}
+	if q.Get("height") != "42" {
+		t.Fatalf("non-credential param must be preserved, got %q", r.URL.RawQuery)
+	}
+
+	// No-queryParam config → no-op (and never panics on empty query).
+	cfg2 := &AuthConfig{Enable: true, Methods: []AuthMethodConfig{{Type: "api-key", Header: "x-api-key"}},
+		Identities: []IdentityConfig{{Name: "c", APIKey: "secret"}}}
+	a2, _ := NewAuthenticator(cfg2, nil)
+	t.Cleanup(func() { _ = a2.Close() })
+	r2, _ := http.NewRequest(http.MethodGet, "http://x/foo?api_key=secret", nil)
+	a2.StripCredentialQuery(r2)
+	if r2.URL.Query().Get("api_key") != "secret" {
+		t.Fatal("a method without queryParam must not strip ?api_key")
 	}
 }

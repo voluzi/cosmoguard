@@ -366,6 +366,44 @@ func (a *Authenticator) CredentialHeaderNames() []string {
 	return names
 }
 
+// queryParamStripper is the optional interface an auth method implements
+// when it reads a credential from the URL query string (api-key
+// queryParam mode). Probed by StripCredentialQuery.
+type queryParamStripper interface {
+	QueryParamsToStrip() []string
+}
+
+// StripCredentialQuery removes any query parameters the configured auth
+// methods consumed as credentials from r.URL, so a `?api_key=...` style
+// credential is never forwarded upstream (where it would leak into the
+// node, its access logs, and intermediary caches). Rewrites RawQuery in
+// place. nil-safe; a no-op when no method uses a query param.
+func (a *Authenticator) StripCredentialQuery(r *http.Request) {
+	if a == nil || r == nil || r.URL == nil || r.URL.RawQuery == "" {
+		return
+	}
+	var toStrip []string
+	for _, m := range a.methods {
+		if qs, ok := m.(queryParamStripper); ok {
+			toStrip = append(toStrip, qs.QueryParamsToStrip()...)
+		}
+	}
+	if len(toStrip) == 0 {
+		return
+	}
+	q := r.URL.Query()
+	changed := false
+	for _, name := range toStrip {
+		if q.Has(name) {
+			q.Del(name)
+			changed = true
+		}
+	}
+	if changed {
+		r.URL.RawQuery = q.Encode()
+	}
+}
+
 // Authorize evaluates the per-rule auth gate against the resolved identity.
 // Returns (allowed, denyReason). denyReason is empty on allow.
 func (a *Authenticator) Authorize(rule *RuleAuthConfig, id *Identity) (bool, string) {
@@ -519,4 +557,16 @@ func (m *apiKeyMethod) extractFromHeader(r *http.Request) string {
 // node never sees cosmoguard auth headers.
 func (m *apiKeyMethod) HeadersToStrip() []string {
 	return m.stripHdrs
+}
+
+// QueryParamsToStrip lists URL query parameters this method consumes as
+// credentials (the optional `queryParam` api-key mode). They must be
+// removed from the outbound URL so the api key isn't forwarded to the
+// upstream node, its access logs, or any intermediary cache. Satisfies
+// the optional queryParamStripper interface the proxy probes for.
+func (m *apiKeyMethod) QueryParamsToStrip() []string {
+	if m.queryParam == "" {
+		return nil
+	}
+	return []string{m.queryParam}
 }

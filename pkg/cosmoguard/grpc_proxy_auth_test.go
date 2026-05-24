@@ -287,3 +287,26 @@ func TestGrpcEnforcePolicy_DoesNotPick(t *testing.T) {
 		t.Fatalf("Handle must pick exactly once: idx %d → %d", before, got)
 	}
 }
+
+// TestGrpcHandle_StashesPickedUpstream is the regression test for
+// transparent gRPC load/circuit accounting: Handle must stash the picked
+// upstream on the returned context so rawTransparentHandler can bump
+// inFlight and RecordOutcome on the SAME upstream it dialled. Without
+// this, transparent (non-cached) traffic never affects least-conn or the
+// circuit breaker.
+func TestGrpcHandle_StashesPickedUpstream(t *testing.T) {
+	p := authProxyForTest(t, nil) // no auth → straight to default-allow
+	up := newTestGrpcUpstream("a", 1)
+	p.pool = newTestGrpcPool("round-robin", up)
+
+	outCtx, conn, err := p.Handle(context.Background(), "/svc/M")
+	if err != nil {
+		t.Fatalf("Handle err: %v", err)
+	}
+	if conn != up.conn {
+		t.Fatal("Handle must return the picked upstream's conn")
+	}
+	if got := upstreamFromCtx(outCtx); got != up {
+		t.Fatalf("Handle must stash the picked upstream on the context, got %v", got)
+	}
+}

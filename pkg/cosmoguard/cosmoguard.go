@@ -99,6 +99,14 @@ type CosmoGuard struct {
 	// non-nil; Record is a no-op when the operator hasn't enabled it.
 	requestLog *requestLog
 
+	// origNodes is the upstream node config as written by the operator,
+	// captured at New() BEFORE expandDiscoveryNodes rewrites cfg.Nodes
+	// in place with resolved IPs. tryReload compares the freshly-read
+	// config's Nodes against this (not the expanded f.cfg.Nodes) so a
+	// discovery-based deployment isn't falsely flagged as a topology
+	// change on every reload.
+	origNodes []NodeConfig
+
 	// cluster owns the in-process olric daemon. Always non-nil after
 	// a successful New(): embedded-only mode in the single-instance
 	// default config, networked in the cluster: block is present. The
@@ -193,6 +201,11 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	if err := PrepareConfig(cfg); err != nil {
 		return nil, err
 	}
+	// Snapshot the operator-written node config before expansion so a
+	// hot reload can detect a real topology change without tripping on
+	// discovery's in-place rewrite of cfg.Nodes (see CosmoGuard.origNodes
+	// and tryReload).
+	origNodes := append([]NodeConfig(nil), cfg.Nodes...)
 	// Expand any discovery templates BEFORE building pools so the
 	// constructors see concrete IPs. Templates whose DNS lookup
 	// returns zero records at boot survive — they're tracked in the
@@ -223,6 +236,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	}
 	cosmoGuard := &CosmoGuard{
 		cfg:            cfg,
+		origNodes:      origNodes,
 		startedAt:      time.Now(),
 		runDone:        make(chan struct{}),
 		dashboard:      newDashboardObservability(),
@@ -918,6 +932,20 @@ func (f *CosmoGuard) tryReload() {
 	// individual rules still hot-reloads, since it lives in the rules).
 	if !reflect.DeepEqual(f.cfg.Auth, newCfg.Auth) {
 		err := fmt.Errorf("auth config change requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	// Upstream topology (nodes:) is wired ONCE at startup: the LCD/RPC/
+	// gRPC/EVM pools are built from cfg.Nodes in New() and a reload only
+	// calls SetRules — it never rebuilds pools. Accepting a nodes: edit
+	// would report success while traffic kept flowing to the OLD upstream
+	// set. Reject as restart-required (runtime pod-IP churn for a node is
+	// handled separately by the DNS discovery reconciler, which mutates
+	// pools in place — that path is unaffected by this guard because it
+	// doesn't go through config reload).
+	if !reflect.DeepEqual(f.origNodes, newCfg.Nodes) {
+		err := fmt.Errorf("nodes (upstream topology) change requires a process restart")
 		slog.Warn("config reload rejected", "error", err)
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return

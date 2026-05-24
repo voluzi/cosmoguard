@@ -453,6 +453,19 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 	return ctx, status.Errorf(codes.Unavailable, "Unauthorized")
 }
 
+// grpcUpstreamCtxKey carries the picked *GrpcUpstream from Handle to the
+// transparent forwarder so the forwarder can account in-flight load and
+// record the call outcome on the SAME upstream it dialled. The director
+// signature can only return a *grpc.ClientConn, so the upstream travels
+// on the context instead.
+type grpcUpstreamCtxKey struct{}
+
+// upstreamFromCtx recovers the picked upstream stashed by Handle, or nil.
+func upstreamFromCtx(ctx context.Context) *GrpcUpstream {
+	up, _ := ctx.Value(grpcUpstreamCtxKey{}).(*GrpcUpstream)
+	return up
+}
+
 // Handle is the StreamDirector for the transparent forwarder: enforce
 // policy, then select an upstream. The cache path calls enforcePolicy
 // directly and picks only on a miss, so it never burns a pick on a hit.
@@ -466,5 +479,10 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 		trace.SpanFromContext(ctx).SetStatus(otelcodes.Error, "no upstream available")
 		return ctx, nil, status.Error(codes.Unavailable, "no upstream available")
 	}
+	// Stash the picked upstream so rawTransparentHandler can bump
+	// inFlight (for least-conn) and RecordOutcome (for the circuit
+	// breaker) — otherwise transparent gRPC traffic never affects load
+	// or circuit state and only the cache-miss Invoke path does.
+	outCtx = context.WithValue(outCtx, grpcUpstreamCtxKey{}, up)
 	return outCtx, up.conn, nil
 }
