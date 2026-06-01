@@ -59,6 +59,16 @@ changed from v3; existing v3 configs continue to work — run
 
 ## Installation
 
+### Install script (Linux / macOS)
+
+The quickest way to grab the latest release binary. The trailing `!`
+tells the installer (jpillora/installer) to move the binary into your
+`PATH` rather than just dropping it in the current directory:
+
+```bash
+curl -s https://get.voluzi.com/cosmoguard! | bash
+```
+
 ### Prerequisites
 - Go 1.25+ (for building from source).
 

@@ -45,5 +45,11 @@ builds:
       - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.Version={{ .Version }}
       - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.CommitHash={{ .Commit }}
 
+release:
+  # Mark tags with a pre-release suffix (-rc, -beta, -alpha, …) as
+  # GitHub pre-releases so they don't displace the stable "Latest
+  # release". "auto" detects the suffix from the semver tag.
+  prerelease: auto
+
 universal_binaries:
   - id: darwin
