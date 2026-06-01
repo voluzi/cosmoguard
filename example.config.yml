@@ -1,142 +1,239 @@
-host: 0.0.0.0 # optional
-rpcPort: 16657 # optional
-lcdPort: 11317 # optional
-grpcPort: 19090 # optional
-enableEvm: false # optional
-evmRpcPort: 18545 # optional
-evmRpcWsPort: 18546 # optional
+# Example cosmoguard v4 configuration. See CONFIG.md for the full reference.
+# This file shows the most common v4 features end-to-end. Every block is
+# annotated with the v3 → v4 equivalent where relevant.
 
-node: # optional, defaults to values below
-  host: 127.0.0.1 # optional
-  rpcPort: 26657 # optional
-  lcdPort: 1317 # optional
-  grpcPort: 9090 # optional
-  evmRpcPort: 8545 # optional
-  evmRpcWsPort: 8546 # optional
+host: 0.0.0.0
+lcdPort: 11317
+rpcPort: 16657
+grpcPort: 19090
 
-cache: # optional, defaults to values below
-  ttl: 5s # optional
-  redis: <connection-url> # defaults to use in memory cache if not set
+# enableEvm: true   # uncomment to also proxy EVM RPC + WS
+# evmRpcPort: 18545
+# evmRpcWsPort: 18546
 
-metrics: # optional, defaults to values below
-  enable: true # optional
-  port: 9001 # optional
+# ---------------------------------------------------------------------------
+# Upstream nodes (v4 list; v3 singular `node:` continues to work)
+# ---------------------------------------------------------------------------
+nodes:
+  - name: validator-1
+    host: 127.0.0.1
+    lcdPort: 1317
+    rpcPort: 26657
+    grpcPort: 9090
+    healthcheck:
+      enable: true
+      path: /status        # Tendermint RPC liveness endpoint
+      service: rpc         # which upstream port to probe
+      interval: 5s
+      timeout: 2s
+      unhealthyAfter: 3
+      healthyAfter: 2
+    # circuitBreaker complements healthcheck: probes monitor liveness,
+    # the breaker observes actual request outcomes (5xx + transport
+    # errors). After N consecutive failures the upstream is taken out
+    # of the picker for cooldownPeriod, then half-open allows a probe.
+    circuitBreaker:
+      enable: true
+      consecutiveFailures: 5
+      cooldownPeriod: 30s
 
-lcd: # optional, defaults to allow everything
-  default: allow # optional
+  # Uncomment to front a second upstream — round-robin'd among healthy nodes.
+  # weight: gives that node a proportional share of traffic.
+  # - name: validator-2
+  #   host: 10.0.0.2
+  #   lcdPort: 1317
+  #   rpcPort: 26657
+  #   grpcPort: 9090
+  #   weight: 2   # gets 2x the rotation slots of weight:1 nodes
+  #   healthcheck: { enable: true, path: /status, service: rpc, interval: 5s }
+  #   circuitBreaker: { enable: true, consecutiveFailures: 5, cooldownPeriod: 30s }
 
-  rules: # default is empty
-    - priority: 9999 # optional, defaults to 1000
-      action: deny # either allow or deny
-      paths: [ ] # empty or nil means all
-      methods: [ ] # empty or nil means all
-      cache: # empty or nil means disabled
-        enable: false
-        ttl: 10s # optional, defaults to global .cache.ttl (5s if not specified)
+# ---------------------------------------------------------------------------
+# Server hardening
+# ---------------------------------------------------------------------------
+server:
+  readHeaderTimeout: 10s
+  readTimeout: 30s
+  writeTimeout: 30s
+  idleTimeout: 60s
+  maxRequestBody: 1048576       # 1 MiB
+  wsReadLimit: 65536            # 64 KiB per WebSocket frame
+  # wsAllowedOrigins is empty by default — cross-origin WS upgrades denied.
+  # Set to ["*"] to restore v3 behavior, or list specific origins:
+  # wsAllowedOrigins:
+  #   - https://app.example.com
+  #   - https://*.preview.example.com
 
-    - priority: 1000
+# ---------------------------------------------------------------------------
+# Cache (embedded olric + in-process L1; include a cluster: block to share
+# state across replicas — see CONFIG.md).
+# ---------------------------------------------------------------------------
+cache:
+  ttl: 5s
+  # cluster:
+  #   bindAddr: "${POD_IP}"
+  #   discovery: { mode: dns, dns: { host: cosmoguard-peers.svc.cluster.local } }
+
+# ---------------------------------------------------------------------------
+# Metrics + ops (/metrics, /healthz, /readyz on metrics.port)
+# ---------------------------------------------------------------------------
+metrics:
+  enable: true
+  port: 9001
+
+# ---------------------------------------------------------------------------
+# CORS — cosmoguard owns the cross-origin surface (upstream's CORS stripped)
+# ---------------------------------------------------------------------------
+# cors:
+#   enable: true
+#   allowedOrigins: [https://app.example.com]
+#   allowedMethods: [GET, POST, OPTIONS]
+#   allowedHeaders: [Authorization, Content-Type]
+#   exposeHeaders: [X-Request-Id]
+#   maxAge: 1h
+#   credentials: false
+
+# ---------------------------------------------------------------------------
+# Authentication — API-key + JWT + external-validator
+# ---------------------------------------------------------------------------
+# auth:
+#   enable: true
+#   methods:
+#     - type: api-key
+#       header: Authorization                # accepts "Bearer <key>" or raw "<key>"
+#     - type: jwt
+#       header: Authorization
+#       algorithm: HS256
+#       secret: "${JWT_SECRET}"
+#       audience: cosmoguard-prod
+#       issuer: https://auth.example.com
+#     # external-validator: validate the credential against an HTTP service
+#     # (e.g. an Allora-style developer portal). Results are TTL-cached.
+#     - type: external-validator
+#       endpoint: https://api.example.com/v1/keys/validate
+#       responseValid: data.valid
+#       responseIdentity: data.userId
+#       responseScopes: data.scopes
+#       cacheTTL: 60s
+#       timeout: 2s
+#       failureMode: fail-closed
+#   identities:
+#     - name: prod-webapp
+#       apiKey: "${PROD_API_KEY}"
+#       scopes: [read, broadcast]
+#       # Per-identity rate limits are expressed at the rule layer
+#       # (rateLimit: { scope: per-identity }); see the lcd: / rpc: blocks
+#       # below.
+
+# ---------------------------------------------------------------------------
+# LCD (Cosmos REST gateway)
+# ---------------------------------------------------------------------------
+lcd:
+  default: allow
+  rules:
+    # Deny-list: catch a hypothetical internal-only path even when default:allow.
+    - priority: 100
+      action: deny
+      match:
+        path: /cosmos/_internal/*
+
+    # Height-pinned reads — immutable, cache aggressively.
+    - priority: 200
       action: allow
-      paths:
-        - /cosmos/staking/v1beta1/params
-      methods:
-        - GET
+      match:
+        all:
+          - paths: [/cosmos/base/tendermint/v1beta1/blocks/*]
+          - query.height: "[0-9]*"
       cache:
         enable: true
-        ttl: 20s
+        ttl: 1h
 
-    - priority: 1000
+    # Common allow-list paths cached at the default global TTL.
+    - priority: 300
       action: allow
-      paths:
-        - /cosmos/staking/v1beta1/validators
-        - /cosmos/staking/v1beta1/pool
-        - /cosmos/distribution/v1beta1/community_pool
-        - /cosmos/base/tendermint/v1beta1/node_info
-        - /cosmos/bank/v1beta1/supply/by_denom
-        - /cosmos/mint/v1beta1/inflation
-        - /cosmos/bank/v1beta1/supply/*
-        - /cosmos/base/tendermint/v1beta1/validatorsets/*
-        - /cosmos/base/tendermint/v1beta1/blocks/*
-      methods:
-        - GET
+      match:
+        methods: [GET]
+        paths:
+          - /cosmos/staking/v1beta1/params
+          - /cosmos/staking/v1beta1/validators
+          - /cosmos/distribution/v1beta1/community_pool
+          - /cosmos/mint/v1beta1/inflation
+          - /cosmos/bank/v1beta1/supply/*
       cache:
         enable: true
 
-grpc: # optional, defaults to allow everything
-  default: allow # optional
+    # Tx broadcast: rate-limit, require auth.broadcast scope (when auth is enabled).
+    - priority: 400
+      action: allow
+      match:
+        path: /cosmos/tx/v1beta1/txs
+        methods: [POST]
+      # auth:
+      #   require: true
+      #   scopes: [broadcast]
+      rateLimit:
+        rate: 10/s
+        scope: per-ip          # or per-identity once auth is wired up
 
-  rules: # default is empty
+# ---------------------------------------------------------------------------
+# RPC (Tendermint HTTP + WebSocket + JSON-RPC)
+# ---------------------------------------------------------------------------
+rpc:
+  default: allow
+  webSocketEnabled: true
+  webSocketConnections: 10
+
+  rules:
     - action: allow
-      methods: # empty or nil means all
-        - /cosmos.bank.v1beta1.Query/AllBalances
-
-rpc: # optional, defaults to allow everything
-  default: allow # optional
-
-  rules: # default is empty
-    - priority: 9999 # optional, defaults to 1000
-      action: deny # either allow or deny
-      paths: [ ] # empty or nil means all
-      methods: [ ] # empty or nil means all
-      cache: # empty or nil means disabled
-        enable: false
-        ttl: 10s # optional, defaults to global .cache.ttl (5s if not specified)
-
-    - action: allow
-      paths:
-        - /status
-      methods:
-        - GET
+      match:
+        paths: [/status, /abci_info, /net_info]
+        methods: [GET]
       cache:
         enable: true
         ttl: 2s
 
-  jsonrpc: # optional, default is allow everything
+  jsonrpc:
     default: allow
+    maxBatchSize: 100          # rejects oversized batches with 413
 
-    webSocketEnabled: true # optional, enabled by default
-    webSocketConnections: 10 # optional
-
-    rules: # default is empty
-      - priority: 9999 # optional, defaults to 1000
-        action: deny # either allow or deny
-        methods: [ ] # empty or nil means all
-        params: { } # empty or nil means all
-        cache: # empty or nil means disabled
-          enable: false
-          ttl: 10s # optional, defaults to global .cache.ttl (5s if not specified)
+    rules:
+      # Subscriptions are stateful — let them through, no caching.
+      - action: allow
+        methods: [subscribe, unsubscribe, unsubscribe_all]
 
       - action: allow
-        methods: [ "subscribe", "unsubscribe", "unsubscribe_all" ]
-
-      - action: allow
-        methods: [ "status" ]
+        methods: [status]
         cache:
           enable: true
+          ttl: 2s
 
       - action: allow
-        methods: [ "abci_query" ]
+        methods: [abci_query]
         params:
           path: /cosmos.bank.v1beta1.Query/AllBalances
         cache:
           enable: true
           ttl: 2s
 
-      - action: allow
-        methods: [ "abci_query" ]
-        params:
-          path: /nibiru.epochs.v1.Query/EpochInfos
+# ---------------------------------------------------------------------------
+# gRPC (Cosmos Query)
+# ---------------------------------------------------------------------------
+grpc:
+  default: deny
+  rules:
+    - action: allow
+      methods:
+        - /cosmos.bank.v1beta1.Query/*
+        - /cosmos.staking.v1beta1.Query/*
 
-      - action: allow
-        methods: [ "abci_query" ]
-        params:
-          path: /cosmos.distribution.v1beta1.Query/DelegationTotalRewards
-
-evm: # optional, defaults to allow everything
-  rpc: # optional, defaults to allow everything
-    default: allow
-    rules: [ ]
-
-  ws: # optional, defaults to allow everything
-    webSocketConnections: 10
-    default: allow
-    rules: [ ]
+# ---------------------------------------------------------------------------
+# EVM (only used when enableEvm: true)
+# ---------------------------------------------------------------------------
+# evm:
+#   rpc:
+#     default: allow
+#     rules: []
+#   ws:
+#     webSocketConnections: 10
+#     default: allow
+#     rules: []

@@ -113,3 +113,60 @@ func (s *SubscriptionManager) GetSubscriptionClients(id string) map[*JsonRpcWsCl
 	defer s.clientsMux.RUnlock()
 	return maps.Clone(s.clientSubscriptions[id])
 }
+
+// SubStat is one upstream subscription's dashboard view: the
+// subscription param (e.g. tm.event='NewBlock' / newHeads), the
+// upstream id it was minted as, and how many clients are fanned out
+// from it.
+type SubStat struct {
+	ID          string `json:"-"`
+	Param       string `json:"param"`
+	Subscribers int    `json:"subscribers"`
+}
+
+// Snapshot returns one SubStat per active upstream subscription. The
+// subscriber count is the number of clients fanned out from each
+// upstream subscription — the dedup ratio between client-facing and
+// upstream-facing subscriptions is the panel's headline number.
+func (s *SubscriptionManager) Snapshot() []SubStat {
+	s.subscriptionMux.RLock()
+	defer s.subscriptionMux.RUnlock()
+	s.clientsMux.RLock()
+	defer s.clientsMux.RUnlock()
+	out := make([]SubStat, 0, len(s.idToParam))
+	for id, param := range s.idToParam {
+		out = append(out, SubStat{ID: id, Param: param, Subscribers: len(s.clientSubscriptions[id])})
+	}
+	return out
+}
+
+// ReplaceSubscriptionID rewires the subscription registry from oldID
+// to newID while preserving the existing client set + the param→id
+// mapping. Used by the pool's subscription migrator when an upstream
+// dies and its subscriptions are re-issued on a healthy upstream
+// (which returns a different ID).
+//
+// Returns true when the swap happened; false when oldID was unknown
+// (caller raced with a client unsubscribe).
+func (s *SubscriptionManager) ReplaceSubscriptionID(oldID, newID string) bool {
+	if oldID == newID {
+		return true
+	}
+	s.subscriptionMux.Lock()
+	defer s.subscriptionMux.Unlock()
+	param, ok := s.idToParam[oldID]
+	if !ok {
+		return false
+	}
+	delete(s.idToParam, oldID)
+	s.idToParam[newID] = param
+	s.paramToID[param] = newID
+
+	s.clientsMux.Lock()
+	defer s.clientsMux.Unlock()
+	if clients, ok := s.clientSubscriptions[oldID]; ok {
+		s.clientSubscriptions[newID] = clients
+		delete(s.clientSubscriptions, oldID)
+	}
+	return true
+}

@@ -1,0 +1,85 @@
+{{- $fullName := include "cosmoguard.fullname" . }}
+
+cosmoguard {{ .Chart.AppVersion }} is installed.
+
+Service ({{ .Values.service.type }}): {{ $fullName }}
+  lcd      → port {{ .Values.service.lcdPort }}
+  rpc      → port {{ .Values.service.rpcPort }}
+  grpc     → port {{ .Values.service.grpcPort }}
+{{- if .Values.config.enableEvm }}
+  evm-rpc  → port {{ .Values.service.evmRpcPort | default .Values.config.evmRpcPort }}
+  evm-ws   → port {{ .Values.service.evmRpcWsPort | default .Values.config.evmRpcWsPort }}
+{{- end }}
+{{- if .Values.config.metrics.enable }}
+  metrics  → port {{ .Values.service.metricsPort }} (/metrics, /healthz, /readyz)
+{{- end }}
+{{- if .Values.config.dashboard.enable }}
+  dashboard → port {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }} (operator-only, no built-in auth)
+{{- end }}
+
+External exposure:
+{{- if .Values.ingress.enabled }}
+  Ingress mode (networking.k8s.io/v1):
+{{- if gt (len .Values.ingress.lcd.hosts) 0 }}    LCD: {{ join ", " .Values.ingress.lcd.hosts }}{{ end }}
+{{- if gt (len .Values.ingress.rpc.hosts) 0 }}    RPC: {{ join ", " .Values.ingress.rpc.hosts }}{{ end }}
+{{- if and .Values.config.enableEvm (gt (len .Values.ingress.evmRpc.hosts) 0) }}    EVM RPC: {{ join ", " .Values.ingress.evmRpc.hosts }}{{ end }}
+{{- if and .Values.config.enableEvm (gt (len .Values.ingress.evmRpcWs.hosts) 0) }}    EVM WS: {{ join ", " .Values.ingress.evmRpcWs.hosts }}{{ end }}
+{{- if and .Values.ingressGrpc.enabled (gt (len .Values.ingressGrpc.hosts) 0) }}    gRPC: {{ join ", " .Values.ingressGrpc.hosts }} (separate Ingress with backend-protocol=GRPC){{ end }}
+{{- if and .Values.ingressDashboard.enabled (gt (len .Values.ingressDashboard.hosts) 0) }}    dashboard: {{ join ", " .Values.ingressDashboard.hosts }} (operator-only — apply auth annotations){{ end }}
+{{- else if .Values.gateway.enabled }}
+  Gateway API mode (gateway.networking.k8s.io/v1):
+{{- if gt (len .Values.gateway.lcd.hostnames) 0 }}    LCD: {{ join ", " .Values.gateway.lcd.hostnames }}{{ end }}
+{{- if gt (len .Values.gateway.rpc.hostnames) 0 }}    RPC: {{ join ", " .Values.gateway.rpc.hostnames }}{{ end }}
+{{- if and .Values.config.enableEvm (gt (len .Values.gateway.evmRpc.hostnames) 0) }}    EVM RPC: {{ join ", " .Values.gateway.evmRpc.hostnames }}{{ end }}
+{{- if and .Values.config.enableEvm (gt (len .Values.gateway.evmRpcWs.hostnames) 0) }}    EVM WS: {{ join ", " .Values.gateway.evmRpcWs.hostnames }}{{ end }}
+{{- if gt (len .Values.gateway.grpc.hostnames) 0 }}    gRPC: {{ join ", " .Values.gateway.grpc.hostnames }} (GRPCRoute){{ end }}
+{{- if gt (len .Values.gateway.dashboard.hostnames) 0 }}    dashboard: {{ join ", " .Values.gateway.dashboard.hostnames }} (operator-only){{ end }}
+{{- else }}
+  No external Ingress / Gateway configured — Service is reachable only
+  in-cluster. Port-forward for local access:
+    kubectl port-forward svc/{{ $fullName }} {{ .Values.service.lcdPort }}:{{ .Values.service.lcdPort }}
+{{- end }}
+
+{{- if and .Values.config.dashboard.enable (not (or .Values.ingressDashboard.enabled (gt (len .Values.gateway.dashboard.hostnames) 0))) }}
+
+NOTE: the dashboard listener is enabled but no external route exposes
+it. Reach it via:
+  kubectl port-forward svc/{{ $fullName }} {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}:{{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}
+{{- end }}
+
+{{- if eq (include "cosmoguard.clusterEnabled" .) "true" }}
+{{- $cache := dig "cache" (dict) .Values.config }}
+{{- $cluster := dig "cluster" (dict) $cache }}
+{{- $bind := dig "bindPort" 3320 $cluster }}
+{{- $gossip := dig "gossipPort" 3322 $cluster }}
+{{- $peerApi := dig "peerApiPort" 0 $cluster }}
+{{- if eq (int $peerApi) 0 }}{{ $peerApi = (add (int $bind) 1) }}{{ end }}
+
+Cluster mode:
+  workload kind        : {{ default "Deployment" .Values.kind }}
+  replicas             : {{ .Values.replicaCount }}
+  peer service         : {{ include "cosmoguard.peerServiceName" . }} (headless)
+  discovery mode       : {{ default "(unset)" (dig "discovery" "mode" "" $cluster) }}
+{{- if eq (dig "discovery" "mode" "" $cluster) "dns" }}
+  discovery host       : {{ include "cosmoguard.discoveryHost" . }}
+{{- end }}
+  gossip port (TCP+UDP): {{ $gossip }}
+  RESP bind port (TCP) : {{ $bind }}
+  peer api port (TCP)  : {{ $peerApi }}
+
+Inspect the cluster from any pod:
+  kubectl exec -it pod/{{ $fullName }}-0 -- wget -qO- http://localhost:{{ $peerApi }}/api/v1/cluster/peers
+
+Reminders:
+  - memberlist needs BOTH TCP and UDP on the gossip port. Many default
+    NetworkPolicies / firewalls block UDP; cluster will silently fail
+    to converge.
+  - {{ if eq (default "Deployment" .Values.kind) "Deployment" -}}
+    Per-pod observability snapshots are lost on pod replacement because
+    Deployment pods get fresh hostnames. Switch to kind: StatefulSet to
+    preserve panels across rolling restarts.
+    {{- else -}}
+    StatefulSet pod identities are stable — observability snapshots
+    survive rolling restarts via olric DMap replication.
+    {{- end }}
+{{- end }}

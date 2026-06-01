@@ -52,11 +52,13 @@ func TestReadConfigFromFile_DefaultValues(t *testing.T) {
 	assert.Equal(t, cfg.EvmRpcPort, 18545)
 	assert.Equal(t, cfg.EvmRpcWsPort, 18546)
 
-	// Node defaults
-	assert.Equal(t, cfg.Node.Host, "127.0.0.1")
-	assert.Equal(t, cfg.Node.RpcPort, 26657)
-	assert.Equal(t, cfg.Node.LcdPort, 1317)
-	assert.Equal(t, cfg.Node.GrpcPort, 9090)
+	// Node defaults — PrepareConfig promotes the v3 singular
+	// `node:` into Nodes[0] and clears cfg.Node, so assertions
+	// read from the v4-canonical Nodes[0] shape.
+	assert.Equal(t, cfg.Nodes[0].Host, "127.0.0.1")
+	assert.Equal(t, cfg.Nodes[0].RpcPort, 26657)
+	assert.Equal(t, cfg.Nodes[0].LcdPort, 1317)
+	assert.Equal(t, cfg.Nodes[0].GrpcPort, 9090)
 
 	// Cache defaults
 	assert.Equal(t, cfg.Cache.TTL, 5*time.Second)
@@ -113,9 +115,9 @@ lcd:
 	assert.Equal(t, cfg.EnableEvm, true)
 	assert.Equal(t, cfg.EvmRpcPort, 8545)
 
-	assert.Equal(t, cfg.Node.Host, "10.0.0.1")
-	assert.Equal(t, cfg.Node.RpcPort, 26658)
-	assert.Equal(t, cfg.Node.LcdPort, 1318)
+	assert.Equal(t, cfg.Nodes[0].Host, "10.0.0.1")
+	assert.Equal(t, cfg.Nodes[0].RpcPort, 26658)
+	assert.Equal(t, cfg.Nodes[0].LcdPort, 1318)
 
 	assert.Equal(t, cfg.Cache.TTL, 30*time.Second)
 	assert.Equal(t, cfg.Cache.Key, "test-prefix")
@@ -203,53 +205,6 @@ grpc:
 	assert.Equal(t, cfg.GRPC.Rules[1].Priority, 20)
 }
 
-func TestReadConfigFromFile_RedisConfig(t *testing.T) {
-	tmpDir := t.TempDir()
-	tmpFile := filepath.Join(tmpDir, "redis.yml")
-
-	redisURL := "redis://localhost:6379"
-	configContent := `
-cache:
-  ttl: 10s
-  redis: "` + redisURL + `"
-`
-
-	err := os.WriteFile(tmpFile, []byte(configContent), 0644)
-	assert.NilError(t, err)
-
-	cfg, err := ReadConfigFromFile(tmpFile)
-	assert.NilError(t, err)
-
-	assert.Assert(t, cfg.Cache.Redis != nil)
-	assert.Equal(t, *cfg.Cache.Redis, redisURL)
-}
-
-func TestReadConfigFromFile_RedisSentinelConfig(t *testing.T) {
-	tmpDir := t.TempDir()
-	tmpFile := filepath.Join(tmpDir, "sentinel.yml")
-
-	configContent := `
-cache:
-  ttl: 10s
-  redis-sentinel:
-    master_name: mymaster
-    sentinel_addrs:
-      - sentinel1:26379
-      - sentinel2:26379
-      - sentinel3:26379
-`
-
-	err := os.WriteFile(tmpFile, []byte(configContent), 0644)
-	assert.NilError(t, err)
-
-	cfg, err := ReadConfigFromFile(tmpFile)
-	assert.NilError(t, err)
-
-	assert.Assert(t, cfg.Cache.RedisSentinel != nil)
-	assert.Equal(t, cfg.Cache.RedisSentinel.MasterName, "mymaster")
-	assert.Equal(t, len(cfg.Cache.RedisSentinel.SentinelAddrs), 3)
-}
-
 func TestReadConfigFromFile_EVMConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	tmpFile := filepath.Join(tmpDir, "evm.yml")
@@ -323,6 +278,44 @@ lcd:
 	assert.Equal(t, cfg.LCD.Rules[0].Cache.CacheEmptyResult, true)
 }
 
+func TestReadConfigFromFile_HttpRuleQuery(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "query.yml")
+
+	configContent := `
+rpc:
+  rules:
+    - priority: 100
+      action: allow
+      paths: ["/block"]
+      methods: [GET]
+      query:
+        height: "*"
+      cache:
+        enable: true
+        ttl: 1h
+    - priority: 200
+      action: allow
+      paths: ["/block"]
+      methods: [GET]
+`
+
+	err := os.WriteFile(tmpFile, []byte(configContent), 0644)
+	assert.NilError(t, err)
+
+	cfg, err := ReadConfigFromFile(tmpFile)
+	assert.NilError(t, err)
+
+	assert.Equal(t, len(cfg.RPC.Rules), 2)
+	// First rule has query and should be the cacheable one.
+	assert.Equal(t, cfg.RPC.Rules[0].Priority, 100)
+	assert.Equal(t, cfg.RPC.Rules[0].Query["height"], "*")
+	assert.Assert(t, cfg.RPC.Rules[0].QueryGlobs["height"] != nil)
+	// Second rule has no query.
+	assert.Equal(t, cfg.RPC.Rules[1].Priority, 200)
+	assert.Equal(t, len(cfg.RPC.Rules[1].Query), 0)
+}
+
 func TestReadConfigFromFile_RulesPrioritySorting(t *testing.T) {
 	tmpDir := t.TempDir()
 	tmpFile := filepath.Join(tmpDir, "priority.yml")
@@ -355,4 +348,257 @@ lcd:
 	assert.Equal(t, cfg.LCD.Rules[1].Paths[0], "/second")
 	assert.Equal(t, cfg.LCD.Rules[2].Priority, 500)
 	assert.Equal(t, cfg.LCD.Rules[2].Paths[0], "/third")
+}
+
+// TestHealthcheckEnableDisable_RespectsExplicitFalse pins the fix
+// for the creasty/defaults bool-override footgun: a YAML config with
+// `healthcheck.enable: false` must end up disabled after PrepareConfig.
+// Previously the field was a plain `bool` with `default:"true"`, and
+// the library cannot distinguish a zero-value from an unset one, so
+// the explicit false was silently overridden back to true and the
+// operator's healthchecks ran anyway. The *bool form (nil = default,
+// non-nil = honored) is what makes this test pass.
+func TestHealthcheckEnableDisable_RespectsExplicitFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "hc.yml")
+	cfgYAML := `
+host: 127.0.0.1
+nodes:
+  - name: explicit-off
+    host: 10.0.0.1
+    lcdPort: 1317
+    rpcPort: 26657
+    grpcPort: 9090
+    healthcheck:
+      enable: false
+  - name: explicit-on
+    host: 10.0.0.2
+    lcdPort: 1317
+    rpcPort: 26657
+    grpcPort: 9090
+    healthcheck:
+      enable: true
+  - name: defaulted
+    host: 10.0.0.3
+    lcdPort: 1317
+    rpcPort: 26657
+    grpcPort: 9090
+    healthcheck: {}
+`
+	assert.NilError(t, os.WriteFile(tmpFile, []byte(cfgYAML), 0644))
+	cfg, err := ReadConfigFromFile(tmpFile)
+	assert.NilError(t, err)
+
+	// explicit false must stay false (the bug under test).
+	assert.Assert(t, !cfg.Nodes[0].Healthcheck.IsEnabled(),
+		"node[0] explicit enable:false leaked through as enabled")
+	// explicit true stays true.
+	assert.Assert(t, cfg.Nodes[1].Healthcheck.IsEnabled(),
+		"node[1] explicit enable:true should be enabled")
+	// nil pointer means "use the default", which is enabled.
+	assert.Assert(t, cfg.Nodes[2].Healthcheck.IsEnabled(),
+		"node[2] unset enable should default to enabled")
+}
+
+// TestCircuitBreakerEnableDisable_RespectsExplicitFalse is the same
+// pin for CircuitBreakerConfig.Enable. Same root cause as the
+// healthcheck variant — covered separately so a regression on either
+// struct fails the right test.
+func TestCircuitBreakerEnableDisable_RespectsExplicitFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "cb.yml")
+	cfgYAML := `
+host: 127.0.0.1
+nodes:
+  - name: explicit-off
+    host: 10.0.0.1
+    lcdPort: 1317
+    rpcPort: 26657
+    grpcPort: 9090
+    circuitBreaker:
+      enable: false
+  - name: defaulted
+    host: 10.0.0.2
+    lcdPort: 1317
+    rpcPort: 26657
+    grpcPort: 9090
+    circuitBreaker: {}
+`
+	assert.NilError(t, os.WriteFile(tmpFile, []byte(cfgYAML), 0644))
+	cfg, err := ReadConfigFromFile(tmpFile)
+	assert.NilError(t, err)
+
+	assert.Assert(t, !cfg.Nodes[0].CircuitBreaker.IsEnabled(),
+		"node[0] explicit circuitBreaker.enable:false leaked through as enabled")
+	assert.Assert(t, cfg.Nodes[1].CircuitBreaker.IsEnabled(),
+		"node[1] unset enable should default to enabled")
+}
+
+// TestValidateCacheBackend covers the contract surface validated by
+// validateCacheBackend: the cluster: block is present requires a routable
+// bindAddr + a discovery mode, and the per-mode required fields
+// (dns.host, static.peers) are enforced.
+func TestValidateCacheBackend(t *testing.T) {
+	t.Run("empty cache validates", func(t *testing.T) {
+		c := &CacheGlobalConfig{}
+		assert.NilError(t, validateCacheBackend(c))
+	})
+
+	t.Run("the cluster: block is present without bindAddr rejected", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{},
+		}
+		err := validateCacheBackend(c)
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("the cluster: block is present requires discovery mode", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+			},
+		}
+		err := validateCacheBackend(c)
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("dns mode requires host", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+				Discovery:    &ClusterDiscoveryConfig{Mode: "dns"},
+			},
+		}
+		err := validateCacheBackend(c)
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("static mode requires peers", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+				Discovery:    &ClusterDiscoveryConfig{Mode: "static"},
+			},
+		}
+		err := validateCacheBackend(c)
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("static mode with peers passes", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+				Discovery: &ClusterDiscoveryConfig{
+					Mode:   "static",
+					Static: &StaticDiscoveryConfig{Peers: []string{"a:3322", "b:3322"}},
+				},
+			},
+		}
+		assert.NilError(t, validateCacheBackend(c))
+	})
+
+	t.Run("quorum greater than replicaCount rejected", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				ReplicaCount: 2,
+				Quorum:       3,
+				Discovery: &ClusterDiscoveryConfig{
+					Mode:   "static",
+					Static: &StaticDiscoveryConfig{Peers: []string{"a:3322"}},
+				},
+			},
+		}
+		err := validateCacheBackend(c)
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("the cluster: block is present rejects wildcard bindAddr", func(t *testing.T) {
+		for _, addr := range []string{"", "0.0.0.0", "::", "[::]"} {
+			c := &CacheGlobalConfig{
+				Cluster: &ClusterConfig{
+					BindAddr:     addr,
+					ReplicaCount: 2,
+					Quorum:       1,
+					Discovery: &ClusterDiscoveryConfig{
+						Mode:   "static",
+						Static: &StaticDiscoveryConfig{Peers: []string{"a:3322"}},
+					},
+				},
+			}
+			err := validateCacheBackend(c)
+			assert.Assert(t, err != nil, "bindAddr=%q should be rejected", addr)
+		}
+	})
+
+	t.Run("experimental modes accepted at config time", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+				Discovery:    &ClusterDiscoveryConfig{Mode: "kubernetes"},
+			},
+		}
+		assert.NilError(t, validateCacheBackend(c))
+	})
+
+	t.Run("dns port out of range rejected", func(t *testing.T) {
+		for _, port := range []int{-1, 0xffff + 1, 100000} {
+			c := &CacheGlobalConfig{
+				Cluster: &ClusterConfig{
+					BindAddr:     "10.0.0.5",
+					ReplicaCount: 2,
+					Quorum:       1,
+					Discovery: &ClusterDiscoveryConfig{
+						Mode: "dns",
+						DNS:  &DNSDiscoveryConfig{Host: "peers.local", Port: port},
+					},
+				},
+			}
+			err := validateCacheBackend(c)
+			assert.Assert(t, err != nil, "dns.port=%d should be rejected", port)
+		}
+	})
+
+	t.Run("dns port zero accepted (inherits gossipPort)", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+				Discovery: &ClusterDiscoveryConfig{
+					Mode: "dns",
+					DNS:  &DNSDiscoveryConfig{Host: "peers.local"},
+				},
+			},
+		}
+		assert.NilError(t, validateCacheBackend(c))
+	})
+
+	t.Run("dns refreshInterval below 1s rejected", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+				Discovery: &ClusterDiscoveryConfig{
+					Mode: "dns",
+					DNS: &DNSDiscoveryConfig{
+						Host:            "peers.local",
+						RefreshInterval: 100 * time.Millisecond,
+					},
+				},
+			},
+		}
+		err := validateCacheBackend(c)
+		assert.Assert(t, err != nil)
+	})
 }

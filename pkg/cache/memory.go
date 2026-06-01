@@ -64,3 +64,18 @@ func (c MemoryCache[K, V]) Get(_ context.Context, key K) (V, error) {
 func (c MemoryCache[K, V]) Has(_ context.Context, key K) (bool, error) {
 	return c.cache.Has(c.key(key)), nil
 }
+
+// Close stops the ttlcache background expiration goroutine. Idempotent —
+// ttlcache.Cache.Stop() handles repeated calls safely.
+func (c MemoryCache[K, V]) Close() error {
+	c.cache.Stop()
+	return nil
+}
+
+// Reset drops every entry without stopping the background expiry
+// goroutine. Used by TieredCache.InvalidateLocal on hot-reload so the
+// L1 fast path can't serve a value whose underlying rule has changed.
+// The TTL goroutine keeps running; the next write resumes normally.
+func (c MemoryCache[K, V]) Reset() {
+	c.cache.DeleteAll()
+}

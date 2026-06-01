@@ -1,0 +1,442 @@
+# cosmoguard Helm values. See helm/cosmoguard/README.md for the
+# full guide.
+
+image:
+  repository: ghcr.io/voluzi/cosmoguard
+  pullPolicy: IfNotPresent
+  tag: ""  # defaults to .Chart.AppVersion
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Workload kind. Two options:
+#   Deployment   — default, ephemeral pod identities. Cache and rate-limit
+#                  data still survives a single-pod restart via olric DMap
+#                  replication, but per-pod observability snapshots (the
+#                  dashboard panels keyed by pod_id) are lost on pod
+#                  replacement because new pods get new hostnames and
+#                  can't find their old DMap key.
+#   StatefulSet  — recommended when running in cluster mode. Stable pod
+#                  hostnames (cosmoguard-0 is always cosmoguard-0) mean
+#                  the observability snapshot key survives pod
+#                  replacement, so panels stay populated across rolling
+#                  restarts. No PVCs are templated — cosmoguard is
+#                  in-memory only by design; replication via olric is
+#                  the durability mechanism, not disk.
+kind: Deployment
+
+# Three replicas is the textbook olric shape (RF=2, quorum=2 = no
+# split-brain). The chart ships no default affinity so installs on
+# single-node clusters (kind, k3s, minikube) just work — pods stack
+# on the one available node. For production multi-node, add a soft
+# pod-anti-affinity via `affinity:` below or a topologySpreadConstraint.
+replicaCount: 3
+
+# Cosmoguard config rendered as a ConfigMap and mounted at /etc/cosmoguard.
+# This is the SAME YAML you'd put in cosmoguard.yaml directly — see
+# CONFIG.md for the full schema reference.
+config:
+  host: 0.0.0.0
+  lcdPort: 11317
+  rpcPort: 16657
+  grpcPort: 19090
+  # EVM RPC + WS — only exposed when enableEvm is true. The
+  # deployment / service templates conditionally render the matching
+  # container/service ports.
+  enableEvm: false
+  evmRpcPort: 18545
+  evmRpcWsPort: 18546
+  metrics:
+    enable: true
+    port: 9001
+  # Read-only operator dashboard. Off by default in the chart so the
+  # dashboard isn't unintentionally exposed via Service or NetworkPolicy
+  # rules; enable explicitly when you want it.
+  dashboard:
+    enable: false
+    port: 19999
+    # Live-traffic panel: time-windowed log of recent request
+    # metadata (no headers, no bodies). Off by default — turning it
+    # on surfaces every captured request's path, identity, and
+    # source IP on the dashboard, so restrict access (BasicAuth or
+    # IP allowlist) before flipping it on.
+    #
+    # Hot-reloadable: edits to this block take effect on the next
+    # request without a pod restart.
+    # requestLog:
+    #   enable: true
+    #   maxAge: 30m        # entries older than now-maxAge get evicted
+    #   maxEntries: 10000  # global hard cap (OOM backstop)
+    #   includeSuccess: true
+    #   includeDenied: true
+  server:
+    readHeaderTimeout: 10s
+    readTimeout: 30s
+    writeTimeout: 30s
+    idleTimeout: 60s
+    maxRequestBody: 1048576
+  # Replace with your real Cosmos node(s). Multi-node + healthcheck
+  # support enables horizontal HA at the cosmoguard layer.
+  nodes:
+    - name: node-0
+      host: cosmos-node
+      lcdPort: 1317
+      rpcPort: 26657
+      grpcPort: 9090
+      healthcheck:
+        enable: true
+        path: /status
+        service: rpc
+        interval: 5s
+        timeout: 2s
+        unhealthyAfter: 3
+        healthyAfter: 2
+  # Cache + cluster wiring. With cluster.enable: true the chart:
+  #   - injects POD_IP via the downward API (used as bindAddr; wildcard
+  #     addresses would collide on memberlist Name across pods);
+  #   - opens bindPort + gossipPort (TCP + UDP) + peerApiPort on the
+  #     workload and the rendered headless peer Service;
+  #   - auto-fills discovery.dns.host to that headless service's FQDN.
+  # Set cluster.enable: false to run olric in embedded loopback mode
+  # (no gossip, no peer service); useful for permanent single-pod installs.
+  cache:
+    # ttl: 5s
+    cluster:
+      enable: true
+      # bindAddr defaults to "${POD_IP}" via the chart's downward-API
+      # wire-up. Override only on bare metal / non-K8s installs.
+      # bindAddr: "${POD_IP}"
+      bindPort: 3320          # olric RESP (TCP)
+      gossipPort: 3322        # memberlist (TCP + UDP on same port!)
+      peerApiPort: 0          # 0 → bindPort + 1; dashboard fan-out HTTP
+      replicaCount: 2         # olric replication factor (RF=2 is the
+                              # default; 3 is the textbook split-brain-
+                              # proof choice for production HA).
+      quorum: 1               # set to 2 when replicaCount: 3
+      discovery:
+        # "dns" works zero-config with the chart's headless peer
+        # service. "static" wants an explicit peer list (useful on VMs).
+        # "kubernetes" + "mdns" are experimental in v4.
+        mode: dns
+        dns:
+          # Empty → auto-filled to the headless peer service's in-cluster
+          # FQDN (<release>-cosmoguard-peers.<namespace>.svc.cluster.local).
+          host: ""
+          refreshInterval: 10s
+  lcd:
+    default: allow
+  rpc:
+    default: allow
+    jsonrpc:
+      default: allow
+  grpc:
+    default: deny
+
+# Use an existing ConfigMap instead of templating one from `config:` above.
+# Useful when you manage cosmoguard.yaml outside Helm (e.g. ArgoCD).
+existingConfigMap: ""
+
+# Use an existing Secret as the source of env vars for the container —
+# the standard pattern for ${VAR} interpolated secrets in `config:`.
+# The Secret must define the env var names cosmoguard.yaml references.
+existingSecret: ""
+
+# Inline env vars added to the container. Combine with existingSecret
+# above when you have a mix of plaintext and secret env vars.
+env: {}
+  # JWT_SECRET: "..."   # don't put real secrets here; use existingSecret
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+service:
+  type: ClusterIP
+  annotations: {}
+  # Ports here mirror the listening ports in `config:` above.
+  lcdPort: 11317
+  rpcPort: 16657
+  grpcPort: 19090
+  metricsPort: 9001
+  dashboardPort: 19999
+
+# Headless peer Service (clusterIP: None) for memberlist gossip + DNS-based
+# peer discovery. Only rendered when config.cluster.enable is true, since
+# embedded-mode olric has no inter-pod traffic. Carries:
+#   - gossip (TCP + UDP on the SAME port — operators often block UDP by
+#     reflex, which silently breaks cluster formation; the chart documents
+#     both protocols on this port);
+#   - olric RESP bindPort (TCP, node-to-node data replication);
+#   - peerApiPort (TCP, dashboard fan-out aggregator — restricted to the
+#     member set at the network layer, never internet-facing).
+#
+# Headless is required: memberlist needs every pod's real IP, not a VIP.
+# The DNS discovery mode resolves this service's name to the per-pod
+# A records the headless mode produces, which is exactly what olric joins.
+peerService:
+  # The peer service is named "<fullName>-peers" by default. Override
+  # here when you need a specific name (e.g. for an existing NetworkPolicy
+  # selector). Empty → auto-named.
+  nameOverride: ""
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# External exposure
+# ---------------------------------------------------------------------------
+# Two routing modes are supported and are mutually exclusive:
+#   - Ingress (networking.k8s.io/v1)        — set ingress.enabled (and
+#     optionally ingressGrpc.enabled, ingressDashboard.enabled)
+#   - Gateway API (gateway.networking.k8s.io/v1) — set gateway.enabled
+#
+# Each protocol gets its own object because (a) gRPC needs a different
+# backend protocol than LCD/RPC, and (b) the dashboard reveals operator-
+# only data (deny patterns, unmatched paths, rule fingerprints) and
+# should never share a host or auth posture with the public proxy.
+#
+# Disable an endpoint by leaving its `hosts` (Ingress) or `hostnames`
+# (Gateway API) empty — no manifest is rendered for that endpoint.
+
+# Ingress for LCD / RPC / EVM. Per-endpoint hostnames so each protocol
+# can live on its own subdomain. WebSocket upgrades on /websocket and
+# the EVM WS port pass through transparently on all conformant
+# controllers (nginx, traefik, contour, etc.).
+ingress:
+  enabled: false
+  className: ""
+  # Annotations applied to THIS Ingress only. Common picks:
+  #   cert-manager.io/cluster-issuer: letsencrypt-prod
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"  # for WS
+  annotations: {}
+  # TLS shared by the LCD/RPC/EVM hosts. One entry per cert.
+  #   - hosts: ["lcd.example.com", "rpc.example.com"]
+  #     secretName: cosmoguard-tls
+  tls: []
+  lcd:
+    hosts: []    # ["lcd.example.com"]
+    path: /
+    pathType: Prefix
+  rpc:
+    hosts: []    # ["rpc.example.com"]
+    path: /
+    pathType: Prefix
+  evmRpc:
+    hosts: []    # ["evm.example.com"]
+    path: /
+    pathType: Prefix
+  evmRpcWs:
+    hosts: []    # ["evm-ws.example.com"]
+    path: /
+    pathType: Prefix
+
+# Separate Ingress for gRPC. nginx-ingress (and most others) can't mix
+# gRPC and HTTP/1.1 on the same Ingress object — the backend-protocol
+# annotation is per-Ingress. Off by default; opt in when you actually
+# expose the gRPC port.
+ingressGrpc:
+  enabled: false
+  className: ""
+  # Default sets nginx-ingress backend protocol. Override for other
+  # controllers (Traefik: use `traefik.ingress.kubernetes.io/service.serversscheme: h2c`).
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: GRPC
+  hosts: []      # ["grpc.example.com"]
+  path: /
+  pathType: Prefix
+  tls: []
+
+# Separate Ingress for the dashboard. Off even when ingress.enabled is
+# true — the dashboard has no built-in auth and reveals operator data.
+# Refuses to render when config.dashboard.enable is false.
+#
+# Recommended annotations (pick what fits your controller):
+#   nginx.ingress.kubernetes.io/auth-type: basic
+#   nginx.ingress.kubernetes.io/auth-secret: cosmoguard-dashboard-htpasswd
+#   nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8"
+ingressDashboard:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []      # ["cosmoguard.internal.example.com"]
+  path: /
+  pathType: Prefix
+  tls: []
+
+# Gateway API alternative. Mutually exclusive with the three ingress*
+# blocks above. Each route attaches to operator-supplied parentRefs;
+# parentRefs at the top level apply to every route unless an endpoint
+# sets its own.
+#
+# Tested against Istio, Envoy Gateway, and Cilium Gateway. GRPCRoute is
+# required for the grpc endpoint (no conformant implementation models
+# gRPC via HTTPRoute alone).
+gateway:
+  enabled: false
+  # Default parentRefs for every endpoint. Override per-endpoint when
+  # you need different Gateways (e.g. public LCD vs internal dashboard).
+  parentRefs: []
+    # - name: my-gateway
+    #   namespace: gateway-system
+    #   sectionName: https
+  lcd:
+    hostnames: []  # ["lcd.example.com"]
+    parentRefs: []
+  rpc:
+    hostnames: []
+    parentRefs: []
+  evmRpc:
+    hostnames: []
+    parentRefs: []
+  evmRpcWs:
+    hostnames: []
+    parentRefs: []
+  grpc:
+    hostnames: []
+    parentRefs: []
+  dashboard:
+    hostnames: []
+    parentRefs: []
+
+# PodDisruptionBudget — caps voluntary disruptions so the olric cluster
+# keeps quorum during node drains and rolling node upgrades. Off by
+# default for single-replica installs (a PDB with minAvailable: 1 on a
+# 1-replica workload blocks drains entirely). For HA cluster mode
+# (replicas >= 2 with config.cluster.enable: true) you almost certainly
+# want this on with minAvailable: 1 (allows one pod down) or
+# maxUnavailable: 1 — pick whichever expresses your tolerance.
+podDisruptionBudget:
+  enabled: false
+  # Exactly one of minAvailable / maxUnavailable should be set. The chart
+  # rejects setting both to avoid an ambiguous PDB. Integer or "50%".
+  minAvailable: 1
+  # maxUnavailable: 1
+
+resources:
+  limits:
+    cpu: 1
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# NetworkPolicy for the cluster-mode peer surface. Restricts the
+# peer-api port (dashboard fan-out aggregator) AND the gossip / RESP
+# ports to the cosmoguard pods themselves — never the wider network.
+# Without this, any pod in the namespace can hit peer-api (which reads
+# operator-visible state) and any pod can talk to gossip (which can
+# join the cluster as a phantom member if they speak the protocol).
+#
+# Off by default because not every cluster runs a CNI that enforces
+# NetworkPolicy (kindnet doesn't; cilium, calico, weave do). Turn on
+# explicitly when you're sure your CNI enforces.
+networkPolicy:
+  enabled: false
+  # Extra ingress rules for the *proxy* listeners (LCD/RPC/gRPC/...).
+  # By default the proxy listeners are NOT restricted by this policy
+  # (we add nothing for them — they're the public ingress surface and
+  # the controller / mesh handles auth/IP-allowlist). Add rules here
+  # to lock them down to specific namespaces / pod selectors.
+  proxyIngress: []
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: trusted-clients
+
+# Horizontal Pod Autoscaler — bound on top of the Redis-shared rate
+# limiter state from Phase D so replicas don't multiply rate-limit
+# budgets. Safe to enable when `config.cache.cluster.enable: true` (the
+# default) — every replica shares the same olric-backed bucket pool,
+# so a configured `10 req/s per IP` rule stays at 10 req/s regardless
+# of replica count. Without cluster mode, each replica has its own
+# bucket and HPA multiplies the budget by replicaCount.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # targetMemoryUtilizationPercentage: 80
+
+# ServiceMonitor for the Prometheus operator. Disabled by default;
+# enable when prometheus-operator is installed in the cluster.
+#
+# NOTE on labels: most kube-prometheus-stack installations restrict
+# which ServiceMonitors get scraped via a `release: <prometheus-release>`
+# label selector on the Prometheus CR (`serviceMonitorSelector`). If you
+# enable this ServiceMonitor and don't see scrapes, set `labels.release`
+# here to match — typically `release: prometheus` for the standard
+# kube-prometheus-stack release name. Leave empty to fall back to the
+# default app.kubernetes.io/* labels.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+    # release: prometheus
+
+nodeSelector: {}
+tolerations: []
+
+# Affinity. Empty by default so the chart installs on single-node
+# clusters without scheduling failures. For production multi-node
+# deploys, a soft pod-anti-affinity is the right shape — it spreads
+# replicas across nodes when possible but doesn't block scheduling
+# when node count < replicaCount. Example:
+#
+#   affinity:
+#     podAntiAffinity:
+#       preferredDuringSchedulingIgnoredDuringExecution:
+#         - weight: 100
+#           podAffinityTerm:
+#             topologyKey: kubernetes.io/hostname
+#             labelSelector:
+#               matchLabels:
+#                 app.kubernetes.io/name: cosmoguard
+affinity: {}
+
+# Optional topology spread constraints. Apply across zone or node to
+# survive zonal outages with `whenUnsatisfiable: ScheduleAnyway` (soft).
+# Examples:
+#   - maxSkew: 1
+#     topologyKey: topology.kubernetes.io/zone
+#     whenUnsatisfiable: ScheduleAnyway
+#     labelSelector:
+#       matchLabels:
+#         app.kubernetes.io/name: cosmoguard
+topologySpreadConstraints: []
+
+# Lifecycle probes hit cosmoguard's built-in /healthz and /readyz on
+# the metrics port. /readyz reflects upstream-pool health so a node
+# without a healthy upstream stops receiving traffic.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: metrics
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 3

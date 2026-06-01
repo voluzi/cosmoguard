@@ -1,0 +1,170 @@
+{{- include "cosmoguard.exposureValidation" . -}}
+{{- if .Values.gateway.enabled -}}
+{{- $fullName := include "cosmoguard.fullname" . -}}
+{{- $globalRefs := .Values.gateway.parentRefs -}}
+
+{{- /*
+HTTPRoute (LCD). HTTPRoute carries WebSocket upgrades transparently —
+no special route-level config required; the underlying Gateway must
+permit HTTP/1.1 Upgrade frames, which all conformant implementations
+do by default.
+*/ -}}
+{{- if gt (len .Values.gateway.lcd.hostnames) 0 -}}
+{{- $refs := .Values.gateway.lcd.parentRefs -}}
+{{- if eq (len $refs) 0 }}{{ $refs = $globalRefs }}{{ end -}}
+{{- if eq (len $refs) 0 -}}
+{{- fail "cosmoguard: gateway.lcd.hostnames set but no parentRefs (set gateway.parentRefs or gateway.lcd.parentRefs)" -}}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}-lcd
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $refs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.gateway.lcd.hostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullName }}
+          port: {{ .Values.service.lcdPort }}
+---
+{{- end }}
+
+{{- /* HTTPRoute (RPC) — Tendermint RPC plus /websocket upgrade. */ -}}
+{{- if gt (len .Values.gateway.rpc.hostnames) 0 -}}
+{{- $refs := .Values.gateway.rpc.parentRefs -}}
+{{- if eq (len $refs) 0 }}{{ $refs = $globalRefs }}{{ end -}}
+{{- if eq (len $refs) 0 -}}
+{{- fail "cosmoguard: gateway.rpc.hostnames set but no parentRefs (set gateway.parentRefs or gateway.rpc.parentRefs)" -}}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}-rpc
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $refs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.gateway.rpc.hostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullName }}
+          port: {{ .Values.service.rpcPort }}
+---
+{{- end }}
+
+{{- if .Values.config.enableEvm }}
+{{- /* HTTPRoute (EVM RPC). */ -}}
+{{- if gt (len .Values.gateway.evmRpc.hostnames) 0 -}}
+{{- $refs := .Values.gateway.evmRpc.parentRefs -}}
+{{- if eq (len $refs) 0 }}{{ $refs = $globalRefs }}{{ end -}}
+{{- if eq (len $refs) 0 -}}
+{{- fail "cosmoguard: gateway.evmRpc.hostnames set but no parentRefs" -}}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}-evm-rpc
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $refs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.gateway.evmRpc.hostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullName }}
+          port: {{ .Values.service.evmRpcPort | default .Values.config.evmRpcPort }}
+---
+{{- end }}
+
+{{- /* HTTPRoute (EVM WebSocket). */ -}}
+{{- if gt (len .Values.gateway.evmRpcWs.hostnames) 0 -}}
+{{- $refs := .Values.gateway.evmRpcWs.parentRefs -}}
+{{- if eq (len $refs) 0 }}{{ $refs = $globalRefs }}{{ end -}}
+{{- if eq (len $refs) 0 -}}
+{{- fail "cosmoguard: gateway.evmRpcWs.hostnames set but no parentRefs" -}}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}-evm-rpc-ws
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $refs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.gateway.evmRpcWs.hostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullName }}
+          port: {{ .Values.service.evmRpcWsPort | default .Values.config.evmRpcWsPort }}
+---
+{{- end }}
+{{- end }}
+
+{{- /*
+GRPCRoute (gRPC). Separate kind because Gateway API splits HTTP and
+gRPC at the API layer — matches well with the Ingress separation
+above. Operators using a Gateway without GRPCRoute support can fall
+back to HTTPRoute with appProtocol-based backendRefs, but the v1
+implementations (Istio, Envoy Gateway, Cilium) all support GRPCRoute.
+*/ -}}
+{{- if gt (len .Values.gateway.grpc.hostnames) 0 -}}
+{{- $refs := .Values.gateway.grpc.parentRefs -}}
+{{- if eq (len $refs) 0 }}{{ $refs = $globalRefs }}{{ end -}}
+{{- if eq (len $refs) 0 -}}
+{{- fail "cosmoguard: gateway.grpc.hostnames set but no parentRefs" -}}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: {{ $fullName }}-grpc
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $refs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.gateway.grpc.hostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullName }}
+          port: {{ .Values.service.grpcPort }}
+---
+{{- end }}
+
+{{- /*
+HTTPRoute (Dashboard). Same hard guard as the Ingress version: the
+dashboard listener must be enabled on the pod, otherwise routing traffic
+at it produces 502s only — and the operator typically meant to enable
+both. Fail loudly at template time so we don't ship a half-configured
+exposure.
+*/ -}}
+{{- if gt (len .Values.gateway.dashboard.hostnames) 0 -}}
+{{- if not .Values.config.dashboard.enable -}}
+{{- fail "cosmoguard: gateway.dashboard.hostnames set but config.dashboard.enable=false (enable the dashboard listener first)" -}}
+{{- end -}}
+{{- $refs := .Values.gateway.dashboard.parentRefs -}}
+{{- if eq (len $refs) 0 }}{{ $refs = $globalRefs }}{{ end -}}
+{{- if eq (len $refs) 0 -}}
+{{- fail "cosmoguard: gateway.dashboard.hostnames set but no parentRefs" -}}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}-dashboard
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $refs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.gateway.dashboard.hostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullName }}
+          port: {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}
+{{- end }}
+{{- end -}}

@@ -1,0 +1,45 @@
+{{- include "cosmoguard.clusterValidation" . -}}
+{{- if eq (include "cosmoguard.clusterEnabled" .) "true" -}}
+{{- $cache := dig "cache" (dict) .Values.config -}}
+{{- $c := dig "cluster" (dict) $cache -}}
+{{- $bind := dig "bindPort" 3320 $c -}}
+{{- $gossip := dig "gossipPort" 3322 $c -}}
+{{- $peerApi := dig "peerApiPort" 0 $c -}}
+{{- if eq (int $peerApi) 0 }}{{ $peerApi = (add (int $bind) 1) }}{{ end -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cosmoguard.peerServiceName" . }}
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+  {{- with .Values.peerService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Headless — required for memberlist. The DNS discovery mode resolves
+  # this service to the per-pod A records produced by clusterIP: None.
+  clusterIP: None
+  # publishNotReadyAddresses keeps pods in DNS while they're warming up
+  # so a fresh pod can be reached by its peers during the brief window
+  # between Running and Ready. Without this, a rolling restart would
+  # delay cluster convergence by the readiness-probe period.
+  publishNotReadyAddresses: true
+  selector: {{- include "cosmoguard.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: cluster-rpc
+      port: {{ $bind }}
+      targetPort: cluster-rpc
+      protocol: TCP
+    - name: gossip-tcp
+      port: {{ $gossip }}
+      targetPort: gossip-tcp
+      protocol: TCP
+    - name: gossip-udp
+      port: {{ $gossip }}
+      targetPort: gossip-udp
+      protocol: UDP
+    - name: peer-api
+      port: {{ $peerApi }}
+      targetPort: peer-api
+      protocol: TCP
+{{- end -}}

@@ -1,4 +1,7 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
+
+ARG VERSION
+ARG COMMIT
 
 RUN apk --no-cache add git make
 
@@ -9,7 +12,7 @@ RUN go mod download
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,target=/go/pkg \
-  make build
+  VERSION=$VERSION COMMIT=$COMMIT make build
 
 FROM gcr.io/distroless/static
 WORKDIR /

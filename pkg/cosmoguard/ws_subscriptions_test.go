@@ -4,8 +4,24 @@ import (
 	"sync"
 	"testing"
 
+	"go.uber.org/goleak"
 	"gotest.tools/assert"
 )
+
+// TestMain wraps the subscription test suite with goleak so any leaked
+// goroutine surfaces as a test failure. This is Phase A3's investment in
+// catching subscription bugs early.
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m,
+		// fsnotify spins up internal goroutines on init that we don't own.
+		// Filter them out; they're harmless and well-tested by upstream.
+		goleak.IgnoreTopFunction("github.com/fsnotify/fsnotify.(*Watcher).readEvents"),
+		// gRPC's resolver background goroutines from any leftover GrpcProxy
+		// instantiation in tests.
+		goleak.IgnoreAnyFunction("google.golang.org/grpc.(*ccBalancerWrapper).watcher"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/grpcsync.(*CallbackSerializer).run"),
+	)
+}
 
 func TestSubscriptionManager_AddAndRemoveSubscription(t *testing.T) {
 	sm := NewSubscriptionManager()

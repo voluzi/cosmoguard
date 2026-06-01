@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,7 @@ import (
 func TestReusableReader(t *testing.T) {
 	t.Run("read content multiple times", func(t *testing.T) {
 		original := "hello world"
-		reader := ReusableReader(io.NopCloser(strings.NewReader(original)))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader(original)))
 
 		// First read
 		content1, err := io.ReadAll(reader)
@@ -33,13 +34,13 @@ func TestReusableReader(t *testing.T) {
 	})
 
 	t.Run("close returns nil", func(t *testing.T) {
-		reader := ReusableReader(io.NopCloser(strings.NewReader("test")))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader("test")))
 		err := reader.Close()
 		assert.NilError(t, err)
 	})
 
 	t.Run("empty content", func(t *testing.T) {
-		reader := ReusableReader(io.NopCloser(strings.NewReader("")))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader("")))
 
 		content, err := io.ReadAll(reader)
 		assert.NilError(t, err)
@@ -48,7 +49,7 @@ func TestReusableReader(t *testing.T) {
 
 	t.Run("large content", func(t *testing.T) {
 		original := strings.Repeat("abcdefghij", 10000) // 100KB
-		reader := ReusableReader(io.NopCloser(strings.NewReader(original)))
+		reader, _ := ReusableReader(io.NopCloser(strings.NewReader(original)))
 
 		content1, err := io.ReadAll(reader)
 		assert.NilError(t, err)
@@ -115,7 +116,26 @@ func TestResponseWriterWrapper(t *testing.T) {
 	})
 }
 
+// withTrustAll temporarily configures the package-level
+// trustedProxies allowlist to "trust everyone" for the duration of
+// the calling test, then restores the previous allowlist. Tests that
+// need the legacy "every forwarded header is honored" semantics call
+// this once at the top.
+func withTrustAll(t *testing.T) {
+	t.Helper()
+	prev := trustedProxies.Load()
+	if err := SetTrustedProxies([]string{"0.0.0.0/0", "::/0"}); err != nil {
+		t.Fatalf("withTrustAll: %v", err)
+	}
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+}
+
 func TestGetSourceIP(t *testing.T) {
+	// Legacy header-trusting behavior is gated behind the trusted-
+	// proxies allowlist; tests written before that gate existed
+	// assume "trust everyone".
+	withTrustAll(t)
+
 	tests := []struct {
 		name       string
 		headers    map[string]string
@@ -144,13 +164,28 @@ func TestGetSourceIP(t *testing.T) {
 			name:       "fallback to RemoteAddr",
 			headers:    map[string]string{},
 			remoteAddr: "5.6.7.8:1234",
-			expected:   "5.6.7.8:1234",
+			expected:   "5.6.7.8", // host-only: ephemeral port stripped for stable per-IP policy
 		},
 		{
 			name:       "empty headers fallback",
 			headers:    map[string]string{"X-Real-Ip": "", "X-Forwarded-For": ""},
 			remoteAddr: "192.168.1.1:8080",
-			expected:   "192.168.1.1:8080",
+			expected:   "192.168.1.1", // host-only
+		},
+		{
+			// X-Forwarded-For chain: "client, lb-1, lb-2" — return just
+			// the leftmost (original client) per the spec.
+			name:       "X-Forwarded-For chain",
+			headers:    map[string]string{"X-Forwarded-For": "1.2.3.4, 10.0.0.1, 10.0.0.2"},
+			remoteAddr: "5.6.7.8:1234",
+			expected:   "1.2.3.4",
+		},
+		{
+			// X-Forwarded-For chain with no spaces around commas.
+			name:       "X-Forwarded-For chain no spaces",
+			headers:    map[string]string{"X-Forwarded-For": "1.2.3.4,10.0.0.1"},
+			remoteAddr: "5.6.7.8:1234",
+			expected:   "1.2.3.4",
 		},
 	}
 
@@ -165,6 +200,89 @@ func TestGetSourceIP(t *testing.T) {
 			result := GetSourceIP(req)
 			assert.Equal(t, result, tt.expected)
 		})
+	}
+}
+
+// TestGetSourceIP_DefaultDeny pins the secure-by-default behavior:
+// when no trustedProxies CIDRs are configured (the v4 default), the
+// X-Real-Ip / X-Forwarded-For headers MUST be ignored and the source
+// IP comes from r.RemoteAddr. A naked cosmoguard hit directly from
+// the internet must not be tricked into rate-limiting (or auditing)
+// the wrong client by anyone who sends `X-Real-Ip: 1.2.3.4`.
+func TestGetSourceIP_DefaultDeny(t *testing.T) {
+	// Ensure the global is empty for this test even if a prior test
+	// left it populated.
+	prev := trustedProxies.Load()
+	trustedProxies.Store(nil)
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "5.6.7.8:1234"
+	req.Header.Set("X-Real-Ip", "1.2.3.4")
+	req.Header.Set("X-Forwarded-For", "9.9.9.9")
+
+	if got := GetSourceIP(req); got != "5.6.7.8" {
+		t.Fatalf("default-deny must ignore client-supplied headers, got %q", got)
+	}
+}
+
+// TestGetSourceIP_TrustedPeerHonored exercises the gate's positive
+// path: when the immediate peer matches the configured allowlist,
+// X-Real-Ip / X-Forwarded-For are honored; a peer outside the
+// allowlist is treated as untrusted and the headers are ignored.
+func TestGetSourceIP_TrustedPeerHonored(t *testing.T) {
+	prev := trustedProxies.Load()
+	if err := SetTrustedProxies([]string{"10.0.0.0/8"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	// Trusted peer: headers are honored.
+	r1 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r1.RemoteAddr = "10.1.2.3:55555"
+	r1.Header.Set("X-Real-Ip", "1.2.3.4")
+	if got := GetSourceIP(r1); got != "1.2.3.4" {
+		t.Fatalf("trusted peer should honor X-Real-Ip, got %q", got)
+	}
+
+	// Untrusted peer: header is ignored, RemoteAddr is returned.
+	r2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r2.RemoteAddr = "8.8.8.8:55555"
+	r2.Header.Set("X-Real-Ip", "1.2.3.4")
+	if got := GetSourceIP(r2); got != "8.8.8.8" {
+		t.Fatalf("untrusted peer must ignore X-Real-Ip, got %q", got)
+	}
+}
+
+// TestSetTrustedProxies_BareIPAccepted pins the operator-friendly
+// shortcut: a bare IP without a "/mask" is auto-expanded to /32
+// (v4) or /128 (v6). Operators often list LB IPs directly and
+// shouldn't get a confusing "invalid CIDR" startup error.
+func TestSetTrustedProxies_BareIPAccepted(t *testing.T) {
+	prev := trustedProxies.Load()
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	if err := SetTrustedProxies([]string{"10.0.0.1", "2001:db8::1"}); err != nil {
+		t.Fatalf("bare IPs should parse: %v", err)
+	}
+	if !remotePeerTrusted("10.0.0.1:9999") {
+		t.Fatal("10.0.0.1 should be trusted")
+	}
+	if remotePeerTrusted("10.0.0.2:9999") {
+		t.Fatal("10.0.0.2 must NOT be trusted (only /32 allowed)")
+	}
+}
+
+// TestSetTrustedProxies_BadCIDRRejected pins startup failure on
+// a malformed CIDR. Without this, a typo would silently degrade to
+// "trust nothing" and operators would chase a missing-IP bug.
+func TestSetTrustedProxies_BadCIDRRejected(t *testing.T) {
+	prev := trustedProxies.Load()
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	err := SetTrustedProxies([]string{"10.0.0.0/8", "not-a-cidr"})
+	if err == nil {
+		t.Fatal("expected an error on malformed CIDR")
 	}
 }
 
@@ -226,7 +344,7 @@ func TestWriteError(t *testing.T) {
 
 func TestReusableReader_PartialReads(t *testing.T) {
 	original := "hello world this is a test"
-	reader := ReusableReader(io.NopCloser(strings.NewReader(original)))
+	reader, _ := ReusableReader(io.NopCloser(strings.NewReader(original)))
 
 	// Read in chunks
 	buf := make([]byte, 5)
@@ -264,7 +382,7 @@ func BenchmarkReusableReader(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		reader := ReusableReader(io.NopCloser(bytes.NewReader(data)))
+		reader, _ := ReusableReader(io.NopCloser(bytes.NewReader(data)))
 		io.ReadAll(reader)
 		io.ReadAll(reader) // Second read
 	}
@@ -280,5 +398,74 @@ func BenchmarkResponseWriterWrapper(b *testing.B) {
 		wrapper.WriteHeader(http.StatusOK)
 		wrapper.Write(data)
 		wrapper.GetWrittenBytes()
+	}
+}
+
+// TestGetSourceIP_StripsPort pins the host-only guarantee: GetSourceIP
+// never returns an ephemeral source port, so per-IP rate-limit buckets
+// and sourceIP/CIDR matching are stable across TCP connections — whether
+// the IP comes from RemoteAddr or a trusted-proxy header that included a
+// port.
+func TestGetSourceIP_StripsPort(t *testing.T) {
+	prev := trustedProxies.Load()
+	if err := SetTrustedProxies([]string{"10.0.0.0/8"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	// RemoteAddr fallback (untrusted headers): host only.
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "203.0.113.9:44321"
+	if got := GetSourceIP(r); got != "203.0.113.9" {
+		t.Fatalf("RemoteAddr fallback must be host-only, got %q", got)
+	}
+
+	// Trusted proxy supplies X-Real-Ip WITH a port → still host-only.
+	r2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r2.RemoteAddr = "10.1.2.3:55555"
+	r2.Header.Set("X-Real-Ip", "203.0.113.9:7000")
+	if got := GetSourceIP(r2); got != "203.0.113.9" {
+		t.Fatalf("X-Real-Ip with port must be host-only, got %q", got)
+	}
+}
+
+// errReader is an io.ReadCloser that returns an error after yielding
+// some bytes — models http.MaxBytesReader tripping mid-drain.
+type errReader struct {
+	data []byte
+	err  error
+	pos  int
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	if e.pos < len(e.data) {
+		n := copy(p, e.data[e.pos:])
+		e.pos += n
+		return n, nil
+	}
+	return 0, e.err
+}
+func (e *errReader) Close() error { return nil }
+
+// TestReusableReader_SurfacesDrainError is the regression test for the
+// body-cap bypass: ReusableReader must return the underlying read error
+// (e.g. MaxBytesReader's MaxBytesError) so callers reject oversized
+// bodies instead of proceeding with the truncated bytes.
+func TestReusableReader_SurfacesDrainError(t *testing.T) {
+	want := errors.New("http: request body too large")
+	_, err := ReusableReader(&errReader{data: []byte("partial"), err: want})
+	if !errors.Is(err, want) {
+		t.Fatalf("ReusableReader must surface the drain error, got %v", err)
+	}
+
+	// A clean body still returns nil error and is fully readable twice.
+	rr, err := ReusableReader(io.NopCloser(strings.NewReader("hello")))
+	if err != nil {
+		t.Fatalf("clean body must not error, got %v", err)
+	}
+	b1, _ := io.ReadAll(rr)
+	b2, _ := io.ReadAll(rr)
+	if string(b1) != "hello" || string(b2) != "hello" {
+		t.Fatalf("reusable reads mismatch: %q %q", b1, b2)
 	}
 }

@@ -88,12 +88,175 @@ func TestHttpRule_Match(t *testing.T) {
 			},
 			ExpectMatch: true,
 		},
+		// Query: rule requires height to be present and any value.
+		{
+			Rule: HttpRule{
+				Priority: 1000,
+				Action:   RuleActionAllow,
+				Paths:    []string{"/block"},
+				Methods:  []string{"GET"},
+				Query:    map[string]string{"height": "*"},
+			},
+			Request: &http.Request{
+				Method: "GET",
+				URL: &url.URL{
+					Path:     "/block",
+					RawQuery: "height=12345",
+				},
+			},
+			ExpectMatch: true,
+		},
+		// Query: required key absent -> no match.
+		{
+			Rule: HttpRule{
+				Priority: 1000,
+				Action:   RuleActionAllow,
+				Paths:    []string{"/block"},
+				Methods:  []string{"GET"},
+				Query:    map[string]string{"height": "*"},
+			},
+			Request: &http.Request{
+				Method: "GET",
+				URL: &url.URL{
+					Path: "/block",
+				},
+			},
+			ExpectMatch: false,
+		},
+		// Query: glob value matches a specific shape.
+		{
+			Rule: HttpRule{
+				Priority: 1000,
+				Action:   RuleActionAllow,
+				Paths:    []string{"/block"},
+				Methods:  []string{"GET"},
+				Query:    map[string]string{"height": "1234*"},
+			},
+			Request: &http.Request{
+				Method: "GET",
+				URL: &url.URL{
+					Path:     "/block",
+					RawQuery: "height=12345",
+				},
+			},
+			ExpectMatch: true,
+		},
+		// Query: glob value does not match.
+		{
+			Rule: HttpRule{
+				Priority: 1000,
+				Action:   RuleActionAllow,
+				Paths:    []string{"/block"},
+				Methods:  []string{"GET"},
+				Query:    map[string]string{"height": "1234*"},
+			},
+			Request: &http.Request{
+				Method: "GET",
+				URL: &url.URL{
+					Path:     "/block",
+					RawQuery: "height=99999",
+				},
+			},
+			ExpectMatch: false,
+		},
+		// Query: extra request keys are ignored.
+		{
+			Rule: HttpRule{
+				Priority: 1000,
+				Action:   RuleActionAllow,
+				Paths:    []string{"/abci_query"},
+				Methods:  []string{"GET"},
+				Query:    map[string]string{"path": "/cosmos.bank*"},
+			},
+			Request: &http.Request{
+				Method: "GET",
+				URL: &url.URL{
+					Path:     "/abci_query",
+					RawQuery: "path=/cosmos.bank.v1beta1.Query/AllBalances&data=0xff&height=1",
+				},
+			},
+			ExpectMatch: true,
+		},
+		// Query: empty Query map preserves path-only matching.
+		{
+			Rule: HttpRule{
+				Priority: 1000,
+				Action:   RuleActionAllow,
+				Paths:    []string{"/block"},
+				Methods:  []string{"GET"},
+			},
+			Request: &http.Request{
+				Method: "GET",
+				URL: &url.URL{
+					Path:     "/block",
+					RawQuery: "height=12345",
+				},
+			},
+			ExpectMatch: true,
+		},
+		// Query: multiple required keys, all must match.
+		{
+			Rule: HttpRule{
+				Priority: 1000,
+				Action:   RuleActionAllow,
+				Paths:    []string{"/abci_query"},
+				Methods:  []string{"GET"},
+				Query: map[string]string{
+					"path":   "/cosmos.bank*",
+					"height": "*",
+				},
+			},
+			Request: &http.Request{
+				Method: "GET",
+				URL: &url.URL{
+					Path:     "/abci_query",
+					RawQuery: "path=/cosmos.bank.v1beta1.Query/AllBalances",
+				},
+			},
+			ExpectMatch: false,
+		},
 	}
 
 	for _, test := range table {
-		test.Rule.Compile()
-		assert.Equal(t, test.Rule.Match(test.Request), test.ExpectMatch)
+		assert.NilError(t, test.Rule.Compile())
+		assert.Equal(t, test.Rule.Matches(test.Request), test.ExpectMatch)
 	}
+}
+
+// TestHttpRule_Fingerprint pins down the contract for the per-rule cache
+// namespace introduced in Phase B5: (1) Compile populates Fingerprint to a
+// non-zero value, (2) two rules with the same matching+cache shape produce
+// the same Fingerprint, (3) rules that differ in cacheError (or any other
+// fingerprint input) get different Fingerprints. Phase B5's cross-rule
+// cache poisoning fix depends on this contract.
+func TestHttpRule_Fingerprint(t *testing.T) {
+	mkRule := func(cacheErr bool) *HttpRule {
+		return &HttpRule{
+			Priority: 100,
+			Action:   RuleActionAllow,
+			Paths:    []string{"/x"},
+			Methods:  []string{"GET"},
+			Cache: &RuleCache{
+				CacheError: cacheErr,
+			},
+		}
+	}
+
+	a := mkRule(false)
+	assert.NilError(t, a.Compile())
+	assert.Assert(t, a.Fingerprint != 0, "Compile must populate Fingerprint")
+
+	// Same shape → same fingerprint.
+	a2 := mkRule(false)
+	assert.NilError(t, a2.Compile())
+	assert.Equal(t, a.Fingerprint, a2.Fingerprint,
+		"rules with identical shape must share a fingerprint")
+
+	// Different cacheError → different fingerprint (the poisoning-prevention case).
+	b := mkRule(true)
+	assert.NilError(t, b.Compile())
+	assert.Assert(t, a.Fingerprint != b.Fingerprint,
+		"rules differing only in cacheError must have different fingerprints")
 }
 
 func TestJsonRpcRule_Match(t *testing.T) {
@@ -291,7 +454,7 @@ func TestJsonRpcRule_Match(t *testing.T) {
 	}
 
 	for _, test := range table {
-		test.Rule.Compile()
+		assert.NilError(t, test.Rule.Compile())
 		assert.Equal(t, test.Rule.Match(test.Request), test.ExpectMatch)
 	}
 }

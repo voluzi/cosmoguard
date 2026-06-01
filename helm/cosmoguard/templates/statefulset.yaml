@@ -1,0 +1,129 @@
+{{- include "cosmoguard.clusterValidation" . -}}
+{{- if eq (default "Deployment" .Values.kind) "StatefulSet" -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cosmoguard.fullname" . }}
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  # serviceName MUST point at a headless Service so each pod gets a
+  # stable DNS record (<pod>.<svc>.<ns>.svc.cluster.local). When cluster
+  # mode is on, the chart-rendered peer service is that record. When
+  # cluster mode is off but the operator still chose StatefulSet (e.g.
+  # for stable hostnames alone), we fall back to the regular Service —
+  # the cluster-rpc/gossip ports aren't exposed there but the DNS
+  # record still works for hostname stability.
+  serviceName: {{ if eq (include "cosmoguard.clusterEnabled" .) "true" }}{{ include "cosmoguard.peerServiceName" . }}{{ else }}{{ include "cosmoguard.fullname" . }}{{ end }}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  # Parallel pod management — bring every replica up at once so the
+  # memberlist quorum can converge during the initial cluster join.
+  # OrderedReady (the default) blocks pod N+1 until pod N is Ready,
+  # which deadlocks when readiness depends on at least one peer being
+  # reachable. Operators who genuinely need ordered startup (e.g. for
+  # downstream consumers) can override via podManagementPolicy: but it
+  # is the wrong default for a peer-to-peer cluster.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "cosmoguard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # See deployment.yaml — no checksum/config so hot-reload
+        # actually fires on config edits.
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "cosmoguard.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 35 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "cosmoguard.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cosmoguard
+          image: {{ include "cosmoguard.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/cosmoguard/cosmoguard.yaml
+          ports:
+            - name: lcd
+              containerPort: {{ .Values.config.lcdPort }}
+              protocol: TCP
+            - name: rpc
+              containerPort: {{ .Values.config.rpcPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.config.grpcPort }}
+              protocol: TCP
+            {{- if .Values.config.enableEvm }}
+            - name: evm-rpc
+              containerPort: {{ .Values.config.evmRpcPort }}
+              protocol: TCP
+            - name: evm-rpc-ws
+              containerPort: {{ .Values.config.evmRpcWsPort }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.config.metrics.enable }}
+            - name: metrics
+              containerPort: {{ .Values.config.metrics.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.config.dashboard.enable }}
+            - name: dashboard
+              containerPort: {{ .Values.config.dashboard.port }}
+              protocol: TCP
+            {{- end }}
+            {{- include "cosmoguard.clusterContainerPorts" . | nindent 12 }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- $clusterOn := eq (include "cosmoguard.clusterEnabled" .) "true" }}
+          {{- if or .Values.env $clusterOn }}
+          env:
+            {{- include "cosmoguard.podIdentityEnv" . | nindent 12 }}
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- end }}
+          {{- if .Values.config.metrics.enable }}
+          livenessProbe: {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe: {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cosmoguard
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "cosmoguard.configMapName" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end -}}

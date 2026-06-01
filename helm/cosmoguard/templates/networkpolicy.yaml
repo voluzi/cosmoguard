@@ -1,0 +1,72 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- $clusterOn := eq (include "cosmoguard.clusterEnabled" .) "true" -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "cosmoguard.fullname" . }}
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "cosmoguard.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- /*
+    Cluster surface — peer-api + gossip + RESP. ONLY cosmoguard pods
+    themselves may speak this. Drops any other namespace traffic that
+    happens to discover these ports.
+    */ -}}
+    {{- if $clusterOn }}
+    {{- $cache := dig "cache" (dict) .Values.config }}
+    {{- $c := dig "cluster" (dict) $cache }}
+    {{- $bind := dig "bindPort" 3320 $c }}
+    {{- $gossip := dig "gossipPort" 3322 $c }}
+    {{- $peerApi := dig "peerApiPort" 0 $c }}
+    {{- if eq (int $peerApi) 0 }}{{ $peerApi = (add (int $bind) 1) }}{{ end }}
+    - from:
+        - podSelector:
+            matchLabels: {{- include "cosmoguard.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ $bind }}
+          protocol: TCP
+        - port: {{ $gossip }}
+          protocol: TCP
+        - port: {{ $gossip }}
+          protocol: UDP
+        - port: {{ $peerApi }}
+          protocol: TCP
+    {{- end }}
+    {{- /*
+    Proxy listeners. When the operator hasn't supplied proxyIngress,
+    we render an unrestricted allow rule for every proxy port — a
+    NetworkPolicy with peer-only rules would otherwise silently
+    block LCD/RPC/gRPC/dashboard/metrics traffic, because the
+    presence of ingress rules makes everything not explicitly
+    matched implicitly denied.
+    */ -}}
+    {{- if .Values.networkPolicy.proxyIngress }}
+    {{- toYaml .Values.networkPolicy.proxyIngress | nindent 4 }}
+    {{- else }}
+    - ports:
+        - port: {{ .Values.config.lcdPort }}
+          protocol: TCP
+        - port: {{ .Values.config.rpcPort }}
+          protocol: TCP
+        - port: {{ .Values.config.grpcPort }}
+          protocol: TCP
+        {{- if .Values.config.enableEvm }}
+        - port: {{ .Values.config.evmRpcPort }}
+          protocol: TCP
+        - port: {{ .Values.config.evmRpcWsPort }}
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.config.metrics.enable }}
+        - port: {{ .Values.config.metrics.port }}
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.config.dashboard.enable }}
+        - port: {{ .Values.config.dashboard.port }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+{{- end -}}

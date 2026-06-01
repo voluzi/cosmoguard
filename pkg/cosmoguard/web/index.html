@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CosmoGuard · dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cpath d='M50 5 L90 25 L90 60 Q90 85 50 95 Q10 85 10 60 L10 25 Z' fill='%232563eb'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <nav class="side">
+    <div class="brand">
+      <svg viewBox="0 0 100 100" aria-hidden="true">
+        <path d="M50 5 L90 25 L90 60 Q90 85 50 95 Q10 85 10 60 L10 25 Z"
+              fill="currentColor" style="color: var(--accent);"/>
+      </svg>
+      <div>
+        <div class="name">CosmoGuard</div>
+        <div style="font-size:0.7rem;color:var(--muted-soft)">read-only</div>
+      </div>
+    </div>
+    <a class="nav-link active" data-tab="overview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+      Overview
+    </a>
+    <a class="nav-link" data-tab="traffic">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="14 7 21 7 21 14"/></svg>
+      Traffic
+    </a>
+    <a class="nav-link" data-tab="upstreams">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h4M18 12h4M12 2v4M12 18v4M6.34 6.34l2.83 2.83M14.83 14.83l2.83 2.83M6.34 17.66l2.83-2.83M14.83 9.17l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg>
+      Upstreams
+    </a>
+    <a class="nav-link" data-tab="rules">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h12"/></svg>
+      Rules
+    </a>
+    <a class="nav-link" data-tab="identities">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      Identities
+    </a>
+    <a class="nav-link" data-tab="diagnostics">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v3l2 2"/></svg>
+      Diagnostics
+    </a>
+    <a class="nav-link" data-tab="live-traffic">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg>
+      Live traffic
+    </a>
+    <a class="nav-link" data-tab="websockets">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="1.6" fill="currentColor"/><circle cx="14" cy="12" r="1.6" fill="currentColor"/><circle cx="10" cy="17" r="1.6" fill="currentColor"/></svg>
+      WebSockets
+    </a>
+    <a class="nav-link cluster-nav" data-tab="cluster" id="nav-cluster" style="display:none;">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8 6h8M6 8v8M18 8v8M8 18h8"/></svg>
+      Cluster
+    </a>
+    <div class="foot">
+      v<span id="ver">…</span> · auto-refresh 5s
+    </div>
+  </nav>
+
+  <main>
+    <div class="topbar">
+      <h1 id="title">Overview</h1>
+      <div class="meta">
+        <span id="scope-badge" class="scope-badge" style="display:none;" title="dashboard scope">cluster <span id="scope-badge-count" class="scope-count"></span></span>
+        <span><span id="status-dot" class="dot"></span> <span id="status-text">connecting…</span></span>
+        <span>uptime <span id="uptime" class="mono">—</span></span>
+        <span id="reload-pill" class="pill muted" title="hot-reload status">
+          <span class="pill-dot"></span><span id="reload-pill-text">no reloads yet</span>
+        </span>
+      </div>
+    </div>
+
+    <div id="error" class="error-banner"></div>
+
+    <section id="tab-overview" class="active">
+      <div class="stats" id="overview-stats"></div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Upstreams</h3>
+          <span class="hint" id="upstream-hint">live state across LCD/RPC pools</span>
+        </div>
+        <div class="table-wrap">
+          <table id="overview-upstreams">
+            <thead><tr><th>name</th><th>target</th><th>health</th><th>circuit</th></tr></thead>
+            <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-traffic">
+      <div class="chart-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Request rate</h3>
+            <span class="hint">per-protocol requests per second</span>
+          </div>
+          <svg id="chart-rate" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Cache outcomes</h3>
+            <span class="hint">stacked: hit · miss · error · n/a</span>
+          </div>
+          <svg id="chart-cache" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Latency percentiles</h3>
+            <span class="hint">averaged across protocols</span>
+          </div>
+          <svg id="chart-latency" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Upstream health timeline</h3>
+            <span class="hint">last 5 minutes, per pool/upstream</span>
+          </div>
+          <div id="timeline-strips" class="timeline-strips"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-upstreams">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Upstreams</h3>
+          <span class="hint">healthy / circuit-state per pool entry</span>
+        </div>
+        <div class="table-wrap">
+          <table id="upstreams-table">
+            <thead><tr><th>name</th><th>target</th><th>weight</th><th>health</th><th>circuit</th></tr></thead>
+            <tbody><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-rules">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Effective rules</h3>
+          <span class="hint">after defaults + sort + compile; hot-reloadable</span>
+        </div>
+        <div class="table-wrap">
+          <table id="rules-table">
+            <thead>
+              <tr>
+                <th>section</th>
+                <th>priority</th>
+                <th>action</th>
+                <th>match</th>
+                <th>cache</th>
+                <th>rate-limit</th>
+                <th>auth</th>
+                <th>req (5m)</th>
+                <th>hit rate</th>
+              </tr>
+            </thead>
+            <tbody><tr><td colspan="9" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-identities">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Identities</h3>
+          <span class="hint">credentials never exposed — read-only view</span>
+        </div>
+        <div class="table-wrap">
+          <table id="identities-table">
+            <thead><tr><th>name</th><th>scopes</th></tr></thead>
+            <tbody><tr><td colspan="2" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-diagnostics">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Unmatched endpoints</h3>
+          <span class="hint">requests that escaped every rule — candidates for a new rule</span>
+        </div>
+        <div id="unmatched-accordion" class="accordion">
+          <div class="empty" style="padding:1rem 1.15rem;">loading…</div>
+        </div>
+      </div>
+
+      <div class="diag-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Top rules by request rate</h3>
+            <span class="hint">last ~5 minutes, summed across protocols</span>
+          </div>
+          <div id="top-rules" class="bar-list" style="padding:0.85rem 1.15rem;">
+            <div class="empty">collecting…</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Cache cardinality</h3>
+            <span class="hint">distinct keys written per rule — watch for runaway derivation</span>
+          </div>
+          <div class="table-wrap">
+            <table id="cardinality-table">
+              <thead><tr><th>section</th><th>rule tag</th><th>distinct keys</th><th>hot samples</th></tr></thead>
+              <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Per-upstream latency</h3>
+          <span class="hint">P50 / P95 derived from per-upstream histograms — spot the slow one</span>
+        </div>
+        <div id="upstream-latency" class="upstream-latency-grid">
+          <div class="empty" style="padding:1rem 1.15rem;">collecting…</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Where requests went</h3>
+          <span class="hint">last 5 min — cache hit vs upstream call vs denied/rate-limited</span>
+        </div>
+        <div id="upstream-volume" class="upstream-volume-host">
+          <div class="empty" style="padding:1rem 1.15rem;">collecting…</div>
+        </div>
+      </div>
+
+      <div class="diag-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Recent denials</h3>
+            <span class="hint">last 64 entries, newest first</span>
+          </div>
+          <div class="table-wrap">
+            <table id="denied-table">
+              <thead><tr><th>time</th><th>section</th><th>reason</th><th>method</th><th>path</th><th>source</th><th>rule</th></tr></thead>
+              <tbody><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Discovery refresh log</h3>
+            <span class="hint">DNS resolve ticks + add/remove events per template</span>
+          </div>
+          <div class="table-wrap">
+            <table id="discovery-table">
+              <thead><tr><th>time</th><th>template</th><th>type</th><th>detail</th></tr></thead>
+              <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" id="reload-panel">
+        <div class="panel-head">
+          <h3>Last hot-reload</h3>
+          <span class="hint" id="reload-when">no reloads yet</span>
+        </div>
+        <div class="table-wrap">
+          <table id="reload-table">
+            <thead><tr><th>section</th><th>before</th><th>after</th><th>delta</th></tr></thead>
+            <tbody><tr><td colspan="4" class="empty">awaiting first reload…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-live-traffic">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Recent requests</h3>
+          <span class="hint" id="live-traffic-hint">enable via <code>dashboard.requestLog.enable: true</code></span>
+        </div>
+        <div class="table-wrap">
+          <table id="live-traffic-table">
+            <thead><tr>
+              <th>time</th>
+              <th>section</th>
+              <th>method</th>
+              <th>path</th>
+              <th>status</th>
+              <th>latency</th>
+              <th>cache</th>
+              <th>rule</th>
+              <th>identity</th>
+              <th>source</th>
+              <th>upstream</th>
+            </tr></thead>
+            <tbody><tr><td colspan="11" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-websockets">
+      <div class="stats" id="ws-stats"></div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Connections</h3>
+          <span class="hint" id="ws-conns-hint">live client connections</span>
+        </div>
+        <div class="table-wrap">
+          <table id="ws-conns-table">
+            <thead><tr><th>section</th><th>source</th><th>identity</th><th>connected</th><th>subscriptions</th></tr></thead>
+            <tbody><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Subscriptions</h3>
+          <span class="hint" id="ws-subs-hint">upstream subscriptions and their fan-out</span>
+        </div>
+        <div class="table-wrap">
+          <table id="ws-subs-table">
+            <thead><tr><th>section</th><th>subscription</th><th>subscribers</th><th>upstream</th></tr></thead>
+            <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Upstream connections</h3>
+          <span class="hint" id="ws-ups-hint">backend WS pool health and load</span>
+        </div>
+        <div class="table-wrap">
+          <table id="ws-ups-table">
+            <thead><tr><th>section</th><th>target</th><th>health</th><th>subscriptions</th></tr></thead>
+            <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-cluster">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Cluster peers</h3>
+          <span class="hint" id="cluster-hint">olric members visible to this pod</span>
+        </div>
+        <div class="table-wrap">
+          <table id="cluster-peers-table">
+            <thead>
+              <tr>
+                <th>pod</th>
+                <th>address</th>
+                <th>role</th>
+                <th>age</th>
+                <th>partitions owned</th>
+                <th>partitions backed</th>
+                <th>reachable</th>
+              </tr>
+            </thead>
+            <tbody><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel" id="cluster-reload-panel">
+        <div class="panel-head">
+          <h3>Per-pod reload status</h3>
+          <span class="hint">did every pod pick up the latest config?</span>
+        </div>
+        <div class="table-wrap">
+          <table id="cluster-reload-table">
+            <thead><tr><th>pod</th><th>status</th><th>when</th><th>sections changed</th><th>error</th></tr></thead>
+            <tbody><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="charts.js" defer></script>
+<script src="app.js" defer></script>
+</body>
+</html>
