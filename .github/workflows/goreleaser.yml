@@ -21,6 +21,11 @@ jobs:
 
       - name: Set up Go
         uses: actions/setup-go@v6
+        with:
+          # Match the toolchain go.mod requires; without this setup-go
+          # picks a default (1.24) and GOTOOLCHAIN=local blocks the
+          # auto-upgrade, so goreleaser fails "go.mod requires go >= 1.25".
+          go-version-file: go.mod
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
