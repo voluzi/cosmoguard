@@ -361,12 +361,16 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 			// created on — subID belongs to `cli`. Using MakeRequest (which
 			// targets curClient()) could hit a different socket after a
 			// concurrent reconnect, leaving the subscription streaming on the
-			// old connection with no mapping.
-			_, _ = u.makeRequestWithIDOnClient(cli, u.IdGen.ID(), &JsonRpcMsg{
+			// old connection with no mapping. Use a temporary id and RELEASE
+			// it after the round-trip so repeated races don't exhaust the id
+			// space.
+			cleanupID := u.IdGen.ID()
+			_, _ = u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
 				Version: jsonRpcVersion,
 				Method:  methodUnsubscribeEth,
 				Params:  []string{subID},
 			})
+			u.IdGen.Release(cleanupID)
 			return subID, nil
 		}
 	} else {
@@ -437,12 +441,16 @@ func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) {
 		// Best-effort eth_unsubscribe: a racing reconnect-resubmit may have
 		// re-created this subscription on the reconnected socket between the
 		// migration commit and this call; tear it down so it doesn't stream
-		// with no manager mapping. Harmless when the conn is dead.
-		_, _ = u.MakeRequest(&JsonRpcMsg{
-			Version: jsonRpcVersion,
-			Method:  methodUnsubscribeEth,
-			Params:  []string{id},
-		})
+		// with no manager mapping. Run ASYNC so the migrator + the following
+		// SubscriptionManager update aren't blocked for up to responseTimeout
+		// on the old connection (which would drop notifications).
+		go func() {
+			_, _ = u.MakeRequest(&JsonRpcMsg{
+				Version: jsonRpcVersion,
+				Method:  methodUnsubscribeEth,
+				Params:  []string{id},
+			})
+		}()
 	}
 }
 

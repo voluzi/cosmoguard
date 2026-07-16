@@ -144,6 +144,10 @@ mismatch, peerService disabled without cluster.enable=false).
 {{- if eq $mode "" -}}
 {{- fail "cosmoguard: config.cache.cluster.enable=true requires config.cache.cluster.discovery.mode (use \"dns\" with the chart's headless peer service in Kubernetes)" -}}
 {{- end -}}
+{{- $cluster := .Values.cluster | default (dict) -}}
+{{- if and (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) -}}
+{{- fail "cosmoguard: cluster mode requires an encryption key — set cluster.existingEncryptionKeySecret (recommended: a pre-created Secret with an `encryptionKey` field) or cluster.encryptionKey. The chart does NOT auto-generate one, because a generated key is non-deterministic under client-side / GitOps rendering and would silently partition the cluster across syncs. Generate one with: kubectl create secret generic cosmoguard-cluster --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)" -}}
+{{- end -}}
 {{- if eq $mode "static" -}}
 {{- $peers := dig "discovery" "static" "peers" (list) $c -}}
 {{- if eq (len $peers) 0 -}}
@@ -188,11 +192,12 @@ podIdentityEnv emits the env entries injected on every workload pod:
   valueFrom:
     fieldRef:
       fieldPath: metadata.name
-{{- if not (include "cosmoguard.clusterInlineKey" .) }}
+{{- $existingSecret := (.Values.cluster | default dict).existingEncryptionKeySecret -}}
+{{- if and (not (include "cosmoguard.clusterInlineKey" .)) $existingSecret }}
 - name: CLUSTER_ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ include "cosmoguard.clusterSecretName" . }}
+      name: {{ $existingSecret }}
       key: encryptionKey
 {{- end }}
 {{- end }}
@@ -209,41 +214,6 @@ reference / generated Secret is used.
 {{- $fromConfig := dig "cache" "cluster" "encryptionKey" "" .Values.config -}}
 {{- $fromTop := (.Values.cluster | default dict).encryptionKey | default "" -}}
 {{- $fromConfig | default $fromTop -}}
-{{- end -}}
-
-{{/*
-clusterSecretName — the Secret holding the cluster gossip/data encryption key.
-Operators can point at an existing Secret via cluster.existingEncryptionKeySecret;
-otherwise the chart creates one named "<fullName>-cluster".
-*/}}
-{{- define "cosmoguard.clusterSecretName" -}}
-{{- $cluster := .Values.cluster | default (dict) -}}
-{{- if $cluster.existingEncryptionKeySecret -}}
-{{- $cluster.existingEncryptionKeySecret -}}
-{{- else -}}
-{{- printf "%s-cluster" (include "cosmoguard.fullname" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-{{- end -}}
-
-{{/*
-clusterEncryptionKey resolves the base64 32-byte key for the generated Secret.
-Preference order: an explicit cluster.encryptionKey value → the current value
-already stored in the Secret (via lookup, so `helm upgrade` does NOT rotate the
-key and break a running cluster) → a freshly generated random key.
-*/}}
-{{- define "cosmoguard.clusterEncryptionKey" -}}
-{{- $cluster := .Values.cluster | default (dict) -}}
-{{- if $cluster.encryptionKey -}}
-{{- $cluster.encryptionKey -}}
-{{- else -}}
-{{- $name := include "cosmoguard.clusterSecretName" . -}}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace $name -}}
-{{- if and $existing $existing.data.encryptionKey -}}
-{{- $existing.data.encryptionKey | b64dec -}}
-{{- else -}}
-{{- randBytes 32 -}}
-{{- end -}}
-{{- end -}}
 {{- end -}}
 
 {{/*

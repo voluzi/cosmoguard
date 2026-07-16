@@ -110,7 +110,13 @@ config:
   cache:
     # ttl: 5s
     cluster:
-      enable: true
+      # Default OFF: a bare `helm install` runs olric in embedded loopback
+      # mode (single pod, no peers), which needs no encryption key. Turn this
+      # on for multi-replica HA — and then you MUST supply an encryption key
+      # via cluster.encryptionKey or cluster.existingEncryptionKeySecret (the
+      # chart does NOT auto-generate one: a generated key is non-deterministic
+      # under client-side / GitOps rendering and would partition the cluster).
+      enable: false
       # bindAddr defaults to "${POD_IP}" via the chart's downward-API
       # wire-up. Override only on bare metal / non-K8s installs.
       # bindAddr: "${POD_IP}"
@@ -154,19 +160,21 @@ existingSecret: ""
 env: {}
   # JWT_SECRET: "..."   # don't put real secrets here; use existingSecret
 
-# Cluster gossip/data encryption key wiring. Required by cosmoguard in cluster
-# mode (config.cache.cluster.enable: true). By DEFAULT the chart generates a
-# random 32-byte key on first install, stores it in a Secret named
-# "<release>-cosmoguard-cluster", and PRESERVES it across `helm upgrade` (it
-# won't rotate and partition a running cluster). Every replica shares that one
-# Secret. Override only if you manage the key yourself:
+# Cluster gossip/data encryption key wiring. REQUIRED in cluster mode
+# (config.cache.cluster.enable: true). The chart does NOT auto-generate a key:
+# a generated key is non-deterministic under client-side / GitOps rendering
+# (helm template, ArgoCD without cluster access), so each sync would produce a
+# different key and partition the cluster. Supply one of the two below (every
+# replica must share the same value):
 cluster:
-  # Provide the key inline (base64-encoded 16/24/32 bytes). NOT recommended —
-  # this lands in rendered manifests / values. Prefer existingEncryptionKeySecret.
-  encryptionKey: ""
-  # Reference an existing Secret with an `encryptionKey` data field instead of
-  # letting the chart generate one.
+  # RECOMMENDED: reference a pre-created Secret with a base64-encoded
+  # `encryptionKey` data field (16/24/32 bytes). Create it once with e.g.:
+  #   kubectl create secret generic cosmoguard-cluster \
+  #     --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)
   existingEncryptionKeySecret: ""
+  # Alternatively provide the key inline (base64-encoded 16/24/32 bytes). NOT
+  # recommended — it lands in the rendered ConfigMap in cleartext.
+  encryptionKey: ""
 
 serviceAccount:
   create: true

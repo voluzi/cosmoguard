@@ -381,11 +381,16 @@ func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient
 			u.subMux.Unlock()
 			u.IdGen.Release(id)
 			u.log.WithField("param", param).Debug("resubmit aborted: param migrated away")
-			_, _ = u.makeRequestWithIDOnClient(cli, u.IdGen.ID(), &JsonRpcMsg{
+			// Use a temporary id and RELEASE it after the round-trip —
+			// otherwise repeated migration/reconnect races steadily exhaust
+			// the reusable-id space in UniqueID.generated.
+			cleanupID := u.IdGen.ID()
+			_, _ = u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
 				Version: jsonRpcVersion,
 				Method:  methodUnsubscribeCosmos,
 				Params:  []interface{}{param},
 			})
+			u.IdGen.Release(cleanupID)
 			return nil
 		}
 	} else {
@@ -458,13 +463,17 @@ func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) {
 		// have re-created this subscription on the current (reconnected)
 		// socket in the window between the migration commit and this call.
 		// Deleting the maps alone would leave that upstream subscription
-		// streaming with no manager mapping; tear it down. Harmless when the
-		// conn is dead (MakeRequest returns ErrClosed).
-		_, _ = u.MakeRequest(&JsonRpcMsg{
-			Version: jsonRpcVersion,
-			Method:  methodUnsubscribeCosmos,
-			Params:  []interface{}{param},
-		})
+		// streaming with no manager mapping; tear it down. Run ASYNC so the
+		// migrator (and the SubscriptionManager update that follows it) isn't
+		// blocked for up to responseTimeout waiting on the old connection —
+		// which would drop notifications during the wait.
+		go func() {
+			_, _ = u.MakeRequest(&JsonRpcMsg{
+				Version: jsonRpcVersion,
+				Method:  methodUnsubscribeCosmos,
+				Params:  []interface{}{param},
+			})
+		}()
 	}
 	// Deliberately DO NOT Release(id): it is the subscription's canonical
 	// (client-facing) id, still referenced by the broker's SubscriptionManager
