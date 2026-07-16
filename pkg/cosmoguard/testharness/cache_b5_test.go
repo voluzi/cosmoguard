@@ -26,7 +26,7 @@ import (
 func TestB5_PerRuleCacheNamespace(t *testing.T) {
 	cfg1 := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{{
@@ -67,7 +67,7 @@ func TestB5_PerRuleCacheNamespace(t *testing.T) {
 func TestB5_HeaderPreservation(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{{

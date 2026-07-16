@@ -148,6 +148,15 @@ func (u *UpstreamConnManagerEth) connect() error {
 }
 
 func (u *UpstreamConnManagerEth) onUpstreamMessage(msg *JsonRpcMsg) {
+	// Defence-in-depth: a single malformed/duplicate upstream frame must
+	// never take down the process. The Run goroutine that calls this has
+	// no recover of its own.
+	defer func() {
+		if r := recover(); r != nil {
+			u.log.WithField("panic", r).Error("recovered from panic handling upstream message")
+		}
+	}()
+
 	// This is a subscription notification
 	if msg.ID == nil {
 		if msg.Params == nil {
@@ -195,8 +204,16 @@ func (u *UpstreamConnManagerEth) onUpstreamMessage(msg *JsonRpcMsg) {
 			return
 		}
 
+		// Delete the entry under the lock BEFORE send+close so a
+		// duplicate upstream response with the same ID can't re-load the
+		// same closed channel and panic ("send on closed channel"),
+		// which would crash the whole process from this recover-less
+		// goroutine.
 		u.respMux.Lock()
 		wc, ok := u.respMap[msgID]
+		if ok {
+			delete(u.respMap, msgID)
+		}
 		u.respMux.Unlock()
 		if ok {
 			u.log.WithField("ID", msgID).Debug("got response for request")
@@ -368,6 +385,21 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 		"param": param,
 	}).Debug("removed subscription with upstream")
 	return nil
+}
+
+// LocalUnsubscribe drops a subscription param from the local maps with
+// no network I/O — see the interface doc. subByParam maps param → the
+// current upstream subscription id; both entries are removed so a
+// reconnect won't re-issue this (migrated-away) subscription.
+func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) {
+	u.subMux.Lock()
+	defer u.subMux.Unlock()
+	id, ok := u.subByParam[param]
+	if !ok {
+		return
+	}
+	delete(u.subByParam, param)
+	delete(u.subByID, id)
 }
 
 // resetConnectionState clears the per-connection in-flight response map

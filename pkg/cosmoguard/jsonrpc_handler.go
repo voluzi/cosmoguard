@@ -501,6 +501,15 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, GetSourceIP(r), idName)
 		allowed, _, rlErr := l.Allow(r.Context(), key)
 		if rlErr != nil {
+			if rule.RateLimit.FailClosed() {
+				h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; failing closed (denying)")
+				h.cgDashboard.RecordDeny(DenyRecord{
+					Section: h.section, Reason: "rate_limit",
+					SourceIP: GetSourceIP(r), Method: request.Method,
+					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+				})
+				return false, -32005, "rate limiter unavailable"
+			}
 			h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; allowing")
 		} else if !allowed {
 			h.cgDashboard.RecordDeny(DenyRecord{

@@ -36,7 +36,7 @@ func TestHarness_AllowsPassthroughByDefault(t *testing.T) {
 func TestHarness_DenyRule(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionDeny,
 			Rules: []*cosmoguard.HttpRule{
@@ -50,7 +50,7 @@ func TestHarness_DenyRule(t *testing.T) {
 		},
 		RPC: cosmoguard.RpcConfig{
 			Default:              cosmoguard.RuleActionAllow,
-			WebSocketEnabled:     true,
+			WebSocketEnabled:     boolPtr(true),
 			WebSocketConnections: 2,
 			JsonRpc:              cosmoguard.JsonRpcConfig{Default: cosmoguard.RuleActionAllow},
 		},
@@ -77,7 +77,7 @@ func TestHarness_DenyRule(t *testing.T) {
 func TestHarness_CacheHit(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{
@@ -92,7 +92,7 @@ func TestHarness_CacheHit(t *testing.T) {
 		},
 		RPC: cosmoguard.RpcConfig{
 			Default:              cosmoguard.RuleActionAllow,
-			WebSocketEnabled:     true,
+			WebSocketEnabled:     boolPtr(true),
 			WebSocketConnections: 2,
 			JsonRpc:              cosmoguard.JsonRpcConfig{Default: cosmoguard.RuleActionAllow},
 		},
@@ -121,7 +121,7 @@ func TestHarness_CacheHit(t *testing.T) {
 func TestHarness_QueryMatchHeightPinned(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{
@@ -143,7 +143,7 @@ func TestHarness_QueryMatchHeightPinned(t *testing.T) {
 		},
 		RPC: cosmoguard.RpcConfig{
 			Default:              cosmoguard.RuleActionAllow,
-			WebSocketEnabled:     true,
+			WebSocketEnabled:     boolPtr(true),
 			WebSocketConnections: 2,
 			JsonRpc:              cosmoguard.JsonRpcConfig{Default: cosmoguard.RuleActionAllow},
 		},
@@ -299,11 +299,11 @@ func TestHarness_GRPCListenerOpen(t *testing.T) {
 func TestHarness_DefaultDenyBlocksUnmatchedRequests(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionDeny},
 		RPC: cosmoguard.RpcConfig{
 			Default:              cosmoguard.RuleActionAllow,
-			WebSocketEnabled:     true,
+			WebSocketEnabled:     boolPtr(true),
 			WebSocketConnections: 2,
 			JsonRpc:              cosmoguard.JsonRpcConfig{Default: cosmoguard.RuleActionAllow},
 		},
@@ -324,7 +324,7 @@ func TestHarness_DefaultDenyBlocksUnmatchedRequests(t *testing.T) {
 func TestHarness_ContentTypePreserved_CachedHit(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{{
@@ -391,7 +391,7 @@ func TestHarness_JSONRPCDispatchUnderHTTPAllowRule(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Host:    "127.0.0.1",
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{
 			Default: cosmoguard.RuleActionAllow,

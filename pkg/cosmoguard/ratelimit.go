@@ -48,9 +48,14 @@ func (c *RateLimitConfig) validate() error {
 	}
 	switch c.Scope {
 	case "", RateLimitScopeGlobal, RateLimitScopePerIP, RateLimitScopePerIdentity, RateLimitScopeCompound:
-		return nil
 	default:
 		return fmt.Errorf("rateLimit.scope %q is invalid (want one of: global, per-ip, per-identity, compound)", c.Scope)
+	}
+	switch c.FailureMode {
+	case "", "fail-open", "fail-closed":
+		return nil
+	default:
+		return fmt.Errorf("rateLimit.failureMode %q is invalid (want fail-open or fail-closed)", c.FailureMode)
 	}
 }
 
@@ -73,6 +78,19 @@ type RateLimitConfig struct {
 	Burst int `yaml:"burst,omitempty"`
 	// Scope determines whose request rate the bucket counts.
 	Scope RateLimitScope `yaml:"scope,omitempty" default:"per-ip"`
+	// FailureMode controls behaviour when the limiter backend errors (e.g.
+	// olric loses quorum or a partition owner is unreachable). "fail-open"
+	// (default) admits the request so a coordination hiccup doesn't 429 all
+	// traffic; "fail-closed" denies it so a backend outage can't silently
+	// disable rate limiting cluster-wide (turning it into a DoS amplifier
+	// against the protected nodes). Mirrors auth's FailureMode.
+	FailureMode string `yaml:"failureMode,omitempty"`
+}
+
+// FailClosed reports whether a limiter backend error should deny the
+// request. Default (empty / "fail-open") admits it.
+func (c *RateLimitConfig) FailClosed() bool {
+	return c != nil && c.FailureMode == "fail-closed"
 }
 
 // Rate carries a tokens-per-second value and the original spec string so
@@ -274,25 +292,13 @@ func (l *memoryRateLimiter) Close() error { return nil }
 // included so two different rules with the same scope+key don't share
 // buckets. The identity is "" when the request is anonymous; the
 // per-identity and compound scopes degrade to per-ip in that case.
+// rateLimitKey derives the bucket key for an HTTP request. It delegates to
+// grpcRateLimitKey (the single source of truth also used by the WS, JSON-RPC
+// and gRPC paths) so all four transports produce BYTE-IDENTICAL keys for the
+// same rule + scope + client — they share olric buckets, so any divergence
+// would silently split or merge a rule's budget. Previously this was a second
+// hand-rolled copy whose unknown-scope default (`:global`) already differed
+// from grpcRateLimitKey's (`:ip:`).
 func rateLimitKey(scope RateLimitScope, ruleFingerprint uint64, r *http.Request, identity string) string {
-	prefix := strconv.FormatUint(ruleFingerprint, 16)
-	ip := stripPort(GetSourceIP(r))
-	switch scope {
-	case RateLimitScopeGlobal:
-		return prefix + ":global"
-	case RateLimitScopePerIP:
-		return prefix + ":ip:" + ip
-	case RateLimitScopePerIdentity:
-		if identity != "" {
-			return prefix + ":id:" + identity
-		}
-		return prefix + ":ip:" + ip
-	case RateLimitScopeCompound:
-		if identity != "" {
-			return prefix + ":compound:" + identity + "|" + ip
-		}
-		return prefix + ":ip:" + ip
-	default:
-		return prefix + ":global"
-	}
+	return grpcRateLimitKey(scope, ruleFingerprint, GetSourceIP(r), identity)
 }

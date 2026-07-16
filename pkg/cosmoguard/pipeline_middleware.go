@@ -163,6 +163,18 @@ func MWRateLimit(
 		key := rateLimitKey(cfg.Scope, fp, hr, idName)
 		allowed, retry, err := limiter.Allow(req.Context(), key)
 		if err != nil {
+			if cfg.FailClosed() {
+				if logger != nil {
+					logger.WithError(err).Warn("rate limiter error; failing closed (denying)")
+				}
+				return Decision{
+					Stop:       true,
+					Action:     "deny",
+					HTTPStatus: http.StatusTooManyRequests,
+					Reason:     "rate limiter unavailable",
+					RetryAfter: 1,
+				}
+			}
 			if logger != nil {
 				logger.WithError(err).Warn("rate limiter error; failing open")
 			}

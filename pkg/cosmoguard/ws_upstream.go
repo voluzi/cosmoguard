@@ -38,6 +38,14 @@ type UpstreamConnManager interface {
 	HasSubscription(string) bool
 	Subscribe(string) (string, error)
 	Unsubscribe(string) error
+	// LocalUnsubscribe forgets a subscription param from this manager's
+	// own bookkeeping WITHOUT a network round-trip. Called by the pool's
+	// migrator after a subscription is re-established on a healthy
+	// upstream: the source connection is (by definition) unhealthy, so a
+	// networked Unsubscribe would fail, and leaving the param in its local
+	// maps would make it re-subscribe on reconnect — a permanent duplicate
+	// upstream subscription. Idempotent; unknown params are a no-op.
+	LocalUnsubscribe(param string)
 	// IsHealthy reports whether the underlying WS connection is in a
 	// usable state. Returns false when the connection is closed, nil,
 	// or stuck in reconnect backoff. Used by the pool's subscription

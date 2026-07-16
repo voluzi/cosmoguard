@@ -184,6 +184,15 @@ func (u *UpstreamConnManagerCosmos) connect() error {
 }
 
 func (u *UpstreamConnManagerCosmos) onUpstreamMessage(msg *JsonRpcMsg) {
+	// Defence-in-depth: a single malformed/duplicate upstream frame must
+	// never take down the process. The Run goroutine that calls this has
+	// no recover of its own.
+	defer func() {
+		if r := recover(); r != nil {
+			u.log.WithField("panic", r).Error("recovered from panic handling upstream message")
+		}
+	}()
+
 	if msg.ID == nil {
 		u.log.Errorf("dropped message from upstream with no ID")
 		return
@@ -203,9 +212,16 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(msg *JsonRpcMsg) {
 
 	// Let's first check if it's a response to a request. Read under
 	// respMux so we don't race with concurrent writers in
-	// makeRequestWithID.
+	// makeRequestWithID. Delete the entry while still holding the lock,
+	// BEFORE send+close: a buggy/malicious upstream that emits two
+	// responses with the same ID would otherwise re-load the same closed
+	// channel and panic with "send on closed channel", crashing the
+	// process. Deleting first makes the second frame a no-op.
 	u.respMux.Lock()
 	wc, ok := u.respMap[msgID]
+	if ok {
+		delete(u.respMap, msgID)
+	}
 	u.respMux.Unlock()
 	if ok {
 		u.log.WithField("ID", msgID).Debug("got response for request")
@@ -386,6 +402,21 @@ func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
 		"param": param,
 	}).Debug("removed subscription with upstream")
 	return nil
+}
+
+// LocalUnsubscribe drops a subscription param from the local maps with
+// no network I/O — see the interface doc. Releases the id back to the
+// generator so it can be reused.
+func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) {
+	u.subMux.Lock()
+	defer u.subMux.Unlock()
+	id, ok := u.subByParam[param]
+	if !ok {
+		return
+	}
+	delete(u.subByParam, param)
+	delete(u.subByID, id)
+	u.IdGen.Release(id)
 }
 
 // Stop signals the Run loop to exit and closes the live WS client.

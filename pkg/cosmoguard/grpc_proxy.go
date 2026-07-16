@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,7 +60,13 @@ func grpcRateLimitKey(scope RateLimitScope, fingerprint uint64, source, identity
 // request carries only the headers — no body, no path — because the
 // configured AuthMethods only inspect headers.
 func synthRequestFromGrpcMD(md metadata.MD) *http.Request {
-	r := &http.Request{Header: make(http.Header, len(md))}
+	// URL must be non-nil: an api-key AuthMethod configured in queryParam
+	// mode falls back to r.URL.Query() when the header form is absent
+	// (always the case over gRPC, where credentials only arrive as
+	// metadata). A nil URL there panics the handler goroutine on every
+	// keyless RPC. An empty URL yields an empty query, so the method simply
+	// resolves no credential.
+	r := &http.Request{URL: &url.URL{}, Header: make(http.Header, len(md))}
 	for k, vs := range md {
 		for _, v := range vs {
 			r.Header.Add(k, v)
@@ -330,8 +337,17 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 				markErrSpan("auth: " + err.Error())
 				return ctx, status.Error(codes.Unauthenticated, err.Error())
 			}
-			markErrSpan("auth error")
-			return ctx, status.Error(codes.Unauthenticated, "authentication failed")
+			// Other resolve errors (transient auth-backend failures, JWKS
+			// fetch hiccups): treat as anonymous (fail-open) so the SAME
+			// underlying error yields the SAME allow/deny across HTTP and
+			// gRPC — the HTTP MWIdentityResolve path does exactly this. The
+			// per-rule auth gate below still denies if the rule requires an
+			// identity, and a fail-closed auth method surfaces its decision
+			// as ErrInvalidCredential (handled above), not as a transient
+			// error. Previously gRPC hard-denied here while HTTP admitted
+			// anonymously — a transient blip took gRPC down but not HTTP.
+			p.log.WithError(err).Warn("grpc auth resolve error; treating request as anonymous")
+			id = nil
 		}
 		// Strip the configured credential metadata (gRPC keys are
 		// lower-cased) so it is never forwarded upstream.
@@ -376,7 +392,17 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 			key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
 			allowed, retryAfter, rlErr := l.Allow(ctx, key)
 			if rlErr != nil {
-				// Fail-open on limiter transport error so an olric
+				if rule.RateLimit.FailClosed() {
+					p.log.WithError(rlErr).Warn("grpc rate limiter error; failing closed (denying)")
+					p.cgDashboard.RecordDeny(DenyRecord{
+						Section: p.section, Reason: "rate_limit",
+						SourceIP: source, Method: method,
+						RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+					})
+					markErrSpan("rate limiter unavailable")
+					return ctx, status.Error(codes.ResourceExhausted, "rate limiter unavailable")
+				}
+				// Fail-open (default) on limiter transport error so an olric
 				// blip doesn't take down traffic.
 				p.log.WithError(rlErr).Warn("grpc rate limiter error; allowing")
 			} else if !allowed {

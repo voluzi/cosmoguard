@@ -11,6 +11,12 @@ import (
 
 var (
 	ErrClosed = errors.New("websocket client closed")
+	// ErrBadMessage marks a frame that failed to decode as JSON-RPC on an
+	// otherwise-healthy connection (empty frame, malformed JSON, nil
+	// message). Unlike a read error, the socket is still usable, so callers
+	// should reply with a JSON-RPC parse error and keep the connection open
+	// rather than disconnecting the client (and dropping its subscriptions).
+	ErrBadMessage = errors.New("bad json rpc message")
 )
 
 // wsClientWriteDeadline caps how long a single WriteMessage can park
@@ -126,17 +132,21 @@ func (c *JsonRpcWsClient) ReceiveMsg() (*JsonRpcMsg, error) {
 		return nil, ErrClosed
 	}
 
+	// The three cases below are malformed frames on a still-usable socket
+	// (ErrBadMessage), NOT dead connections — the caller keeps the conn
+	// open and replies with a JSON-RPC parse error instead of tearing down
+	// the client and dropping all its subscriptions over one bad frame.
 	if string(message) == "" {
-		return nil, fmt.Errorf("received empty json rpc message")
+		return nil, fmt.Errorf("%w: received empty message", ErrBadMessage)
 	}
 
 	msg, _, err := ParseJsonRpcMessage(message)
 	if err != nil {
-		return nil, fmt.Errorf("error decoding msg: %v", err)
+		return nil, fmt.Errorf("%w: %v", ErrBadMessage, err)
 	}
 
 	if msg == nil {
-		return nil, fmt.Errorf("bad request: %s", string(message))
+		return nil, fmt.Errorf("%w: not a single request: %s", ErrBadMessage, string(message))
 	}
 
 	return msg, nil

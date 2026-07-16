@@ -64,7 +64,7 @@ func TestReadConfigFromFile_DefaultValues(t *testing.T) {
 	assert.Equal(t, cfg.Cache.TTL, 5*time.Second)
 
 	// Metrics defaults
-	assert.Equal(t, cfg.Metrics.Enable, true)
+	assert.Equal(t, cfg.Metrics.IsEnabled(), true)
 	assert.Equal(t, cfg.Metrics.Port, 9001)
 
 	// Default actions
@@ -493,9 +493,10 @@ func TestValidateCacheBackend(t *testing.T) {
 	t.Run("static mode with peers passes", func(t *testing.T) {
 		c := &CacheGlobalConfig{
 			Cluster: &ClusterConfig{
-				BindAddr:     "10.0.0.5",
-				ReplicaCount: 2,
-				Quorum:       1,
+				BindAddr:      "10.0.0.5",
+				ReplicaCount:  2,
+				Quorum:        1,
+				EncryptionKey: testClusterEncryptionKey,
 				Discovery: &ClusterDiscoveryConfig{
 					Mode:   "static",
 					Static: &StaticDiscoveryConfig{Peers: []string{"a:3322", "b:3322"}},
@@ -503,6 +504,37 @@ func TestValidateCacheBackend(t *testing.T) {
 			},
 		}
 		assert.NilError(t, validateCacheBackend(c))
+	})
+
+	t.Run("cluster mode without encryption key rejected", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:     "10.0.0.5",
+				ReplicaCount: 2,
+				Quorum:       1,
+				Discovery: &ClusterDiscoveryConfig{
+					Mode:   "static",
+					Static: &StaticDiscoveryConfig{Peers: []string{"a:3322"}},
+				},
+			},
+		}
+		assert.Assert(t, validateCacheBackend(c) != nil, "missing encryptionKey should be rejected")
+	})
+
+	t.Run("cluster mode with malformed encryption key rejected", func(t *testing.T) {
+		c := &CacheGlobalConfig{
+			Cluster: &ClusterConfig{
+				BindAddr:      "10.0.0.5",
+				ReplicaCount:  2,
+				Quorum:        1,
+				EncryptionKey: "dG9vLXNob3J0", // decodes to 8 bytes — invalid length
+				Discovery: &ClusterDiscoveryConfig{
+					Mode:   "static",
+					Static: &StaticDiscoveryConfig{Peers: []string{"a:3322"}},
+				},
+			},
+		}
+		assert.Assert(t, validateCacheBackend(c) != nil, "8-byte key should be rejected")
 	})
 
 	t.Run("quorum greater than replicaCount rejected", func(t *testing.T) {
@@ -541,10 +573,11 @@ func TestValidateCacheBackend(t *testing.T) {
 	t.Run("experimental modes accepted at config time", func(t *testing.T) {
 		c := &CacheGlobalConfig{
 			Cluster: &ClusterConfig{
-				BindAddr:     "10.0.0.5",
-				ReplicaCount: 2,
-				Quorum:       1,
-				Discovery:    &ClusterDiscoveryConfig{Mode: "kubernetes"},
+				BindAddr:      "10.0.0.5",
+				ReplicaCount:  2,
+				Quorum:        1,
+				EncryptionKey: testClusterEncryptionKey,
+				Discovery:     &ClusterDiscoveryConfig{Mode: "kubernetes"},
 			},
 		}
 		assert.NilError(t, validateCacheBackend(c))
@@ -571,9 +604,10 @@ func TestValidateCacheBackend(t *testing.T) {
 	t.Run("dns port zero accepted (inherits gossipPort)", func(t *testing.T) {
 		c := &CacheGlobalConfig{
 			Cluster: &ClusterConfig{
-				BindAddr:     "10.0.0.5",
-				ReplicaCount: 2,
-				Quorum:       1,
+				BindAddr:      "10.0.0.5",
+				ReplicaCount:  2,
+				Quorum:        1,
+				EncryptionKey: testClusterEncryptionKey,
 				Discovery: &ClusterDiscoveryConfig{
 					Mode: "dns",
 					DNS:  &DNSDiscoveryConfig{Host: "peers.local"},

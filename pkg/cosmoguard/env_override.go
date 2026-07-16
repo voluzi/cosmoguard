@@ -97,7 +97,7 @@ func applyEnvOverrides(cfg *Config) error {
 	if err := envPort("COSMOGUARD_EVM_RPC_WS_PORT", &cfg.EvmRpcWsPort); err != nil {
 		return err
 	}
-	if err := envBool("COSMOGUARD_METRICS_ENABLE", &cfg.Metrics.Enable); err != nil {
+	if err := envBoolPtr("COSMOGUARD_METRICS_ENABLE", &cfg.Metrics.Enable); err != nil {
 		return err
 	}
 	if err := envPort("COSMOGUARD_METRICS_PORT", &cfg.Metrics.Port); err != nil {

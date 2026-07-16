@@ -38,6 +38,13 @@ func getSubscriptionParam(req *JsonRpcMsg) (string, error) {
 		return "", fmt.Errorf("bad params for subscribe")
 	}
 
+	// A client-supplied empty params array ({"method":"subscribe","params":[]})
+	// would index params[0] out of range and panic the connection handler.
+	// Guard it as a malformed request instead.
+	if len(params) == 0 {
+		return "", fmt.Errorf("missing subscription param")
+	}
+
 	query, ok := params[0].(string)
 
 	if !ok {

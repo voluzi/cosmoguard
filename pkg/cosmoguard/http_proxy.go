@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -749,13 +750,34 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 	if q := req.URL.Query().Encode(); q != "" {
 		canonical += "?" + q
 	}
-	// xxhash64 is ~5-10× faster than sha256 on cosmoguard-shaped inputs and
-	// is the right tool for cache-key hashing (no need for cryptographic
-	// collision resistance — the rule fingerprint already namespaces).
+	// Fold a normalized Accept-Encoding into the key. Upstreams commonly
+	// content-negotiate on it (Content-Encoding: gzip + Vary: Accept-
+	// Encoding); without this, a gzip response cached for a gzip-capable
+	// client would be replayed verbatim (with Content-Encoding: gzip) to a
+	// client that didn't ask for gzip, yielding an undecodable body. We
+	// collapse to gzip / br / identity buckets so trivially-different
+	// Accept-Encoding strings still share an entry. Responses that Vary on
+	// anything ELSE are refused caching in cacheMiss (see cacheableByVary).
 	return util.XXHash64Hex(
 		strconv.FormatUint(ruleFingerprint, 16) + "\x00" +
-			req.Method + "\x00" + canonical + "\x00" + string(b),
+			req.Method + "\x00" + canonical + "\x00" +
+			normalizeAcceptEncoding(req.Header.Get("Accept-Encoding")) + "\x00" +
+			string(b),
 	), nil
+}
+
+// normalizeAcceptEncoding collapses an Accept-Encoding header to the coarse
+// bucket that actually changes the cached bytes: "gzip", "br", or "identity".
+// gzip wins when both are offered (the common upstream choice).
+func normalizeAcceptEncoding(ae string) string {
+	ae = strings.ToLower(ae)
+	if strings.Contains(ae, "gzip") {
+		return "gzip"
+	}
+	if strings.Contains(ae, "br") {
+		return "br"
+	}
+	return "identity"
 }
 
 // cacheHit serves an already-fetched cached response. The caller does the
@@ -858,6 +880,15 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 	if !cacheableByUpstream(ww.GetCommittedHeaders()) {
 		return
 	}
+	// Refuse to cache a response whose Vary header names request headers we
+	// don't fold into the cache key. We DO key on Accept-Encoding (see
+	// getRequestHash), so Vary: Accept-Encoding is fine; anything else
+	// (e.g. Vary: Authorization, Accept-Language, *) would let one client's
+	// content-negotiated response be served to a client that sent different
+	// headers.
+	if !cacheableByVary(ww.GetCommittedHeaders()) {
+		return
+	}
 
 	// Parse the upstream's Age header (if any) at store time so cache
 	// hits can compute a correct downstream Age (per RFC 7234 §5.1):
@@ -891,7 +922,51 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 	// string nonce in the hash derivation). Path-plus-query so query
 	// variants register as distinct keys — the operator's signal is
 	// precisely "is this rule writing one entry per unique query?".
-	p.cgDashboard.RecordCardinality(p.section, ruleTag, r.Method+" "+r.URL.RequestURI())
+	p.cgDashboard.RecordCardinality(p.section, ruleTag, r.Method+" "+p.redactedRequestURI(r))
+}
+
+// redactCredentialQuery replaces the value of any credential-carrying query
+// parameter (from an api-key method in queryParam mode) with "REDACTED", so
+// the raw key never lands in the dashboard's request log or cardinality
+// samples. Returns the input unchanged when nothing needs redacting.
+func (p *HttpProxy) redactCredentialQuery(rawQuery string) string {
+	if rawQuery == "" || p.auth == nil {
+		return rawQuery
+	}
+	names := p.auth.CredentialQueryParams()
+	if len(names) == 0 {
+		return rawQuery
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		// Unparseable query: fall back to dropping it entirely rather than
+		// risk logging a credential we couldn't parse out.
+		return "[redacted]"
+	}
+	changed := false
+	for _, name := range names {
+		if q.Has(name) {
+			q.Set(name, "REDACTED")
+			changed = true
+		}
+	}
+	if !changed {
+		return rawQuery
+	}
+	return q.Encode()
+}
+
+// redactedRequestURI rebuilds path?query with credential query params
+// redacted, for cardinality sampling.
+func (p *HttpProxy) redactedRequestURI(r *http.Request) string {
+	if r.URL.RawQuery == "" {
+		return r.URL.RequestURI()
+	}
+	redacted := p.redactCredentialQuery(r.URL.RawQuery)
+	if redacted == "" {
+		return r.URL.Path
+	}
+	return r.URL.Path + "?" + redacted
 }
 
 // cacheableByUpstream reports whether the upstream's Cache-Control
@@ -1028,7 +1103,7 @@ func (p *HttpProxy) recordOutcome(r *http.Request, status int, cacheState, actio
 			Section:    p.section,
 			Method:     r.Method,
 			Path:       r.URL.Path,
-			Query:      r.URL.RawQuery,
+			Query:      p.redactCredentialQuery(r.URL.RawQuery),
 			Status:     status,
 			LatencyMs:  duration.Milliseconds(),
 			CacheState: cacheState,

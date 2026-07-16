@@ -86,6 +86,16 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		mc.BindAddr = bindAddr
 		mc.BindPort = opts.Cluster.GossipPort
 		mc.AdvertisePort = opts.Cluster.GossipPort
+
+		// Enable memberlist gossip encryption + authentication. The key is
+		// validated at config load (validateCacheBackend), but decode again
+		// here so a runtime constructed directly (tests) still fails closed
+		// rather than starting an unencrypted cluster.
+		key, err := DecodeClusterEncryptionKey(opts.Cluster.EncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("cluster runtime: encryption key: %w", err)
+		}
+		mc.SecretKey = key
 	} else {
 		// Embedded-only: ephemeral loopback ports for both surfaces.
 		mc.BindAddr = "127.0.0.1"

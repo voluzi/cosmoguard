@@ -90,6 +90,12 @@ type HttpUpstream struct {
 // caller that observed cooldown was up, so a burst of N concurrent
 // requests after recovery all hit the still-dead upstream
 // simultaneously. The CAS gate below ensures one probe at a time.
+// This is READ-ONLY: it never consumes the half-open probe token, so
+// healthySet can call it for every upstream without side effects. The
+// token is consumed in consumeHalfOpenProbe, called only for the upstream
+// Pick actually returns — otherwise an upstream whose token was consumed
+// by the healthySet scan but that the picker didn't select would never get
+// an RPC (and its RecordOutcome), wedging it open forever.
 func (u *HttpUpstream) CircuitOpen() bool {
 	if !u.cbOpen.Load() {
 		return false
@@ -99,23 +105,33 @@ func (u *HttpUpstream) CircuitOpen() bool {
 	}
 	openedAt := u.cbOpenedAtUnixMs.Load()
 	if openedAt == 0 {
-		// Another goroutine has already won the half-open probe;
-		// everyone else stays rejected until its outcome lands.
+		// A probe is already in flight; everyone else stays rejected
+		// until its outcome lands.
 		return true
+	}
+	// Rejected until cooldown elapses; after that the upstream is
+	// probe-eligible (no token consumed here — read-only).
+	return time.Now().UnixMilli()-openedAt < u.cbConfig.CooldownPeriod.Milliseconds()
+}
+
+// consumeHalfOpenProbe consumes the single half-open probe token when the
+// breaker is open and cooldown has elapsed. Pick calls it only for the
+// upstream it returns, so a consumed token is always paired with a request
+// (and its RecordOutcome). No-op for a closed breaker.
+func (u *HttpUpstream) consumeHalfOpenProbe() {
+	if !u.cbOpen.Load() || u.cbConfig == nil {
+		return
+	}
+	openedAt := u.cbOpenedAtUnixMs.Load()
+	if openedAt == 0 {
+		return
 	}
 	if time.Now().UnixMilli()-openedAt < u.cbConfig.CooldownPeriod.Milliseconds() {
-		return true
+		return
 	}
-	// Cooldown elapsed. CAS so only one caller transitions to
-	// half-open; losers stay rejected.
-	if !u.cbOpenedAtUnixMs.CompareAndSwap(openedAt, 0) {
-		return true
+	if u.cbOpenedAtUnixMs.CompareAndSwap(openedAt, 0) {
+		u.cbConsecFails.Store(0)
 	}
-	// We're the probe. Reset consecFails so a single failure on
-	// the probe re-trips the breaker (instead of needing
-	// ConsecutiveFailures probe-only failures in a row).
-	u.cbConsecFails.Store(0)
-	return false
 }
 
 // RecordOutcome is called after each proxied request completes. ok=true
@@ -649,24 +665,35 @@ func (p *HttpUpstreamPool) Pick() *HttpUpstream {
 		// proxy setup. The common case.
 		return current[0]
 	}
-	healthy := p.healthySet()
+	// Thread the SAME snapshot through healthySet + picker. Previously
+	// healthySet took an independent second snapshot, so a concurrent
+	// RemoveUpstream draining the last upstreams between here and there
+	// yielded an empty set and the pickers divided by zero / indexed [0].
+	healthy := p.healthySet(current)
+	var picked *HttpUpstream
 	switch p.strategy {
 	case "round-robin":
-		return p.pickRR(healthy)
+		picked = p.pickRR(healthy)
 	case "least-conn":
-		return p.pickLeastConn(healthy)
+		picked = p.pickLeastConn(healthy)
 	case "primary-failover":
-		return p.pickPrimary(healthy)
+		picked = p.pickPrimary(healthy)
 	default:
-		return p.pickWeightedRR(healthy)
+		picked = p.pickWeightedRR(healthy)
 	}
+	if picked != nil {
+		// Consume the half-open probe token only for the upstream we
+		// return, so the token is paired with a request. See
+		// consumeHalfOpenProbe.
+		picked.consumeHalfOpenProbe()
+	}
+	return picked
 }
 
 // healthySet returns upstreams currently in the picker (healthy AND
 // circuit-closed). When zero qualify, returns all upstreams so we can
 // still try the request.
-func (p *HttpUpstreamPool) healthySet() []*HttpUpstream {
-	current := p.upstreamsSnapshot()
+func (p *HttpUpstreamPool) healthySet(current []*HttpUpstream) []*HttpUpstream {
 	out := current[:0:0]
 	for _, u := range current {
 		if u.healthy.Load() && !u.CircuitOpen() {
@@ -680,6 +707,9 @@ func (p *HttpUpstreamPool) healthySet() []*HttpUpstream {
 }
 
 func (p *HttpUpstreamPool) pickRR(set []*HttpUpstream) *HttpUpstream {
+	if len(set) == 0 {
+		return nil
+	}
 	// Use uint32 arithmetic end-to-end so the % stays non-negative when
 	// idx wraps past 2^32. The previous `int(i)-1` form went negative on
 	// the wrap boundary (i=0 → -1 → set[-1] panic). After ~4B requests
@@ -689,6 +719,9 @@ func (p *HttpUpstreamPool) pickRR(set []*HttpUpstream) *HttpUpstream {
 }
 
 func (p *HttpUpstreamPool) pickWeightedRR(set []*HttpUpstream) *HttpUpstream {
+	if len(set) == 0 {
+		return nil
+	}
 	totalWeight := 0
 	for _, u := range set {
 		totalWeight += u.Weight
@@ -708,6 +741,9 @@ func (p *HttpUpstreamPool) pickWeightedRR(set []*HttpUpstream) *HttpUpstream {
 }
 
 func (p *HttpUpstreamPool) pickLeastConn(set []*HttpUpstream) *HttpUpstream {
+	if len(set) == 0 {
+		return nil
+	}
 	// Find min in-flight; collect all upstreams at that minimum; round-
 	// robin within the tie set so ties don't perpetually slam one node.
 	minF := int32(-1)
@@ -723,6 +759,11 @@ func (p *HttpUpstreamPool) pickLeastConn(set []*HttpUpstream) *HttpUpstream {
 			tied = append(tied, u)
 		}
 	}
+	// inFlight can shift between the two passes, emptying tied; fall back
+	// to the full (non-empty) set rather than panicking in pickRR.
+	if len(tied) == 0 {
+		return p.pickRR(set)
+	}
 	if len(tied) == 1 {
 		return tied[0]
 	}
@@ -734,6 +775,9 @@ func (p *HttpUpstreamPool) pickPrimary(set []*HttpUpstream) *HttpUpstream {
 	// in the healthy set. Configured order is determined by position in
 	// the nodes: list — the first node is primary, second is the
 	// immediate failover, and so on.
+	if len(set) == 0 {
+		return nil
+	}
 	for _, u := range p.upstreamsSnapshot() {
 		for _, h := range set {
 			if u == h {
@@ -912,7 +956,7 @@ func (p *HttpUpstreamPool) pickNotTried(tried map[*HttpUpstream]struct{}) *HttpU
 		return nil
 	}
 	// First try the configured strategy among untried upstreams.
-	healthy := p.healthySet()
+	healthy := p.healthySet(current)
 	candidates := healthy[:0:0]
 	for _, u := range healthy {
 		if _, seen := tried[u]; !seen {

@@ -40,6 +40,7 @@ func (f *fakeUpstreamConn) Subscribe(string) (string, error) {
 	return fmt.Sprintf("%s/i%d#%d", f.target.Host, f.instance, f.subIDSeq.Add(1)), nil
 }
 func (f *fakeUpstreamConn) Unsubscribe(string) error { return nil }
+func (f *fakeUpstreamConn) LocalUnsubscribe(string)  {}
 func (f *fakeUpstreamConn) IsHealthy() bool          { return f.healthy.Load() }
 func (f *fakeUpstreamConn) Stop()                    {}
 

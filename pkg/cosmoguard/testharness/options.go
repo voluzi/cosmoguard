@@ -8,6 +8,10 @@ import (
 	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
 )
 
+// boolPtr returns a pointer to b, for the *bool config fields
+// (Metrics.Enable, RpcConfig.WebSocketEnabled).
+func boolPtr(b bool) *bool { return &b }
+
 // Option customizes a Harness before it boots.
 type Option interface{ apply(*Harness) }
 
@@ -92,7 +96,7 @@ func WithMetricsEnabled() Option {
 		if h.cfg == nil {
 			h.cfg = defaultHarnessConfig()
 		}
-		h.cfg.Metrics.Enable = true
+		h.cfg.Metrics.Enable = boolPtr(true)
 	})
 }
 

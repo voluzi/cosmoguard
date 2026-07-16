@@ -1,18 +1,53 @@
 package cosmoguard
 
 import (
+	"context"
 	"testing"
 
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
+// TestGrpcCacheKey_MetadataDistinguishesHeight is the #6 regression: two
+// otherwise-identical requests that differ only by the x-cosmos-block-height
+// metadata must produce different cache keys (both raw and method-only),
+// and the block-height key must be included by default.
+func TestGrpcCacheKey_MetadataDistinguishesHeight(t *testing.T) {
+	keys := (&RuleCache{}).EffectiveKeyMetadata()
+	ctx100 := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("x-cosmos-block-height", "100"))
+	ctx200 := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("x-cosmos-block-height", "200"))
+	mp100 := grpcCacheKeyMetaPart(ctx100, keys)
+	mp200 := grpcCacheKeyMetaPart(ctx200, keys)
+	if mp100 == mp200 {
+		t.Fatal("metadata part should differ by block height")
+	}
+
+	m := "/cosmos.bank.v1beta1.Query/Balance"
+	if grpcCacheKey(0xabc, m, []byte("addr=A"), "", nil, mp100) ==
+		grpcCacheKey(0xabc, m, []byte("addr=A"), "", nil, mp200) {
+		t.Fatal("raw key must differ when block height differs")
+	}
+	if grpcCacheKey(0xabc, m, []byte("addr=A"), "method-only", nil, mp100) ==
+		grpcCacheKey(0xabc, m, []byte("addr=A"), "method-only", nil, mp200) {
+		t.Fatal("method-only key must still differ when block height differs")
+	}
+
+	// Explicit empty list opts out (keys collapse regardless of height).
+	empty := (&RuleCache{KeyMetadata: []string{}}).EffectiveKeyMetadata()
+	if grpcCacheKeyMetaPart(ctx100, empty) != "" {
+		t.Fatal("explicit empty KeyMetadata should fold in no metadata")
+	}
+}
+
 // TestGrpcCacheKey_RawIncludesPayload: different payloads under the same
 // rule + method must produce different keys.
 func TestGrpcCacheKey_RawIncludesPayload(t *testing.T) {
-	a := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Balance", []byte("addr=A"), "", nil)
-	b := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Balance", []byte("addr=B"), "", nil)
+	a := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Balance", []byte("addr=A"), "", nil, "")
+	b := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Balance", []byte("addr=B"), "", nil, "")
 	if a == b {
 		t.Fatalf("raw key should differ when payload differs; got %s == %s", a, b)
 	}
@@ -21,8 +56,8 @@ func TestGrpcCacheKey_RawIncludesPayload(t *testing.T) {
 // TestGrpcCacheKey_MethodOnlyIgnoresPayload: the same rule + method with
 // different payloads must collapse to one key.
 func TestGrpcCacheKey_MethodOnlyIgnoresPayload(t *testing.T) {
-	a := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Params", []byte("anything"), "method-only", nil)
-	b := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Params", []byte("else"), "method-only", nil)
+	a := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Params", []byte("anything"), "method-only", nil, "")
+	b := grpcCacheKey(0xdead, "/cosmos.bank.v1beta1.Query/Params", []byte("else"), "method-only", nil, "")
 	if a != b {
 		t.Fatalf("method-only should ignore payload; got %s != %s", a, b)
 	}
@@ -32,8 +67,8 @@ func TestGrpcCacheKey_MethodOnlyIgnoresPayload(t *testing.T) {
 // fingerprint must produce a fresh key even in method-only mode (per-rule
 // namespacing applies in both modes).
 func TestGrpcCacheKey_RuleNamespaceHoldsAcrossKeyModes(t *testing.T) {
-	a := grpcCacheKey(0x1, "/m", []byte("x"), "method-only", nil)
-	b := grpcCacheKey(0x2, "/m", []byte("x"), "method-only", nil)
+	a := grpcCacheKey(0x1, "/m", []byte("x"), "method-only", nil, "")
+	b := grpcCacheKey(0x2, "/m", []byte("x"), "method-only", nil, "")
 	if a == b {
 		t.Fatalf("different rule fingerprints must produce different keys")
 	}
@@ -54,8 +89,8 @@ func TestGrpcCacheKey_CanonicalCollapses(t *testing.T) {
 		t.Fatalf("test setup: the two encodings should be byte-different")
 	}
 
-	k1 := grpcCacheKey(0xabc, method, abOrder, "canonical", reg)
-	k2 := grpcCacheKey(0xabc, method, baOrder, "canonical", reg)
+	k1 := grpcCacheKey(0xabc, method, abOrder, "canonical", reg, "")
+	k2 := grpcCacheKey(0xabc, method, baOrder, "canonical", reg, "")
 	if k1 != k2 {
 		t.Fatalf("canonical should collapse byte differences; got %s != %s", k1, k2)
 	}
@@ -67,8 +102,8 @@ func TestGrpcCacheKey_CanonicalCollapses(t *testing.T) {
 func TestGrpcCacheKey_CanonicalUnknownMethodDegrades(t *testing.T) {
 	reg := buildCanonicalTestRegistry(t)
 
-	k1 := grpcCacheKey(0xabc, "/unknown.Svc/Method", []byte("aaa"), "canonical", reg)
-	k2 := grpcCacheKey(0xabc, "/unknown.Svc/Method", []byte("bbb"), "canonical", reg)
+	k1 := grpcCacheKey(0xabc, "/unknown.Svc/Method", []byte("aaa"), "canonical", reg, "")
+	k2 := grpcCacheKey(0xabc, "/unknown.Svc/Method", []byte("bbb"), "canonical", reg, "")
 	if k1 == k2 {
 		t.Fatalf("unknown methods should degrade to raw; different payloads should differ")
 	}

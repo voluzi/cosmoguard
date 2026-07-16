@@ -245,7 +245,7 @@ func safetyBaseConfig(maxBody int64) *cosmoguard.Config {
 	return &cosmoguard.Config{
 		Host:    "127.0.0.1",
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		Server: cosmoguard.ServerConfig{
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       5 * time.Second,
@@ -257,7 +257,7 @@ func safetyBaseConfig(maxBody int64) *cosmoguard.Config {
 		LCD: cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{
 			Default:              cosmoguard.RuleActionAllow,
-			WebSocketEnabled:     true,
+			WebSocketEnabled:     boolPtr(true),
 			WebSocketConnections: 2,
 			JsonRpc:              cosmoguard.JsonRpcConfig{Default: cosmoguard.RuleActionAllow},
 		},

@@ -21,7 +21,7 @@ func TestJ_WebUI(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache: cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
 		Metrics: cosmoguard.MetricsConfig{
-			Enable: true,
+			Enable: boolPtr(true),
 			// Dashboard is off by default in v4.0.0 to avoid leaking
 			// upstream targets / identity scopes on a metrics port
 			// that's often cluster-wide reachable. Opt in here.

@@ -164,7 +164,7 @@ func New(t *testing.T, opts ...Option) *Harness {
 			h.cfg.Node.EvmRpcWsPort = h.Upstream.RPCPort() // ditto
 		}
 
-		if h.cfg.Metrics.Enable {
+		if h.cfg.Metrics.IsEnabled() {
 			h.cfg.Metrics.Port = freePort(t)
 		}
 		if h.cfg.Dashboard.IsEnabled() {
@@ -241,7 +241,7 @@ func (h *Harness) Stop() {
 func (h *Harness) waitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	ports := []int{h.cfg.LcdPort, h.cfg.RpcPort, h.cfg.GrpcPort}
-	if h.cfg.Metrics.Enable {
+	if h.cfg.Metrics.IsEnabled() {
 		ports = append(ports, h.cfg.Metrics.Port)
 	}
 	if h.cfg.Dashboard.IsEnabled() {
@@ -405,12 +405,12 @@ func defaultHarnessConfig() *cosmoguard.Config {
 		Cache: cosmoguard.CacheGlobalConfig{
 			TTL: 5 * time.Second,
 		},
-		Metrics:   cosmoguard.MetricsConfig{Enable: false},
+		Metrics:   cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		Dashboard: cosmoguard.DashboardConfig{Enable: &dashboardOff},
 		LCD:       cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{
 			Default:              cosmoguard.RuleActionAllow,
-			WebSocketEnabled:     true,
+			WebSocketEnabled:     boolPtr(true),
 			WebSocketConnections: 2,
 			JsonRpc: cosmoguard.JsonRpcConfig{
 				Default: cosmoguard.RuleActionAllow,
