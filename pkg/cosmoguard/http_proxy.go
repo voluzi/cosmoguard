@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -750,30 +751,33 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 	if q := req.URL.Query().Encode(); q != "" {
 		canonical += "?" + q
 	}
-	// Fold a normalized Accept-Encoding into the key. Upstreams commonly
-	// content-negotiate on it (Content-Encoding: gzip + Vary: Accept-
-	// Encoding); without this, a gzip response cached for a gzip-capable
-	// client would be replayed verbatim (with Content-Encoding: gzip) to a
-	// client that didn't ask for gzip, yielding an undecodable body. We
-	// collapse to gzip / br / identity buckets so trivially-different
-	// Accept-Encoding strings still share an entry. Responses that Vary on
-	// anything ELSE are refused caching in cacheMiss (see cacheableByVary).
+	// Fold the client's acceptable content-coding set into the key. Upstreams
+	// commonly content-negotiate on it (Content-Encoding + Vary: Accept-
+	// Encoding); without this, a compressed response cached for one client
+	// would be replayed verbatim to a client that can't decode that coding.
+	// We key on the FULL set of acceptable codings (not a gzip/br/identity
+	// bucket) so a client accepting e.g. `gzip, zstd` never shares an entry
+	// with a gzip-only client — the upstream might return zstd, which the
+	// gzip-only client couldn't accept. Responses that Vary on anything
+	// besides Accept-Encoding are refused caching (see cacheableByVary).
 	return util.XXHash64Hex(
 		strconv.FormatUint(ruleFingerprint, 16) + "\x00" +
 			req.Method + "\x00" + canonical + "\x00" +
-			normalizeAcceptEncoding(req.Header.Get("Accept-Encoding")) + "\x00" +
+			acceptEncodingKey(req.Header.Get("Accept-Encoding")) + "\x00" +
 			string(b),
 	), nil
 }
 
-// normalizeAcceptEncoding collapses an Accept-Encoding header to the coarse
-// bucket that actually changes the cached bytes: "gzip", "br", or "identity".
-// It parses the codings and their `q` values (RFC 9110 §12.5.3) rather than
-// substring-matching, so `gzip;q=0` (gzip explicitly forbidden) does NOT map
-// to the gzip bucket — otherwise a later q=0 client could be served a cached
-// gzip body it can't accept. gzip wins over br when both are acceptable.
-func normalizeAcceptEncoding(ae string) string {
-	gzipOK, brOK := false, false
+// acceptEncodingKey returns a canonical, order-independent representation of
+// the codings a client will accept (those with q > 0), so two clients share a
+// cache entry only when their acceptable-coding sets are identical. It parses
+// `q` values (RFC 9110 §12.5.3), so `gzip;q=0` is excluded. `*` (any coding)
+// is kept as its own token — a `*` client and a `gzip` client must not share
+// an entry because the upstream may return a coding only one of them accepts.
+// `identity` is always implicitly acceptable unless explicitly excluded.
+func acceptEncodingKey(ae string) string {
+	set := map[string]struct{}{}
+	identityExcluded := false
 	for _, part := range strings.Split(ae, ",") {
 		token := strings.TrimSpace(part)
 		if token == "" {
@@ -783,7 +787,6 @@ func normalizeAcceptEncoding(ae string) string {
 		q := 1.0
 		if semi := strings.IndexByte(token, ';'); semi >= 0 {
 			coding = strings.TrimSpace(token[:semi])
-			// Parse a q= parameter if present; anything unparseable leaves q=1.
 			for _, param := range strings.Split(token[semi+1:], ";") {
 				param = strings.TrimSpace(param)
 				if v, ok := strings.CutPrefix(strings.ToLower(param), "q="); ok {
@@ -793,23 +796,24 @@ func normalizeAcceptEncoding(ae string) string {
 				}
 			}
 		}
+		coding = strings.ToLower(coding)
 		if q <= 0 {
+			if coding == "identity" || coding == "*" {
+				identityExcluded = true
+			}
 			continue // coding explicitly not acceptable
 		}
-		switch strings.ToLower(coding) {
-		case "gzip":
-			gzipOK = true
-		case "br":
-			brOK = true
-		}
+		set[coding] = struct{}{}
 	}
-	if gzipOK {
-		return "gzip"
+	if !identityExcluded {
+		set["identity"] = struct{}{}
 	}
-	if brOK {
-		return "br"
+	codings := make([]string, 0, len(set))
+	for c := range set {
+		codings = append(codings, c)
 	}
-	return "identity"
+	sort.Strings(codings)
+	return strings.Join(codings, ",")
 }
 
 // cacheHit serves an already-fetched cached response. The caller does the

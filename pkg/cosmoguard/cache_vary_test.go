@@ -34,16 +34,23 @@ func TestCacheableByVary(t *testing.T) {
 	}
 }
 
-// TestNormalizeAcceptEncoding: gzip-capable and non-gzip clients land in
-// different buckets so they don't share a cache entry.
-func TestNormalizeAcceptEncoding(t *testing.T) {
-	if normalizeAcceptEncoding("gzip, deflate, br") != "gzip" {
-		t.Fatal("gzip should win when offered")
+// TestAcceptEncodingKey: clients with different acceptable-coding sets must
+// get different keys; identical sets (any order) share.
+func TestAcceptEncodingKey(t *testing.T) {
+	if acceptEncodingKey("") != "identity" {
+		t.Fatalf("empty Accept-Encoding should be identity, got %q", acceptEncodingKey(""))
 	}
-	if normalizeAcceptEncoding("") != "identity" {
-		t.Fatal("empty Accept-Encoding should be identity")
+	// Order-independent.
+	if acceptEncodingKey("gzip, br") != acceptEncodingKey("br, gzip") {
+		t.Fatal("acceptable-coding set must be order-independent")
 	}
-	if normalizeAcceptEncoding("gzip") == normalizeAcceptEncoding("identity") {
-		t.Fatal("gzip and identity must map to different buckets")
+	// A gzip-only client and a gzip+zstd client must NOT share an entry —
+	// the upstream might return zstd, which the gzip-only client can't take.
+	if acceptEncodingKey("gzip") == acceptEncodingKey("gzip, zstd") {
+		t.Fatal("gzip vs gzip+zstd must produce different keys")
+	}
+	// gzip-capable and identity-only clients differ.
+	if acceptEncodingKey("gzip") == acceptEncodingKey("identity") {
+		t.Fatal("gzip and identity-only must differ")
 	}
 }

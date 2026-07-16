@@ -267,7 +267,7 @@ func ParseErrorResponse() *JsonRpcMsg {
 		Version: "2.0",
 		Error: &JsonRpcError{
 			Code:    -32700,
-			Message: "parse error",
+			Message: "Parse error",
 		},
 		ID: explicitNullID,
 	}
@@ -282,7 +282,7 @@ func InvalidRequestResponse() *JsonRpcMsg {
 		Version: "2.0",
 		Error: &JsonRpcError{
 			Code:    -32600,
-			Message: "invalid request",
+			Message: "Invalid Request",
 		},
 		ID: explicitNullID,
 	}

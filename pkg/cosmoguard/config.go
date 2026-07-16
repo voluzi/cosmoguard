@@ -894,6 +894,9 @@ func PrepareConfig(cfg *Config) error {
 	if err := validateAuthEndpoints(&cfg.Auth); err != nil {
 		return err
 	}
+	if err := validateServerLimits(&cfg.Server); err != nil {
+		return err
+	}
 	if err := validateCacheBackend(&cfg.Cache); err != nil {
 		return err
 	}
@@ -1111,6 +1114,21 @@ func validateUpstreamStrategy(s string) error {
 	default:
 		return fmt.Errorf("upstream.strategy: unknown value %q (want weighted-round-robin / round-robin / least-conn / primary-failover)", s)
 	}
+}
+
+// validateServerLimits rejects a negative maxRequestBody / wsReadLimit. Those
+// fields are *int64 where nil means "use the default" and an explicit 0 means
+// "no limit"; a negative value (e.g. a `-1` typo) is neither, and would slip
+// past the `> 0` cap check at use sites and silently remove the cap. Fail
+// startup with a clear message instead.
+func validateServerLimits(s *ServerConfig) error {
+	if s.MaxRequestBody != nil && *s.MaxRequestBody < 0 {
+		return fmt.Errorf("server.maxRequestBody must be >= 0 (0 means no limit); got %d", *s.MaxRequestBody)
+	}
+	if s.WSReadLimit != nil && *s.WSReadLimit < 0 {
+		return fmt.Errorf("server.wsReadLimit must be >= 0 (0 means no limit); got %d", *s.WSReadLimit)
+	}
+	return nil
 }
 
 // validateAuthEndpoints requires the URLs cosmoguard fetches keys/decisions

@@ -1003,6 +1003,16 @@ func (f *CosmoGuard) tryReload() {
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
 	}
+	// The metrics server is constructed once in New(). Now that an explicit
+	// `metrics.enable: false` survives defaulting, a reload that flips
+	// enable or changes the port would be accepted while the old listener
+	// keeps serving (or none exists) — reject it as restart-required.
+	if f.cfg.Metrics.IsEnabled() != newCfg.Metrics.IsEnabled() || f.cfg.Metrics.Port != newCfg.Metrics.Port {
+		err := fmt.Errorf("metrics config change (enable / port) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
 	// Reload accepted: keep the new trusted-proxy list PrepareConfig
 	// already published (the deferred restore is now a no-op).
 	accepted = true
@@ -1029,8 +1039,12 @@ func serverRuntimeImmutableChanged(old, new *ServerConfig) bool {
 		old.ReadTimeout != new.ReadTimeout ||
 		old.WriteTimeout != new.WriteTimeout ||
 		old.IdleTimeout != new.IdleTimeout ||
-		!equalInt64Ptr(old.MaxRequestBody, new.MaxRequestBody) ||
-		!equalInt64Ptr(old.WSReadLimit, new.WSReadLimit) ||
+		// Compare EFFECTIVE limits so a behaviour-neutral edit — e.g.
+		// spelling the default explicitly (`maxRequestBody: 5242880`) or as
+		// nil — isn't flagged as a change and doesn't block a rules-only
+		// reload.
+		old.EffectiveMaxRequestBody() != new.EffectiveMaxRequestBody() ||
+		old.EffectiveWSReadLimit() != new.EffectiveWSReadLimit() ||
 		!equalStringSet(old.WSAllowedOrigins, new.WSAllowedOrigins)
 }
 
@@ -1042,14 +1056,6 @@ func equalStringSet(a, b []string) bool {
 		return true
 	}
 	return reflect.DeepEqual(a, b)
-}
-
-// equalInt64Ptr compares two *int64 by value (nil == nil).
-func equalInt64Ptr(a, b *int64) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
 }
 
 // corsDeclChanged reports whether the operator-facing (declarative) CORS

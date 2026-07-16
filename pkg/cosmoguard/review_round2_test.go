@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,16 +141,58 @@ func TestEffectiveServerLimits(t *testing.T) {
 	}
 }
 
-// TestNormalizeAcceptEncoding_QValues is the codex #28 regression: gzip;q=0
-// (explicitly forbidden) must NOT map to the gzip bucket.
-func TestNormalizeAcceptEncoding_QValues(t *testing.T) {
-	if got := normalizeAcceptEncoding("gzip;q=0, br"); got == "gzip" {
-		t.Fatalf("gzip;q=0 must not select the gzip bucket, got %q", got)
+// TestAcceptEncodingKey_QValues is the codex #28 regression: gzip;q=0
+// (explicitly forbidden) must NOT appear in the acceptable set.
+func TestAcceptEncodingKey_QValues(t *testing.T) {
+	if got := acceptEncodingKey("gzip;q=0, br"); strings.Contains(got, "gzip") {
+		t.Fatalf("gzip;q=0 must be excluded, got %q", got)
 	}
-	if got := normalizeAcceptEncoding("gzip;q=0"); got != "identity" {
+	if got := acceptEncodingKey("gzip;q=0"); got != "identity" {
 		t.Fatalf("gzip;q=0 with nothing else acceptable must be identity, got %q", got)
 	}
-	if got := normalizeAcceptEncoding("gzip;q=0.5, br;q=1"); got != "gzip" {
-		t.Fatalf("acceptable gzip should win, got %q", got)
+	if got := acceptEncodingKey("gzip;q=0.5, br;q=1"); !strings.Contains(got, "gzip") || !strings.Contains(got, "br") {
+		t.Fatalf("gzip and br (q>0) should both be present, got %q", got)
+	}
+	// identity;q=0 excludes the implicit identity coding.
+	if got := acceptEncodingKey("gzip, identity;q=0"); strings.Contains(got, "identity") {
+		t.Fatalf("identity;q=0 must exclude identity, got %q", got)
+	}
+}
+
+// TestValidateServerLimits_RejectsNegative is the cubic ws_proxy.go:109
+// follow-up: a negative maxRequestBody/wsReadLimit must be rejected (it would
+// otherwise slip past the `> 0` cap check and remove the limit).
+func TestValidateServerLimits_RejectsNegative(t *testing.T) {
+	neg := int64(-1)
+	if err := validateServerLimits(&ServerConfig{WSReadLimit: &neg}); err == nil {
+		t.Fatal("negative wsReadLimit must be rejected")
+	}
+	if err := validateServerLimits(&ServerConfig{MaxRequestBody: &neg}); err == nil {
+		t.Fatal("negative maxRequestBody must be rejected")
+	}
+	zero := int64(0)
+	if err := validateServerLimits(&ServerConfig{WSReadLimit: &zero, MaxRequestBody: &zero}); err != nil {
+		t.Fatalf("explicit 0 (no limit) must be accepted, got %v", err)
+	}
+	if err := validateServerLimits(&ServerConfig{}); err != nil {
+		t.Fatalf("unset limits must be accepted, got %v", err)
+	}
+}
+
+// TestServerReload_EffectiveLimitsNeutral is the cubic cosmoguard.go:1033
+// follow-up: spelling a limit as its default explicitly must NOT be seen as a
+// change (so a rules-only reload isn't rejected).
+func TestServerReload_EffectiveLimitsNeutral(t *testing.T) {
+	defBody := defaultMaxRequestBody
+	defWS := defaultServerWSRead
+	unset := &ServerConfig{}
+	explicit := &ServerConfig{MaxRequestBody: &defBody, WSReadLimit: &defWS}
+	if serverRuntimeImmutableChanged(unset, explicit) {
+		t.Fatal("spelling the default explicitly must be behaviour-neutral")
+	}
+	other := int64(defBody + 1)
+	changed := &ServerConfig{MaxRequestBody: &other}
+	if !serverRuntimeImmutableChanged(unset, changed) {
+		t.Fatal("a real limit change must be detected")
 	}
 }

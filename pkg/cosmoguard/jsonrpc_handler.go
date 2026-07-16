@@ -407,13 +407,12 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 		// not as a JSON-RPC message). Previously a parse failure on a
 		// non-array payload still produced a defaulted request struct
 		// and silently went on to handleHttpSingle.
-		code := -32700
-		msg := "Parse error"
+		// Use the explicit-null-id builders so the response carries
+		// `"id":null` (§5.1) rather than dropping the id via omitempty.
+		errResp := ParseErrorResponse() // -32700, unparseable JSON
 		if req != nil || requests != nil {
-			code = -32600
-			msg = "Invalid Request"
+			errResp = InvalidRequestResponse() // -32600, parsed but not JSON-RPC
 		}
-		errResp := ErrorResponse(&JsonRpcMsg{ID: nil}, code, msg, nil)
 		body, mErr := errResp.Marshal()
 		if mErr != nil {
 			WriteError(w, http.StatusBadRequest, "bad request")
@@ -432,7 +431,7 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 	// `[]` back — spec-violating, and a confusing no-op for clients
 	// debugging a malformed batch generator.
 	if len(requests) == 0 {
-		errResp := ErrorResponse(&JsonRpcMsg{ID: nil}, -32600, "Invalid Request", nil)
+		errResp := InvalidRequestResponse() // -32600 with explicit "id":null
 		body, mErr := errResp.Marshal()
 		if mErr != nil {
 			h.log.Errorf("error marshalling empty-batch error response: %v", mErr)
