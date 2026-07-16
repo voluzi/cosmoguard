@@ -81,6 +81,36 @@ func TestRecordOutcomeErr_ClientErrorsDoNotTrip(t *testing.T) {
 	}
 }
 
+// TestRecordOutcomeErr_ApplicationRejectionCountsAsSuccess mirrors the HTTP
+// breaker's `<500` handling: an application-level gRPC status (the upstream
+// responded, it just rejected the request) must reset consecFails and close
+// a half-open breaker, not merely leave it untouched.
+func TestRecordOutcomeErr_ApplicationRejectionCountsAsSuccess(t *testing.T) {
+	// Resets consecFails so it takes ConsecutiveFailures fresh failures to trip.
+	u := &GrpcUpstream{cbConfig: enabledBreaker(3, time.Minute)}
+	u.RecordOutcomeErr(status.Error(codes.Unavailable, "down"))
+	u.RecordOutcomeErr(status.Error(codes.Unavailable, "down"))
+	u.RecordOutcomeErr(status.Error(codes.NotFound, "not found")) // should reset
+	if u.cbConsecFails.Load() != 0 {
+		t.Fatalf("application rejection should reset consecFails, got %d", u.cbConsecFails.Load())
+	}
+	u.RecordOutcomeErr(status.Error(codes.Unavailable, "down"))
+	u.RecordOutcomeErr(status.Error(codes.Unavailable, "down"))
+	if u.cbOpen.Load() {
+		t.Fatal("breaker should not have tripped: only 2 consecutive failures since the reset")
+	}
+
+	// Closes a half-open probe.
+	probe := &GrpcUpstream{cbConfig: enabledBreaker(3, 10*time.Millisecond)}
+	probe.cbOpen.Store(true)
+	probe.cbOpenedAtUnixMs.Store(time.Now().Add(-time.Second).UnixMilli())
+	probe.consumeHalfOpenProbe()
+	probe.RecordOutcomeErr(status.Error(codes.InvalidArgument, "bad request"))
+	if probe.CircuitOpen() {
+		t.Fatal("application rejection on the half-open probe should close the breaker")
+	}
+}
+
 // TestRecordOutcomeErr_ClientErrorReArmsHalfOpen: a neutral (client-caused)
 // outcome on the probe RPC must re-arm the cooldown rather than leaving the
 // consumed token unresolved (which would wedge the upstream).

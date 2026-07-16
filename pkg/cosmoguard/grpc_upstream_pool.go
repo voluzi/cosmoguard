@@ -143,21 +143,30 @@ func (u *GrpcUpstream) consumeHalfOpenProbe() bool {
 	return false
 }
 
-// grpcClientCaused reports whether a gRPC error reflects a client-side or
-// application-level outcome (request cancelled, deadline set by the client,
-// invalid arguments, not-found, permission/auth) rather than upstream
-// health. These MUST NOT trip the circuit breaker — otherwise a burst of
-// client cancels or a client hammering a cacheable method with requests the
-// node legitimately rejects (InvalidArgument/NotFound) would open the
-// breaker on a perfectly healthy upstream and pull it from rotation.
-func grpcClientCaused(err error) bool {
-	if err == nil {
+// grpcNeutral reports whether a gRPC error is pure client-side noise (the
+// caller went away or gave up before the upstream's health could be
+// observed) that must not move the breaker in either direction.
+func grpcNeutral(err error) bool {
+	switch status.Code(err) {
+	case codes.Canceled, codes.DeadlineExceeded:
+		return true
+	default:
 		return false
 	}
+}
+
+// grpcClientCaused reports whether a gRPC error is an application-level
+// rejection (invalid arguments, not-found, permission/auth, ...) rather
+// than an upstream health problem. The upstream received the request and
+// responded — mirroring the HTTP breaker's `<500` handling, that counts
+// as a successful breaker outcome, not a failure or a no-op. Otherwise a
+// client hammering a cacheable method with requests the node legitimately
+// rejects (InvalidArgument/NotFound) would leave a healthy upstream's
+// consecutive-failure count un-reset, or a half-open probe answered with
+// NotFound would never close the breaker.
+func grpcClientCaused(err error) bool {
 	switch status.Code(err) {
-	case codes.Canceled,
-		codes.DeadlineExceeded,
-		codes.InvalidArgument,
+	case codes.InvalidArgument,
 		codes.NotFound,
 		codes.AlreadyExists,
 		codes.PermissionDenied,
@@ -174,11 +183,13 @@ func grpcClientCaused(err error) bool {
 }
 
 // RecordOutcomeErr records an RPC result classified by gRPC status code,
-// so only genuine upstream/transport failures move the breaker. Client-
-// caused / application-level errors are treated as neutral — EXCEPT that a
-// neutral outcome on the half-open probe RPC re-arms the cooldown (rather
-// than leaving the token consumed with no resolution, which would wedge the
-// upstream open forever).
+// so only genuine upstream/transport failures move the breaker toward
+// open. A true local cancellation (grpcNeutral) is treated as neutral —
+// EXCEPT that a neutral outcome on the half-open probe RPC re-arms the
+// cooldown (rather than leaving the token consumed with no resolution,
+// which would wedge the upstream open forever). An application-level
+// rejection (grpcClientCaused) is recorded as a breaker success, since the
+// upstream demonstrably responded.
 func (u *GrpcUpstream) RecordOutcomeErr(err error) {
 	if err == nil {
 		u.RecordOutcome(true)
@@ -187,13 +198,14 @@ func (u *GrpcUpstream) RecordOutcomeErr(err error) {
 	if u.cbConfig == nil || !u.cbConfig.IsEnabled() {
 		return
 	}
-	if grpcClientCaused(err) {
-		// Not an upstream health signal. If this was the half-open probe
-		// RPC (token already consumed → openedAt==0), re-arm the cooldown
-		// so the upstream is probed again instead of staying wedged.
+	if grpcNeutral(err) {
 		if u.cbOpen.Load() && u.cbOpenedAtUnixMs.Load() == 0 {
 			u.cbOpenedAtUnixMs.Store(time.Now().UnixMilli())
 		}
+		return
+	}
+	if grpcClientCaused(err) {
+		u.RecordOutcome(true)
 		return
 	}
 	u.RecordOutcome(false)
