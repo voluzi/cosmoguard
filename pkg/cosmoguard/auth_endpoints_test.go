@@ -12,15 +12,16 @@ func TestValidateAuthEndpoints(t *testing.T) {
 		method  AuthMethodConfig
 		wantErr bool
 	}{
-		{"https jwks ok", AuthMethodConfig{JwksURL: "https://idp.example/jwks.json"}, false},
-		{"http jwks rejected", AuthMethodConfig{JwksURL: "http://idp.example/jwks.json"}, true},
-		{"loopback http jwks ok", AuthMethodConfig{JwksURL: "http://127.0.0.1:8080/jwks.json"}, false},
-		{"localhost http jwks ok", AuthMethodConfig{JwksURL: "http://localhost/jwks.json"}, false},
-		{"http introspection rejected", AuthMethodConfig{IntrospectionEndpoint: "http://idp/introspect"}, true},
-		{"https introspection ok", AuthMethodConfig{IntrospectionEndpoint: "https://idp/introspect"}, false},
-		{"http external rejected", AuthMethodConfig{Endpoint: "http://validator/check"}, true},
+		{"https jwks ok", AuthMethodConfig{Type: "jwt", JwksURL: "https://idp.example/jwks.json"}, false},
+		{"http jwks rejected", AuthMethodConfig{Type: "jwt", JwksURL: "http://idp.example/jwks.json"}, true},
+		{"loopback http jwks ok", AuthMethodConfig{Type: "jwt", JwksURL: "http://127.0.0.1:8080/jwks.json"}, false},
+		{"localhost http jwks ok", AuthMethodConfig{Type: "jwt", JwksURL: "http://localhost/jwks.json"}, false},
+		{"http introspection rejected", AuthMethodConfig{Type: "introspection", IntrospectionEndpoint: "http://idp/introspect"}, true},
+		{"https introspection ok", AuthMethodConfig{Type: "introspection", IntrospectionEndpoint: "https://idp/introspect"}, false},
+		{"http external rejected", AuthMethodConfig{Type: "external-validator", Endpoint: "http://validator/check"}, true},
 		{"empty ok", AuthMethodConfig{}, false},
-		{"bad scheme rejected", AuthMethodConfig{JwksURL: "ftp://idp/jwks"}, true},
+		{"bad scheme rejected", AuthMethodConfig{Type: "jwt", JwksURL: "ftp://idp/jwks"}, true},
+		{"unused field ignored for type", AuthMethodConfig{Type: "jwt", JwksURL: "https://idp.example/jwks.json", Endpoint: "http://dev-validator"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1149,14 +1149,23 @@ func validateAuthEndpoints(a *AuthConfig) error {
 	}
 	for i := range a.Methods {
 		m := &a.Methods[i]
-		for _, e := range []struct{ field, value string }{
-			{"jwksUrl", m.JwksURL},
-			{"introspectionEndpoint", m.IntrospectionEndpoint},
-			{"endpoint", m.Endpoint},
-		} {
-			if err := requireSecureAuthURL(e.field, e.value); err != nil {
-				return fmt.Errorf("auth.methods[%d]: %w", i, err)
-			}
+		// Validate only the field the method's type actually fetches from —
+		// buildAuthMethod consumes exactly one of these per type, so a
+		// stale/staged http:// value in a field the type ignores must not
+		// fail startup.
+		var field, value string
+		switch m.Type {
+		case "jwt":
+			field, value = "jwksUrl", m.JwksURL
+		case "introspection":
+			field, value = "introspectionEndpoint", m.IntrospectionEndpoint
+		case "external-validator":
+			field, value = "endpoint", m.Endpoint
+		default:
+			continue
+		}
+		if err := requireSecureAuthURL(field, value); err != nil {
+			return fmt.Errorf("auth.methods[%d]: %w", i, err)
 		}
 	}
 	return nil
