@@ -196,3 +196,49 @@ func TestServerReload_EffectiveLimitsNeutral(t *testing.T) {
 		t.Fatal("a real limit change must be detected")
 	}
 }
+
+// TestDetectRemovedConfigKeys_Backend is the codex config.go:769 follow-up:
+// a removed cache.backend must fail loudly.
+func TestDetectRemovedConfigKeys_Backend(t *testing.T) {
+	if err := detectRemovedConfigKeys([]byte("cache:\n  backend: redis\n")); err == nil {
+		t.Fatal("cache.backend must be rejected as a removed key")
+	}
+	if err := detectRemovedConfigKeys([]byte("cache:\n  redis: redis://x\n")); err == nil {
+		t.Fatal("cache.redis must still be rejected")
+	}
+	if err := detectRemovedConfigKeys([]byte("cache:\n  ttl: 5s\n")); err != nil {
+		t.Fatalf("a valid v4 cache block must pass, got %v", err)
+	}
+}
+
+// TestAcceptEncodingKey_WildcardExclusion is the codex http_proxy.go:806
+// follow-up: `*, gzip;q=0` must NOT collide with plain `*`.
+func TestAcceptEncodingKey_WildcardExclusion(t *testing.T) {
+	if acceptEncodingKey("*, gzip;q=0") == acceptEncodingKey("*") {
+		t.Fatal("*, gzip;q=0 must differ from * (it forbids gzip)")
+	}
+	// Without a wildcard, an exclusion is equivalent to omission (better dedup).
+	if acceptEncodingKey("br, gzip;q=0") != acceptEncodingKey("br") {
+		t.Fatal("non-wildcard exclusion should dedup with plain omission")
+	}
+}
+
+// TestLimiterForFailedInit is the codex pipeline_middleware.go:173 follow-up:
+// a fail-closed rule whose limiter can't be built gets a failing sentinel
+// (which denies), a fail-open rule gets nil (runs unlimited).
+func TestLimiterForFailedInit(t *testing.T) {
+	closed := &RateLimitConfig{FailureMode: "fail-closed"}
+	l := limiterForFailedInit(closed, errTest)
+	if l == nil {
+		t.Fatal("fail-closed rule must get a sentinel limiter")
+	}
+	if allowed, _, err := l.Allow(context.Background(), "k"); allowed || err == nil {
+		t.Fatalf("sentinel must deny with an error; allowed=%v err=%v", allowed, err)
+	}
+	open := &RateLimitConfig{} // default fail-open
+	if limiterForFailedInit(open, errTest) != nil {
+		t.Fatal("fail-open rule must get nil (runs unlimited)")
+	}
+}
+
+var errTest = errors.New("boom")

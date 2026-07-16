@@ -392,8 +392,14 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
 		if err != nil {
-			p.log.WithError(err).WithField("rule_priority", r.Priority).
-				Error("rate limiter init failed; rule will run without limit")
+			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-closed rule will DENY")
+				newLimiters[r.Fingerprint] = sentinel
+			} else {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-open rule will run without limit")
+			}
 			continue
 		}
 		newLimiters[r.Fingerprint] = l
@@ -776,8 +782,8 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 // an entry because the upstream may return a coding only one of them accepts.
 // `identity` is always implicitly acceptable unless explicitly excluded.
 func acceptEncodingKey(ae string) string {
-	set := map[string]struct{}{}
-	identityExcluded := false
+	accepted := map[string]struct{}{}
+	excluded := map[string]struct{}{}
 	for _, part := range strings.Split(ae, ",") {
 		token := strings.TrimSpace(part)
 		if token == "" {
@@ -798,22 +804,38 @@ func acceptEncodingKey(ae string) string {
 		}
 		coding = strings.ToLower(coding)
 		if q <= 0 {
-			if coding == "identity" || coding == "*" {
-				identityExcluded = true
-			}
-			continue // coding explicitly not acceptable
+			excluded[coding] = struct{}{}
+		} else {
+			accepted[coding] = struct{}{}
 		}
-		set[coding] = struct{}{}
 	}
-	if !identityExcluded {
-		set["identity"] = struct{}{}
+	// identity is implicitly acceptable unless it — or `*` — is explicitly
+	// excluded (RFC 9110 §12.5.3).
+	_, identityExcluded := excluded["identity"]
+	_, starExcluded := excluded["*"]
+	if !identityExcluded && !starExcluded {
+		accepted["identity"] = struct{}{}
 	}
-	codings := make([]string, 0, len(set))
-	for c := range set {
-		codings = append(codings, c)
+	tokens := make([]string, 0, len(accepted)+len(excluded))
+	for c := range accepted {
+		tokens = append(tokens, c)
 	}
-	sort.Strings(codings)
-	return strings.Join(codings, ",")
+	// When the client accepts a wildcard, an explicit `coding;q=0` exclusion
+	// is meaningful (it carves the coding OUT of "anything") and MUST stay in
+	// the key — otherwise `*, gzip;q=0` would collide with plain `*` and a
+	// gzip response chosen for the wildcard client could later be served to a
+	// client that forbids gzip. Without a wildcard, an excluded coding is
+	// equivalent to simply not listing it, so it's dropped for better dedup.
+	if _, wildcard := accepted["*"]; wildcard {
+		for c := range excluded {
+			if c == "*" {
+				continue
+			}
+			tokens = append(tokens, "!"+c)
+		}
+	}
+	sort.Strings(tokens)
+	return strings.Join(tokens, ",")
 }
 
 // cacheHit serves an already-fetched cached response. The caller does the

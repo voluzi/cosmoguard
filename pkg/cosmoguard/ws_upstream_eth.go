@@ -357,7 +357,12 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 			// the id we just minted so the upstream stops pushing on it.
 			u.subMux.Unlock()
 			u.log.WithField("param", param).Debug("resubmit aborted: param migrated away")
-			_, _ = u.MakeRequest(&JsonRpcMsg{
+			// Send the eth_unsubscribe on the SAME client the subscribe was
+			// created on — subID belongs to `cli`. Using MakeRequest (which
+			// targets curClient()) could hit a different socket after a
+			// concurrent reconnect, leaving the subscription streaming on the
+			// old connection with no mapping.
+			_, _ = u.makeRequestWithIDOnClient(cli, u.IdGen.ID(), &JsonRpcMsg{
 				Version: jsonRpcVersion,
 				Method:  methodUnsubscribeEth,
 				Params:  []string{subID},

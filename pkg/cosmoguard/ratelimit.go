@@ -188,6 +188,29 @@ type RateLimiter interface {
 	Close() error
 }
 
+// failingRateLimiter is stored for a FAIL-CLOSED rule whose real limiter
+// could not be constructed (e.g. an olric error at SetRules time). Its Allow
+// always errors, which drives every enforcement path's fail-closed branch to
+// DENY — otherwise the limiter would be nil and the request would run with no
+// limit at all, silently violating the operator's fail-closed intent.
+type failingRateLimiter struct{ err error }
+
+func (l failingRateLimiter) Allow(context.Context, string) (bool, time.Duration, error) {
+	return false, 0, l.err
+}
+func (failingRateLimiter) Close() error { return nil }
+
+// limiterForFailedInit returns a sentinel failing limiter for a fail-closed
+// rule, or nil for a fail-open rule (which safely runs without a limit when
+// construction fails). Centralises the SetRules error-branch behaviour across
+// the HTTP, JSON-RPC, and gRPC proxies.
+func limiterForFailedInit(cfg *RateLimitConfig, initErr error) RateLimiter {
+	if cfg.FailClosed() {
+		return failingRateLimiter{err: fmt.Errorf("rate limiter init failed: %w", initErr)}
+	}
+	return nil
+}
+
 // NewRateLimiter returns an olric-backed token bucket when an olric
 // client is supplied — pods share one budget per key. Falls back to
 // a per-pod in-process bucket only when olricClient is nil (test

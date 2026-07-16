@@ -1003,12 +1003,28 @@ func (f *CosmoGuard) tryReload() {
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
 	}
-	// The metrics server is constructed once in New(). Now that an explicit
-	// `metrics.enable: false` survives defaulting, a reload that flips
-	// enable or changes the port would be accepted while the old listener
-	// keeps serving (or none exists) — reject it as restart-required.
-	if f.cfg.Metrics.IsEnabled() != newCfg.Metrics.IsEnabled() || f.cfg.Metrics.Port != newCfg.Metrics.Port {
-		err := fmt.Errorf("metrics config change (enable / port) requires a process restart")
+	// The metrics server (and its /admin WebUI routes + auth) is constructed
+	// once in New(). Now that an explicit `metrics.enable: false` survives
+	// defaulting, a reload that flips enable, changes the port, or edits the
+	// WebUI block would be accepted while the old listener keeps serving (or
+	// none exists) — reject it as restart-required.
+	if f.cfg.Metrics.IsEnabled() != newCfg.Metrics.IsEnabled() ||
+		f.cfg.Metrics.Port != newCfg.Metrics.Port ||
+		!reflect.DeepEqual(f.cfg.Metrics.WebUI, newCfg.Metrics.WebUI) {
+		err := fmt.Errorf("metrics config change (enable / port / webUI) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	// The JSON-RPC WebSocket proxy (webSocketEnabled / webSocketConnections,
+	// for both RPC and EVM) is wired once in NewJsonRpcHandler; a reload only
+	// calls SetRules. Now that an explicit `webSocketEnabled: false` survives
+	// defaulting, toggling it (or changing the connection count) on reload
+	// would be accepted but ignored — reject as restart-required.
+	if f.cfg.RPC.WebSocketIsEnabled() != newCfg.RPC.WebSocketIsEnabled() ||
+		f.cfg.RPC.WebSocketConnections != newCfg.RPC.WebSocketConnections ||
+		f.cfg.EVM.WS.WebSocketConnections != newCfg.EVM.WS.WebSocketConnections {
+		err := fmt.Errorf("websocket config change (webSocketEnabled / webSocketConnections) requires a process restart")
 		slog.Warn("config reload rejected", "error", err)
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return

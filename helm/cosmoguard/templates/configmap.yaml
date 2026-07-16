@@ -16,6 +16,10 @@ Render cosmoguard's YAML from .Values.config, with two transforms:
 {{- if eq $bindAddr "" -}}
 {{- $_ := set $cluster "bindAddr" "${POD_IP}" -}}
 {{- end -}}
+{{- $encKey := index $cluster "encryptionKey" | default "" -}}
+{{- if eq $encKey "" -}}
+{{- $_ := set $cluster "encryptionKey" "${CLUSTER_ENCRYPTION_KEY}" -}}
+{{- end -}}
 {{- $disc := index $cluster "discovery" | default (dict) -}}
 {{- $mode := index $disc "mode" | default "" -}}
 {{- if eq $mode "dns" -}}

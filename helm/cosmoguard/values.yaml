@@ -147,6 +147,20 @@ existingSecret: ""
 env: {}
   # JWT_SECRET: "..."   # don't put real secrets here; use existingSecret
 
+# Cluster gossip/data encryption key wiring. Required by cosmoguard in cluster
+# mode (config.cache.cluster.enable: true). By DEFAULT the chart generates a
+# random 32-byte key on first install, stores it in a Secret named
+# "<release>-cosmoguard-cluster", and PRESERVES it across `helm upgrade` (it
+# won't rotate and partition a running cluster). Every replica shares that one
+# Secret. Override only if you manage the key yourself:
+cluster:
+  # Provide the key inline (base64-encoded 16/24/32 bytes). NOT recommended —
+  # this lands in rendered manifests / values. Prefer existingEncryptionKeySecret.
+  encryptionKey: ""
+  # Reference an existing Secret with an `encryptionKey` data field instead of
+  # letting the chart generate one.
+  existingEncryptionKeySecret: ""
+
 serviceAccount:
   create: true
   annotations: {}

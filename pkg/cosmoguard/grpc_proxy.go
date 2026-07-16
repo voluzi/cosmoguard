@@ -272,8 +272,14 @@ func (p *GrpcProxy) SetRules(rules []*GrpcRule, defaultAction RuleAction) {
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
 		if err != nil {
-			p.log.WithError(err).WithField("rule_priority", r.Priority).
-				Error("rate limiter init failed; rule will run without limit")
+			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-closed rule will DENY")
+				newLimiters[r.Fingerprint] = sentinel
+			} else {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-open rule will run without limit")
+			}
 			continue
 		}
 		newLimiters[r.Fingerprint] = l

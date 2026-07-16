@@ -764,6 +764,7 @@ func ReadConfigFromFile(path string) (*Config, error) {
 func detectRemovedConfigKeys(raw []byte) error {
 	var probe struct {
 		Cache struct {
+			Backend       *yaml.Node `yaml:"backend"`
 			Redis         *yaml.Node `yaml:"redis"`
 			RedisSentinel *yaml.Node `yaml:"redis-sentinel"`
 		} `yaml:"cache"`
@@ -771,8 +772,8 @@ func detectRemovedConfigKeys(raw []byte) error {
 	// Ignore unmarshal errors here — the real unmarshal already validated
 	// the document; this probe only inspects specific keys.
 	_ = yaml.Unmarshal(raw, &probe)
-	if probe.Cache.Redis != nil || probe.Cache.RedisSentinel != nil {
-		return fmt.Errorf("cache.redis / cache.redis-sentinel were removed in v4: the distributed cache/rate-limiter now uses the embedded olric cluster — migrate to a cache.cluster block (see CONFIG.md). Remove the redis keys to start")
+	if probe.Cache.Backend != nil || probe.Cache.Redis != nil || probe.Cache.RedisSentinel != nil {
+		return fmt.Errorf("cache.backend / cache.redis / cache.redis-sentinel were removed in v4: the distributed cache/rate-limiter now uses the embedded olric cluster — migrate to a cache.cluster block (see CONFIG.md). Remove those keys to start")
 	}
 	return nil
 }
