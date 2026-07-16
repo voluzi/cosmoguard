@@ -545,6 +545,21 @@ func (p *HttpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				RuleTag:  ruleTag,
 			})
 			p.tooManyRequests(w, r, time.Duration(decision.RetryAfter)*time.Second, start)
+		case http.StatusServiceUnavailable:
+			// Fail-closed auth/rate-limit outage: a genuine denial that must
+			// still land on the dashboard's recent-denials feed, the
+			// live-traffic/request log, and request-duration metrics/tracing
+			// — the plain http.Error default would make it disappear.
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section:  p.section,
+				Reason:   "auth",
+				SourceIP: GetSourceIP(r),
+				Method:   r.Method,
+				Path:     r.URL.Path,
+				RuleTag:  ruleTag,
+			})
+			WriteError(w, http.StatusServiceUnavailable, decision.Reason)
+			p.recordOutcome(r, http.StatusServiceUnavailable, cacheMiss, RuleActionDeny, start, "request denied (auth/limiter unavailable)")
 		default:
 			http.Error(w, decision.Reason, decision.HTTPStatus)
 		}

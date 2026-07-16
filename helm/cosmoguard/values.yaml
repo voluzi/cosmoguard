@@ -26,12 +26,18 @@ fullnameOverride: ""
 #                  the durability mechanism, not disk.
 kind: Deployment
 
-# Three replicas is the textbook olric shape (RF=2, quorum=2 = no
-# split-brain). The chart ships no default affinity so installs on
-# single-node clusters (kind, k3s, minikube) just work — pods stack
-# on the one available node. For production multi-node, add a soft
+# Default 1 because cluster mode is OFF by default (see cache.cluster.enable):
+# with cluster mode off each pod runs an ISOLATED loopback olric daemon, so
+# running multiple replicas would load-balance across independent cache,
+# rate-limit, and JWT-replay stores — replay protection would be bypassable
+# per-pod and rate limits would multiply by the replica count.
+#
+# For HA, enable cluster mode (cache.cluster.enable: true + an encryption key)
+# AND raise replicaCount to 3 — the textbook olric shape (RF=2, quorum=2 = no
+# split-brain). The chart ships no default affinity so single-node clusters
+# (kind, k3s, minikube) just work; for production multi-node add a soft
 # pod-anti-affinity via `affinity:` below or a topologySpreadConstraint.
-replicaCount: 3
+replicaCount: 1
 
 # Cosmoguard config rendered as a ConfigMap and mounted at /etc/cosmoguard.
 # This is the SAME YAML you'd put in cosmoguard.yaml directly — see
