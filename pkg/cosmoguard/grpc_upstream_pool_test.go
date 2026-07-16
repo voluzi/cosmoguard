@@ -54,6 +54,10 @@ func TestGrpcPickerLeastConn(t *testing.T) {
 		if got != b {
 			t.Fatalf("grpc least-conn iter %d: got %s want b", i, got.Name)
 		}
+		// Pick reserves an in-flight lease; a real caller releases it when
+		// the RPC completes. Release here so least-conn keeps seeing b as the
+		// least-loaded across iterations.
+		got.inFlight.Add(-1)
 	}
 }
 

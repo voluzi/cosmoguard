@@ -24,10 +24,19 @@ func TestValidateAuthEndpoints(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateAuthEndpoints(&AuthConfig{Methods: []AuthMethodConfig{tc.method}})
+			err := validateAuthEndpoints(&AuthConfig{Enable: true, Methods: []AuthMethodConfig{tc.method}})
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("validateAuthEndpoints err=%v, wantErr=%v", err, tc.wantErr)
 			}
 		})
 	}
+
+	// Disabled auth: even an http:// non-loopback endpoint is inert and
+	// must not fail startup.
+	t.Run("disabled auth skips validation", func(t *testing.T) {
+		err := validateAuthEndpoints(&AuthConfig{Enable: false, Methods: []AuthMethodConfig{{JwksURL: "http://idp.example/jwks.json"}}})
+		if err != nil {
+			t.Fatalf("disabled auth should skip endpoint validation, got %v", err)
+		}
+	})
 }

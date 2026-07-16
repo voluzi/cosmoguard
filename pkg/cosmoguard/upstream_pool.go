@@ -114,24 +114,40 @@ func (u *HttpUpstream) CircuitOpen() bool {
 	return time.Now().UnixMilli()-openedAt < u.cbConfig.CooldownPeriod.Milliseconds()
 }
 
-// consumeHalfOpenProbe consumes the single half-open probe token when the
-// breaker is open and cooldown has elapsed. Pick calls it only for the
-// upstream it returns, so a consumed token is always paired with a request
-// (and its RecordOutcome). No-op for a closed breaker.
-func (u *HttpUpstream) consumeHalfOpenProbe() {
+// consumeHalfOpenProbe attempts to consume the single half-open probe token,
+// returning true when the caller MAY dispatch to this upstream. See the gRPC
+// GrpcUpstream.consumeHalfOpenProbe for the full state table — closed → true;
+// open+cooldown-elapsed+won-CAS → true; open+probe-in-flight or CAS-lost →
+// false; still-tripped → false. Pick/pickNotTried call it only for the
+// upstream they intend to return and reselect/reject on false, so a consumed
+// token is always paired with exactly one request.
+func (u *HttpUpstream) consumeHalfOpenProbe() bool {
 	if !u.cbOpen.Load() || u.cbConfig == nil {
-		return
+		return true
 	}
 	openedAt := u.cbOpenedAtUnixMs.Load()
 	if openedAt == 0 {
-		return
+		return false
 	}
 	if time.Now().UnixMilli()-openedAt < u.cbConfig.CooldownPeriod.Milliseconds() {
-		return
+		return false
 	}
 	if u.cbOpenedAtUnixMs.CompareAndSwap(openedAt, 0) {
 		u.cbConsecFails.Store(0)
+		return true
 	}
+	return false
+}
+
+// firstClosed returns the first upstream in set (other than skip) whose
+// breaker is fully closed, or nil.
+func (p *HttpUpstreamPool) firstClosed(set []*HttpUpstream, skip *HttpUpstream) *HttpUpstream {
+	for _, u := range set {
+		if u != skip && !u.cbOpen.Load() {
+			return u
+		}
+	}
+	return nil
 }
 
 // RecordOutcome is called after each proxied request completes. ok=true
@@ -670,24 +686,29 @@ func (p *HttpUpstreamPool) Pick() *HttpUpstream {
 	// RemoveUpstream draining the last upstreams between here and there
 	// yielded an empty set and the pickers divided by zero / indexed [0].
 	healthy := p.healthySet(current)
-	var picked *HttpUpstream
-	switch p.strategy {
-	case "round-robin":
-		picked = p.pickRR(healthy)
-	case "least-conn":
-		picked = p.pickLeastConn(healthy)
-	case "primary-failover":
-		picked = p.pickPrimary(healthy)
-	default:
-		picked = p.pickWeightedRR(healthy)
-	}
-	if picked != nil {
-		// Consume the half-open probe token only for the upstream we
-		// return, so the token is paired with a request. See
-		// consumeHalfOpenProbe.
-		picked.consumeHalfOpenProbe()
+	picked := p.pickFromSet(healthy)
+	if picked != nil && !picked.consumeHalfOpenProbe() {
+		// Lost the half-open probe token (concurrent probe) — prefer a
+		// fully-closed upstream so we don't double-probe a recovering node.
+		if alt := p.firstClosed(healthy, picked); alt != nil {
+			return alt
+		}
 	}
 	return picked
+}
+
+// pickFromSet dispatches to the configured strategy picker.
+func (p *HttpUpstreamPool) pickFromSet(set []*HttpUpstream) *HttpUpstream {
+	switch p.strategy {
+	case "round-robin":
+		return p.pickRR(set)
+	case "least-conn":
+		return p.pickLeastConn(set)
+	case "primary-failover":
+		return p.pickPrimary(set)
+	default:
+		return p.pickWeightedRR(set)
+	}
 }
 
 // healthySet returns upstreams currently in the picker (healthy AND
@@ -964,16 +985,19 @@ func (p *HttpUpstreamPool) pickNotTried(tried map[*HttpUpstream]struct{}) *HttpU
 		}
 	}
 	if len(candidates) > 0 {
-		switch p.strategy {
-		case "round-robin":
-			return p.pickRR(candidates)
-		case "least-conn":
-			return p.pickLeastConn(candidates)
-		case "primary-failover":
-			return p.pickPrimary(candidates)
-		default:
-			return p.pickWeightedRR(candidates)
+		picked := p.pickFromSet(candidates)
+		// Retry picks must consume the half-open probe token too, exactly
+		// like Pick — otherwise a retryable request routed here after
+		// cooldown never transitions the breaker to half-open (openedAt
+		// stays non-zero), so RecordOutcome can't resolve it and the
+		// breaker stays open while still serving traffic. On a lost token,
+		// prefer a fully-closed untried candidate.
+		if picked != nil && !picked.consumeHalfOpenProbe() {
+			if alt := p.firstClosed(candidates, picked); alt != nil {
+				return alt
+			}
 		}
+		return picked
 	}
 	// Fall back to any untried upstream — health bit may be stale.
 	for _, u := range current {

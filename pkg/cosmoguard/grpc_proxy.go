@@ -329,23 +329,28 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		var err error
 		id, err = p.auth.Resolve(synthReq)
 		if err != nil {
-			if errors.Is(err, ErrReplay) || errors.Is(err, ErrInvalidCredential) {
+			// Replay / invalid credential / fail-closed-backend-down all
+			// DENY (mirroring the HTTP MWIdentityResolve path). In
+			// particular ErrAuthUnavailable (a fail-closed method whose
+			// backend is unreachable) must NOT fall through to the
+			// anonymous path below — that would admit the request on any
+			// public / auth.require:false rule, defeating fail-closed.
+			if errors.Is(err, ErrReplay) || errors.Is(err, ErrInvalidCredential) || errors.Is(err, ErrAuthUnavailable) {
 				p.cgDashboard.RecordDeny(DenyRecord{
 					Section: p.section, Reason: "auth",
 					SourceIP: source, Method: method,
 				})
 				markErrSpan("auth: " + err.Error())
-				return ctx, status.Error(codes.Unauthenticated, err.Error())
+				code := codes.Unauthenticated
+				if errors.Is(err, ErrAuthUnavailable) {
+					code = codes.Unavailable
+				}
+				return ctx, status.Error(code, err.Error())
 			}
-			// Other resolve errors (transient auth-backend failures, JWKS
-			// fetch hiccups): treat as anonymous (fail-open) so the SAME
-			// underlying error yields the SAME allow/deny across HTTP and
-			// gRPC — the HTTP MWIdentityResolve path does exactly this. The
-			// per-rule auth gate below still denies if the rule requires an
-			// identity, and a fail-closed auth method surfaces its decision
-			// as ErrInvalidCredential (handled above), not as a transient
-			// error. Previously gRPC hard-denied here while HTTP admitted
-			// anonymously — a transient blip took gRPC down but not HTTP.
+			// Other resolve errors (transient failures from a fail-OPEN
+			// method): treat as anonymous so the SAME underlying error
+			// yields the SAME allow/deny across HTTP and gRPC. The per-rule
+			// auth gate below still denies if the rule requires an identity.
 			p.log.WithError(err).Warn("grpc auth resolve error; treating request as anonymous")
 			id = nil
 		}

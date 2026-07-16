@@ -163,7 +163,7 @@ cache:
         refreshInterval: 10s
 ```
 
-**`encryptionKey` is required in cluster mode.** It enables memberlist gossip encryption + peer authentication (AES-128/192/256-GCM). Without it the gossip and RESP data ports carry no encryption and no authentication, so any host that can reach them can join the cluster and read/write the shared DMaps (rate-limit buckets, cache, JWT replay set). Generate one with `head -c32 /dev/urandom | base64` and give **every pod the same value** (from a Kubernetes Secret). Still restrict the peer ports at the network layer (NetworkPolicy) — the key is defence-in-depth, not a substitute.
+**`encryptionKey` is required in cluster mode.** It enables memberlist gossip encryption + peer authentication (AES-128/192/256-GCM) AND password authentication on olric's RESP data port, so both the gossip plane and the data plane require the shared secret. Without it, any host that can reach the peer ports could join the cluster and read/write the shared DMaps (rate-limit buckets, cache, JWT replay set). Generate one with `head -c32 /dev/urandom | base64` and give **every pod the same value** (from a Kubernetes Secret). Still restrict the peer ports at the network layer (NetworkPolicy) — the key is defence-in-depth, not a substitute.
 
 #### Discovery modes
 

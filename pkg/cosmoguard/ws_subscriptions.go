@@ -74,8 +74,9 @@ func (s *SubscriptionManager) RemoveSubscription(id string) {
 }
 
 // CanonicalID maps a current upstream subscription id to its stable
-// canonical id. Returns (upstreamID, true) unchanged when there is no
-// translation entry, so callers can use the result directly.
+// canonical id. When there is no translation entry it returns
+// (upstreamID, false) — the id unchanged so callers can use it directly, and
+// false signalling that no translation was found (not a migrated id).
 func (s *SubscriptionManager) CanonicalID(upstreamID string) (string, bool) {
 	s.subscriptionMux.RLock()
 	defer s.subscriptionMux.RUnlock()

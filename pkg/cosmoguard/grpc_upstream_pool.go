@@ -14,11 +14,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// removeUpstreamCloseGrace is the delay before a removed upstream's
-// ClientConn drain check begins — long enough to cover the Pick→dispatch
-// gap so an RPC the picker already routed to this upstream isn't cut off.
-const removeUpstreamCloseGrace = 500 * time.Millisecond
-
 // GrpcUpstream is a single upstream gRPC node — name, dial target, weight,
 // the dialled ClientConn, and per-upstream load / circuit-breaker state.
 //
@@ -113,27 +108,39 @@ func (u *GrpcUpstream) CircuitOpen() bool {
 	return time.Now().UnixMilli()-openedAt < u.cbConfig.CooldownPeriod.Milliseconds()
 }
 
-// consumeHalfOpenProbe consumes the single half-open probe token when this
-// upstream's breaker is open and its cooldown has elapsed. Pick calls it
-// ONLY for the upstream it actually returns, so a consumed token is always
-// paired with an RPC and its RecordOutcome — never leaving the upstream
-// wedged. No-op for a closed breaker (the common case).
-func (u *GrpcUpstream) consumeHalfOpenProbe() {
+// consumeHalfOpenProbe attempts to consume the single half-open probe token.
+// It returns true when the caller MAY dispatch to this upstream:
+//   - closed breaker → true (the common case, no token involved);
+//   - open + cooldown elapsed + this caller won the CAS → true (it is THE
+//     probe, so its RPC + RecordOutcome resolves the breaker);
+//   - open + cooldown elapsed + this caller LOST the CAS to a concurrent
+//     probe → false (another probe is already in flight; dispatching here
+//     would send a second, defeating the single-probe guarantee);
+//   - open + cooldown not elapsed → false (still tripped).
+//
+// Pick/pickNotTried call this only for the upstream they intend to return and
+// reselect/reject on false, so a consumed token is always paired with exactly
+// one RPC and the upstream can never be wedged.
+func (u *GrpcUpstream) consumeHalfOpenProbe() bool {
 	if !u.cbOpen.Load() || u.cbConfig == nil {
-		return
+		return true
 	}
 	openedAt := u.cbOpenedAtUnixMs.Load()
 	if openedAt == 0 {
-		return
+		// A probe is already in flight — reject.
+		return false
 	}
 	if time.Now().UnixMilli()-openedAt < u.cbConfig.CooldownPeriod.Milliseconds() {
-		return
+		return false
 	}
-	// Reset consecFails so a single failure on the probe re-trips the
-	// breaker rather than needing ConsecutiveFailures probe-only failures.
+	// Cooldown elapsed: exactly one caller wins the CAS and becomes the
+	// probe; losers must NOT dispatch. Reset consecFails so a single failure
+	// on the probe re-trips the breaker.
 	if u.cbOpenedAtUnixMs.CompareAndSwap(openedAt, 0) {
 		u.cbConsecFails.Store(0)
+		return true
 	}
+	return false
 }
 
 // grpcClientCaused reports whether a gRPC error reflects a client-side or
@@ -520,14 +527,13 @@ func (p *GrpcUpstreamPool) RemoveUpstream(name string) {
 	// repeated pod churn doesn't pile up zombie connections.
 	if removed.conn != nil {
 		go func(u *GrpcUpstream) {
-			// Grace before the drain check: Pick() returns an upstream and
-			// the caller increments inFlight a few calls later (director →
-			// NewClientStream). During that sub-millisecond gap inFlight is
-			// still 0, so without the grace a Close() here could fire
-			// between Pick and the RPC and fail it with Unavailable even
-			// though healthy upstreams existed. The grace lets the RPC
-			// register its inFlight before we start checking.
-			time.Sleep(removeUpstreamCloseGrace)
+			// Pick() now reserves the in-flight lease atomically with
+			// selection (Pick returns an upstream only after Add(1)), so
+			// there is no Pick→dispatch window where inFlight is 0 while an
+			// RPC is inbound. The snapshot swap above stops NEW picks, and
+			// this drain waits out the leases already handed out — no grace
+			// heuristic needed. The 5s deadline bounds a stuck stream so
+			// repeated pod churn can't pile up zombie connections.
 			deadline := time.Now().Add(5 * time.Second)
 			for u.inFlight.Load() > 0 && time.Now().Before(deadline) {
 				time.Sleep(25 * time.Millisecond)
@@ -790,24 +796,53 @@ func (p *GrpcUpstreamPool) Pick() *GrpcUpstream {
 	// the previous short-circuit had — without skipping the breaker
 	// check on a sole upstream whose breaker is open.
 	healthy := p.healthySet(current)
-	var picked *GrpcUpstream
-	switch p.strategy {
-	case "round-robin":
-		picked = p.pickRR(healthy)
-	case "least-conn":
-		picked = p.pickLeastConn(healthy)
-	case "primary-failover":
-		picked = p.pickPrimary(healthy)
-	default:
-		picked = p.pickWeightedRR(healthy)
+	picked := p.pickFromSet(healthy)
+	if picked != nil && !picked.consumeHalfOpenProbe() {
+		// We selected a half-open-eligible upstream but lost the probe
+		// token to a concurrent caller (or its cooldown wasn't actually
+		// elapsed). Dispatching anyway would send a second probe, defeating
+		// the single-probe guarantee — instead prefer a fully-closed
+		// upstream. Keep `picked` only if none exists (better to
+		// double-probe a recovering node than fail the request outright).
+		if alt := p.firstClosed(healthy, picked); alt != nil {
+			picked = alt
+		}
 	}
 	if picked != nil {
-		// Consume the half-open probe token for the upstream we actually
-		// return (no-op unless its breaker is open + cooldown elapsed), so
-		// the token is always paired with an RPC. See consumeHalfOpenProbe.
-		picked.consumeHalfOpenProbe()
+		// Reserve an in-flight LEASE atomically with selection. The caller
+		// MUST release it with inFlight.Add(-1) exactly once. This closes
+		// the RemoveUpstream close-race: there is no longer a gap between
+		// Pick returning an upstream and its in-flight count rising, so a
+		// concurrent RemoveUpstream's drain-wait always observes the lease
+		// and won't Close() the conn out from under the RPC.
+		picked.inFlight.Add(1)
 	}
 	return picked
+}
+
+// pickFromSet dispatches to the configured strategy picker.
+func (p *GrpcUpstreamPool) pickFromSet(set []*GrpcUpstream) *GrpcUpstream {
+	switch p.strategy {
+	case "round-robin":
+		return p.pickRR(set)
+	case "least-conn":
+		return p.pickLeastConn(set)
+	case "primary-failover":
+		return p.pickPrimary(set)
+	default:
+		return p.pickWeightedRR(set)
+	}
+}
+
+// firstClosed returns the first upstream in set (other than skip) whose
+// breaker is fully closed (not open at all), or nil.
+func (p *GrpcUpstreamPool) firstClosed(set []*GrpcUpstream, skip *GrpcUpstream) *GrpcUpstream {
+	for _, u := range set {
+		if u != skip && !u.cbOpen.Load() {
+			return u
+		}
+	}
+	return nil
 }
 
 func (p *GrpcUpstreamPool) healthySet(current []*GrpcUpstream) []*GrpcUpstream {

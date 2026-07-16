@@ -53,23 +53,25 @@ var hopByHopHeaders = []string{
 // on anything else — or on "*" — cannot be safely reused across clients and
 // must not be cached. Absent/empty Vary is cacheable.
 func cacheableByVary(upstream http.Header) bool {
-	vary := upstream.Get("Vary")
-	if vary == "" {
-		return true
-	}
-	for _, field := range strings.Split(vary, ",") {
-		f := strings.ToLower(strings.TrimSpace(field))
-		if f == "" {
-			continue
-		}
-		// "*" means the response varies on unspecified request
-		// characteristics — never cacheable (RFC 7234 §4.1).
-		if f == "*" {
-			return false
-		}
-		// Accept-Encoding is folded into the cache key, so it's safe.
-		if f != "accept-encoding" {
-			return false
+	// An upstream can legally send Vary across MULTIPLE header lines; Get
+	// returns only the first, so a response with `Vary: Accept-Encoding`
+	// followed by `Vary: Authorization` would otherwise slip through. Walk
+	// every value.
+	for _, vary := range upstream.Values("Vary") {
+		for _, field := range strings.Split(vary, ",") {
+			f := strings.ToLower(strings.TrimSpace(field))
+			if f == "" {
+				continue
+			}
+			// "*" means the response varies on unspecified request
+			// characteristics — never cacheable (RFC 7234 §4.1).
+			if f == "*" {
+				return false
+			}
+			// Accept-Encoding is folded into the cache key, so it's safe.
+			if f != "accept-encoding" {
+				return false
+			}
 		}
 	}
 	return true

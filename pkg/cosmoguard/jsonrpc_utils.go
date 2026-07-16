@@ -249,9 +249,19 @@ func UnauthorizedResponse(req *JsonRpcMsg) *JsonRpcMsg {
 	}
 }
 
-// ParseErrorResponse builds a JSON-RPC 2.0 parse error (-32700) with a
-// null id. Used when an inbound frame can't be decoded, so there is no
-// request id to echo (JSON-RPC 2.0 §5.1: id MUST be null on parse errors).
+// explicitNullID is an ID sentinel that marshals to the literal JSON `null`.
+// The JsonRpcMsg.ID field carries `omitempty`, so a bare `nil` id is dropped
+// from the wire entirely — but JSON-RPC 2.0 §5.1 requires `"id":null` (not
+// absent) on parse / invalid-request errors where no request id is known.
+// A non-nil interface holding this value defeats omitempty and emits `null`.
+type explicitNullIDType struct{}
+
+func (explicitNullIDType) MarshalJSON() ([]byte, error) { return []byte("null"), nil }
+
+var explicitNullID interface{} = explicitNullIDType{}
+
+// ParseErrorResponse builds a JSON-RPC 2.0 parse error (-32700) with an
+// explicit `"id":null` (§5.1) — used when an inbound frame isn't valid JSON.
 func ParseErrorResponse() *JsonRpcMsg {
 	return &JsonRpcMsg{
 		Version: "2.0",
@@ -259,7 +269,22 @@ func ParseErrorResponse() *JsonRpcMsg {
 			Code:    -32700,
 			Message: "parse error",
 		},
-		ID: nil,
+		ID: explicitNullID,
+	}
+}
+
+// InvalidRequestResponse builds a JSON-RPC 2.0 invalid-request error
+// (-32600) with an explicit `"id":null`. Used when a frame is valid JSON but
+// not a supported single request (e.g. a batch array, which cosmoguard's WS
+// path does not support).
+func InvalidRequestResponse() *JsonRpcMsg {
+	return &JsonRpcMsg{
+		Version: "2.0",
+		Error: &JsonRpcError{
+			Code:    -32600,
+			Message: "invalid request",
+		},
+		ID: explicitNullID,
 	}
 }
 

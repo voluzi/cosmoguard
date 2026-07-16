@@ -251,8 +251,8 @@ func safetyBaseConfig(maxBody int64) *cosmoguard.Config {
 			ReadTimeout:       5 * time.Second,
 			WriteTimeout:      5 * time.Second,
 			IdleTimeout:       5 * time.Second,
-			MaxRequestBody:    maxBody,
-			WSReadLimit:       65536,
+			MaxRequestBody:    &maxBody,
+			WSReadLimit:       int64Ptr(65536),
 		},
 		LCD: cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{

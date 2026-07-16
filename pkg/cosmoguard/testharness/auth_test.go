@@ -11,8 +11,6 @@ import (
 	"github.com/voluzi/cosmoguard/pkg/cosmoguard/testharness"
 )
 
-func ptrBool(b bool) *bool { return &b }
-
 // TestI_AuthRequiredNoCredential — a rule with auth.require:true returns
 // 401 when the client presents no credential, and the upstream is never
 // hit.
@@ -24,7 +22,7 @@ func TestI_AuthRequiredNoCredential(t *testing.T) {
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
 		Auth: &cosmoguard.RuleAuthConfig{
-			Require: ptrBool(true),
+			Require: boolPtr(true),
 		},
 	}}
 
@@ -49,7 +47,7 @@ func TestI_AuthRequiredValidKey(t *testing.T) {
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
 		Auth: &cosmoguard.RuleAuthConfig{
-			Require: ptrBool(true),
+			Require: boolPtr(true),
 		},
 	}}
 
@@ -76,7 +74,7 @@ func TestI_AuthStripsCredentialHeader(t *testing.T) {
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
 		Auth: &cosmoguard.RuleAuthConfig{
-			Require: ptrBool(true),
+			Require: boolPtr(true),
 		},
 	}}
 
@@ -111,7 +109,7 @@ func TestI_AuthScopeEnforcement(t *testing.T) {
 		Paths:    []string{"/sensitive"},
 		Methods:  []string{http.MethodPost},
 		Auth: &cosmoguard.RuleAuthConfig{
-			Require: ptrBool(true),
+			Require: boolPtr(true),
 			Scopes:  []string{"write"},
 		},
 	}}

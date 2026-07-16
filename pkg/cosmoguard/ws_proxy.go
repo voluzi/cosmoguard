@@ -100,15 +100,13 @@ func NewJsonRpcWebSocketProxy(name string, backends []string, path string, conne
 	}
 	var allowed []string
 	if serverCfg != nil {
-		// Honor the configured limit verbatim, INCLUDING 0 — per the
-		// wsReadLimit field doc, 0 means "no explicit limit". The config
-		// layer supplies a bounded positive default (ServerConfig.WSReadLimit
-		// default tag) so a normal deployment is protected; an operator who
-		// explicitly sets 0 has opted out. The previous `<= 0 → 64 KiB`
-		// override silently clamped an explicit 0 AND contradicted the doc,
-		// closing connections that sent legitimately large frames (e.g. a
-		// big eth_sendRawTransaction).
-		proxy.wsReadLimit = serverCfg.WSReadLimit
+		// EffectiveWSReadLimit honors an explicit 0 as "no limit" (per the
+		// field doc) while defaulting nil to a bounded 1 MiB — a `*int64`
+		// so an explicit 0 survives defaults.Set. The previous `<= 0 →
+		// 64 KiB` override silently clamped an explicit 0 AND contradicted
+		// the doc, closing connections that sent legitimately large frames
+		// (e.g. a big eth_sendRawTransaction).
+		proxy.wsReadLimit = serverCfg.EffectiveWSReadLimit()
 		allowed = serverCfg.WSAllowedOrigins
 	} else {
 		// No ServerConfig threaded through (programmatic embedders, tests):
@@ -264,14 +262,20 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 	for {
 		req, err := client.ReceiveMsg()
 		if err != nil {
-			// A malformed frame (bad JSON, empty frame) on an otherwise
-			// healthy connection must NOT tear down the client and drop
-			// all its subscriptions. Reply with a JSON-RPC parse error
-			// (id: null) and keep reading. If that write fails the socket
-			// really is dead, so fall through to close.
-			if errors.Is(err, ErrBadMessage) {
+			// A malformed / unsupported frame on an otherwise healthy
+			// connection must NOT tear down the client and drop all its
+			// subscriptions. Reply with the appropriate JSON-RPC error
+			// (id: null) and keep reading — invalid JSON → -32700 Parse
+			// Error, valid-JSON-but-not-a-single-request (e.g. a batch) →
+			// -32600 Invalid Request. If the write fails the socket really
+			// is dead, so fall through to close.
+			if errors.Is(err, ErrBadMessage) || errors.Is(err, ErrInvalidRequest) {
 				p.log.Warnf("bad message from client: %v", err)
-				if sendErr := client.SendMsg(ParseErrorResponse()); sendErr == nil {
+				resp := ParseErrorResponse()
+				if errors.Is(err, ErrInvalidRequest) {
+					resp = InvalidRequestResponse()
+				}
+				if sendErr := client.SendMsg(resp); sendErr == nil {
 					continue
 				}
 				client.Close()

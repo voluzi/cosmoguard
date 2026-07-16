@@ -178,7 +178,7 @@ func cachingStreamHandler(
 		if upstream == nil {
 			return status.Error(codes.Unavailable, "no upstream available")
 		}
-		upstream.inFlight.Add(1)
+		// Pick already reserved the in-flight lease; release it after Invoke.
 		invokeErr := upstream.conn.Invoke(
 			outCtx, method, &req, &resp,
 			grpc.ForceCodec(rawCodec{}),
@@ -277,7 +277,12 @@ func grpcCacheKeyMetaPart(ctx context.Context, keys []string) string {
 		vals := md.Get(strings.ToLower(k))
 		b.WriteString(strings.ToLower(k))
 		b.WriteByte('=')
-		b.WriteString(strings.Join(vals, ","))
+		// Quote each value so value boundaries are unambiguous: a single
+		// value containing a separator (e.g. ["a,b"]) must NOT serialize
+		// identically to two values (["a","b"]) — otherwise two requests
+		// with different forwarded metadata could share a cache entry.
+		// %q escapes embedded quotes, so the encoding is injective.
+		fmt.Fprintf(&b, "%q", vals)
 		b.WriteByte(';')
 	}
 	return b.String()
@@ -326,7 +331,8 @@ func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 		// previously only the cache-miss Invoke path did. nil-safe when
 		// no upstream was stashed (e.g. a non-GrpcProxy director in tests).
 		if up := upstreamFromCtx(outCtx); up != nil {
-			up.inFlight.Add(1)
+			// Pick (in the director) already reserved the in-flight lease;
+			// release it when the stream finishes.
 			defer func() {
 				up.inFlight.Add(-1)
 				// Classify by status code: a client cancel/deadline or an

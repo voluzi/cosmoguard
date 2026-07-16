@@ -58,7 +58,7 @@ func TestI_Introspection_Active(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,
@@ -106,7 +106,7 @@ func TestI_Introspection_Inactive(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t, testharness.WithConfig(cfg))

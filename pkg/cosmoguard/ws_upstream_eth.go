@@ -29,7 +29,11 @@ type UpstreamConnManagerEth struct {
 	onSubscriptionMessage func(msg *JsonRpcMsg)
 	subByID               map[string]string
 	subByParam            map[string]string
-	subMux                sync.Mutex
+	// migratedAway tombstones params LocalUnsubscribe removed due to a pool
+	// migration, so a concurrent reconnect-resubmit can't resurrect them —
+	// see the Cosmos impl for the full race. Guarded by subMux.
+	migratedAway map[string]struct{}
+	subMux       sync.Mutex
 
 	// failedReconnects — consecutive dial failures; see Cosmos impl.
 	failedReconnects atomic.Int32
@@ -65,6 +69,7 @@ func EthUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMes
 		IdGen:                 idGen,
 		subByParam:            make(map[string]string),
 		subByID:               make(map[string]string),
+		migratedAway:          make(map[string]struct{}),
 		respMap:               make(map[string]chan *JsonRpcMsg),
 		onSubscriptionMessage: onSubscriptionMessage,
 	}
@@ -312,13 +317,15 @@ func (u *UpstreamConnManagerEth) Subscribe(query string) (string, error) {
 }
 
 func (u *UpstreamConnManagerEth) subscribeWithID(id string, param string) (string, error) {
-	return u.subscribeWithIDOnClient(u.curClient(), id, param)
+	return u.subscribeWithIDOnClient(u.curClient(), id, param, false)
 }
 
 // subscribeWithIDOnClient binds the subscribe round-trip to an explicit
 // client so the resubmit-after-reconnect path can't get redirected to a
-// new connection mid-flight.
-func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string) (string, error) {
+// new connection mid-flight. When resubmit is true and the param was
+// migrated away mid-flight, the commit is aborted and the freshly-created
+// upstream subscription is torn down — see migratedAway.
+func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) (string, error) {
 	defer u.IdGen.Release(id)
 
 	// Send subscribe request
@@ -343,10 +350,24 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 	}
 
 	u.subMux.Lock()
-	defer u.subMux.Unlock()
-
+	if resubmit {
+		if _, migrated := u.migratedAway[param]; migrated {
+			// Migrated onto another conn while we re-subscribed. Don't
+			// re-track it (would be a duplicate); best-effort eth_unsubscribe
+			// the id we just minted so the upstream stops pushing on it.
+			u.subMux.Unlock()
+			u.log.WithField("param", param).Debug("resubmit aborted: param migrated away")
+			_, _ = u.MakeRequest(&JsonRpcMsg{
+				Version: jsonRpcVersion,
+				Method:  methodUnsubscribeEth,
+				Params:  []string{subID},
+			})
+			return subID, nil
+		}
+	}
 	u.subByParam[param] = subID
 	u.subByID[subID] = param
+	u.subMux.Unlock()
 
 	u.log.WithFields(map[string]interface{}{
 		"ID":    subID,
@@ -394,6 +415,8 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) {
 	u.subMux.Lock()
 	defer u.subMux.Unlock()
+	// Tombstone so a concurrent resubmit can't re-add the migrated param.
+	u.migratedAway[param] = struct{}{}
 	id, ok := u.subByParam[param]
 	if !ok {
 		return
@@ -432,6 +455,8 @@ func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsCli
 	for param := range u.subByParam {
 		pending = append(pending, param)
 	}
+	// Fresh migration-tombstone epoch for this resubmit (see migratedAway).
+	u.migratedAway = make(map[string]struct{})
 	u.subMux.Unlock()
 
 	if len(pending) == 0 {
@@ -443,7 +468,7 @@ func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsCli
 			"param": param,
 		}).Debug("re-submitting subscription")
 		id := u.IdGen.ID()
-		if _, err := u.subscribeWithIDOnClient(cli, id, param); err != nil {
+		if _, err := u.subscribeWithIDOnClient(cli, id, param, true); err != nil {
 			return err
 		}
 	}

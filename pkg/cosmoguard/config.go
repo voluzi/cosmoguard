@@ -70,16 +70,19 @@ type ServerConfig struct {
 	// server closes it.
 	IdleTimeout time.Duration `yaml:"idleTimeout,omitempty" default:"60s"`
 	// MaxRequestBody bounds the request body cosmoguard will read into memory.
-	// Requests exceeding this return 413 Request Entity Too Large. The
-	// default (5 MiB) accommodates large Cosmos payloads such as a wasm
-	// MsgStoreCode broadcast while still preventing unbounded memory use;
-	// the v4.0.0-rc.1 default of 1 MiB rejected those. 0 means no limit.
-	MaxRequestBody int64 `yaml:"maxRequestBody,omitempty" default:"5242880"`
+	// Requests exceeding this return 413 Request Entity Too Large. Read via
+	// EffectiveMaxRequestBody(): nil (unset) → 5 MiB default (accommodates a
+	// wasm MsgStoreCode broadcast; the rc.1 default of 1 MiB rejected those),
+	// explicit 0 → no limit. It is a *int64 (not a plain int64 with a default
+	// tag) so an explicit `maxRequestBody: 0` survives defaults.Set instead of
+	// being silently reset to the default.
+	MaxRequestBody *int64 `yaml:"maxRequestBody,omitempty"`
 	// WSReadLimit bounds individual WebSocket frames cosmoguard will read.
-	// Default 1 MiB is generous for any legitimate Cosmos/EVM frame
-	// (including a large eth_sendRawTransaction) — the rc.1 default of 64 KiB
-	// closed connections that sent bigger frames. 0 means no explicit limit.
-	WSReadLimit int64 `yaml:"wsReadLimit,omitempty" default:"1048576"`
+	// Read via EffectiveWSReadLimit(): nil (unset) → 1 MiB default (generous
+	// for any legitimate Cosmos/EVM frame incl. a large eth_sendRawTransaction;
+	// the rc.1 default of 64 KiB closed bigger frames), explicit 0 → no limit.
+	// *int64 for the same explicit-zero-survives-defaults reason as above.
+	WSReadLimit *int64 `yaml:"wsReadLimit,omitempty"`
 	// WSAllowedOrigins is the allowlist applied to the Origin header on
 	// incoming WebSocket upgrade requests. Same-origin requests (Origin host
 	// matches Host header) are always permitted. Requests with no Origin
@@ -107,6 +110,29 @@ type ServerConfig struct {
 	// X-Forwarded-For are honored ONLY when the immediate connection
 	// peer matches one of the allowed CIDRs.
 	TrustedProxies []string `yaml:"trustedProxies,omitempty"`
+}
+
+const (
+	defaultMaxRequestBody int64 = 5 << 20 // 5 MiB
+	defaultServerWSRead   int64 = 1 << 20 // 1 MiB
+)
+
+// EffectiveMaxRequestBody resolves the request-body cap: nil → the 5 MiB
+// default, explicit value (including 0 = no limit) → that value.
+func (s *ServerConfig) EffectiveMaxRequestBody() int64 {
+	if s.MaxRequestBody == nil {
+		return defaultMaxRequestBody
+	}
+	return *s.MaxRequestBody
+}
+
+// EffectiveWSReadLimit resolves the WS frame cap: nil → the 1 MiB default,
+// explicit value (including 0 = no limit) → that value.
+func (s *ServerConfig) EffectiveWSReadLimit() int64 {
+	if s.WSReadLimit == nil {
+		return defaultServerWSRead
+	}
+	return *s.WSReadLimit
 }
 
 type NodeConfig struct {
@@ -1096,7 +1122,10 @@ func validateUpstreamStrategy(s string) error {
 // separately (validateNodeURLs); auth endpoints previously had no scheme
 // check at all.
 func validateAuthEndpoints(a *AuthConfig) error {
-	if a == nil {
+	// When auth is disabled, NewAuthenticator builds no methods and never
+	// fetches any endpoint, so a staged/dev http:// JWKS or validator URL in
+	// a disabled block is inert — don't fail startup on it.
+	if a == nil || !a.Enable {
 		return nil
 	}
 	for i := range a.Methods {

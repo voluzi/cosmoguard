@@ -176,7 +176,12 @@ func (m *externalValidatorMethod) Resolve(r *http.Request) (*Identity, error) {
 			// retries the validator.
 			return degradedIdentity("external-validator"), nil
 		}
-		return nil, err
+		// Fail-closed: the validator is unreachable and the operator chose
+		// strict verification. Surface ErrAuthUnavailable (not a generic
+		// error) so BOTH the HTTP and gRPC paths deny — a generic error is
+		// treated as anonymous (fail-open) upstream, which would admit the
+		// request on a public / auth.require:false rule.
+		return nil, fmt.Errorf("%w: %v", ErrAuthUnavailable, err)
 	}
 
 	// Cache positive results for the configured TTL. Negative results

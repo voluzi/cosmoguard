@@ -969,8 +969,11 @@ func (f *CosmoGuard) tryReload() {
 	// construction; a reload only calls SetRules, which never touches it. So
 	// accepting a cors: edit would report success while the proxies kept
 	// enforcing the OLD policy. Reject as restart-required rather than
-	// silently ignoring it.
-	if !reflect.DeepEqual(f.cfg.CORS, newCfg.CORS) {
+	// silently ignoring it. Compare only the DECLARATIVE fields — CORSConfig
+	// also carries a compiled `originCheck` closure that reflect.DeepEqual
+	// treats as never-equal, so a whole-struct compare would reject EVERY
+	// reload (even a rules-only edit) whenever CORS is enabled.
+	if corsDeclChanged(&f.cfg.CORS, &newCfg.CORS) {
 		err := fmt.Errorf("cors config change requires a process restart")
 		slog.Warn("config reload rejected", "error", err)
 		f.dashboard.RecordReload(false, err.Error(), nil)
@@ -1026,9 +1029,40 @@ func serverRuntimeImmutableChanged(old, new *ServerConfig) bool {
 		old.ReadTimeout != new.ReadTimeout ||
 		old.WriteTimeout != new.WriteTimeout ||
 		old.IdleTimeout != new.IdleTimeout ||
-		old.MaxRequestBody != new.MaxRequestBody ||
-		old.WSReadLimit != new.WSReadLimit ||
-		!reflect.DeepEqual(old.WSAllowedOrigins, new.WSAllowedOrigins)
+		!equalInt64Ptr(old.MaxRequestBody, new.MaxRequestBody) ||
+		!equalInt64Ptr(old.WSReadLimit, new.WSReadLimit) ||
+		!equalStringSet(old.WSAllowedOrigins, new.WSAllowedOrigins)
+}
+
+// equalStringSet compares two string slices treating nil and empty as
+// equal, so a behaviour-neutral edit (e.g. spelling the default WS-origin
+// policy as `wsAllowedOrigins: []` instead of omitting it) isn't rejected.
+func equalStringSet(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// equalInt64Ptr compares two *int64 by value (nil == nil).
+func equalInt64Ptr(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// corsDeclChanged reports whether the operator-facing (declarative) CORS
+// fields differ, ignoring the compiled closure/string state so an unchanged
+// cors: block never blocks a rules-only reload.
+func corsDeclChanged(old, new *CORSConfig) bool {
+	return old.Enable != new.Enable ||
+		old.Credentials != new.Credentials ||
+		old.MaxAge != new.MaxAge ||
+		!equalStringSet(old.AllowedOrigins, new.AllowedOrigins) ||
+		!equalStringSet(old.AllowedMethods, new.AllowedMethods) ||
+		!equalStringSet(old.AllowedHeaders, new.AllowedHeaders) ||
+		!equalStringSet(old.ExposeHeaders, new.ExposeHeaders)
 }
 
 // dashboardRuntimeImmutableChanged reports whether a DashboardConfig field

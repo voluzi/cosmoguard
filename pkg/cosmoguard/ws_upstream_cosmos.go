@@ -32,7 +32,17 @@ type UpstreamConnManagerCosmos struct {
 	onSubscriptionMessage func(msg *JsonRpcMsg)
 	subByID               map[string]string
 	subByParam            map[string]string
-	subMux                sync.Mutex
+	// migratedAway tombstones params that LocalUnsubscribe removed because
+	// the pool migrated them onto a healthy conn. It exists to close a
+	// reconnect↔migration race: reSubmitSubscriptionsOnClient snapshots
+	// subByParam and does network subscribes outside subMux, so a
+	// LocalUnsubscribe landing in that window would otherwise be undone when
+	// the resubmit re-adds the param — recreating a duplicate upstream
+	// subscription nobody is mapped to. The resubmit commit consults this
+	// set and drops (best-effort unsubscribes) any param migrated away
+	// mid-flight. Cleared at the start of each resubmit. Guarded by subMux.
+	migratedAway map[string]struct{}
+	subMux       sync.Mutex
 
 	// failedReconnects counts consecutive Dial failures. Reset to 0 on
 	// any successful connect. Read by IsHealthy so the pool's
@@ -81,6 +91,7 @@ func CosmosUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscription
 		IdGen:                 idGen,
 		subByParam:            make(map[string]string),
 		subByID:               make(map[string]string),
+		migratedAway:          make(map[string]struct{}),
 		respMap:               make(map[string]chan *JsonRpcMsg),
 		onSubscriptionMessage: onSubscriptionMessage,
 	}
@@ -338,13 +349,15 @@ func (u *UpstreamConnManagerCosmos) Subscribe(param string) (string, error) {
 }
 
 func (u *UpstreamConnManagerCosmos) subscribeWithID(id string, param string) error {
-	return u.subscribeWithIDOnClient(u.curClient(), id, param)
+	return u.subscribeWithIDOnClient(u.curClient(), id, param, false)
 }
 
 // subscribeWithIDOnClient binds the subscribe round-trip to an explicit
 // client so the resubmit-after-reconnect path can't get redirected to a
-// new connection mid-flight.
-func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string) error {
+// new connection mid-flight. When resubmit is true, the commit is aborted
+// (and the just-created upstream subscription torn down) if the param was
+// migrated away while the network subscribe was in flight — see migratedAway.
+func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) error {
 	msg := &JsonRpcMsg{
 		Version: jsonRpcVersion,
 		ID:      id,
@@ -359,10 +372,26 @@ func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient
 	}
 
 	u.subMux.Lock()
-	defer u.subMux.Unlock()
-
+	if resubmit {
+		if _, migrated := u.migratedAway[param]; migrated {
+			// The pool migrated this param onto another conn while we were
+			// re-subscribing. Don't re-track it here (that would be a
+			// duplicate upstream subscription mapped to nobody); tear the
+			// upstream subscription back down best-effort and release the id.
+			u.subMux.Unlock()
+			u.IdGen.Release(id)
+			u.log.WithField("param", param).Debug("resubmit aborted: param migrated away")
+			_, _ = u.makeRequestWithIDOnClient(cli, u.IdGen.ID(), &JsonRpcMsg{
+				Version: jsonRpcVersion,
+				Method:  methodUnsubscribeCosmos,
+				Params:  []interface{}{param},
+			})
+			return nil
+		}
+	}
 	u.subByParam[param] = id
 	u.subByID[id] = param
+	u.subMux.Unlock()
 
 	u.log.WithFields(map[string]interface{}{
 		"ID":    id,
@@ -410,13 +439,21 @@ func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
 func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) {
 	u.subMux.Lock()
 	defer u.subMux.Unlock()
+	// Tombstone the param so a concurrent resubmit can't re-add it.
+	u.migratedAway[param] = struct{}{}
 	id, ok := u.subByParam[param]
 	if !ok {
 		return
 	}
 	delete(u.subByParam, param)
 	delete(u.subByID, id)
-	u.IdGen.Release(id)
+	// Deliberately DO NOT Release(id) here. This id is the subscription's
+	// canonical (client-facing) id, which the broker's SubscriptionManager
+	// still references after the migration. Releasing it back to the shared
+	// IdGen would let a LATER subscription draw the same id and overwrite the
+	// migrated subscription's SM maps (wrong routing / unsubscribe). The id
+	// stays reserved for the process lifetime — a negligible cost (one entry
+	// per migrated subscription) versus the correctness hazard.
 }
 
 // Stop signals the Run loop to exit and closes the live WS client.
@@ -445,6 +482,9 @@ func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWs
 	for param, id := range u.subByParam {
 		pending[param] = id
 	}
+	// Start a fresh migration-tombstone epoch: any LocalUnsubscribe from
+	// HERE on (i.e. during this resubmit) is what the commit must honour.
+	u.migratedAway = make(map[string]struct{})
 	u.subMux.Unlock()
 
 	if len(pending) == 0 {
@@ -456,7 +496,7 @@ func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWs
 			"ID":    id,
 			"param": param,
 		}).Debug("re-submitting subscription")
-		if err := u.subscribeWithIDOnClient(cli, id, param); err != nil {
+		if err := u.subscribeWithIDOnClient(cli, id, param, true); err != nil {
 			return err
 		}
 	}

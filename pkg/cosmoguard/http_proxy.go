@@ -167,7 +167,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		cors:             cfg.CORSConfig,
 	}
 	if cfg.ServerConfig != nil {
-		proxy.maxRequestBody = cfg.ServerConfig.MaxRequestBody
+		proxy.maxRequestBody = cfg.ServerConfig.EffectiveMaxRequestBody()
 	}
 
 	// Per-request request rewrite: stripped credential headers, anything
@@ -768,13 +768,45 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 
 // normalizeAcceptEncoding collapses an Accept-Encoding header to the coarse
 // bucket that actually changes the cached bytes: "gzip", "br", or "identity".
-// gzip wins when both are offered (the common upstream choice).
+// It parses the codings and their `q` values (RFC 9110 §12.5.3) rather than
+// substring-matching, so `gzip;q=0` (gzip explicitly forbidden) does NOT map
+// to the gzip bucket — otherwise a later q=0 client could be served a cached
+// gzip body it can't accept. gzip wins over br when both are acceptable.
 func normalizeAcceptEncoding(ae string) string {
-	ae = strings.ToLower(ae)
-	if strings.Contains(ae, "gzip") {
+	gzipOK, brOK := false, false
+	for _, part := range strings.Split(ae, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		coding := token
+		q := 1.0
+		if semi := strings.IndexByte(token, ';'); semi >= 0 {
+			coding = strings.TrimSpace(token[:semi])
+			// Parse a q= parameter if present; anything unparseable leaves q=1.
+			for _, param := range strings.Split(token[semi+1:], ";") {
+				param = strings.TrimSpace(param)
+				if v, ok := strings.CutPrefix(strings.ToLower(param), "q="); ok {
+					if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+						q = f
+					}
+				}
+			}
+		}
+		if q <= 0 {
+			continue // coding explicitly not acceptable
+		}
+		switch strings.ToLower(coding) {
+		case "gzip":
+			gzipOK = true
+		case "br":
+			brOK = true
+		}
+	}
+	if gzipOK {
 		return "gzip"
 	}
-	if strings.Contains(ae, "br") {
+	if brOK {
 		return "br"
 	}
 	return "identity"
