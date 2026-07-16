@@ -188,7 +188,7 @@ podIdentityEnv emits the env entries injected on every workload pod:
   valueFrom:
     fieldRef:
       fieldPath: metadata.name
-{{- if not (dig "cache" "cluster" "encryptionKey" "" .Values.config) }}
+{{- if not (include "cosmoguard.clusterInlineKey" .) }}
 - name: CLUSTER_ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
@@ -196,6 +196,19 @@ podIdentityEnv emits the env entries injected on every workload pod:
       key: encryptionKey
 {{- end }}
 {{- end }}
+{{- end -}}
+
+{{/*
+clusterInlineKey — the encryption key the operator supplied INLINE, from
+either config.cache.cluster.encryptionKey or the top-level cluster.encryptionKey.
+Empty when neither is set (chart generates a Secret / uses an existing one).
+When non-empty the key is rendered directly into the config and NO env
+reference / generated Secret is used.
+*/}}
+{{- define "cosmoguard.clusterInlineKey" -}}
+{{- $fromConfig := dig "cache" "cluster" "encryptionKey" "" .Values.config -}}
+{{- $fromTop := (.Values.cluster | default dict).encryptionKey | default "" -}}
+{{- $fromConfig | default $fromTop -}}
 {{- end -}}
 
 {{/*

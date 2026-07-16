@@ -147,8 +147,8 @@ func TestAcceptEncodingKey_QValues(t *testing.T) {
 	if got := acceptEncodingKey("gzip;q=0, br"); strings.Contains(got, "gzip") {
 		t.Fatalf("gzip;q=0 must be excluded, got %q", got)
 	}
-	if got := acceptEncodingKey("gzip;q=0"); got != "identity" {
-		t.Fatalf("gzip;q=0 with nothing else acceptable must be identity, got %q", got)
+	if got := acceptEncodingKey("gzip;q=0"); got != "identity;q=1" {
+		t.Fatalf("gzip;q=0 with nothing else acceptable must be identity;q=1, got %q", got)
 	}
 	if got := acceptEncodingKey("gzip;q=0.5, br;q=1"); !strings.Contains(got, "gzip") || !strings.Contains(got, "br") {
 		t.Fatalf("gzip and br (q>0) should both be present, got %q", got)
@@ -156,6 +156,11 @@ func TestAcceptEncodingKey_QValues(t *testing.T) {
 	// identity;q=0 excludes the implicit identity coding.
 	if got := acceptEncodingKey("gzip, identity;q=0"); strings.Contains(got, "identity") {
 		t.Fatalf("identity;q=0 must exclude identity, got %q", got)
+	}
+	// Opposite rankings of the same coding set must produce different keys
+	// (a q-honouring upstream could pick different encodings).
+	if acceptEncodingKey("gzip;q=1, br;q=0.5") == acceptEncodingKey("gzip;q=0.5, br;q=1") {
+		t.Fatal("opposite gzip/br rankings must produce different keys")
 	}
 }
 

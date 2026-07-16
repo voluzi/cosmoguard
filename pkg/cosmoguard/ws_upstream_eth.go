@@ -369,6 +369,10 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 			})
 			return subID, nil
 		}
+	} else {
+		// A genuine (non-resubmit) subscription clears any stale migration
+		// tombstone for this param — it's legitimately live on this conn now.
+		delete(u.migratedAway, param)
 	}
 	u.subByParam[param] = subID
 	u.subByID[subID] = param
@@ -419,15 +423,27 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 // reconnect won't re-issue this (migrated-away) subscription.
 func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) {
 	u.subMux.Lock()
-	defer u.subMux.Unlock()
 	// Tombstone so a concurrent resubmit can't re-add the migrated param.
+	// Persists until a genuine new subscription clears it (not reset per
+	// resubmit epoch — see the Cosmos impl for the ordering rationale).
 	u.migratedAway[param] = struct{}{}
 	id, ok := u.subByParam[param]
-	if !ok {
-		return
+	if ok {
+		delete(u.subByParam, param)
+		delete(u.subByID, id)
 	}
-	delete(u.subByParam, param)
-	delete(u.subByID, id)
+	u.subMux.Unlock()
+	if ok {
+		// Best-effort eth_unsubscribe: a racing reconnect-resubmit may have
+		// re-created this subscription on the reconnected socket between the
+		// migration commit and this call; tear it down so it doesn't stream
+		// with no manager mapping. Harmless when the conn is dead.
+		_, _ = u.MakeRequest(&JsonRpcMsg{
+			Version: jsonRpcVersion,
+			Method:  methodUnsubscribeEth,
+			Params:  []string{id},
+		})
+	}
 }
 
 // resetConnectionState clears the per-connection in-flight response map
@@ -460,8 +476,6 @@ func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsCli
 	for param := range u.subByParam {
 		pending = append(pending, param)
 	}
-	// Fresh migration-tombstone epoch for this resubmit (see migratedAway).
-	u.migratedAway = make(map[string]struct{})
 	u.subMux.Unlock()
 
 	if len(pending) == 0 {

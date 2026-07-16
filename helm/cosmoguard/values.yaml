@@ -73,9 +73,16 @@ config:
   server:
     readHeaderTimeout: 10s
     readTimeout: 30s
-    writeTimeout: 30s
+    # writeTimeout defaults to 0 (no limit) so large/slow streamed responses
+    # (/block_results, /genesis, big eth_getLogs) aren't truncated mid-body.
+    # Set an explicit ceiling if exposing cosmoguard to untrusted clients.
+    writeTimeout: 0
     idleTimeout: 60s
-    maxRequestBody: 1048576
+    # 5 MiB accommodates large payloads (e.g. a wasm MsgStoreCode broadcast).
+    # 0 means no limit.
+    maxRequestBody: 5242880
+    # wsReadLimit defaults to 1 MiB (0 = no limit).
+    wsReadLimit: 1048576
   # Replace with your real Cosmos node(s). Multi-node + healthcheck
   # support enables horizontal HA at the cosmoguard layer.
   nodes:

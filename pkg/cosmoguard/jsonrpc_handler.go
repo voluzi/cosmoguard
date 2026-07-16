@@ -319,9 +319,14 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 		if r.RateLimit == nil {
 			continue
 		}
+		// Reuse the previous limiter unless it's a failed-init sentinel,
+		// which must be rebuilt so a fail-closed rule recovers once the
+		// backend is healthy again.
 		if l, ok := existing[r.Fingerprint]; ok {
-			newLimiters[r.Fingerprint] = l
-			continue
+			if _, failed := l.(failingRateLimiter); !failed {
+				newLimiters[r.Fingerprint] = l
+				continue
+			}
 		}
 		keyspace := h.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := NewRateLimiter(*r.RateLimit, h.olricClient, keyspace)

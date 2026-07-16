@@ -37,8 +37,8 @@ func TestCacheableByVary(t *testing.T) {
 // TestAcceptEncodingKey: clients with different acceptable-coding sets must
 // get different keys; identical sets (any order) share.
 func TestAcceptEncodingKey(t *testing.T) {
-	if acceptEncodingKey("") != "identity" {
-		t.Fatalf("empty Accept-Encoding should be identity, got %q", acceptEncodingKey(""))
+	if acceptEncodingKey("") != "identity;q=1" {
+		t.Fatalf("empty Accept-Encoding should be identity;q=1, got %q", acceptEncodingKey(""))
 	}
 	// Order-independent.
 	if acceptEncodingKey("gzip, br") != acceptEncodingKey("br, gzip") {

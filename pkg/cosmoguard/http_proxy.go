@@ -382,10 +382,15 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		if r.RateLimit == nil {
 			continue
 		}
-		// Reuse the previous limiter if the rule fingerprint didn't change.
+		// Reuse the previous limiter if the rule fingerprint didn't change —
+		// UNLESS it's a failed-init sentinel, which must be rebuilt so a
+		// fail-closed rule recovers once the backend is healthy again
+		// (otherwise a transient olric error would deny that rule forever).
 		if l, ok := existing[r.Fingerprint]; ok {
-			newLimiters[r.Fingerprint] = l
-			continue
+			if _, failed := l.(failingRateLimiter); !failed {
+				newLimiters[r.Fingerprint] = l
+				continue
+			}
 		}
 		// Each rule's bucket pool gets its own keyspace under the proxy
 		// name so multiple proxies (lcd, rpc, etc.) don't share buckets.
@@ -766,10 +771,13 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 	// with a gzip-only client — the upstream might return zstd, which the
 	// gzip-only client couldn't accept. Responses that Vary on anything
 	// besides Accept-Encoding are refused caching (see cacheableByVary).
+	// Join ALL Accept-Encoding header lines — a client may legally send more
+	// than one, and the reverse proxy forwards them all upstream; Header.Get
+	// would see only the first and could mis-key.
 	return util.XXHash64Hex(
 		strconv.FormatUint(ruleFingerprint, 16) + "\x00" +
 			req.Method + "\x00" + canonical + "\x00" +
-			acceptEncodingKey(req.Header.Get("Accept-Encoding")) + "\x00" +
+			acceptEncodingKey(strings.Join(req.Header.Values("Accept-Encoding"), ",")) + "\x00" +
 			string(b),
 	), nil
 }
@@ -782,7 +790,8 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 // an entry because the upstream may return a coding only one of them accepts.
 // `identity` is always implicitly acceptable unless explicitly excluded.
 func acceptEncodingKey(ae string) string {
-	accepted := map[string]struct{}{}
+	// accepted maps coding → normalized q (>0); excluded is the set with q=0.
+	accepted := map[string]float64{}
 	excluded := map[string]struct{}{}
 	for _, part := range strings.Split(ae, ",") {
 		token := strings.TrimSpace(part)
@@ -805,27 +814,33 @@ func acceptEncodingKey(ae string) string {
 		coding = strings.ToLower(coding)
 		if q <= 0 {
 			excluded[coding] = struct{}{}
-		} else {
-			accepted[coding] = struct{}{}
+			delete(accepted, coding)
+		} else if _, ex := excluded[coding]; !ex {
+			accepted[coding] = q
 		}
 	}
-	// identity is implicitly acceptable unless it — or `*` — is explicitly
-	// excluded (RFC 9110 §12.5.3).
+	// identity is implicitly acceptable (q=1) unless it — or `*` — is
+	// explicitly excluded (RFC 9110 §12.5.3).
 	_, identityExcluded := excluded["identity"]
 	_, starExcluded := excluded["*"]
 	if !identityExcluded && !starExcluded {
-		accepted["identity"] = struct{}{}
+		if _, ok := accepted["identity"]; !ok {
+			accepted["identity"] = 1.0
+		}
 	}
+	// Each token carries its NORMALIZED q value, so two clients that accept
+	// the same coding set but RANK them differently (e.g. gzip>br vs br>gzip)
+	// get different keys — a q-honouring upstream could pick different
+	// encodings for them, and they must not share a cached variant.
 	tokens := make([]string, 0, len(accepted)+len(excluded))
-	for c := range accepted {
-		tokens = append(tokens, c)
+	for c, q := range accepted {
+		tokens = append(tokens, c+";q="+strconv.FormatFloat(q, 'g', -1, 64))
 	}
 	// When the client accepts a wildcard, an explicit `coding;q=0` exclusion
-	// is meaningful (it carves the coding OUT of "anything") and MUST stay in
-	// the key — otherwise `*, gzip;q=0` would collide with plain `*` and a
-	// gzip response chosen for the wildcard client could later be served to a
-	// client that forbids gzip. Without a wildcard, an excluded coding is
-	// equivalent to simply not listing it, so it's dropped for better dedup.
+	// carves the coding OUT of "anything" and MUST stay in the key —
+	// otherwise `*, gzip;q=0` would collide with plain `*`. Without a
+	// wildcard an excluded coding is equivalent to omission (dropped for
+	// better dedup).
 	if _, wildcard := accepted["*"]; wildcard {
 		for c := range excluded {
 			if c == "*" {
