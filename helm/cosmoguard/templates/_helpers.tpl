@@ -145,7 +145,10 @@ mismatch, peerService disabled without cluster.enable=false).
 {{- fail "cosmoguard: config.cache.cluster.enable=true requires config.cache.cluster.discovery.mode (use \"dns\" with the chart's headless peer service in Kubernetes)" -}}
 {{- end -}}
 {{- $cluster := .Values.cluster | default (dict) -}}
-{{- if and (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) -}}
+{{/* Skip the key check when the config is an externally-managed ConfigMap —
+     the chart doesn't render cosmoguard.yaml then, so it can't see the key
+     (the operator supplies it in their own ConfigMap/Secret wiring). */}}
+{{- if and (not .Values.existingConfigMap) (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) -}}
 {{- fail "cosmoguard: cluster mode requires an encryption key — set cluster.existingEncryptionKeySecret (recommended: a pre-created Secret with an `encryptionKey` field) or cluster.encryptionKey. The chart does NOT auto-generate one, because a generated key is non-deterministic under client-side / GitOps rendering and would silently partition the cluster across syncs. Generate one with: kubectl create secret generic cosmoguard-cluster --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)" -}}
 {{- end -}}
 {{- if eq $mode "static" -}}
