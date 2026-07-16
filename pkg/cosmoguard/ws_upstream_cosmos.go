@@ -377,13 +377,17 @@ func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient
 			// The pool migrated this param onto another conn while we were
 			// re-subscribing. Don't re-track it here (that would be a
 			// duplicate upstream subscription mapped to nobody); tear the
-			// upstream subscription back down best-effort and release the id.
+			// upstream subscription back down best-effort.
 			u.subMux.Unlock()
-			u.IdGen.Release(id)
+			// Do NOT Release(id): for Cosmos this `id` IS the subscription's
+			// canonical (client-facing) id, which SubscriptionManager.Migrate
+			// keeps referencing for the live subscription on the alternate
+			// upstream. Releasing it would let IdGen hand the same id to a
+			// later subscription and overwrite/misroute the migrated one —
+			// same rationale as LocalUnsubscribe. It stays reserved.
 			u.log.WithField("param", param).Debug("resubmit aborted: param migrated away")
-			// Use a temporary id and RELEASE it after the round-trip —
-			// otherwise repeated migration/reconnect races steadily exhaust
-			// the reusable-id space in UniqueID.generated.
+			// The unsubscribe uses a SEPARATE temporary id, released after
+			// the round-trip so repeated races don't exhaust the id space.
 			cleanupID := u.IdGen.ID()
 			_, _ = u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
 				Version: jsonRpcVersion,
