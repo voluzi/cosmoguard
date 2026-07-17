@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,7 +60,13 @@ func grpcRateLimitKey(scope RateLimitScope, fingerprint uint64, source, identity
 // request carries only the headers — no body, no path — because the
 // configured AuthMethods only inspect headers.
 func synthRequestFromGrpcMD(md metadata.MD) *http.Request {
-	r := &http.Request{Header: make(http.Header, len(md))}
+	// URL must be non-nil: an api-key AuthMethod configured in queryParam
+	// mode falls back to r.URL.Query() when the header form is absent
+	// (always the case over gRPC, where credentials only arrive as
+	// metadata). A nil URL there panics the handler goroutine on every
+	// keyless RPC. An empty URL yields an empty query, so the method simply
+	// resolves no credential.
+	r := &http.Request{URL: &url.URL{}, Header: make(http.Header, len(md))}
 	for k, vs := range md {
 		for _, v := range vs {
 			r.Header.Add(k, v)
@@ -258,15 +265,26 @@ func (p *GrpcProxy) SetRules(rules []*GrpcRule, defaultAction RuleAction) {
 		if r.RateLimit == nil {
 			continue
 		}
+		// Reuse the previous limiter unless it's a failed-init sentinel,
+		// which must be rebuilt so a fail-closed rule recovers once the
+		// backend is healthy again.
 		if l, ok := existing[r.Fingerprint]; ok {
-			newLimiters[r.Fingerprint] = l
-			continue
+			if _, failed := l.(failingRateLimiter); !failed {
+				newLimiters[r.Fingerprint] = l
+				continue
+			}
 		}
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
 		if err != nil {
-			p.log.WithError(err).WithField("rule_priority", r.Priority).
-				Error("rate limiter init failed; rule will run without limit")
+			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-closed rule will DENY")
+				newLimiters[r.Fingerprint] = sentinel
+			} else {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-open rule will run without limit")
+			}
 			continue
 		}
 		newLimiters[r.Fingerprint] = l
@@ -322,16 +340,30 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		var err error
 		id, err = p.auth.Resolve(synthReq)
 		if err != nil {
-			if errors.Is(err, ErrReplay) || errors.Is(err, ErrInvalidCredential) {
+			// Replay / invalid credential / fail-closed-backend-down all
+			// DENY (mirroring the HTTP MWIdentityResolve path). In
+			// particular ErrAuthUnavailable (a fail-closed method whose
+			// backend is unreachable) must NOT fall through to the
+			// anonymous path below — that would admit the request on any
+			// public / auth.require:false rule, defeating fail-closed.
+			if errors.Is(err, ErrReplay) || errors.Is(err, ErrInvalidCredential) || errors.Is(err, ErrAuthUnavailable) {
 				p.cgDashboard.RecordDeny(DenyRecord{
 					Section: p.section, Reason: "auth",
 					SourceIP: source, Method: method,
 				})
 				markErrSpan("auth: " + err.Error())
-				return ctx, status.Error(codes.Unauthenticated, err.Error())
+				code := codes.Unauthenticated
+				if errors.Is(err, ErrAuthUnavailable) {
+					code = codes.Unavailable
+				}
+				return ctx, status.Error(code, err.Error())
 			}
-			markErrSpan("auth error")
-			return ctx, status.Error(codes.Unauthenticated, "authentication failed")
+			// Other resolve errors (transient failures from a fail-OPEN
+			// method): treat as anonymous so the SAME underlying error
+			// yields the SAME allow/deny across HTTP and gRPC. The per-rule
+			// auth gate below still denies if the rule requires an identity.
+			p.log.WithError(err).Warn("grpc auth resolve error; treating request as anonymous")
+			id = nil
 		}
 		// Strip the configured credential metadata (gRPC keys are
 		// lower-cased) so it is never forwarded upstream.
@@ -376,7 +408,17 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 			key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
 			allowed, retryAfter, rlErr := l.Allow(ctx, key)
 			if rlErr != nil {
-				// Fail-open on limiter transport error so an olric
+				if rule.RateLimit.FailClosed() {
+					p.log.WithError(rlErr).Warn("grpc rate limiter error; failing closed (denying)")
+					p.cgDashboard.RecordDeny(DenyRecord{
+						Section: p.section, Reason: "rate_limit",
+						SourceIP: source, Method: method,
+						RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+					})
+					markErrSpan("rate limiter unavailable")
+					return ctx, status.Error(codes.ResourceExhausted, "rate limiter unavailable")
+				}
+				// Fail-open (default) on limiter transport error so an olric
 				// blip doesn't take down traffic.
 				p.log.WithError(rlErr).Warn("grpc rate limiter error; allowing")
 			} else if !allowed {

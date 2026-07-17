@@ -162,28 +162,6 @@ func (j *JsonRpcMsg) CloneWithID(id interface{}) *JsonRpcMsg {
 	}
 }
 
-// Hash produces the cache-key digest for a JSON-RPC message.
-// Method and Params are joined with a NUL separator so a request
-// ("abc", {"x":1}) doesn't collide with ("a", "bc{\"x\":1}") — the
-// previous shape was `append(Method, Params...)` which conflated
-// method-name boundaries into the params bytes. NUL is fine as a
-// separator because JSON-RPC method names can't legally contain
-// embedded NULs (they're identifiers).
-//
-// Does NOT mix in any rule-level identity — callers that need a
-// per-rule cache namespace must use HashWithRule below.
-func (j *JsonRpcMsg) Hash() uint64 {
-	b, err := json.Marshal(j.Params)
-	if err != nil {
-		return 0
-	}
-	buf := make([]byte, 0, len(j.Method)+1+len(b))
-	buf = append(buf, j.Method...)
-	buf = append(buf, 0)
-	buf = append(buf, b...)
-	return fnv1a.HashBytes64(buf)
-}
-
 // HashWithRule mixes a rule fingerprint into the cache key so two
 // cacheable rules matching the same JSON-RPC method don't share the
 // same cache namespace. Without this, a request matched by rule A
@@ -217,16 +195,6 @@ func (j *JsonRpcMsg) Marshal() ([]byte, error) {
 		b = append(b, j.WireSuffix...)
 	}
 	return b, nil
-}
-
-func (j *JsonRpcMsg) MaybeGetPath() string {
-	path := ""
-	if m, ok := j.Params.(map[string]interface{}); ok {
-		if v, ok := m["path"]; ok {
-			path, _ = v.(string)
-		}
-	}
-	return path
 }
 
 type JsonRpcMsgs []*JsonRpcMsg
@@ -278,6 +246,45 @@ func UnauthorizedResponse(req *JsonRpcMsg) *JsonRpcMsg {
 			Message: "unauthorized access",
 		},
 		ID: req.ID,
+	}
+}
+
+// explicitNullID is an ID sentinel that marshals to the literal JSON `null`.
+// The JsonRpcMsg.ID field carries `omitempty`, so a bare `nil` id is dropped
+// from the wire entirely — but JSON-RPC 2.0 §5.1 requires `"id":null` (not
+// absent) on parse / invalid-request errors where no request id is known.
+// A non-nil interface holding this value defeats omitempty and emits `null`.
+type explicitNullIDType struct{}
+
+func (explicitNullIDType) MarshalJSON() ([]byte, error) { return []byte("null"), nil }
+
+var explicitNullID interface{} = explicitNullIDType{}
+
+// ParseErrorResponse builds a JSON-RPC 2.0 parse error (-32700) with an
+// explicit `"id":null` (§5.1) — used when an inbound frame isn't valid JSON.
+func ParseErrorResponse() *JsonRpcMsg {
+	return &JsonRpcMsg{
+		Version: "2.0",
+		Error: &JsonRpcError{
+			Code:    -32700,
+			Message: "Parse error",
+		},
+		ID: explicitNullID,
+	}
+}
+
+// InvalidRequestResponse builds a JSON-RPC 2.0 invalid-request error
+// (-32600) with an explicit `"id":null`. Used when a frame is valid JSON but
+// not a supported single request (e.g. a batch array, which cosmoguard's WS
+// path does not support).
+func InvalidRequestResponse() *JsonRpcMsg {
+	return &JsonRpcMsg{
+		Version: "2.0",
+		Error: &JsonRpcError{
+			Code:    -32600,
+			Message: "Invalid Request",
+		},
+		ID: explicitNullID,
 	}
 }
 

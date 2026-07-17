@@ -19,7 +19,7 @@ import (
 func TestJ_HealthzReady(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: true},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(true)},
 		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{
 			Default: cosmoguard.RuleActionAllow,
@@ -87,7 +87,7 @@ func contains(s, sub string) bool {
 func TestJ_InfoUpstreamCountTracksPool(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: true},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(true)},
 		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{
 			Default: cosmoguard.RuleActionAllow,

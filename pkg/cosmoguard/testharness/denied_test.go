@@ -20,7 +20,7 @@ import (
 func TestDashboard_Denied(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionDeny},
 		RPC: cosmoguard.RpcConfig{
 			Default: cosmoguard.RuleActionAllow,
@@ -68,7 +68,7 @@ func TestDashboard_Denied(t *testing.T) {
 func TestDashboard_DeniedRingBuffer(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionDeny},
 		RPC: cosmoguard.RpcConfig{
 			Default: cosmoguard.RuleActionAllow,

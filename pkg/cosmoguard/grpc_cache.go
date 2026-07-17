@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -12,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -159,7 +162,8 @@ func cachingStreamHandler(
 			return err
 		}
 
-		key := grpcCacheKey(rule.Fingerprint, method, req.Payload, rule.Cache.KeyMode, p.canonical)
+		metaPart := grpcCacheKeyMetaPart(stream.Context(), rule.Cache.EffectiveKeyMetadata())
+		key := grpcCacheKey(rule.Fingerprint, method, req.Payload, rule.Cache.KeyMode, p.canonical, metaPart)
 
 		if cached, err := p.grpcCache.Get(stream.Context(), key); err == nil {
 			return stream.SendMsg(&rawFrame{Payload: cached})
@@ -174,13 +178,16 @@ func cachingStreamHandler(
 		if upstream == nil {
 			return status.Error(codes.Unavailable, "no upstream available")
 		}
-		upstream.inFlight.Add(1)
+		// Pick already reserved the in-flight lease; release it after Invoke.
 		invokeErr := upstream.conn.Invoke(
 			outCtx, method, &req, &resp,
 			grpc.ForceCodec(rawCodec{}),
 		)
 		upstream.inFlight.Add(-1)
-		upstream.RecordOutcome(invokeErr == nil)
+		// Classify by status code so client-caused / application-level
+		// errors (Canceled, DeadlineExceeded, InvalidArgument, NotFound…)
+		// don't trip the breaker on a healthy upstream.
+		upstream.RecordOutcomeErr(invokeErr)
 		if invokeErr != nil {
 			return invokeErr
 		}
@@ -231,18 +238,54 @@ func (p *GrpcProxy) findMatchingAllowRule(method string) *GrpcRule {
 //     before hashing. Cache hits across clients that emit the same
 //     logical message regardless of byte-level differences.
 //     Methods missing from the registry silently degrade to "raw".
-func grpcCacheKey(fingerprint uint64, method string, payload []byte, keyMode string, canonical *CanonicalRegistry) string {
+//
+// metaPart carries the response-affecting request metadata (e.g. block
+// height) so requests differing only by that metadata don't collide. It is
+// folded into EVERY mode — including method-only, where the payload is
+// ignored but the height still selects a different response.
+func grpcCacheKey(fingerprint uint64, method string, payload []byte, keyMode string, canonical *CanonicalRegistry, metaPart string) string {
 	switch keyMode {
 	case "method-only":
 		return util.XXHash64Hex(
-			fmt.Sprintf("%x\x00%s", fingerprint, method),
+			fmt.Sprintf("%x\x00%s\x00%s", fingerprint, method, metaPart),
 		)
 	case "canonical":
 		payload = canonical.Canonicalize(method, payload)
 	}
 	return util.XXHash64Hex(
-		fmt.Sprintf("%x\x00%s\x00", fingerprint, method) + string(payload),
+		fmt.Sprintf("%x\x00%s\x00", fingerprint, method) + string(payload) + "\x00" + metaPart,
 	)
+}
+
+// grpcCacheKeyMetaPart builds the deterministic metadata contribution to a
+// gRPC cache key from the inbound context. keys are the rule's effective
+// KeyMetadata allowlist; they are sorted so ordering can't change the key,
+// and multi-valued metadata is joined so all values participate.
+func grpcCacheKeyMetaPart(ctx context.Context, keys []string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+	var b strings.Builder
+	for _, k := range sorted {
+		// gRPC canonicalizes metadata keys to lowercase.
+		vals := md.Get(strings.ToLower(k))
+		b.WriteString(strings.ToLower(k))
+		b.WriteByte('=')
+		// Quote each value so value boundaries are unambiguous: a single
+		// value containing a separator (e.g. ["a,b"]) must NOT serialize
+		// identically to two values (["a","b"]) — otherwise two requests
+		// with different forwarded metadata could share a cache entry.
+		// %q escapes embedded quotes, so the encoding is injective.
+		fmt.Fprintf(&b, "%q", vals)
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // Compile-time interface check.
@@ -288,10 +331,14 @@ func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 		// previously only the cache-miss Invoke path did. nil-safe when
 		// no upstream was stashed (e.g. a non-GrpcProxy director in tests).
 		if up := upstreamFromCtx(outCtx); up != nil {
-			up.inFlight.Add(1)
+			// Pick (in the director) already reserved the in-flight lease;
+			// release it when the stream finishes.
 			defer func() {
 				up.inFlight.Add(-1)
-				up.RecordOutcome(retErr == nil)
+				// Classify by status code: a client cancel/deadline or an
+				// app-level status the node returns (InvalidArgument,
+				// NotFound…) must not open the breaker on a healthy upstream.
+				up.RecordOutcomeErr(retErr)
 			}()
 		}
 

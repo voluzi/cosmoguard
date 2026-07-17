@@ -176,7 +176,12 @@ func (m *externalValidatorMethod) Resolve(r *http.Request) (*Identity, error) {
 			// retries the validator.
 			return degradedIdentity("external-validator"), nil
 		}
-		return nil, err
+		// Fail-closed: the validator is unreachable and the operator chose
+		// strict verification. Surface ErrAuthUnavailable (not a generic
+		// error) so BOTH the HTTP and gRPC paths deny — a generic error is
+		// treated as anonymous (fail-open) upstream, which would admit the
+		// request on a public / auth.require:false rule.
+		return nil, fmt.Errorf("%w: %v", ErrAuthUnavailable, err)
 	}
 
 	// Cache positive results for the configured TTL. Negative results
@@ -287,9 +292,13 @@ func lookupPath(doc map[string]any, path []string) any {
 	return cur
 }
 
-// isTruthy interprets a JSON-derived value as the operator likely
-// intended: explicit booleans pass through; non-empty strings/arrays/
-// objects are true; zero numbers and nil are false.
+// isTruthy interprets a JSON-derived value as the operator likely intended.
+// This gates an auth ACCEPT decision (external-validator responseValid /
+// introspection `active`), so for STRING values it uses an explicit truthy
+// allowlist rather than a blocklist: the previous form only rejected "",
+// "false", and "0", so a stringly-typed backend returning "False", "no",
+// "off", or "inactive" for an invalid credential was accepted. Booleans pass
+// through; non-zero numbers are true; empty containers/nil are false.
 func isTruthy(v any) bool {
 	switch x := v.(type) {
 	case nil:
@@ -297,7 +306,12 @@ func isTruthy(v any) bool {
 	case bool:
 		return x
 	case string:
-		return x != "" && x != "false" && x != "0"
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "true", "1", "yes", "y", "on", "active", "valid":
+			return true
+		default:
+			return false
+		}
 	case float64:
 		return x != 0
 	case []any:

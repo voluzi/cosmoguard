@@ -339,7 +339,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		cosmoGuard.cfg.GRPC.Protosets,
 		WithCacheConfig[GrpcProxyOptions](&cosmoGuard.cfg.Cache),
 		WithOlricClient[GrpcProxyOptions](cosmoGuard.cluster.Client()),
-		WithMetricsEnabled[GrpcProxyOptions](cosmoGuard.cfg.Metrics.Enable),
+		WithMetricsEnabled[GrpcProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 		WithAuthenticator[GrpcProxyOptions](cosmoGuard.auth),
 	)
 	if err != nil {
@@ -356,7 +356,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
 		WithCORSConfig[HttpProxyOptions](&cosmoGuard.cfg.CORS),
 		WithUpstreamConfig[HttpProxyOptions](&cosmoGuard.cfg.Upstream),
-		WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.Enable),
+		WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up lcd cosmoguard proxy: %w", err)
@@ -370,10 +370,10 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	cosmoGuard.jsonRpcHandler, err = NewJsonRpcHandler("jsonrpc",
 		WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 		WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
-		WithWebSocketEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.RPC.WebSocketEnabled),
+		WithWebSocketEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.RPC.WebSocketIsEnabled()),
 		WithWebSocketBackends[JsonRpcHandlerOptions](rpcWSBackends),
 		WithWebSocketConnections[JsonRpcHandlerOptions](cosmoGuard.cfg.RPC.WebSocketConnections),
-		WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.Enable),
+		WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 		WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
 		WithMaxBatchSize[JsonRpcHandlerOptions](*cosmoGuard.cfg.RPC.JsonRpc.MaxBatchSize),
 	)
@@ -391,7 +391,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
 		WithCORSConfig[HttpProxyOptions](&cosmoGuard.cfg.CORS),
 		WithUpstreamConfig[HttpProxyOptions](&cosmoGuard.cfg.Upstream),
-		WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.Enable),
+		WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 		WithEndpointHandler[HttpProxyOptions]([]Endpoint{
 			{
 				Path:   "/",
@@ -413,7 +413,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 			WithWebSocketEnabled[JsonRpcHandlerOptions](false),
-			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.Enable),
+			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 			WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
 			// EVM RPC JsonRpc config reuses the RPC JsonRpc batch cap unless
 			// it has its own (EvmRpcConfig is currently flat; revisit in
@@ -433,7 +433,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 			WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
 			WithCORSConfig[HttpProxyOptions](&cosmoGuard.cfg.CORS),
 			WithUpstreamConfig[HttpProxyOptions](&cosmoGuard.cfg.Upstream),
-			WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.Enable),
+			WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 			WithEndpointHandler[HttpProxyOptions]([]Endpoint{
 				{
 					Path:   "/",
@@ -458,7 +458,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 			WithWebSocketBackends[JsonRpcHandlerOptions](evmWSBackends),
 			WithWebSocketPath[JsonRpcHandlerOptions]("/"),
 			WithUpstreamManager[JsonRpcHandlerOptions](EthUpstreamConnManager),
-			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.Enable),
+			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 			WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
 		)
 		if err != nil {
@@ -474,7 +474,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 			WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
 			WithCORSConfig[HttpProxyOptions](&cosmoGuard.cfg.CORS),
 			WithUpstreamConfig[HttpProxyOptions](&cosmoGuard.cfg.Upstream),
-			WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.Enable),
+			WithMetricsEnabled[HttpProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 			WithEndpointHandler[HttpProxyOptions]([]Endpoint{
 				{
 					Path:   "/",
@@ -600,7 +600,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	// metrics endpoint don't get an unexpected port bound. Kubernetes
 	// deployments wanting health probes therefore need metrics enabled
 	// (the default).
-	if cfg.Metrics.Enable {
+	if cfg.Metrics.IsEnabled() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
 		// Opt-in pprof on the metrics port. Gated by COSMOGUARD_PPROF
@@ -965,6 +965,70 @@ func (f *CosmoGuard) tryReload() {
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
 	}
+	// CORS is compiled ONCE and captured by pointer into each HTTP proxy at
+	// construction; a reload only calls SetRules, which never touches it. So
+	// accepting a cors: edit would report success while the proxies kept
+	// enforcing the OLD policy. Reject as restart-required rather than
+	// silently ignoring it. Compare only the DECLARATIVE fields — CORSConfig
+	// also carries a compiled `originCheck` closure that reflect.DeepEqual
+	// treats as never-equal, so a whole-struct compare would reject EVERY
+	// reload (even a rules-only edit) whenever CORS is enabled.
+	if corsDeclChanged(&f.cfg.CORS, &newCfg.CORS) {
+		err := fmt.Errorf("cors config change requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	// Server timeouts / max-body / WS limits / WS allowed-origins are copied
+	// by value into the already-constructed http.Server + proxies at
+	// startup; a reload can't re-apply them to a live listener. Reject a
+	// change to any of those so the operator isn't fooled into thinking a
+	// timeout/body-cap edit took effect. (TrustedProxies is deliberately
+	// excluded — PrepareConfig re-publishes it via SetTrustedProxies, so it
+	// DOES hot-reload.)
+	if serverRuntimeImmutableChanged(&f.cfg.Server, &newCfg.Server) {
+		err := fmt.Errorf("server config change (timeouts / maxRequestBody / wsReadLimit / wsAllowedOrigins) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	// The standalone dashboard server (enable, port, basic-auth) is
+	// installed ONCE at startup with the credentials captured in a closure;
+	// a reload does not rewire it. Only dashboard.requestLog is hot-
+	// reloadable (applied below). Reject changes to the other dashboard
+	// fields rather than reporting a success that rotates no password.
+	if dashboardRuntimeImmutableChanged(&f.cfg.Dashboard, &newCfg.Dashboard) {
+		err := fmt.Errorf("dashboard config change (enable / port / basicAuth) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	// The metrics server (and its /admin WebUI routes + auth) is constructed
+	// once in New(). Now that an explicit `metrics.enable: false` survives
+	// defaulting, a reload that flips enable, changes the port, or edits the
+	// WebUI block would be accepted while the old listener keeps serving (or
+	// none exists) — reject it as restart-required.
+	if f.cfg.Metrics.IsEnabled() != newCfg.Metrics.IsEnabled() ||
+		f.cfg.Metrics.Port != newCfg.Metrics.Port ||
+		!reflect.DeepEqual(f.cfg.Metrics.WebUI, newCfg.Metrics.WebUI) {
+		err := fmt.Errorf("metrics config change (enable / port / webUI) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	// The JSON-RPC WebSocket proxy (webSocketEnabled / webSocketConnections,
+	// for both RPC and EVM) is wired once in NewJsonRpcHandler; a reload only
+	// calls SetRules. Now that an explicit `webSocketEnabled: false` survives
+	// defaulting, toggling it (or changing the connection count) on reload
+	// would be accepted but ignored — reject as restart-required.
+	if f.cfg.RPC.WebSocketIsEnabled() != newCfg.RPC.WebSocketIsEnabled() ||
+		f.cfg.RPC.WebSocketConnections != newCfg.RPC.WebSocketConnections ||
+		f.cfg.EVM.WS.WebSocketConnections != newCfg.EVM.WS.WebSocketConnections {
+		err := fmt.Errorf("websocket config change (webSocketEnabled / webSocketConnections) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
 	// Reload accepted: keep the new trusted-proxy list PrepareConfig
 	// already published (the deferred restore is now a no-op).
 	accepted = true
@@ -979,6 +1043,65 @@ func (f *CosmoGuard) tryReload() {
 	}
 	after := f.ruleFingerprintsLocked()
 	f.dashboard.RecordReload(true, "", reloadDelta(before, after))
+}
+
+// serverRuntimeImmutableChanged reports whether any ServerConfig field that
+// is captured by value at startup (and therefore can't be re-applied to a
+// running listener/proxy on reload) differs between two configs.
+// TrustedProxies is intentionally excluded — it IS hot-reloadable because
+// PrepareConfig re-publishes it via SetTrustedProxies.
+func serverRuntimeImmutableChanged(old, new *ServerConfig) bool {
+	return old.ReadHeaderTimeout != new.ReadHeaderTimeout ||
+		old.ReadTimeout != new.ReadTimeout ||
+		old.WriteTimeout != new.WriteTimeout ||
+		old.IdleTimeout != new.IdleTimeout ||
+		// Compare EFFECTIVE limits so a behaviour-neutral edit — e.g.
+		// spelling the default explicitly (`maxRequestBody: 5242880`) or as
+		// nil — isn't flagged as a change and doesn't block a rules-only
+		// reload.
+		old.EffectiveMaxRequestBody() != new.EffectiveMaxRequestBody() ||
+		old.EffectiveWSReadLimit() != new.EffectiveWSReadLimit() ||
+		!equalStringSet(old.WSAllowedOrigins, new.WSAllowedOrigins)
+}
+
+// equalStringSet compares two string slices treating nil and empty as
+// equal, so a behaviour-neutral edit (e.g. spelling the default WS-origin
+// policy as `wsAllowedOrigins: []` instead of omitting it) isn't rejected.
+func equalStringSet(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// corsDeclChanged reports whether the operator-facing (declarative) CORS
+// fields differ, ignoring the compiled closure/string state so an unchanged
+// cors: block never blocks a rules-only reload.
+func corsDeclChanged(old, new *CORSConfig) bool {
+	return old.Enable != new.Enable ||
+		old.Credentials != new.Credentials ||
+		old.MaxAge != new.MaxAge ||
+		!equalStringSet(old.AllowedOrigins, new.AllowedOrigins) ||
+		!equalStringSet(old.AllowedMethods, new.AllowedMethods) ||
+		!equalStringSet(old.AllowedHeaders, new.AllowedHeaders) ||
+		!equalStringSet(old.ExposeHeaders, new.ExposeHeaders)
+}
+
+// dashboardRuntimeImmutableChanged reports whether a DashboardConfig field
+// wired once at startup (enable, port, basic-auth) differs. RequestLog is
+// excluded — it hot-reloads via requestLog.ApplyConfig.
+func dashboardRuntimeImmutableChanged(old, new *DashboardConfig) bool {
+	oldEnable, newEnable := false, false
+	if old.Enable != nil {
+		oldEnable = *old.Enable
+	}
+	if new.Enable != nil {
+		newEnable = *new.Enable
+	}
+	return oldEnable != newEnable ||
+		old.Port != new.Port ||
+		old.BasicAuthUser != new.BasicAuthUser ||
+		old.BasicAuthPassword != new.BasicAuthPassword
 }
 
 // cacheTopologyChange reports whether the cache section between two configs
@@ -1346,7 +1469,7 @@ func (f *CosmoGuard) MetricsPort() int {
 	if cfg == nil {
 		return 0
 	}
-	if !cfg.Metrics.Enable {
+	if !cfg.Metrics.IsEnabled() {
 		return 0
 	}
 	return cfg.Metrics.Port

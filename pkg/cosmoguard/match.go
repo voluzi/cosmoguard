@@ -311,18 +311,28 @@ func (c *compiledMatch) matchRequest(r *http.Request, sourceIP net.IP) bool {
 		for k, p := range c.queryAtoms {
 			vals, has := q[k]
 			val := ""
-			if has && len(vals) > 0 {
+			if len(vals) > 0 {
 				val = vals[0]
 			}
-			if !p.eval(val, has && len(vals) > 0 && val != "") {
+			// Presence is key EXISTENCE, not value non-emptiness: `?debug`
+			// or `?debug=` (empty value) must satisfy a `present` predicate
+			// and fail an `absent` one. The previous `val != ""` conflation
+			// treated a present-but-empty key as absent.
+			if !p.eval(val, has) {
 				return false
 			}
 		}
 	}
 	if len(c.headerAtoms) > 0 {
 		for k, p := range c.headerAtoms {
-			val := r.Header.Get(k)
-			has := val != ""
+			// Use the header map directly (not Get) so a present-but-empty
+			// header (`X-Debug:`) counts as present — Get returns "" for
+			// both missing and empty, which made present/absent wrong.
+			vals, has := r.Header[http.CanonicalHeaderKey(k)]
+			val := ""
+			if len(vals) > 0 {
+				val = vals[0]
+			}
 			if !p.eval(val, has) {
 				return false
 			}

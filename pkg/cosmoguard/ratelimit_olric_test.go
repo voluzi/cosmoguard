@@ -156,11 +156,12 @@ func newTwoNodeClusterForTest(t *testing.T) (*clusterRuntime, *clusterRuntime) {
 
 	mk := func(bind, gossip int) *clusterRuntime {
 		cfg := &ClusterConfig{
-			BindAddr:     "127.0.0.1",
-			BindPort:     bind,
-			GossipPort:   gossip,
-			ReplicaCount: 2,
-			Quorum:       1,
+			BindAddr:      "127.0.0.1",
+			BindPort:      bind,
+			GossipPort:    gossip,
+			ReplicaCount:  2,
+			Quorum:        1,
+			EncryptionKey: testClusterEncryptionKey,
 			Discovery: &ClusterDiscoveryConfig{
 				Mode:   "static",
 				Static: &StaticDiscoveryConfig{Peers: peers},

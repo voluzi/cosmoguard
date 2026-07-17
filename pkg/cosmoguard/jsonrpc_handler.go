@@ -319,15 +319,26 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 		if r.RateLimit == nil {
 			continue
 		}
+		// Reuse the previous limiter unless it's a failed-init sentinel,
+		// which must be rebuilt so a fail-closed rule recovers once the
+		// backend is healthy again.
 		if l, ok := existing[r.Fingerprint]; ok {
-			newLimiters[r.Fingerprint] = l
-			continue
+			if _, failed := l.(failingRateLimiter); !failed {
+				newLimiters[r.Fingerprint] = l
+				continue
+			}
 		}
 		keyspace := h.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := NewRateLimiter(*r.RateLimit, h.olricClient, keyspace)
 		if err != nil {
-			h.log.WithError(err).WithField("rule_priority", r.Priority).
-				Error("rate limiter init failed; rule will run without limit")
+			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
+				h.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-closed rule will DENY")
+				newLimiters[r.Fingerprint] = sentinel
+			} else {
+				h.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-open rule will run without limit")
+			}
 			continue
 		}
 		newLimiters[r.Fingerprint] = l
@@ -407,13 +418,12 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 		// not as a JSON-RPC message). Previously a parse failure on a
 		// non-array payload still produced a defaulted request struct
 		// and silently went on to handleHttpSingle.
-		code := -32700
-		msg := "Parse error"
+		// Use the explicit-null-id builders so the response carries
+		// `"id":null` (§5.1) rather than dropping the id via omitempty.
+		errResp := ParseErrorResponse() // -32700, unparseable JSON
 		if req != nil || requests != nil {
-			code = -32600
-			msg = "Invalid Request"
+			errResp = InvalidRequestResponse() // -32600, parsed but not JSON-RPC
 		}
-		errResp := ErrorResponse(&JsonRpcMsg{ID: nil}, code, msg, nil)
 		body, mErr := errResp.Marshal()
 		if mErr != nil {
 			WriteError(w, http.StatusBadRequest, "bad request")
@@ -432,7 +442,7 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 	// `[]` back — spec-violating, and a confusing no-op for clients
 	// debugging a malformed batch generator.
 	if len(requests) == 0 {
-		errResp := ErrorResponse(&JsonRpcMsg{ID: nil}, -32600, "Invalid Request", nil)
+		errResp := InvalidRequestResponse() // -32600 with explicit "id":null
 		body, mErr := errResp.Marshal()
 		if mErr != nil {
 			h.log.Errorf("error marshalling empty-batch error response: %v", mErr)
@@ -501,6 +511,15 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, GetSourceIP(r), idName)
 		allowed, _, rlErr := l.Allow(r.Context(), key)
 		if rlErr != nil {
+			if rule.RateLimit.FailClosed() {
+				h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; failing closed (denying)")
+				h.cgDashboard.RecordDeny(DenyRecord{
+					Section: h.section, Reason: "rate_limit",
+					SourceIP: GetSourceIP(r), Method: request.Method,
+					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+				})
+				return false, -32005, "rate limiter unavailable"
+			}
 			h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; allowing")
 		} else if !allowed {
 			h.cgDashboard.RecordDeny(DenyRecord{

@@ -47,6 +47,36 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
+// cacheableByVary reports whether a response is safe to cache given its
+// Vary header. cosmoguard keys the cache on Accept-Encoding (see
+// getRequestHash) but on no other request header, so a response that Vary's
+// on anything else — or on "*" — cannot be safely reused across clients and
+// must not be cached. Absent/empty Vary is cacheable.
+func cacheableByVary(upstream http.Header) bool {
+	// An upstream can legally send Vary across MULTIPLE header lines; Get
+	// returns only the first, so a response with `Vary: Accept-Encoding`
+	// followed by `Vary: Authorization` would otherwise slip through. Walk
+	// every value.
+	for _, vary := range upstream.Values("Vary") {
+		for _, field := range strings.Split(vary, ",") {
+			f := strings.ToLower(strings.TrimSpace(field))
+			if f == "" {
+				continue
+			}
+			// "*" means the response varies on unspecified request
+			// characteristics — never cacheable (RFC 7234 §4.1).
+			if f == "*" {
+				return false
+			}
+			// Accept-Encoding is folded into the cache key, so it's safe.
+			if f != "accept-encoding" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // pickCacheableHeaders returns a flat map of header-name → value containing
 // just the headers we want to store in the cache. Names are canonicalized
 // via http.CanonicalHeaderKey so case mismatches across runs don't fragment

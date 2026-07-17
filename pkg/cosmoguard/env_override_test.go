@@ -39,7 +39,7 @@ func TestApplyEnvOverrides_Listener(t *testing.T) {
 	assert.Equal(t, cfg.EnableEvm, true)
 	assert.Equal(t, cfg.EvmRpcPort, 18000)
 	assert.Equal(t, cfg.EvmRpcWsPort, 18001)
-	assert.Equal(t, cfg.Metrics.Enable, false)
+	assert.Equal(t, cfg.Metrics.IsEnabled(), false)
 	assert.Equal(t, cfg.Metrics.Port, 9091)
 }
 
@@ -389,8 +389,8 @@ func TestApplyEnvOverrides_PrecedenceTable(t *testing.T) {
 		{
 			name:   "MetricsEnable",
 			setEnv: func(t *testing.T) { t.Setenv("COSMOGUARD_METRICS_ENABLE", "false") },
-			yaml:   &Config{Metrics: MetricsConfig{Enable: true}},
-			check:  func(t *testing.T, cfg *Config) { assert.Equal(t, cfg.Metrics.Enable, false) },
+			yaml:   &Config{Metrics: MetricsConfig{Enable: func() *bool { b := true; return &b }()}},
+			check:  func(t *testing.T, cfg *Config) { assert.Equal(t, cfg.Metrics.IsEnabled(), false) },
 		},
 		{
 			name:   "MetricsPort",
@@ -563,8 +563,13 @@ func TestDashboardIsEnabled_DefaultsOff(t *testing.T) {
 // layer.
 func TestValidateListenerPorts_ZeroPortRejected(t *testing.T) {
 	on := true
+	metricsOff := false
 	cfg := &Config{
 		RpcPort: 1, LcdPort: 2, GrpcPort: 3,
+		// Metrics defaults to enabled (nil *bool); disable it here so this
+		// bare Config (no PrepareConfig, so metrics.port stays 0) isolates
+		// the dashboard.port check under test.
+		Metrics:   MetricsConfig{Enable: &metricsOff},
 		Dashboard: DashboardConfig{Enable: &on, Port: 0},
 	}
 	err := validateListenerPorts(cfg)
@@ -579,6 +584,7 @@ func TestValidateListenerPorts_ZeroPortRejected(t *testing.T) {
 	off := false
 	cfg2 := &Config{
 		RpcPort: 1, LcdPort: 2, GrpcPort: 3,
+		Metrics:   MetricsConfig{Enable: &metricsOff},
 		Dashboard: DashboardConfig{Enable: &off, Port: 0},
 	}
 	assert.NilError(t, validateListenerPorts(cfg2),
@@ -591,8 +597,10 @@ func TestValidateListenerPorts_ZeroPortRejected(t *testing.T) {
 // error.
 func TestValidateListenerPorts_OutOfRangeRejected(t *testing.T) {
 	on := true
+	metricsOff := false
 	cfg := &Config{
 		RpcPort: 1, LcdPort: 2, GrpcPort: 3,
+		Metrics:   MetricsConfig{Enable: &metricsOff},
 		Dashboard: DashboardConfig{Enable: &on, Port: 99999},
 	}
 	err := validateListenerPorts(cfg)

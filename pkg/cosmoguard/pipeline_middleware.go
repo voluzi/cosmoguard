@@ -71,10 +71,16 @@ func MWIdentityResolve(auth *Authenticator, httpReq func(Request) *http.Request)
 			if errors.Is(err, ErrInvalidCredential) {
 				return Decision{Stop: true, Action: "deny", HTTPStatus: http.StatusUnauthorized, Reason: "invalid credential"}
 			}
-			// Other resolve errors (transient backend failures, etc.):
-			// treat as anonymous (fail-open), matching the pre-pipeline
-			// behaviour. The rule's auth gate will deny if it requires
-			// an identity.
+			// A fail-closed method whose backend is down: deny outright.
+			// Treating this as anonymous would admit the request on any
+			// public / auth.require:false rule — defeating fail-closed.
+			if errors.Is(err, ErrAuthUnavailable) {
+				return Decision{Stop: true, Action: "deny", HTTPStatus: http.StatusServiceUnavailable, Reason: "authentication backend unavailable"}
+			}
+			// Other resolve errors (transient failures from a fail-OPEN
+			// method, etc.): treat as anonymous (fail-open), matching the
+			// pre-pipeline behaviour. The rule's auth gate will deny if it
+			// requires an identity.
 			return next(req)
 		}
 		req.SetIdentity(id)
@@ -134,9 +140,10 @@ func MWAuthGate(auth *Authenticator, ruleAuth func(Request) *RuleAuthConfig) Mid
 // On denial, surfaces RetryAfter in whole seconds (rounded up per
 // RFC 7231 — truncating a 1.5s wait to 1 would let the client retry
 // early and trip the limiter again). Minimum of 1s so the header is
-// never `Retry-After: 0`. On limiter error, fails open — same policy
-// the pre-pipeline code used so a Redis hiccup doesn't take down all
-// requests.
+// never `Retry-After: 0`. On a limiter backend error the behaviour depends
+// on the rule's failureMode: fail-open (default) admits the request so a
+// coordination hiccup doesn't take down all traffic; fail-closed denies it
+// with 429 so an outage can't silently disable rate limiting cluster-wide.
 func MWRateLimit(
 	rateConfigFor func(Request) (*RateLimitConfig, uint64),
 	limiterFor func(uint64) RateLimiter,
@@ -163,6 +170,18 @@ func MWRateLimit(
 		key := rateLimitKey(cfg.Scope, fp, hr, idName)
 		allowed, retry, err := limiter.Allow(req.Context(), key)
 		if err != nil {
+			if cfg.FailClosed() {
+				if logger != nil {
+					logger.WithError(err).Warn("rate limiter error; failing closed (denying)")
+				}
+				return Decision{
+					Stop:       true,
+					Action:     "deny",
+					HTTPStatus: http.StatusTooManyRequests,
+					Reason:     "rate limiter unavailable",
+					RetryAfter: 1,
+				}
+			}
 			if logger != nil {
 				logger.WithError(err).Warn("rate limiter error; failing open")
 			}

@@ -404,6 +404,23 @@ func (a *Authenticator) StripCredentialQuery(r *http.Request) {
 	}
 }
 
+// CredentialQueryParams returns the URL query parameter names that carry
+// credentials (from any api-key method in queryParam mode). Used to redact
+// them before request metadata is logged / sampled to the dashboard. nil
+// when no method consumes a query param.
+func (a *Authenticator) CredentialQueryParams() []string {
+	if a == nil {
+		return nil
+	}
+	var names []string
+	for _, m := range a.methods {
+		if qs, ok := m.(queryParamStripper); ok {
+			names = append(names, qs.QueryParamsToStrip()...)
+		}
+	}
+	return names
+}
+
 // Authorize evaluates the per-rule auth gate against the resolved identity.
 // Returns (allowed, denyReason). denyReason is empty on allow.
 func (a *Authenticator) Authorize(rule *RuleAuthConfig, id *Identity) (bool, string) {
@@ -509,7 +526,9 @@ func buildAuthMethod(cfg AuthMethodConfig, a *Authenticator) (AuthMethod, error)
 func (m *apiKeyMethod) Resolve(r *http.Request) (*Identity, error) {
 	// Header first.
 	cred := m.extractFromHeader(r)
-	if cred == "" && m.queryParam != "" {
+	// r.URL is nil-guarded: synthetic requests (e.g. the gRPC metadata
+	// shim) may not set a URL, and dereferencing it here would panic.
+	if cred == "" && m.queryParam != "" && r.URL != nil {
 		cred = r.URL.Query().Get(m.queryParam)
 	}
 	if cred == "" {

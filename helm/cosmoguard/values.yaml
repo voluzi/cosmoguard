@@ -26,12 +26,18 @@ fullnameOverride: ""
 #                  the durability mechanism, not disk.
 kind: Deployment
 
-# Three replicas is the textbook olric shape (RF=2, quorum=2 = no
-# split-brain). The chart ships no default affinity so installs on
-# single-node clusters (kind, k3s, minikube) just work — pods stack
-# on the one available node. For production multi-node, add a soft
+# Default 1 because cluster mode is OFF by default (see cache.cluster.enable):
+# with cluster mode off each pod runs an ISOLATED loopback olric daemon, so
+# running multiple replicas would load-balance across independent cache,
+# rate-limit, and JWT-replay stores — replay protection would be bypassable
+# per-pod and rate limits would multiply by the replica count.
+#
+# For HA, enable cluster mode (cache.cluster.enable: true + an encryption key)
+# AND raise replicaCount to 3 — the textbook olric shape (RF=2, quorum=2 = no
+# split-brain). The chart ships no default affinity so single-node clusters
+# (kind, k3s, minikube) just work; for production multi-node add a soft
 # pod-anti-affinity via `affinity:` below or a topologySpreadConstraint.
-replicaCount: 3
+replicaCount: 1
 
 # Cosmoguard config rendered as a ConfigMap and mounted at /etc/cosmoguard.
 # This is the SAME YAML you'd put in cosmoguard.yaml directly — see
@@ -73,9 +79,16 @@ config:
   server:
     readHeaderTimeout: 10s
     readTimeout: 30s
-    writeTimeout: 30s
+    # writeTimeout defaults to 0 (no limit) so large/slow streamed responses
+    # (/block_results, /genesis, big eth_getLogs) aren't truncated mid-body.
+    # Set an explicit ceiling if exposing cosmoguard to untrusted clients.
+    writeTimeout: 0
     idleTimeout: 60s
-    maxRequestBody: 1048576
+    # 5 MiB accommodates large payloads (e.g. a wasm MsgStoreCode broadcast).
+    # 0 means no limit.
+    maxRequestBody: 5242880
+    # wsReadLimit defaults to 1 MiB (0 = no limit).
+    wsReadLimit: 1048576
   # Replace with your real Cosmos node(s). Multi-node + healthcheck
   # support enables horizontal HA at the cosmoguard layer.
   nodes:
@@ -103,7 +116,13 @@ config:
   cache:
     # ttl: 5s
     cluster:
-      enable: true
+      # Default OFF: a bare `helm install` runs olric in embedded loopback
+      # mode (single pod, no peers), which needs no encryption key. Turn this
+      # on for multi-replica HA — and then you MUST supply an encryption key
+      # via cluster.encryptionKey or cluster.existingEncryptionKeySecret (the
+      # chart does NOT auto-generate one: a generated key is non-deterministic
+      # under client-side / GitOps rendering and would partition the cluster).
+      enable: false
       # bindAddr defaults to "${POD_IP}" via the chart's downward-API
       # wire-up. Override only on bare metal / non-K8s installs.
       # bindAddr: "${POD_IP}"
@@ -146,6 +165,22 @@ existingSecret: ""
 # above when you have a mix of plaintext and secret env vars.
 env: {}
   # JWT_SECRET: "..."   # don't put real secrets here; use existingSecret
+
+# Cluster gossip/data encryption key wiring. REQUIRED in cluster mode
+# (config.cache.cluster.enable: true). The chart does NOT auto-generate a key:
+# a generated key is non-deterministic under client-side / GitOps rendering
+# (helm template, ArgoCD without cluster access), so each sync would produce a
+# different key and partition the cluster. Supply one of the two below (every
+# replica must share the same value):
+cluster:
+  # RECOMMENDED: reference a pre-created Secret with a base64-encoded
+  # `encryptionKey` data field (16/24/32 bytes). Create it once with e.g.:
+  #   kubectl create secret generic cosmoguard-cluster \
+  #     --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)
+  existingEncryptionKeySecret: ""
+  # Alternatively provide the key inline (base64-encoded 16/24/32 bytes). NOT
+  # recommended — it lands in the rendered ConfigMap in cleartext.
+  encryptionKey: ""
 
 serviceAccount:
   create: true

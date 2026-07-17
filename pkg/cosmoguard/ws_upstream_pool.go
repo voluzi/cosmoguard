@@ -349,6 +349,12 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		return nil
 	}
 	candidates := make([]pending, 0)
+	// provisional tracks migrations already assigned to each alt in THIS
+	// pass so a backlog of orphaned subscriptions spreads across survivors
+	// instead of all landing on whichever conn is currently least-loaded
+	// (the per-conn subCount isn't incremented until the commit phase, so
+	// without this every candidate would pick the same alt).
+	provisional := make(map[UpstreamConnManager]int64)
 	for oldID, conn := range p.subscriptionConn {
 		if conn.IsHealthy() {
 			continue
@@ -357,10 +363,11 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		if !ok {
 			continue
 		}
-		alt := p.firstHealthyOther(conn)
+		alt := p.firstHealthyOther(conn, provisional)
 		if alt == nil {
 			continue
 		}
+		provisional[alt]++
 		candidates = append(candidates, pending{oldID: oldID, conn: conn, alt: alt, param: param})
 	}
 	p.subMux.Unlock()
@@ -409,6 +416,12 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		p.addSubCount(c.alt, 1)
 		p.subMux.Unlock()
 
+		// Forget the param on the now-orphaned source conn so that when it
+		// eventually reconnects it does NOT re-subscribe the param we just
+		// migrated away — which would create a permanent duplicate upstream
+		// subscription whose events land on an id nobody is listening for.
+		c.conn.LocalUnsubscribe(c.param)
+
 		if p.log != nil {
 			p.log.WithFields(Fields{
 				"oldID": c.oldID,
@@ -431,7 +444,7 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 // in the slice — a pool-wide outage that recovers one conn at a time
 // would otherwise clump the whole backlog on the first survivor,
 // defeating the load-aware promise of the picker.
-func (p *UpstreamPool) firstHealthyOther(skip UpstreamConnManager) UpstreamConnManager {
+func (p *UpstreamPool) firstHealthyOther(skip UpstreamConnManager, provisional map[UpstreamConnManager]int64) UpstreamConnManager {
 	var best UpstreamConnManager
 	var bestCount int64
 	for _, c := range p.conn {
@@ -444,6 +457,9 @@ func (p *UpstreamPool) firstHealthyOther(skip UpstreamConnManager) UpstreamConnM
 				cnt = ctr.Load()
 			}
 		}
+		// Add migrations already assigned to this conn in the current
+		// pass so the backlog spreads instead of stacking on one conn.
+		cnt += provisional[c]
 		if best == nil || cnt < bestCount {
 			best = c
 			bestCount = cnt

@@ -128,7 +128,10 @@ func (m *introspectionMethod) Resolve(r *http.Request) (*Identity, error) {
 			// protected routes). Not cached — the next request retries.
 			return degradedIdentity("introspection"), nil
 		}
-		return nil, err
+		// Fail-closed: surface ErrAuthUnavailable so both HTTP and gRPC deny
+		// on an IdP outage instead of falling back to anonymous (which would
+		// admit a public / auth.require:false rule).
+		return nil, fmt.Errorf("%w: %v", ErrAuthUnavailable, err)
 	}
 	// Negative results (token invalid → id == nil) get a shorter TTL
 	// so an IdP that briefly returned active=false during a key

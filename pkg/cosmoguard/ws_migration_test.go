@@ -48,6 +48,14 @@ func (f *fakeMigratingConn) Unsubscribe(id string) error {
 	delete(f.subscribed, id)
 	return nil
 }
+func (f *fakeMigratingConn) LocalUnsubscribe(param string) {
+	for id, p := range f.subscribed {
+		if p == param {
+			delete(f.subscribed, id)
+			return
+		}
+	}
+}
 func (f *fakeMigratingConn) Stop() {}
 
 // TestMigrateUnhealthy_MovesSubscriptionToSurvivor: dead = pinned conn;
@@ -122,35 +130,77 @@ func TestMigrateUnhealthy_NoSurvivorKeepsSubscription(t *testing.T) {
 	}
 }
 
-// TestSubscriptionManager_ReplaceID rewires param→id mappings + client
-// set when the broker moves a subscription to a new upstream ID.
-func TestSubscriptionManager_ReplaceID(t *testing.T) {
+// TestSubscriptionManager_MigrateKeepsCanonicalID: after a migration the
+// client-facing (canonical) id stays stable — only the upstream id moves.
+// This is the invariant that stops EVM clients from silently dropping
+// events (they match notifications on params.subscription == canonical id)
+// and that keeps eth_unsubscribe(canonicalID) resolving.
+func TestSubscriptionManager_MigrateKeepsCanonicalID(t *testing.T) {
 	sm := NewSubscriptionManager()
 	sm.AddSubscription("p", "old")
 	client := &JsonRpcWsClient{} // empty struct is fine — used as a map key here
 	sm.SubscribeClient("old", client, "client-tag")
 
-	if !sm.ReplaceSubscriptionID("old", "new") {
-		t.Fatal("replace should succeed")
+	if !sm.Migrate("old", "new") {
+		t.Fatal("migrate should succeed")
 	}
-	if id, _ := sm.GetSubscriptionID("p"); id != "new" {
-		t.Fatalf("paramToID not rewired: %s", id)
+
+	// Canonical id (client-facing) is UNCHANGED.
+	if id, _ := sm.GetSubscriptionID("p"); id != "old" {
+		t.Fatalf("canonical id should stay 'old', got %s", id)
 	}
-	if p, _ := sm.GetSubscriptionParam("new"); p != "p" {
-		t.Fatalf("idToParam not rewired: %s", p)
+	if p, _ := sm.GetSubscriptionParam("old"); p != "p" {
+		t.Fatalf("canonical id lost its param mapping: %s", p)
 	}
-	if _, stillThere := sm.GetSubscriptionParam("old"); stillThere {
-		t.Fatal("old id should be gone")
+	// The current upstream id resolves forward from the canonical id...
+	if up, ok := sm.UpstreamID("old"); !ok || up != "new" {
+		t.Fatalf("UpstreamID(old) = %q, %v; want new,true", up, ok)
 	}
-	clients := sm.GetSubscriptionClients("new")
+	// ...and an inbound notification carrying the NEW upstream id routes
+	// back to the canonical id.
+	if canon, ok := sm.CanonicalID("new"); !ok || canon != "old" {
+		t.Fatalf("CanonicalID(new) = %q, %v; want old,true", canon, ok)
+	}
+	// Client set is preserved under the canonical id (never moved).
+	clients := sm.GetSubscriptionClients("old")
 	if clients[client] != "client-tag" {
 		t.Fatalf("client set not preserved: %+v", clients)
 	}
+
+	// A second migration chains correctly off the current upstream id.
+	if !sm.Migrate("new", "newer") {
+		t.Fatal("second migrate should succeed")
+	}
+	if canon, _ := sm.CanonicalID("newer"); canon != "old" {
+		t.Fatalf("CanonicalID(newer) = %q; want old", canon)
+	}
+	if up, _ := sm.UpstreamID("old"); up != "newer" {
+		t.Fatalf("UpstreamID(old) = %q; want newer", up)
+	}
+	// The stale upstream id no longer resolves.
+	if _, ok := sm.CanonicalID("new"); ok {
+		t.Fatal("stale upstream id 'new' should no longer translate")
+	}
 }
 
-func TestSubscriptionManager_ReplaceIDMissingOldReturnsFalse(t *testing.T) {
+func TestSubscriptionManager_MigrateMissingOldReturnsFalse(t *testing.T) {
 	sm := NewSubscriptionManager()
-	if sm.ReplaceSubscriptionID("nope", "new") {
-		t.Fatal("expected false for unknown oldID")
+	if sm.Migrate("nope", "new") {
+		t.Fatal("expected false for unknown upstream id")
+	}
+}
+
+// TestSubscriptionManager_RemoveClearsTranslation ensures RemoveSubscription
+// tears down the canonical↔upstream translation entries too (no leak).
+func TestSubscriptionManager_RemoveClearsTranslation(t *testing.T) {
+	sm := NewSubscriptionManager()
+	sm.AddSubscription("p", "old")
+	sm.Migrate("old", "new")
+	sm.RemoveSubscription("old")
+	if _, ok := sm.CanonicalID("new"); ok {
+		t.Fatal("upstream translation should be gone after remove")
+	}
+	if _, ok := sm.UpstreamID("old"); ok {
+		t.Fatal("canonical translation should be gone after remove")
 	}
 }

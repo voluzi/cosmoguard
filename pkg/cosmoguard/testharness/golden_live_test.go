@@ -415,11 +415,11 @@ func bootCosmoguardForLive(t *testing.T, c liveChainCase) (*cosmoguard.CosmoGuar
 		EvmRpcPort:   evmRpcPort,
 		EvmRpcWsPort: freePort(t),
 		Nodes:        []cosmoguard.NodeConfig{c.Node},
-		Metrics:      cosmoguard.MetricsConfig{Enable: false},
+		Metrics:      cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD:          cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{
 			Default:              cosmoguard.RuleActionAllow,
-			WebSocketEnabled:     false, // we don't exercise WS in this test
+			WebSocketEnabled:     boolPtr(false), // we don't exercise WS in this test
 			WebSocketConnections: 1,
 			JsonRpc:              cosmoguard.JsonRpcConfig{Default: cosmoguard.RuleActionAllow},
 		},

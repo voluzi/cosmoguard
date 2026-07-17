@@ -144,6 +144,13 @@ mismatch, peerService disabled without cluster.enable=false).
 {{- if eq $mode "" -}}
 {{- fail "cosmoguard: config.cache.cluster.enable=true requires config.cache.cluster.discovery.mode (use \"dns\" with the chart's headless peer service in Kubernetes)" -}}
 {{- end -}}
+{{- $cluster := .Values.cluster | default (dict) -}}
+{{/* Skip the key check when the config is an externally-managed ConfigMap —
+     the chart doesn't render cosmoguard.yaml then, so it can't see the key
+     (the operator supplies it in their own ConfigMap/Secret wiring). */}}
+{{- if and (not .Values.existingConfigMap) (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) -}}
+{{- fail "cosmoguard: cluster mode requires an encryption key — set cluster.existingEncryptionKeySecret (recommended: a pre-created Secret with an `encryptionKey` field) or cluster.encryptionKey. The chart does NOT auto-generate one, because a generated key is non-deterministic under client-side / GitOps rendering and would silently partition the cluster across syncs. Generate one with: kubectl create secret generic cosmoguard-cluster --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)" -}}
+{{- end -}}
 {{- if eq $mode "static" -}}
 {{- $peers := dig "discovery" "static" "peers" (list) $c -}}
 {{- if eq (len $peers) 0 -}}
@@ -188,7 +195,28 @@ podIdentityEnv emits the env entries injected on every workload pod:
   valueFrom:
     fieldRef:
       fieldPath: metadata.name
+{{- $existingSecret := (.Values.cluster | default dict).existingEncryptionKeySecret -}}
+{{- if and (not (include "cosmoguard.clusterInlineKey" .)) $existingSecret }}
+- name: CLUSTER_ENCRYPTION_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ $existingSecret }}
+      key: encryptionKey
 {{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+clusterInlineKey — the encryption key the operator supplied INLINE, from
+either config.cache.cluster.encryptionKey or the top-level cluster.encryptionKey.
+Empty when neither is set (chart generates a Secret / uses an existing one).
+When non-empty the key is rendered directly into the config and NO env
+reference / generated Secret is used.
+*/}}
+{{- define "cosmoguard.clusterInlineKey" -}}
+{{- $fromConfig := dig "cache" "cluster" "encryptionKey" "" .Values.config -}}
+{{- $fromTop := (.Values.cluster | default dict).encryptionKey | default "" -}}
+{{- $fromConfig | default $fromTop -}}
 {{- end -}}
 
 {{/*

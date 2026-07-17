@@ -488,7 +488,13 @@ func (r *JsonRpcRule) Match(req *JsonRpcMsg) bool {
 	switch requestParams := req.Params.(type) {
 	case map[string]interface{}:
 		if !r.ParamsMap {
-			return true
+			// The rule filters by positional (slice) params but the request
+			// sent an object. The configured params constraint cannot be
+			// satisfied by a differently-shaped payload, so the rule does
+			// NOT match. Returning true here previously let a params-scoped
+			// allow/deny rule be bypassed simply by sending params in the
+			// other JSON shape.
+			return false
 		}
 		paramsMap, ok := r.Params.(map[string]interface{})
 		if !ok {
@@ -517,7 +523,10 @@ func (r *JsonRpcRule) Match(req *JsonRpcMsg) bool {
 		return true
 	case []interface{}:
 		if !r.ParamsSlice {
-			return true
+			// Mirror of the map case: the rule filters by object (map)
+			// params but the request sent a positional array, so the
+			// constraint can't match. Do not short-circuit to true.
+			return false
 		}
 		paramsSlice, ok := r.Params.([]interface{})
 		if !ok {

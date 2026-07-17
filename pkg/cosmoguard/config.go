@@ -1,7 +1,10 @@
 package cosmoguard
 
 import (
+	"encoding/base64"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"time"
@@ -54,20 +57,32 @@ type ServerConfig struct {
 	ReadHeaderTimeout time.Duration `yaml:"readHeaderTimeout,omitempty" default:"10s"`
 	// ReadTimeout caps the total time to read the entire request (headers
 	// + body). Set higher than ReadHeaderTimeout to allow legitimate large
-	// tx broadcasts.
+	// tx broadcasts. 0 means no limit.
 	ReadTimeout time.Duration `yaml:"readTimeout,omitempty" default:"30s"`
 	// WriteTimeout caps how long the server may take to write a response.
-	WriteTimeout time.Duration `yaml:"writeTimeout,omitempty" default:"30s"`
+	// Default 0 = NO LIMIT, matching v3 behaviour: blockchain endpoints can
+	// legitimately stream very large / slow responses (/block_results,
+	// /genesis, big eth_getLogs) that a fixed 30s deadline would truncate
+	// mid-body with no error to the client. Operators exposing cosmoguard to
+	// untrusted clients should set an explicit ceiling.
+	WriteTimeout time.Duration `yaml:"writeTimeout,omitempty"`
 	// IdleTimeout caps how long a keep-alive connection sits idle before the
 	// server closes it.
 	IdleTimeout time.Duration `yaml:"idleTimeout,omitempty" default:"60s"`
 	// MaxRequestBody bounds the request body cosmoguard will read into memory.
-	// Requests exceeding this return 413 Request Entity Too Large. The
-	// default (1 MiB) accommodates every observed Cosmos LCD/RPC payload
-	// while preventing unbounded memory consumption.
-	MaxRequestBody int64 `yaml:"maxRequestBody,omitempty" default:"1048576"`
+	// Requests exceeding this return 413 Request Entity Too Large. Read via
+	// EffectiveMaxRequestBody(): nil (unset) → 5 MiB default (accommodates a
+	// wasm MsgStoreCode broadcast; the rc.1 default of 1 MiB rejected those),
+	// explicit 0 → no limit. It is a *int64 (not a plain int64 with a default
+	// tag) so an explicit `maxRequestBody: 0` survives defaults.Set instead of
+	// being silently reset to the default.
+	MaxRequestBody *int64 `yaml:"maxRequestBody,omitempty"`
 	// WSReadLimit bounds individual WebSocket frames cosmoguard will read.
-	WSReadLimit int64 `yaml:"wsReadLimit,omitempty" default:"65536"`
+	// Read via EffectiveWSReadLimit(): nil (unset) → 1 MiB default (generous
+	// for any legitimate Cosmos/EVM frame incl. a large eth_sendRawTransaction;
+	// the rc.1 default of 64 KiB closed bigger frames), explicit 0 → no limit.
+	// *int64 for the same explicit-zero-survives-defaults reason as above.
+	WSReadLimit *int64 `yaml:"wsReadLimit,omitempty"`
 	// WSAllowedOrigins is the allowlist applied to the Origin header on
 	// incoming WebSocket upgrade requests. Same-origin requests (Origin host
 	// matches Host header) are always permitted. Requests with no Origin
@@ -95,6 +110,29 @@ type ServerConfig struct {
 	// X-Forwarded-For are honored ONLY when the immediate connection
 	// peer matches one of the allowed CIDRs.
 	TrustedProxies []string `yaml:"trustedProxies,omitempty"`
+}
+
+const (
+	defaultMaxRequestBody int64 = 5 << 20 // 5 MiB
+	defaultServerWSRead   int64 = 1 << 20 // 1 MiB
+)
+
+// EffectiveMaxRequestBody resolves the request-body cap: nil → the 5 MiB
+// default, explicit value (including 0 = no limit) → that value.
+func (s *ServerConfig) EffectiveMaxRequestBody() int64 {
+	if s.MaxRequestBody == nil {
+		return defaultMaxRequestBody
+	}
+	return *s.MaxRequestBody
+}
+
+// EffectiveWSReadLimit resolves the WS frame cap: nil → the 1 MiB default,
+// explicit value (including 0 = no limit) → that value.
+func (s *ServerConfig) EffectiveWSReadLimit() int64 {
+	if s.WSReadLimit == nil {
+		return defaultServerWSRead
+	}
+	return *s.WSReadLimit
 }
 
 type NodeConfig struct {
@@ -349,6 +387,19 @@ type ClusterConfig struct {
 	// error rather than silently falling back to a default that would
 	// pick the wrong mode in some environments.
 	Discovery *ClusterDiscoveryConfig `yaml:"discovery,omitempty"`
+
+	// EncryptionKey is a base64-encoded 16, 24, or 32-byte key that
+	// enables memberlist gossip encryption + authentication (AES-128/192/
+	// 256-GCM). REQUIRED in cluster mode: without it the gossip and RESP
+	// data ports carry no encryption and no peer authentication, so any
+	// host that can reach them can join the cluster and read/write the
+	// shared DMaps — rate-limit buckets, cached responses, and the JWT
+	// replay set. Generate one with e.g. `head -c32 /dev/urandom | base64`
+	// and give every pod in the cluster the SAME value (wire it from a
+	// Kubernetes Secret / env var). Node discovery must still restrict the
+	// peer ports at the network layer (NetworkPolicy) — this is
+	// defence-in-depth, not a substitute.
+	EncryptionKey string `yaml:"encryptionKey,omitempty"`
 }
 
 // ClusterDiscoveryConfig selects and configures the peer-discovery mode.
@@ -437,6 +488,35 @@ type RuleCache struct {
 	// The HTTP cache always hashes the full request (path + query +
 	// body); KeyMode is honored on gRPC only.
 	KeyMode string `yaml:"keyMode,omitempty"`
+
+	// KeyMetadata lists inbound gRPC metadata keys whose values are folded
+	// into the cache key, so requests that differ only by such metadata are
+	// cached separately. This matters because response-affecting metadata
+	// (notably `x-cosmos-block-height`, which selects the state height a
+	// Cosmos query runs against) IS forwarded upstream and changes the
+	// response — but was previously absent from the key, so a query at one
+	// height served another height's cached response for the whole TTL.
+	//
+	// A nil (unset) list defaults to the response-affecting keys in
+	// defaultGrpcCacheKeyMetadata (currently x-cosmos-block-height). Set an
+	// explicit empty list ([]) to opt out entirely (e.g. a method-only rule
+	// on a genuinely height-independent query). Keys are matched
+	// lowercase, as gRPC canonicalizes metadata keys to lowercase.
+	KeyMetadata []string `yaml:"keyMetadata,omitempty"`
+}
+
+// defaultGrpcCacheKeyMetadata is the response-affecting gRPC metadata folded
+// into cache keys when a rule doesn't configure KeyMetadata explicitly.
+var defaultGrpcCacheKeyMetadata = []string{"x-cosmos-block-height"}
+
+// EffectiveKeyMetadata returns the metadata keys to fold into the gRPC cache
+// key: the configured list when non-nil (including an explicit empty list,
+// which opts out), or the safe default otherwise.
+func (c *RuleCache) EffectiveKeyMetadata() []string {
+	if c.KeyMetadata != nil {
+		return c.KeyMetadata
+	}
+	return defaultGrpcCacheKeyMetadata
 }
 
 type LcdConfig struct {
@@ -445,11 +525,21 @@ type LcdConfig struct {
 }
 
 type RpcConfig struct {
-	Default              RuleAction    `yaml:"default,omitempty" default:"deny"`
-	Rules                []*HttpRule   `yaml:"rules,omitempty"`
-	JsonRpc              JsonRpcConfig `yaml:"jsonrpc,omitempty"`
-	WebSocketEnabled     bool          `yaml:"webSocketEnabled,omitempty" default:"true"`
-	WebSocketConnections int           `yaml:"webSocketConnections,omitempty" default:"10"`
+	Default RuleAction    `yaml:"default,omitempty" default:"deny"`
+	Rules   []*HttpRule   `yaml:"rules,omitempty"`
+	JsonRpc JsonRpcConfig `yaml:"jsonrpc,omitempty"`
+	// WebSocketEnabled is *bool so an explicit `webSocketEnabled: false`
+	// survives defaults.Set (a plain bool with default:"true" would be
+	// silently re-enabled — creasty/defaults can't distinguish false from
+	// unset). Read via WebSocketIsEnabled(). nil → default (enabled).
+	WebSocketEnabled     *bool `yaml:"webSocketEnabled,omitempty"`
+	WebSocketConnections int   `yaml:"webSocketConnections,omitempty" default:"10"`
+}
+
+// WebSocketIsEnabled reports whether the JSON-RPC WebSocket proxy is on.
+// nil-default-enabled idiom.
+func (c *RpcConfig) WebSocketIsEnabled() bool {
+	return c.WebSocketEnabled == nil || *c.WebSocketEnabled
 }
 
 type JsonRpcConfig struct {
@@ -484,8 +574,13 @@ type GrpcConfig struct {
 }
 
 type MetricsConfig struct {
-	Enable bool `yaml:"enable" default:"true"`
-	Port   int  `yaml:"port,omitempty" default:"9001"`
+	// Enable is *bool (not a plain bool with default:"true") so an explicit
+	// `metrics: {enable: false}` survives defaults.Set — creasty/defaults
+	// can't tell a zero-value false from unset, so default:"true" on a plain
+	// bool silently re-enabled metrics an operator had explicitly disabled.
+	// Read via IsEnabled(). nil → default (enabled).
+	Enable *bool `yaml:"enable,omitempty"`
+	Port   int   `yaml:"port,omitempty" default:"9001"`
 	// WebUI controls the /admin/ dashboard mounted on the metrics
 	// port. Default is false: cosmoguard's metrics port is commonly
 	// exposed inside a cluster (Prometheus scrape), so an
@@ -493,6 +588,15 @@ type MetricsConfig struct {
 	// identity scopes to anyone with cluster access. Operators who
 	// want the dashboard must opt in explicitly.
 	WebUI WebUIConfig `yaml:"webUI,omitempty"`
+}
+
+// IsEnabled reports whether metrics are on. nil-default-enabled idiom, same
+// as NodeHealthcheckConfig.IsEnabled.
+func (m *MetricsConfig) IsEnabled() bool {
+	if m == nil {
+		return false
+	}
+	return m.Enable == nil || *m.Enable
 }
 
 // WebUIConfig configures the optional read-only dashboard.
@@ -640,10 +744,38 @@ func ReadConfigFromFile(path string) (*Config, error) {
 	if err := yaml.Unmarshal([]byte(interpolated), &cfg); err != nil {
 		return nil, fmt.Errorf("error in config file unmarshal: %v", err)
 	}
+	// yaml.Unmarshal silently drops keys with no matching struct field, so a
+	// v3 config's removed Redis backend would be ignored and each replica
+	// would fall back to an ISOLATED embedded cache instead of the shared one
+	// the operator intended. Detect the removed keys and fail loudly with a
+	// migration pointer rather than degrade silently.
+	if err := detectRemovedConfigKeys([]byte(interpolated)); err != nil {
+		return nil, err
+	}
 	if err := PrepareConfig(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// detectRemovedConfigKeys fails when a config still contains keys that v4
+// removed, so the operator gets a clear migration message instead of a
+// silently-ignored setting.
+func detectRemovedConfigKeys(raw []byte) error {
+	var probe struct {
+		Cache struct {
+			Backend       *yaml.Node `yaml:"backend"`
+			Redis         *yaml.Node `yaml:"redis"`
+			RedisSentinel *yaml.Node `yaml:"redis-sentinel"`
+		} `yaml:"cache"`
+	}
+	// Ignore unmarshal errors here — the real unmarshal already validated
+	// the document; this probe only inspects specific keys.
+	_ = yaml.Unmarshal(raw, &probe)
+	if probe.Cache.Backend != nil || probe.Cache.Redis != nil || probe.Cache.RedisSentinel != nil {
+		return fmt.Errorf("cache.backend / cache.redis / cache.redis-sentinel were removed in v4: the distributed cache/rate-limiter now uses the embedded olric cluster — migrate to a cache.cluster block (see CONFIG.md). Remove those keys to start")
+	}
+	return nil
 }
 
 // PrepareConfig finalizes a parsed-or-constructed Config: applies struct-tag
@@ -760,6 +892,12 @@ func PrepareConfig(cfg *Config) error {
 	if err := validateDashboardAuth(cfg); err != nil {
 		return err
 	}
+	if err := validateAuthEndpoints(&cfg.Auth); err != nil {
+		return err
+	}
+	if err := validateServerLimits(&cfg.Server); err != nil {
+		return err
+	}
 	if err := validateCacheBackend(&cfg.Cache); err != nil {
 		return err
 	}
@@ -839,7 +977,7 @@ func validateListenerPorts(cfg *Config) error {
 			entry{"evmRpcWsPort", cfg.EvmRpcWsPort},
 		)
 	}
-	if cfg.Metrics.Enable {
+	if cfg.Metrics.IsEnabled() {
 		entries = append(entries, entry{"metrics.port", cfg.Metrics.Port})
 	}
 	if cfg.Dashboard.IsEnabled() {
@@ -934,9 +1072,36 @@ func validateCacheBackend(c *CacheGlobalConfig) error {
 		if c.Cluster.Quorum < 1 || c.Cluster.Quorum > c.Cluster.ReplicaCount {
 			return fmt.Errorf("cache.cluster.quorum: must be in [1, replicaCount=%d] (got %d)", c.Cluster.ReplicaCount, c.Cluster.Quorum)
 		}
+		// Require gossip encryption/auth in cluster mode. Without it the
+		// peer ports are unauthenticated and unencrypted — any host that
+		// reaches them can join and read/write the shared DMaps (rate-limit
+		// buckets, cache, JWT replay set).
+		if _, err := DecodeClusterEncryptionKey(c.Cluster.EncryptionKey); err != nil {
+			return fmt.Errorf("cache.cluster.encryptionKey: %w", err)
+		}
 	}
 
 	return nil
+}
+
+// DecodeClusterEncryptionKey decodes and validates the base64 cluster
+// encryption key. memberlist accepts 16, 24, or 32-byte keys (AES-128/192/
+// 256). An empty key is rejected in cluster mode (this is only called from
+// the cluster branch of validateCacheBackend and from the runtime).
+func DecodeClusterEncryptionKey(b64 string) ([]byte, error) {
+	if b64 == "" {
+		return nil, fmt.Errorf("required in cluster mode: set a base64-encoded 16/24/32-byte key (e.g. `head -c32 /dev/urandom | base64`), the SAME value on every pod")
+	}
+	key, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("not valid base64: %w", err)
+	}
+	switch len(key) {
+	case 16, 24, 32:
+		return key, nil
+	default:
+		return nil, fmt.Errorf("decoded key is %d bytes; must be 16, 24, or 32 (AES-128/192/256)", len(key))
+	}
 }
 
 // validateUpstreamStrategy returns an error for unknown strategy
@@ -950,6 +1115,94 @@ func validateUpstreamStrategy(s string) error {
 	default:
 		return fmt.Errorf("upstream.strategy: unknown value %q (want weighted-round-robin / round-robin / least-conn / primary-failover)", s)
 	}
+}
+
+// validateServerLimits rejects a negative maxRequestBody / wsReadLimit. Those
+// fields are *int64 where nil means "use the default" and an explicit 0 means
+// "no limit"; a negative value (e.g. a `-1` typo) is neither, and would slip
+// past the `> 0` cap check at use sites and silently remove the cap. Fail
+// startup with a clear message instead.
+func validateServerLimits(s *ServerConfig) error {
+	if s.MaxRequestBody != nil && *s.MaxRequestBody < 0 {
+		return fmt.Errorf("server.maxRequestBody must be >= 0 (0 means no limit); got %d", *s.MaxRequestBody)
+	}
+	if s.WSReadLimit != nil && *s.WSReadLimit < 0 {
+		return fmt.Errorf("server.wsReadLimit must be >= 0 (0 means no limit); got %d", *s.WSReadLimit)
+	}
+	return nil
+}
+
+// validateAuthEndpoints requires the URLs cosmoguard fetches keys/decisions
+// from (JWKS, OAuth introspection, external validator) to use https, unless
+// they point at loopback. Over plaintext http an on-path attacker can serve
+// a forged JWKS (its own RSA key under the expected kid) or a forged
+// introspection/validator response and mint a fully-trusted identity — a
+// complete authentication bypass. Node upstream URLs are validated
+// separately (validateNodeURLs); auth endpoints previously had no scheme
+// check at all.
+func validateAuthEndpoints(a *AuthConfig) error {
+	// When auth is disabled, NewAuthenticator builds no methods and never
+	// fetches any endpoint, so a staged/dev http:// JWKS or validator URL in
+	// a disabled block is inert — don't fail startup on it.
+	if a == nil || !a.Enable {
+		return nil
+	}
+	for i := range a.Methods {
+		m := &a.Methods[i]
+		// Validate only the field the method's type actually fetches from —
+		// buildAuthMethod consumes exactly one of these per type, so a
+		// stale/staged http:// value in a field the type ignores must not
+		// fail startup.
+		var field, value string
+		switch m.Type {
+		case "jwt":
+			field, value = "jwksUrl", m.JwksURL
+		case "introspection":
+			field, value = "introspectionEndpoint", m.IntrospectionEndpoint
+		case "external-validator":
+			field, value = "endpoint", m.Endpoint
+		default:
+			continue
+		}
+		if err := requireSecureAuthURL(field, value); err != nil {
+			return fmt.Errorf("auth.methods[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// requireSecureAuthURL enforces https on an auth endpoint, allowing http
+// only for loopback (local dev / sidecar on the same host).
+func requireSecureAuthURL(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	u, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%s: invalid URL %q: %w", field, value, err)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("%s: refusing plaintext http for a non-loopback auth endpoint %q — use https (an on-path attacker could forge the response and bypass authentication)", field, value)
+	default:
+		return fmt.Errorf("%s: scheme %q not supported (want https)", field, u.Scheme)
+	}
+}
+
+// isLoopbackHost reports whether host is localhost or a loopback IP.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // validateNodeURLs rejects malformed or scheme-incompatible per-service

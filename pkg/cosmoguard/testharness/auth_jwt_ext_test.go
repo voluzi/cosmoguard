@@ -34,7 +34,7 @@ func TestI_JWT_ValidToken(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,
@@ -69,7 +69,7 @@ func TestI_JWT_ExpiredToken(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,
@@ -96,7 +96,7 @@ func TestI_JWT_BadSignature(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,
@@ -137,7 +137,7 @@ func TestI_ExternalValidator_Allow(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,
@@ -180,7 +180,7 @@ func TestI_ExternalValidator_Reject(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,
@@ -230,7 +230,7 @@ func TestI_JWT_RSA(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,
@@ -299,7 +299,7 @@ func TestI_JWT_JWKS(t *testing.T) {
 		Action:   cosmoguard.RuleActionAllow,
 		Paths:    []string{"/private"},
 		Methods:  []string{http.MethodGet},
-		Auth:     &cosmoguard.RuleAuthConfig{Require: ptrBool(true)},
+		Auth:     &cosmoguard.RuleAuthConfig{Require: boolPtr(true)},
 	}}
 
 	h := testharness.New(t,

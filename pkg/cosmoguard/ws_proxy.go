@@ -16,6 +16,14 @@ import (
 
 const (
 	defaultWebsocketPath = "/websocket"
+
+	// defaultWSReadLimit bounds a single inbound client WS frame when no
+	// ServerConfig is threaded through the constructor. 1 MiB is generous
+	// for any legitimate Cosmos/EVM frame (including a large
+	// eth_sendRawTransaction) while still capping worst-case heap from a
+	// single oversized frame. Deployments that need a different value set
+	// server.wsReadLimit; 0 there means "no explicit limit".
+	defaultWSReadLimit int64 = 1 << 20
 )
 
 type JsonRpcWebSocketProxy struct {
@@ -92,18 +100,19 @@ func NewJsonRpcWebSocketProxy(name string, backends []string, path string, conne
 	}
 	var allowed []string
 	if serverCfg != nil {
-		proxy.wsReadLimit = serverCfg.WSReadLimit
+		// EffectiveWSReadLimit honors an explicit 0 as "no limit" (per the
+		// field doc) while defaulting nil to a bounded 1 MiB — a `*int64`
+		// so an explicit 0 survives defaults.Set. The previous `<= 0 →
+		// 64 KiB` override silently clamped an explicit 0 AND contradicted
+		// the doc, closing connections that sent legitimately large frames
+		// (e.g. a big eth_sendRawTransaction).
+		proxy.wsReadLimit = serverCfg.EffectiveWSReadLimit()
 		allowed = serverCfg.WSAllowedOrigins
-	}
-	// Apply a sane default when the caller didn't thread a ServerConfig
-	// through (older programmatic embedders, tests). Without this, a
-	// nil serverCfg leaves proxy.wsReadLimit == 0 and SetReadLimit is
-	// never called, so gorilla/websocket accepts arbitrarily large
-	// frames — a single client can pin GB of heap with one
-	// WriteMessage. 64 KiB matches the JSON-RPC body cap on the HTTP
-	// side and is generous for any legitimate Cosmos / EVM message.
-	if proxy.wsReadLimit <= 0 {
-		proxy.wsReadLimit = 64 << 10
+	} else {
+		// No ServerConfig threaded through (programmatic embedders, tests):
+		// apply a bounded default so a client can't pin large heap with one
+		// oversized frame.
+		proxy.wsReadLimit = defaultWSReadLimit
 	}
 
 	check, err := compileOriginAllowlist(allowed)
@@ -183,6 +192,15 @@ func (p *JsonRpcWebSocketProxy) policyVerdict(request *JsonRpcMsg, rule *JsonRpc
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
 		allowed, _, rlErr := l.Allow(context.Background(), key)
 		if rlErr != nil {
+			if rule.RateLimit.FailClosed() {
+				p.log.WithError(rlErr).Warn("ws rate limiter error; failing closed (denying)")
+				p.cgDashboard.RecordDeny(DenyRecord{
+					Section: p.section, Reason: "rate_limit",
+					SourceIP: source, Method: request.Method,
+					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+				})
+				return false, -32005, "rate limiter unavailable"
+			}
 			p.log.WithError(rlErr).Warn("ws rate limiter error; allowing")
 		} else if !allowed {
 			p.cgDashboard.RecordDeny(DenyRecord{
@@ -244,6 +262,25 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 	for {
 		req, err := client.ReceiveMsg()
 		if err != nil {
+			// A malformed / unsupported frame on an otherwise healthy
+			// connection must NOT tear down the client and drop all its
+			// subscriptions. Reply with the appropriate JSON-RPC error
+			// (id: null) and keep reading — invalid JSON → -32700 Parse
+			// Error, valid-JSON-but-not-a-single-request (e.g. a batch) →
+			// -32600 Invalid Request. If the write fails the socket really
+			// is dead, so fall through to close.
+			if errors.Is(err, ErrBadMessage) || errors.Is(err, ErrInvalidRequest) {
+				p.log.Warnf("bad message from client: %v", err)
+				resp := ParseErrorResponse()
+				if errors.Is(err, ErrInvalidRequest) {
+					resp = InvalidRequestResponse()
+				}
+				if sendErr := client.SendMsg(resp); sendErr == nil {
+					continue
+				}
+				client.Close()
+				break
+			}
 			if errors.Is(err, ErrClosed) {
 				p.log.Warnf("client disconnected")
 				client.Close()

@@ -11,6 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testClusterEncryptionKey is a valid base64-encoded 32-byte memberlist
+// key shared by cluster-forming tests (runtime, rate-limiter, replication).
+const testClusterEncryptionKey = "Y29zbW9ndWFyZC10ZXN0LWtleS0zMi1ieXRlcyEhISE="
+
 // TestClusterRuntimeEmbeddedStartStop verifies that the embedded-only
 // default cluster runtime starts, exposes a usable client, and shuts down
 // cleanly. This is the path that runs on every single-instance install,
@@ -64,11 +68,12 @@ func TestClusterRuntimeTwoNodeStaticDiscovery(t *testing.T) {
 
 	newNode := func(bind, gossip int) *clusterRuntime {
 		cfg := &ClusterConfig{
-			BindAddr:     "127.0.0.1",
-			BindPort:     bind,
-			GossipPort:   gossip,
-			ReplicaCount: 2,
-			Quorum:       1,
+			BindAddr:      "127.0.0.1",
+			BindPort:      bind,
+			GossipPort:    gossip,
+			ReplicaCount:  2,
+			Quorum:        1,
+			EncryptionKey: testClusterEncryptionKey,
 			Discovery: &ClusterDiscoveryConfig{
 				Mode:   "static",
 				Static: &StaticDiscoveryConfig{Peers: staticPeers},

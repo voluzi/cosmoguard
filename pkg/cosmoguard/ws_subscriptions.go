@@ -10,6 +10,22 @@ type SubscriptionManager struct {
 	paramToID       map[string]string
 	idToParam       map[string]string
 
+	// The SubscriptionManager is keyed throughout by a STABLE "canonical"
+	// subscription id (the id the client was first handed). The underlying
+	// upstream subscription id can change when a subscription is migrated
+	// off a dead upstream onto a healthy one (the new upstream mints a
+	// different id). These two maps translate between the canonical id and
+	// the current upstream id so:
+	//   - inbound notifications (which carry the CURRENT upstream id) route
+	//     to the right client set (upstreamToCanonical), and
+	//   - the broker can call pool.Unsubscribe with the CURRENT upstream id
+	//     (canonicalToUpstream).
+	// For EVM subscriptions the canonical id is also embedded verbatim in
+	// each notification's params.subscription, so keeping it stable is what
+	// stops web3 clients from silently dropping events after a migration.
+	upstreamToCanonical map[string]string
+	canonicalToUpstream map[string]string
+
 	clientsMux          sync.RWMutex
 	clientSubscriptions map[string]map[*JsonRpcWsClient]interface{}
 }
@@ -18,30 +34,68 @@ func NewSubscriptionManager() *SubscriptionManager {
 	return &SubscriptionManager{
 		paramToID:           make(map[string]string),
 		idToParam:           make(map[string]string),
+		upstreamToCanonical: make(map[string]string),
+		canonicalToUpstream: make(map[string]string),
 		clientSubscriptions: make(map[string]map[*JsonRpcWsClient]interface{}),
 	}
 }
 
+// AddSubscription registers a new upstream subscription. `id` is both the
+// canonical (stable, client-facing) id and the initial upstream id — they
+// only diverge later if Migrate moves the subscription to another upstream.
 func (s *SubscriptionManager) AddSubscription(param string, id string) {
 	s.subscriptionMux.Lock()
 	defer s.subscriptionMux.Unlock()
 	s.paramToID[param] = id
 	s.idToParam[id] = param
+	s.upstreamToCanonical[id] = id
+	s.canonicalToUpstream[id] = id
 
 	s.clientsMux.Lock()
 	defer s.clientsMux.Unlock()
 	s.clientSubscriptions[id] = make(map[*JsonRpcWsClient]interface{})
 }
 
+// RemoveSubscription drops a subscription by its canonical id, including
+// the canonical↔upstream translation entries.
 func (s *SubscriptionManager) RemoveSubscription(id string) {
 	s.subscriptionMux.Lock()
 	defer s.subscriptionMux.Unlock()
 	delete(s.paramToID, s.idToParam[id])
 	delete(s.idToParam, id)
+	if upstream, ok := s.canonicalToUpstream[id]; ok {
+		delete(s.upstreamToCanonical, upstream)
+		delete(s.canonicalToUpstream, id)
+	}
 
 	s.clientsMux.Lock()
 	defer s.clientsMux.Unlock()
 	delete(s.clientSubscriptions, id)
+}
+
+// CanonicalID maps a current upstream subscription id to its stable
+// canonical id. When there is no translation entry it returns
+// (upstreamID, false) — the id unchanged so callers can use it directly, and
+// false signalling that no translation was found (not a migrated id).
+func (s *SubscriptionManager) CanonicalID(upstreamID string) (string, bool) {
+	s.subscriptionMux.RLock()
+	defer s.subscriptionMux.RUnlock()
+	if canonical, ok := s.upstreamToCanonical[upstreamID]; ok {
+		return canonical, true
+	}
+	return upstreamID, false
+}
+
+// UpstreamID maps a canonical subscription id to its current upstream id
+// (what pool.Subscribe/Unsubscribe key on). Returns (canonicalID, false)
+// when unknown so callers can fall back to the canonical id.
+func (s *SubscriptionManager) UpstreamID(canonicalID string) (string, bool) {
+	s.subscriptionMux.RLock()
+	defer s.subscriptionMux.RUnlock()
+	if upstream, ok := s.canonicalToUpstream[canonicalID]; ok {
+		return upstream, true
+	}
+	return canonicalID, false
 }
 
 func (s *SubscriptionManager) SubscriptionEmpty(id string) bool {
@@ -140,33 +194,30 @@ func (s *SubscriptionManager) Snapshot() []SubStat {
 	return out
 }
 
-// ReplaceSubscriptionID rewires the subscription registry from oldID
-// to newID while preserving the existing client set + the param→id
-// mapping. Used by the pool's subscription migrator when an upstream
-// dies and its subscriptions are re-issued on a healthy upstream
-// (which returns a different ID).
+// Migrate repoints a subscription from an old upstream id to a new one
+// after the pool re-subscribed it on a healthy upstream. Crucially it
+// leaves the canonical (client-facing) id, the param→canonical mapping,
+// and the client set UNCHANGED — only the canonical↔upstream translation
+// is updated. This is what keeps the client-facing subscription id stable
+// across a migration: EVM clients match notifications on
+// params.subscription (the canonical id), and a client's
+// eth_unsubscribe(canonicalID) keeps resolving.
 //
-// Returns true when the swap happened; false when oldID was unknown
-// (caller raced with a client unsubscribe).
-func (s *SubscriptionManager) ReplaceSubscriptionID(oldID, newID string) bool {
-	if oldID == newID {
+// oldUpstreamID / newUpstreamID are the pool's subscription ids before and
+// after the re-subscribe. Returns true when the swap happened; false when
+// oldUpstreamID was unknown (caller raced with a client unsubscribe).
+func (s *SubscriptionManager) Migrate(oldUpstreamID, newUpstreamID string) bool {
+	if oldUpstreamID == newUpstreamID {
 		return true
 	}
 	s.subscriptionMux.Lock()
 	defer s.subscriptionMux.Unlock()
-	param, ok := s.idToParam[oldID]
+	canonical, ok := s.upstreamToCanonical[oldUpstreamID]
 	if !ok {
 		return false
 	}
-	delete(s.idToParam, oldID)
-	s.idToParam[newID] = param
-	s.paramToID[param] = newID
-
-	s.clientsMux.Lock()
-	defer s.clientsMux.Unlock()
-	if clients, ok := s.clientSubscriptions[oldID]; ok {
-		s.clientSubscriptions[newID] = clients
-		delete(s.clientSubscriptions, oldID)
-	}
+	delete(s.upstreamToCanonical, oldUpstreamID)
+	s.upstreamToCanonical[newUpstreamID] = canonical
+	s.canonicalToUpstream[canonical] = newUpstreamID
 	return true
 }

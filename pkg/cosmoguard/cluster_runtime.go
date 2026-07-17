@@ -86,6 +86,24 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		mc.BindAddr = bindAddr
 		mc.BindPort = opts.Cluster.GossipPort
 		mc.AdvertisePort = opts.Cluster.GossipPort
+
+		// Enable memberlist gossip encryption + authentication. The key is
+		// validated at config load (validateCacheBackend), but decode again
+		// here so a runtime constructed directly (tests) still fails closed
+		// rather than starting an unencrypted cluster.
+		key, err := DecodeClusterEncryptionKey(opts.Cluster.EncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("cluster runtime: encryption key: %w", err)
+		}
+		mc.SecretKey = key
+		// SecretKey only protects the memberlist GOSSIP plane. The olric RESP
+		// DATA port (BindPort) is a separate listener over which peers (and
+		// the embedded client) read/write the shared DMaps — without auth,
+		// any host reaching that port could manipulate rate-limit buckets,
+		// the cache, and the JWT replay set. Turn on olric's password auth so
+		// the data plane requires the same shared secret; olric wires the
+		// embedded client's credentials from the same setting automatically.
+		c.Authentication = &config.Authentication{Password: opts.Cluster.EncryptionKey}
 	} else {
 		// Embedded-only: ephemeral loopback ports for both surfaces.
 		mc.BindAddr = "127.0.0.1"

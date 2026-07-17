@@ -21,7 +21,7 @@ import (
 func TestD_RateLimitPerIP(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{{
@@ -69,7 +69,7 @@ func TestD_RateLimitPerIP(t *testing.T) {
 func TestD_RateLimitGlobal(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{{
@@ -113,7 +113,7 @@ func TestD_RateLimitGlobal(t *testing.T) {
 func TestD_RateLimitDoesNotPoisonOtherRules(t *testing.T) {
 	cfg := &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD: cosmoguard.LcdConfig{
 			Default: cosmoguard.RuleActionAllow,
 			Rules: []*cosmoguard.HttpRule{

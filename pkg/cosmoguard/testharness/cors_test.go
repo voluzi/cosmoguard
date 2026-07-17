@@ -121,7 +121,7 @@ func TestJ_CORS_DisallowedOriginNoHeaders(t *testing.T) {
 func corsBaseConfig() *cosmoguard.Config {
 	return &cosmoguard.Config{
 		Cache:   cosmoguard.CacheGlobalConfig{TTL: 5 * time.Second},
-		Metrics: cosmoguard.MetricsConfig{Enable: false},
+		Metrics: cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD:     cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{
 			Default: cosmoguard.RuleActionAllow,

@@ -128,3 +128,12 @@ var ErrReplay = errors.New("jwt replay detected")
 // method reading the same header value. The pipeline maps it to a
 // 401 Unauthorized response.
 var ErrInvalidCredential = errors.New("invalid credential")
+
+// ErrAuthUnavailable is returned by a fail-closed AuthMethod (external
+// validator / introspection with `failureMode: fail-closed`) when its
+// backend is unreachable. Both the HTTP pipeline and the gRPC path must
+// DENY on it — a fail-closed method's whole point is that an outage rejects
+// rather than admits. Distinct from ErrInvalidCredential (which means "a
+// bad credential was presented") and from a generic transient error (which
+// is treated as anonymous / fail-open for methods that opted into that).
+var ErrAuthUnavailable = errors.New("authentication backend unavailable")

@@ -305,7 +305,7 @@ func TestDashboard_PortCollisionRejected(t *testing.T) {
 		RpcPort:   17777,
 		LcdPort:   17776,
 		GrpcPort:  17775,
-		Metrics:   cosmoguard.MetricsConfig{Enable: true, Port: 17777},
+		Metrics:   cosmoguard.MetricsConfig{Enable: boolPtr(true), Port: 17777},
 		Dashboard: cosmoguard.DashboardConfig{Enable: &dashEnable, Port: 17777},
 		LCD:       cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
 		RPC: cosmoguard.RpcConfig{

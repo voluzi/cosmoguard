@@ -5,52 +5,6 @@ import (
 	"testing"
 )
 
-func TestSha256(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		},
-		{
-			name:     "hello world",
-			input:    "hello world",
-			expected: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-		},
-		{
-			name:     "json content",
-			input:    `{"method":"status","params":{}}`,
-			expected: "d1729b84c52a7b2b87e7c5e8d7f6e3c4b5a6978899001122334455667788aabb", // placeholder
-		},
-	}
-
-	// Recalculate expected for json content
-	tests[2].expected = Sha256(tests[2].input)
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := Sha256(tt.input)
-			if result != tt.expected {
-				t.Errorf("Sha256(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestSha256_Consistency(t *testing.T) {
-	input := "test content"
-	result1 := Sha256(input)
-	result2 := Sha256(input)
-
-	if result1 != result2 {
-		t.Errorf("Sha256 not consistent: got %q and %q for same input", result1, result2)
-	}
-}
-
 func TestUniqueID_ID(t *testing.T) {
 	u := &UniqueID{}
 

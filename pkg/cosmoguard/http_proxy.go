@@ -6,6 +6,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -166,7 +168,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		cors:             cfg.CORSConfig,
 	}
 	if cfg.ServerConfig != nil {
-		proxy.maxRequestBody = cfg.ServerConfig.MaxRequestBody
+		proxy.maxRequestBody = cfg.ServerConfig.EffectiveMaxRequestBody()
 	}
 
 	// Per-request request rewrite: stripped credential headers, anything
@@ -380,18 +382,29 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		if r.RateLimit == nil {
 			continue
 		}
-		// Reuse the previous limiter if the rule fingerprint didn't change.
+		// Reuse the previous limiter if the rule fingerprint didn't change —
+		// UNLESS it's a failed-init sentinel, which must be rebuilt so a
+		// fail-closed rule recovers once the backend is healthy again
+		// (otherwise a transient olric error would deny that rule forever).
 		if l, ok := existing[r.Fingerprint]; ok {
-			newLimiters[r.Fingerprint] = l
-			continue
+			if _, failed := l.(failingRateLimiter); !failed {
+				newLimiters[r.Fingerprint] = l
+				continue
+			}
 		}
 		// Each rule's bucket pool gets its own keyspace under the proxy
 		// name so multiple proxies (lcd, rpc, etc.) don't share buckets.
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
 		if err != nil {
-			p.log.WithError(err).WithField("rule_priority", r.Priority).
-				Error("rate limiter init failed; rule will run without limit")
+			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-closed rule will DENY")
+				newLimiters[r.Fingerprint] = sentinel
+			} else {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).
+					Error("rate limiter init failed; fail-open rule will run without limit")
+			}
 			continue
 		}
 		newLimiters[r.Fingerprint] = l
@@ -532,6 +545,21 @@ func (p *HttpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				RuleTag:  ruleTag,
 			})
 			p.tooManyRequests(w, r, time.Duration(decision.RetryAfter)*time.Second, start)
+		case http.StatusServiceUnavailable:
+			// Fail-closed auth/rate-limit outage: a genuine denial that must
+			// still land on the dashboard's recent-denials feed, the
+			// live-traffic/request log, and request-duration metrics/tracing
+			// — the plain http.Error default would make it disappear.
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section:  p.section,
+				Reason:   "auth",
+				SourceIP: GetSourceIP(r),
+				Method:   r.Method,
+				Path:     r.URL.Path,
+				RuleTag:  ruleTag,
+			})
+			WriteError(w, http.StatusServiceUnavailable, decision.Reason)
+			p.recordOutcome(r, http.StatusServiceUnavailable, cacheMiss, RuleActionDeny, start, "request denied (auth/limiter unavailable)")
 		default:
 			http.Error(w, decision.Reason, decision.HTTPStatus)
 		}
@@ -749,13 +777,95 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 	if q := req.URL.Query().Encode(); q != "" {
 		canonical += "?" + q
 	}
-	// xxhash64 is ~5-10× faster than sha256 on cosmoguard-shaped inputs and
-	// is the right tool for cache-key hashing (no need for cryptographic
-	// collision resistance — the rule fingerprint already namespaces).
+	// Fold the client's acceptable content-coding set into the key. Upstreams
+	// commonly content-negotiate on it (Content-Encoding + Vary: Accept-
+	// Encoding); without this, a compressed response cached for one client
+	// would be replayed verbatim to a client that can't decode that coding.
+	// We key on the FULL set of acceptable codings (not a gzip/br/identity
+	// bucket) so a client accepting e.g. `gzip, zstd` never shares an entry
+	// with a gzip-only client — the upstream might return zstd, which the
+	// gzip-only client couldn't accept. Responses that Vary on anything
+	// besides Accept-Encoding are refused caching (see cacheableByVary).
+	// Join ALL Accept-Encoding header lines — a client may legally send more
+	// than one, and the reverse proxy forwards them all upstream; Header.Get
+	// would see only the first and could mis-key.
 	return util.XXHash64Hex(
 		strconv.FormatUint(ruleFingerprint, 16) + "\x00" +
-			req.Method + "\x00" + canonical + "\x00" + string(b),
+			req.Method + "\x00" + canonical + "\x00" +
+			acceptEncodingKey(strings.Join(req.Header.Values("Accept-Encoding"), ",")) + "\x00" +
+			string(b),
 	), nil
+}
+
+// acceptEncodingKey returns a canonical, order-independent representation of
+// the codings a client will accept (those with q > 0), so two clients share a
+// cache entry only when their acceptable-coding sets are identical. It parses
+// `q` values (RFC 9110 §12.5.3), so `gzip;q=0` is excluded. `*` (any coding)
+// is kept as its own token — a `*` client and a `gzip` client must not share
+// an entry because the upstream may return a coding only one of them accepts.
+// `identity` is always implicitly acceptable unless explicitly excluded.
+func acceptEncodingKey(ae string) string {
+	// accepted maps coding → normalized q (>0); excluded is the set with q=0.
+	accepted := map[string]float64{}
+	excluded := map[string]struct{}{}
+	for _, part := range strings.Split(ae, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		coding := token
+		q := 1.0
+		if semi := strings.IndexByte(token, ';'); semi >= 0 {
+			coding = strings.TrimSpace(token[:semi])
+			for _, param := range strings.Split(token[semi+1:], ";") {
+				param = strings.TrimSpace(param)
+				if v, ok := strings.CutPrefix(strings.ToLower(param), "q="); ok {
+					if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+						q = f
+					}
+				}
+			}
+		}
+		coding = strings.ToLower(coding)
+		if q <= 0 {
+			excluded[coding] = struct{}{}
+			delete(accepted, coding)
+		} else if _, ex := excluded[coding]; !ex {
+			accepted[coding] = q
+		}
+	}
+	// identity is implicitly acceptable (q=1) unless it — or `*` — is
+	// explicitly excluded (RFC 9110 §12.5.3).
+	_, identityExcluded := excluded["identity"]
+	_, starExcluded := excluded["*"]
+	if !identityExcluded && !starExcluded {
+		if _, ok := accepted["identity"]; !ok {
+			accepted["identity"] = 1.0
+		}
+	}
+	// Each token carries its NORMALIZED q value, so two clients that accept
+	// the same coding set but RANK them differently (e.g. gzip>br vs br>gzip)
+	// get different keys — a q-honouring upstream could pick different
+	// encodings for them, and they must not share a cached variant.
+	tokens := make([]string, 0, len(accepted)+len(excluded))
+	for c, q := range accepted {
+		tokens = append(tokens, c+";q="+strconv.FormatFloat(q, 'g', -1, 64))
+	}
+	// When the client accepts a wildcard, an explicit `coding;q=0` exclusion
+	// carves the coding OUT of "anything" and MUST stay in the key —
+	// otherwise `*, gzip;q=0` would collide with plain `*`. Without a
+	// wildcard an excluded coding is equivalent to omission (dropped for
+	// better dedup).
+	if _, wildcard := accepted["*"]; wildcard {
+		for c := range excluded {
+			if c == "*" {
+				continue
+			}
+			tokens = append(tokens, "!"+c)
+		}
+	}
+	sort.Strings(tokens)
+	return strings.Join(tokens, ",")
 }
 
 // cacheHit serves an already-fetched cached response. The caller does the
@@ -858,6 +968,15 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 	if !cacheableByUpstream(ww.GetCommittedHeaders()) {
 		return
 	}
+	// Refuse to cache a response whose Vary header names request headers we
+	// don't fold into the cache key. We DO key on Accept-Encoding (see
+	// getRequestHash), so Vary: Accept-Encoding is fine; anything else
+	// (e.g. Vary: Authorization, Accept-Language, *) would let one client's
+	// content-negotiated response be served to a client that sent different
+	// headers.
+	if !cacheableByVary(ww.GetCommittedHeaders()) {
+		return
+	}
 
 	// Parse the upstream's Age header (if any) at store time so cache
 	// hits can compute a correct downstream Age (per RFC 7234 §5.1):
@@ -891,7 +1010,51 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 	// string nonce in the hash derivation). Path-plus-query so query
 	// variants register as distinct keys — the operator's signal is
 	// precisely "is this rule writing one entry per unique query?".
-	p.cgDashboard.RecordCardinality(p.section, ruleTag, r.Method+" "+r.URL.RequestURI())
+	p.cgDashboard.RecordCardinality(p.section, ruleTag, r.Method+" "+p.redactedRequestURI(r))
+}
+
+// redactCredentialQuery replaces the value of any credential-carrying query
+// parameter (from an api-key method in queryParam mode) with "REDACTED", so
+// the raw key never lands in the dashboard's request log or cardinality
+// samples. Returns the input unchanged when nothing needs redacting.
+func (p *HttpProxy) redactCredentialQuery(rawQuery string) string {
+	if rawQuery == "" || p.auth == nil {
+		return rawQuery
+	}
+	names := p.auth.CredentialQueryParams()
+	if len(names) == 0 {
+		return rawQuery
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		// Unparseable query: fall back to dropping it entirely rather than
+		// risk logging a credential we couldn't parse out.
+		return "[redacted]"
+	}
+	changed := false
+	for _, name := range names {
+		if q.Has(name) {
+			q.Set(name, "REDACTED")
+			changed = true
+		}
+	}
+	if !changed {
+		return rawQuery
+	}
+	return q.Encode()
+}
+
+// redactedRequestURI rebuilds path?query with credential query params
+// redacted, for cardinality sampling.
+func (p *HttpProxy) redactedRequestURI(r *http.Request) string {
+	if r.URL.RawQuery == "" {
+		return r.URL.RequestURI()
+	}
+	redacted := p.redactCredentialQuery(r.URL.RawQuery)
+	if redacted == "" {
+		return r.URL.Path
+	}
+	return r.URL.Path + "?" + redacted
 }
 
 // cacheableByUpstream reports whether the upstream's Cache-Control
@@ -1028,7 +1191,7 @@ func (p *HttpProxy) recordOutcome(r *http.Request, status int, cacheState, actio
 			Section:    p.section,
 			Method:     r.Method,
 			Path:       r.URL.Path,
-			Query:      r.URL.RawQuery,
+			Query:      p.redactCredentialQuery(r.URL.RawQuery),
 			Status:     status,
 			LatencyMs:  duration.Milliseconds(),
 			CacheState: cacheState,

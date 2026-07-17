@@ -122,7 +122,7 @@ func (b *Broker) runMigration() {
 	defer b.upstreamSubMux.Unlock()
 
 	for _, m := range b.pool.MigrateUnhealthy() {
-		if !b.sm.ReplaceSubscriptionID(m.OldID, m.NewID) {
+		if !b.sm.Migrate(m.OldID, m.NewID) {
 			b.log.WithFields(Fields{
 				"oldID": m.OldID,
 				"newID": m.NewID,
@@ -141,10 +141,12 @@ func (b *Broker) SubStats() []WSSubInfo {
 	subs := b.sm.Snapshot()
 	out := make([]WSSubInfo, 0, len(subs))
 	for _, s := range subs {
+		// s.ID is the canonical id; the pool tracks the current upstream id.
+		upstreamID, _ := b.sm.UpstreamID(s.ID)
 		out = append(out, WSSubInfo{
 			Param:       s.Param,
 			Subscribers: s.Subscribers,
-			Upstream:    b.pool.SubscriptionTarget(s.ID),
+			Upstream:    b.pool.SubscriptionTarget(upstreamID),
 		})
 	}
 	return out
@@ -283,7 +285,10 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 	defer b.upstreamSubMux.Unlock()
 
 	if b.sm.SubscriptionEmpty(subID) {
-		if err = b.pool.Unsubscribe(subID); err != nil {
+		// pool.Unsubscribe keys on the CURRENT upstream id, which differs
+		// from the canonical subID after a migration.
+		upstreamID, _ := b.sm.UpstreamID(subID)
+		if err = b.pool.Unsubscribe(upstreamID); err != nil {
 			return err
 		}
 		param, _ := b.sm.GetSubscriptionParam(subID)
@@ -321,7 +326,9 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 
 		if b.sm.SubscriptionEmpty(subscriptionID) {
 			b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
-			if err := b.pool.Unsubscribe(subscriptionID); err != nil {
+			// pool.Unsubscribe keys on the CURRENT upstream id (post-migration).
+			upstreamID, _ := b.sm.UpstreamID(subscriptionID)
+			if err := b.pool.Unsubscribe(upstreamID); err != nil {
 				errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
 				continue
 			}
@@ -343,10 +350,26 @@ func (b *Broker) onSubscriptionMessage(msg *JsonRpcMsg) {
 	// minted via util.UniqueID). Defend against malformed upstreams
 	// that send a non-string ID — a raw type assertion here used to
 	// panic the broker's read goroutine.
-	msgID, ok := msg.ID.(string)
+	upstreamID, ok := msg.ID.(string)
 	if !ok {
 		b.log.WithField("ID", msg.ID).Warn("dropped subscription message with non-string ID")
 		return
+	}
+
+	// The notification carries the CURRENT upstream subscription id, which
+	// differs from the stable canonical id after a migration. Route on the
+	// canonical id so the client set is found, and — for EVM, where the id
+	// is echoed to the client inside params.subscription — rewrite that
+	// field back to the canonical id the client actually subscribed with.
+	// Without this rewrite, web3 clients match on params.subscription and
+	// silently drop every event after a migration.
+	msgID, translated := b.sm.CanonicalID(upstreamID)
+	if translated && msgID != upstreamID {
+		if params, ok := msg.Params.(map[string]interface{}); ok {
+			if _, has := params["subscription"]; has {
+				params["subscription"] = msgID
+			}
+		}
 	}
 
 	clients := b.sm.GetSubscriptionClients(msgID)

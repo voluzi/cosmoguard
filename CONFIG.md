@@ -44,16 +44,23 @@ The `server:` block tunes HTTP/WS server timeouts and body caps. Defaults are co
 server:
   readHeaderTimeout: 10s    # cap on time to read HTTP headers (slowloris defense)
   readTimeout: 30s          # cap on total request-read time
-  writeTimeout: 30s         # cap on response write time
+  writeTimeout: 0            # cap on response write time; 0 = no limit (default)
   idleTimeout: 60s          # keep-alive idle timeout
-  maxRequestBody: 1048576   # bytes; requests exceeding this return 413
-  wsReadLimit: 65536        # max bytes per inbound WebSocket frame
+  maxRequestBody: 5242880   # bytes; requests exceeding this return 413 (0 = no limit)
+  wsReadLimit: 1048576      # max bytes per inbound WebSocket frame (0 = no limit)
   wsAllowedOrigins:         # cross-origin WS upgrade allowlist
     - https://app.example.com
     - https://*.preview.example.com
 ```
 
 **Breaking from v3:** `wsAllowedOrigins` defaults to empty — cross-origin WS upgrades are denied unless explicitly allowed. To restore v3 behavior, set `wsAllowedOrigins: ["*"]`.
+
+**Default changes since v4.0.0-rc.1** (all restore v3-compatible behaviour that the rc.1 defaults broke):
+- `writeTimeout` now defaults to **0 (no limit)**. A fixed deadline truncated large/slow streamed responses (`/block_results`, `/genesis`, big `eth_getLogs`) mid-body. Set an explicit ceiling if exposing cosmoguard to untrusted clients.
+- `maxRequestBody` default raised from 1 MiB to **5 MiB** so large payloads (e.g. a wasm `MsgStoreCode` broadcast) aren't rejected with 413.
+- `wsReadLimit` default raised from 64 KiB to **1 MiB**, and an explicit `0` now means "no limit" (as documented) instead of being silently forced to 64 KiB. Large frames (e.g. a big `eth_sendRawTransaction`) are no longer dropped.
+
+**Hot-reload:** `server:` timeouts / body caps, `cors:`, and dashboard `enable`/`port`/`basicAuth` are captured at startup and now **reject** a reload that changes them (with a clear "requires a process restart" message) instead of silently accepting a change that never takes effect. `dashboard.requestLog` and `server.trustedProxies` still hot-reload.
 
 ---
 
@@ -133,7 +140,7 @@ cache:
 
 ### Migration from v3
 
-`cache.backend`, `cache.redis`, and `cache.redis-sentinel` were removed in v4. The embedded olric runtime + L1 cache covers every workload — see `bench/RESULTS.md` for the comparison numbers. Existing v3 configs with `cache.redis: …` should remove the field; cosmoguard will ignore it (yaml unknown-field tolerance) but log a startup warning.
+`cache.backend`, `cache.redis`, and `cache.redis-sentinel` were removed in v4. The embedded olric runtime + L1 cache covers every workload — see `bench/RESULTS.md` for the comparison numbers. A config that still contains `cache.redis` or `cache.redis-sentinel` now **fails startup** with a migration error (rather than silently ignoring the field and running an isolated per-pod cache). Remove those keys and, for multi-replica deployments, add a `cluster:` block.
 
 ### Cluster mode
 
@@ -148,12 +155,15 @@ cache:
     peerApiPort: 0          # 0 → bindPort + 1, used for the cluster dashboard fan-out
     replicaCount: 2         # RF=2 — primary + one replica per partition
     quorum: 1               # 2 for split-brain-proof mode with replicaCount=3
+    encryptionKey: "${CLUSTER_KEY}"  # REQUIRED — base64 16/24/32-byte gossip encryption key
     discovery:
       mode: dns             # required; see below
       dns:
         host: cosmoguard-peers.cosmoguard.svc.cluster.local
         refreshInterval: 10s
 ```
+
+**`encryptionKey` is required in cluster mode.** It enables memberlist gossip encryption + peer authentication (AES-128/192/256-GCM) AND password authentication on olric's RESP data port, so both the gossip plane and the data plane require the shared secret. Without it, any host that can reach the peer ports could join the cluster and read/write the shared DMaps (rate-limit buckets, cache, JWT replay set). Generate one with `head -c32 /dev/urandom | base64` and give **every pod the same value** (from a Kubernetes Secret). Still restrict the peer ports at the network layer (NetworkPolicy) — the key is defence-in-depth, not a substitute.
 
 #### Discovery modes
 
@@ -322,7 +332,9 @@ Per-identity rate limits are expressed at the **rule** level via `rateLimit: { s
 
 When `auth.replayProtection.enable` is true and a verified JWT carries a `jti` claim, cosmoguard checks a seen-set keyed on `(issuer, jti)`. A repeat within the token's expiration window is rejected with **HTTP 401** and `reason=token replayed` in the audit log. Tokens without `jti` are not enforced — replay protection requires the IdP to mint unique identifiers. The store is backed by olric when cluster mode is on (so replicas share the seen-set); otherwise in-process with a periodic-GC sweep.
 
-Credential-carrying headers are **always stripped** before forwarding upstream — a Cosmos node never sees cosmoguard's auth headers. The strip set is derived from the configured methods (you don't list it manually).
+Credential-carrying headers are **always stripped** before forwarding upstream — a Cosmos node never sees cosmoguard's auth headers. The strip set is derived from the configured methods (you don't list it manually). An api-key passed via `queryParam` is likewise redacted from the dashboard's request log and cardinality samples.
+
+**Auth endpoints must use https.** `jwksUrl`, `introspectionEndpoint`, and the external-validator `endpoint` are rejected at startup unless they use `https` (or point at loopback for local dev). Over plaintext http an on-path attacker could serve a forged JWKS or validator response and mint a fully-trusted identity — a complete authentication bypass.
 
 Per-rule auth gate:
 
@@ -487,10 +499,13 @@ Cache keys are namespaced per rule fingerprint — two rules matching the same r
 rateLimit:
   rate: 100/s                        # or "100", "30/min", "1/5s", "250/250ms"
   burst: 200                         # max bucket capacity; defaults to rate
-  scope: per-ip                      # per-ip (default) | global | per-identity
+  scope: per-ip                      # per-ip (default) | global | per-identity | compound
+  failureMode: fail-open             # fail-open (default) | fail-closed
 ```
 
 With a `cache.cluster` block present, rate-limit buckets are sharded across replicas through olric so the configured rate is a true cluster-wide budget. In single-pod / embedded olric mode the rate is enforced per pod.
+
+`failureMode` controls behaviour when the limiter backend errors (e.g. olric loses quorum). `fail-open` (default) admits the request so a coordination hiccup doesn't 429 all traffic; `fail-closed` denies it so a backend outage can't silently disable rate limiting cluster-wide. Applies uniformly across HTTP, JSON-RPC, WebSocket, and gRPC.
 
 #### Examples
 
@@ -592,6 +607,15 @@ grpc:
         enable: true
         ttl: 60s
         keyMode: method-only        # no parameters; one entry per method
+```
+
+**`keyMetadata` (gRPC).** Response-affecting request metadata is folded into the cache key so requests that differ only by such metadata cache separately. It defaults to `["x-cosmos-block-height"]` — the metadata that selects the state height a Cosmos query runs against — so a query at one height never serves another height's cached response. Set an explicit empty list (`keyMetadata: []`) to opt out on a genuinely height-independent method:
+
+```yaml
+      cache:
+        enable: true
+        ttl: 5s
+        keyMetadata: ["x-cosmos-block-height"]   # default; requests at different heights cache separately
 ```
 
 ---
