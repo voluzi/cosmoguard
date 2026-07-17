@@ -11,26 +11,82 @@ import (
 // client that sent different headers.
 func TestCacheableByVary(t *testing.T) {
 	cases := []struct {
-		vary string
-		want bool
+		vary      string
+		corsOwned bool
+		want      bool
 	}{
-		{"", true},
-		{"Accept-Encoding", true},
-		{"accept-encoding", true},
-		{"Accept-Encoding, Accept-Encoding", true},
-		{"Accept-Language", false},
-		{"Authorization", false},
-		{"Accept-Encoding, Accept-Language", false},
-		{"*", false},
+		{"", false, true},
+		{"Accept-Encoding", false, true},
+		{"accept-encoding", false, true},
+		{"Accept-Encoding, Accept-Encoding", false, true},
+		{"Accept-Language", false, false},
+		{"Authorization", false, false},
+		{"Accept-Encoding, Accept-Language", false, false},
+		{"*", false, false},
+		// Origin is cacheable only when cosmoguard owns CORS — ACAO is
+		// re-derived per hit and never stored.
+		{"Origin", false, false},
+		{"Origin", true, true},
+		{"origin", true, true},
+		{"Accept-Encoding, Origin", true, true},
+		// Real per-client variance stays uncacheable even under CORS ownership.
+		{"Authorization", true, false},
+		{"Cookie", true, false},
+		{"Origin, Authorization", true, false},
+		{"*", true, false},
 	}
 	for _, tc := range cases {
 		h := http.Header{}
 		if tc.vary != "" {
 			h.Set("Vary", tc.vary)
 		}
-		if got := cacheableByVary(h); got != tc.want {
-			t.Errorf("cacheableByVary(Vary: %q) = %v, want %v", tc.vary, got, tc.want)
+		if got := cacheableByVary(h, tc.corsOwned); got != tc.want {
+			t.Errorf("cacheableByVary(Vary: %q, corsOwned=%v) = %v, want %v", tc.vary, tc.corsOwned, got, tc.want)
 		}
+	}
+}
+
+// TestCacheableByVaryMultiLine covers Vary spread across multiple header lines
+// (an upstream + cosmoguard's addVary can produce this).
+func TestCacheableByVaryMultiLine(t *testing.T) {
+	h := http.Header{}
+	h.Add("Vary", "Accept-Encoding")
+	h.Add("Vary", "Origin")
+	if !cacheableByVary(h, true) {
+		t.Error("Accept-Encoding + Origin across two lines must be cacheable when CORS owned")
+	}
+	if cacheableByVary(h, false) {
+		t.Error("Origin must NOT be cacheable when CORS is not owned")
+	}
+	bad := http.Header{}
+	bad.Add("Vary", "Accept-Encoding")
+	bad.Add("Vary", "Authorization")
+	if cacheableByVary(bad, true) {
+		t.Error("Authorization must never be cacheable, even under CORS ownership")
+	}
+}
+
+// TestPickCacheableHeadersExcludesACAO is the safety linchpin: the CORS
+// Allow-Origin header must never be stored, so a cached body can't leak one
+// origin's ACAO to another (it's re-derived per hit by ApplyToResponse).
+func TestPickCacheableHeadersExcludesACAO(t *testing.T) {
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	h.Set("Vary", "Origin")
+	h.Set("Access-Control-Allow-Origin", "https://app.example.com")
+	h.Set("Access-Control-Allow-Credentials", "true")
+	got := pickCacheableHeaders(h, nil)
+	if _, ok := got["Access-Control-Allow-Origin"]; ok {
+		t.Error("Access-Control-Allow-Origin must NOT be stored in the cache")
+	}
+	if _, ok := got["Access-Control-Allow-Credentials"]; ok {
+		t.Error("Access-Control-Allow-Credentials must NOT be stored in the cache")
+	}
+	if got["Content-Type"] != "application/json" {
+		t.Errorf("Content-Type must be preserved, got %q", got["Content-Type"])
+	}
+	if got["Vary"] != "Origin" {
+		t.Errorf("Vary must be preserved, got %q", got["Vary"])
 	}
 }
 

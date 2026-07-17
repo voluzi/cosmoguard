@@ -52,7 +52,15 @@ var hopByHopHeaders = []string{
 // getRequestHash) but on no other request header, so a response that Vary's
 // on anything else — or on "*" — cannot be safely reused across clients and
 // must not be cached. Absent/empty Vary is cacheable.
-func cacheableByVary(upstream http.Header) bool {
+//
+// Origin is a special case: when corsOwned is true (cosmoguard's CORS layer
+// is enabled) the Origin dimension belongs to cosmoguard, not the cached
+// content. Access-Control-Allow-Origin is never stored (it's not in
+// alwaysPreservedHeaders) and is re-derived per request by
+// CORSConfig.ApplyToResponse on every cache hit, so a Vary: Origin response
+// — whose body is identical across origins — is safe to cache. With CORS
+// off we stay conservative and treat Origin like any other varying header.
+func cacheableByVary(upstream http.Header, corsOwned bool) bool {
 	// An upstream can legally send Vary across MULTIPLE header lines; Get
 	// returns only the first, so a response with `Vary: Accept-Encoding`
 	// followed by `Vary: Authorization` would otherwise slip through. Walk
@@ -69,9 +77,17 @@ func cacheableByVary(upstream http.Header) bool {
 				return false
 			}
 			// Accept-Encoding is folded into the cache key, so it's safe.
-			if f != "accept-encoding" {
-				return false
+			if f == "accept-encoding" {
+				continue
 			}
+			// Origin is safe only when cosmoguard owns the CORS surface.
+			if f == "origin" && corsOwned {
+				continue
+			}
+			// Any other varying header (Authorization, Cookie,
+			// Accept-Language, …) reflects real per-client content
+			// variance the cache can't key on — refuse.
+			return false
 		}
 	}
 	return true

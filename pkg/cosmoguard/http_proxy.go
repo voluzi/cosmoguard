@@ -990,8 +990,14 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 	// getRequestHash), so Vary: Accept-Encoding is fine; anything else
 	// (e.g. Vary: Authorization, Accept-Language, *) would let one client's
 	// content-negotiated response be served to a client that sent different
-	// headers.
-	if !cacheableByVary(ww.GetCommittedHeaders()) {
+	// headers. Vary: Origin is safe when cosmoguard owns CORS — ACAO is
+	// re-derived per hit and never stored (see cacheableByVary).
+	//
+	// These committed headers are POST-CORS: on the miss path the pool's
+	// modifyResponse hook already ran ApplyToResponse (line ~232), so a
+	// CORS-owned response carries cosmoguard's own Vary: Origin here, not the
+	// upstream's.
+	if !cacheableByVary(ww.GetCommittedHeaders(), p.cors != nil && p.cors.Enable) {
 		return
 	}
 
