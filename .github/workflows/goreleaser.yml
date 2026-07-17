@@ -27,6 +27,28 @@ jobs:
           # auto-upgrade, so goreleaser fails "go.mod requires go >= 1.25".
           go-version-file: go.mod
 
+      # For a STABLE release, base the changelog on the previous stable tag
+      # (e.g. v4.0.0 → v3.0.0) instead of goreleaser's default of the
+      # immediately-preceding tag, which would be the last -rc. Prerelease
+      # tags (-rc/-beta/…) keep the default behaviour (diff against the prior
+      # tag). GORELEASER_PREVIOUS_TAG overrides goreleaser's auto-detection.
+      - name: Compute changelog base
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$tag" != *-* ]]; then
+            # Newest stable (no prerelease suffix) tag that isn't this one.
+            prev=$(git tag --list 'v*' --sort=-v:refname \
+              | awk -v cur="$tag" '$0 !~ /-/ && $0 != cur {print; exit}')
+            if [ -n "$prev" ]; then
+              echo "GORELEASER_PREVIOUS_TAG=$prev" >> "$GITHUB_ENV"
+              echo "Stable release $tag: changelog base $prev..$tag"
+            else
+              echo "Stable release $tag: no prior stable tag; using goreleaser default"
+            fi
+          else
+            echo "Prerelease $tag: using goreleaser default changelog base"
+          fi
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
