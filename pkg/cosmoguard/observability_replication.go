@@ -271,7 +271,7 @@ func (r *observabilityReplicator) flush(ctx context.Context) error {
 		History:       r.history.Snapshot(),
 		WrittenMs:     time.Now().UnixMilli(),
 	}
-	blob, err := msgpack.Marshal(&payload)
+	blob, err := marshalReplicationPayload(&payload)
 	if err != nil {
 		return fmt.Errorf("observability replication: marshal: %w", err)
 	}
@@ -279,6 +279,45 @@ func (r *observabilityReplicator) flush(ctx context.Context) error {
 		return fmt.Errorf("observability replication: put: %w", err)
 	}
 	return nil
+}
+
+// maxReplicationBlobBytes bounds the marshalled replication payload so its
+// olric Put can't exceed the per-fragment entry cap (olricTableSizeBytes) and
+// fail with ErrEntryTooLarge — which, unlike the response caches, has no
+// uncached fallback and would drop dashboard restart-restore entirely. Left a
+// margin below the table size for olric's own per-entry framing.
+const maxReplicationBlobBytes = int(olricTableSizeBytes) - (16 << 10) // 240 KiB
+
+// marshalReplicationPayload marshals the payload, trimming the metrics
+// History oldest-first until the blob fits under maxReplicationBlobBytes.
+// History is the unbounded, high-cardinality-sensitive part; the base
+// observability snapshot is kept even if it alone is large (a too-large Put
+// then surfaces as the normal flush error rather than being silently lost).
+func marshalReplicationPayload(payload *replicationPayload) ([]byte, error) {
+	blob, err := msgpack.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) <= maxReplicationBlobBytes || len(payload.History) == 0 {
+		return blob, nil
+	}
+	// Binary search would be overkill; drop the oldest history entries in
+	// halving steps until it fits or history is exhausted.
+	trimmed := payload.History
+	for len(trimmed) > 0 && len(blob) > maxReplicationBlobBytes {
+		drop := len(trimmed)/2 + 1
+		trimmed = trimmed[drop:]
+		p := *payload
+		p.History = trimmed
+		if blob, err = msgpack.Marshal(&p); err != nil {
+			return nil, err
+		}
+	}
+	if dropped := len(payload.History) - len(trimmed); dropped > 0 {
+		slog.Warn("observability replication: trimmed history to fit entry cap",
+			"dropped", dropped, "kept", len(trimmed), "bytes", len(blob), "cap", maxReplicationBlobBytes)
+	}
+	return blob, nil
 }
 
 // restore reads this pod's own previous snapshot from the DMap and

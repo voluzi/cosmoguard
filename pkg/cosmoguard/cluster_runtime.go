@@ -51,6 +51,14 @@ const olricLRUSamples = 10
 // olric default because all peers must agree on the count.
 const embeddedPartitionCount = 31
 
+// olricTableSizeBytes caps olric's per-fragment table allocation. olric's
+// default (1 MiB per (partition, dmap) fragment, allocated upfront regardless
+// of contents) puts an idle cluster well past 500 MiB. This also bounds the
+// largest storable entry: a value bigger than one table returns
+// ErrEntryTooLarge (response caches then serve uncached; the observability
+// replicator trims its blob to stay under this — see maxReplicationBlobBytes).
+const olricTableSizeBytes uint64 = 256 << 10 // 256 KiB
+
 // applyL2EvictionConfig bounds the olric L2 working set (issue #15). LRU is
 // set as the GLOBAL default so every response-cache DMap inherits it; the
 // non-cache DMaps (rate-limit buckets/locks, JWT replay set, observability
@@ -286,7 +294,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		c.DMaps.Engine.Config = map[string]interface{}{}
 	}
 	if _, set := c.DMaps.Engine.Config["tableSize"]; !set {
-		c.DMaps.Engine.Config["tableSize"] = uint64(256 << 10) // 256 KiB
+		c.DMaps.Engine.Config["tableSize"] = uint64(olricTableSizeBytes)
 	}
 
 	// Bound the L2 (olric) working set so a high-cardinality query load can't
