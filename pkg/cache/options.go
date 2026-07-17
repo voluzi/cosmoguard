@@ -16,8 +16,9 @@ type Options struct {
 	TTL time.Duration
 	// MaxCostBytes caps the in-memory (L1) working set by approximate
 	// payload cost in bytes, evicting least-recently-used entries above
-	// the cap. 0 means unbounded. The cost of an entry is computed by
-	// costOf (see memory.go).
+	// the cap. 0 means unbounded. Each entry is charged a flat per-entry
+	// overhead (entryOverheadBytes) plus its value's own size (costOf) —
+	// see memory.go — so a flood of tiny values is bounded by real heap use.
 	MaxCostBytes uint64
 	// MaxItems caps the L1 entry count, evicting LRU entries above the
 	// cap. 0 means unbounded. A secondary guard alongside MaxCostBytes.
