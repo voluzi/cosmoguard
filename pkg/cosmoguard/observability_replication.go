@@ -98,6 +98,12 @@ type observabilityReplicator struct {
 	stopOnce  sync.Once
 	startOnce sync.Once
 	wg        sync.WaitGroup
+
+	// oversizedWarned gates the "snapshot exceeds entry cap" warning to the
+	// transition edge, so a persistent extreme-cardinality condition logs
+	// once (and logs recovery once) instead of every flush tick. flush runs
+	// serially on the replication ticker, so no lock is needed.
+	oversizedWarned bool
 }
 
 // newObservabilityReplicator wires up a replicator. The olric client
@@ -271,14 +277,73 @@ func (r *observabilityReplicator) flush(ctx context.Context) error {
 		History:       r.history.Snapshot(),
 		WrittenMs:     time.Now().UnixMilli(),
 	}
-	blob, err := msgpack.Marshal(&payload)
+	blob, err := marshalReplicationPayload(&payload)
 	if err != nil {
 		return fmt.Errorf("observability replication: marshal: %w", err)
+	}
+	// If the blob is still over the entry cap after trimming history, the
+	// base observability snapshot alone is too large (extreme cardinality).
+	// Skip the write rather than let olric reject it with ErrEntryTooLarge on
+	// every tick — restart-restore is best-effort, so a logged skip is the
+	// right failure mode. Bounding the snapshot's internal cardinality is a
+	// separate observability change, not this cache-memory fix.
+	if len(blob) > maxReplicationBlobBytes {
+		// Log only on the transition into the oversized state so a persistent
+		// condition doesn't emit a warning every tick (~2880/day/pod).
+		if !r.oversizedWarned {
+			slog.Warn("observability replication: snapshot exceeds entry cap even after trimming history; skipping restore writes until it shrinks",
+				"bytes", len(blob), "cap", maxReplicationBlobBytes)
+			r.oversizedWarned = true
+		}
+		return nil
+	}
+	if r.oversizedWarned {
+		slog.Info("observability replication: snapshot back under entry cap; resuming restore writes")
+		r.oversizedWarned = false
 	}
 	if err := r.dm.Put(ctx, r.key(), blob, olric.EX(replicationTTL)); err != nil {
 		return fmt.Errorf("observability replication: put: %w", err)
 	}
 	return nil
+}
+
+// maxReplicationBlobBytes bounds the marshalled replication payload so its
+// olric Put can't exceed the per-fragment entry cap (olricTableSizeBytes) and
+// fail with ErrEntryTooLarge — which, unlike the response caches, has no
+// uncached fallback and would drop dashboard restart-restore entirely. Left a
+// margin below the table size for olric's own per-entry framing.
+const maxReplicationBlobBytes = int(olricTableSizeBytes) - (16 << 10) // 240 KiB
+
+// marshalReplicationPayload marshals the payload, trimming the metrics
+// History oldest-first until the blob fits under maxReplicationBlobBytes.
+// History is the unbounded, high-cardinality-sensitive part; the base
+// observability snapshot is kept even if it alone is large (a too-large Put
+// then surfaces as the normal flush error rather than being silently lost).
+func marshalReplicationPayload(payload *replicationPayload) ([]byte, error) {
+	blob, err := msgpack.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) <= maxReplicationBlobBytes || len(payload.History) == 0 {
+		return blob, nil
+	}
+	// Binary search would be overkill; drop the oldest history entries in
+	// halving steps until it fits or history is exhausted.
+	trimmed := payload.History
+	for len(trimmed) > 0 && len(blob) > maxReplicationBlobBytes {
+		drop := len(trimmed)/2 + 1
+		trimmed = trimmed[drop:]
+		p := *payload
+		p.History = trimmed
+		if blob, err = msgpack.Marshal(&p); err != nil {
+			return nil, err
+		}
+	}
+	if dropped := len(payload.History) - len(trimmed); dropped > 0 {
+		slog.Warn("observability replication: trimmed history to fit entry cap",
+			"dropped", dropped, "kept", len(trimmed), "bytes", len(blob), "cap", maxReplicationBlobBytes)
+	}
+	return blob, nil
 }
 
 // restore reads this pod's own previous snapshot from the DMap and

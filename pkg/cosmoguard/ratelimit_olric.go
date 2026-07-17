@@ -71,7 +71,7 @@ func newOlricRateLimiter(client *olric.EmbeddedClient, cfg RateLimitConfig, keys
 	// the same partition map. The keyspace lives inside the key, not
 	// the DMap name, so a single DMap holds every rule's buckets — fewer
 	// olric internal structures than one DMap per rule.
-	dm, err := client.NewDMap("ratelimit")
+	dm, err := client.NewDMap(rateLimitDMap)
 	if err != nil {
 		return nil, fmt.Errorf("rate limiter: dmap: %w", err)
 	}
@@ -86,7 +86,7 @@ func newOlricRateLimiter(client *olric.EmbeddedClient, cfg RateLimitConfig, keys
 	// Allow and breaking Unlock for the holder. With locks isolated, no
 	// key collision is structurally possible regardless of what identity
 	// names an external validator returns.
-	locks, err := client.NewDMap("ratelimit-locks")
+	locks, err := client.NewDMap(rateLimitLocksDMap)
 	if err != nil {
 		return nil, fmt.Errorf("rate limiter: locks dmap: %w", err)
 	}

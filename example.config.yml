@@ -70,6 +70,11 @@ server:
 # ---------------------------------------------------------------------------
 cache:
   ttl: 5s
+  # memory:                          # cache memory budget (bounds OOM risk)
+  #   # Defaults auto-derive from the pod's memory limit; override if needed:
+  #   maxBytes: 0                    # absolute L1 cap (bytes); unset → auto; 0 → unlimited
+  #   distributedMaxBytesPerNode: 0  # absolute olric L2 per-node cap; unset → auto; 0 → unlimited
+  #   reserveFraction: 0.20          # auto-mode runtime reserve fraction, [0, 0.9)
   # cluster:
   #   bindAddr: "${POD_IP}"
   #   discovery: { mode: dns, dns: { host: cosmoguard-peers.svc.cluster.local } }

@@ -7,6 +7,10 @@ type SharedOptions struct {
 	ServerConfig   *ServerConfig
 	Authenticator  *Authenticator
 	MetricsEnabled bool
+	// CacheBudget is the per-instance memory budget for this proxy's
+	// response cache, already divided across the enabled caches by New().
+	// Zero-value means unbounded (the test/programmatic path).
+	CacheBudget CacheBudget
 	// OlricClient is the in-process olric handle used by the v4
 	// cluster-shared rate limiter (cache.backend=olric, the default).
 	// nil when no clusterRuntime is wired (tests, programmatic
@@ -86,6 +90,27 @@ func WithCacheConfig[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions 
 			x.CacheConfig = c
 		case *GrpcProxyOptions:
 			x.CacheConfig = c
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+// WithCacheBudget threads the per-instance response-cache memory budget
+// (issue #15) into a proxy. New() resolves the total budget from the pod's
+// memory limit and divides it across the enabled caches before passing each
+// share here. The zero value leaves the cache unbounded (test path).
+func WithCacheBudget[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions | GrpcProxyOptions](b CacheBudget) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *SharedOptions:
+			x.CacheBudget = b
+		case *HttpProxyOptions:
+			x.CacheBudget = b
+		case *JsonRpcHandlerOptions:
+			x.CacheBudget = b
+		case *GrpcProxyOptions:
+			x.CacheBudget = b
 		default:
 			panic("unexpected use")
 		}

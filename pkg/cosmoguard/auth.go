@@ -252,7 +252,7 @@ func NewAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient) (*Auth
 	a := &Authenticator{defaultReq: cfg.DefaultRequire}
 
 	if cfg.ReplayProtection != nil && cfg.ReplayProtection.Enable {
-		store, err := NewReplayStore(olricClient, "cosmoguard:jti")
+		store, err := NewReplayStore(olricClient, replayJTIDMap)
 		if err != nil {
 			return nil, fmt.Errorf("auth.replayProtection: %w", err)
 		}

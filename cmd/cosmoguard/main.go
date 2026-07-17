@@ -158,6 +158,13 @@ func main() {
 
 	setupSlog(logLevel, logFormat)
 
+	// Align the Go runtime with the container's CPU/memory limits before
+	// building anything: GOMAXPROCS from the CPU quota and GOMEMLIMIT to a
+	// fraction of the memory limit. GOMEMLIMIT in particular is the primary
+	// defence against cache-driven OOMKills, so it must be set before the
+	// caches (and their eviction budgets) come up.
+	cosmoguard.SetupRuntimeTuning(slog.Default())
+
 	// Back-compat: --validate / --migrate-config still work, but emit a
 	// one-line deprecation note so operators migrate to the subcommand
 	// form.

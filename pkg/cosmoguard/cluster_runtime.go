@@ -15,6 +15,114 @@ import (
 	"github.com/olric-data/olric/config"
 )
 
+// Non-cache olric DMap names that must NEVER be subject to the response
+// cache's LRU eviction. Evicting rate-limit buckets, their lock tokens, the
+// JWT replay set, or the observability snapshots under memory pressure would
+// be a correctness/security regression (e.g. a replayed JWT, a reset rate
+// limiter). The response-cache DMaps opt INTO eviction via the global LRU
+// default; these are pinned back to EvictionPolicy=NONE via DMaps.Custom.
+// Referenced by their NewDMap call sites so a rename can't silently drop the
+// exemption. (replicationDMap = "observability" is defined alongside the
+// observability replicator.)
+const (
+	rateLimitDMap      = "ratelimit"
+	rateLimitLocksDMap = "ratelimit-locks"
+	replayJTIDMap      = "cosmoguard:jti"
+)
+
+// evictionExemptDMaps is the set of DMaps kept free of LRU eviction. Kept in
+// one place so the wiring and its regression test share a single source.
+var evictionExemptDMaps = []string{
+	rateLimitDMap,
+	rateLimitLocksDMap,
+	replayJTIDMap,
+	replicationDMap,
+}
+
+// olricLRUSamples is the sample size for olric's approximate (Redis-style)
+// LRU. Deliberately 2× olric's own default of 5 (config.DefaultLRUSamples)
+// for tighter eviction accuracy — cheap given the cache's short TTL.
+const olricLRUSamples = 10
+
+// embeddedPartitionCount is the olric partition count used in embedded/
+// single-pod mode. Lower than olric's default (271) because the L2 LRU has an
+// unavoidable per-DMap floor: olric can't evict a partition below one entry,
+// so the smallest achievable footprint per cache DMap is
+// ownedPartitions × maxEntrySize (= PartitionCount × olricTableSizeBytes in
+// embedded mode, where this node owns every partition). Across N cache DMaps
+// the aggregate L2 floor is N × PartitionCount × olricTableSizeBytes, which
+// must fit the smallest supported pod's L2 budget:
+//
+//	16 partitions × 256 KiB × 8 DMaps (EVM enabled) = 32 MiB
+//
+// — within the ~38 MiB L2 budget a 128 MiB pod resolves. Pods smaller than
+// that (or with more DMaps) can exceed the L2 cap by this floor; that's a
+// documented characteristic of the approximate olric bound (see CONFIG.md),
+// not something a still-lower count can fix for an arbitrarily tiny pod.
+// Cluster mode keeps olric's default because all peers must agree on the count
+// and each node then owns only PartitionCount/N_nodes partitions.
+const embeddedPartitionCount = 16
+
+// olricTableSizeBytes caps olric's per-fragment table allocation. olric's
+// default (1 MiB per (partition, dmap) fragment, allocated upfront regardless
+// of contents) puts an idle cluster well past 500 MiB. This also bounds the
+// largest storable entry: a value bigger than one table returns
+// ErrEntryTooLarge (response caches then serve uncached; the observability
+// replicator trims its blob to stay under this — see maxReplicationBlobBytes).
+const olricTableSizeBytes uint64 = 256 << 10 // 256 KiB
+
+// l2AssumedEntryOverheadBytes is the assumed per-key heap cost in olric
+// (hashed key, index/access-log slab entry, storage bookkeeping) beyond the
+// value bytes. Used to derive a MaxKeys ceiling alongside the byte cap: a
+// flood of tiny values can exhaust heap in per-key structures while the
+// byte-based Inuse counter stays low, so we also bound the key count to
+// ~budget/overhead. Mirrors the L1 entryOverheadBytes intent for L2.
+const l2AssumedEntryOverheadBytes uint64 = 512
+
+// applyL2EvictionConfig bounds the olric L2 working set (issue #15). LRU is
+// set as the GLOBAL default so every response-cache DMap inherits it; the
+// non-cache DMaps (rate-limit buckets/locks, JWT replay set, observability
+// snapshots) are pinned back to no-eviction via Custom so memory pressure
+// can never evict security/correctness state. l2MaxBytesPerNode == 0 leaves
+// eviction disabled (unlimited). Split out so it is unit-testable without
+// standing up a real olric daemon.
+//
+// olric's LRU cap only governs PRIMARY-partition writes; backup (replica)
+// writes bypass it (putOnReplicaFragment → PutRaw). So a node with
+// replicaFactor copies resident holds ~replicaFactor × MaxInuse. To keep the
+// node's actual in-use bytes within l2MaxBytesPerNode we set MaxInuse to
+// l2MaxBytesPerNode / replicaFactor. replicaFactor is 1 in embedded/single-
+// pod mode (no peers → no backups).
+func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replicaFactor int) {
+	if dmaps == nil || l2MaxBytesPerNode == 0 {
+		return
+	}
+	if replicaFactor < 1 {
+		replicaFactor = 1
+	}
+	maxInuse := l2MaxBytesPerNode / uint64(replicaFactor)
+	if maxInuse == 0 {
+		maxInuse = 1
+	}
+	dmaps.EvictionPolicy = config.LRUEviction
+	dmaps.MaxInuse = int(maxInuse)
+	// Complement the byte cap with a key-count cap so a high-cardinality flood
+	// of tiny values can't exhaust heap in per-key index structures before the
+	// byte-based Inuse counter trips. olric honors MaxInuse and MaxKeys
+	// together (whichever binds first). Derived from the same per-node byte
+	// budget and an assumed per-entry overhead.
+	if maxKeys := maxInuse / l2AssumedEntryOverheadBytes; maxKeys > 0 {
+		dmaps.MaxKeys = int(maxKeys)
+	}
+	dmaps.LRUSamples = olricLRUSamples
+	if dmaps.Custom == nil {
+		dmaps.Custom = map[string]config.DMap{}
+	}
+	for _, name := range evictionExemptDMaps {
+		dmaps.Custom[name] = config.DMap{EvictionPolicy: config.EvictionPolicy("NONE")}
+	}
+}
+
 // clusterRuntime owns the in-process olric daemon. It is always running, even
 // in the zero-config single-instance deployment, so the consumers (cache,
 // rate-limiter, observability replication) get a single uniform interface
@@ -51,6 +159,11 @@ type clusterRuntimeOptions struct {
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
 	// don't depend on the host's resolver.
 	Lookup LookupFunc
+	// L2MaxBytesPerNode caps the olric L2's per-node in-use bytes for each
+	// response-cache DMap (LRU eviction above the cap). 0 disables L2
+	// eviction (unlimited). The non-cache DMaps (evictionExemptDMaps) are
+	// always kept exempt regardless of this value.
+	L2MaxBytesPerNode uint64
 }
 
 func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
@@ -67,6 +180,19 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	clustered := opts.Cluster != nil
 
 	c := config.New("local")
+
+	// In embedded/single-pod mode this node owns every partition, so the
+	// olric LRU cap (which can't evict a partition below one entry) has an
+	// effective floor of PartitionCount × maxEntrySize per DMap. olric's
+	// default of 271 partitions would floor a small pod's L2 well above its
+	// budget (271 × 256 KiB ≈ 68 MiB/DMap) and reintroduce the OOM risk this
+	// guards. A smaller count lowers that floor (~8 MiB/DMap) so MaxInuse
+	// actually binds at realistic budgets. Only safe to change in embedded
+	// mode — in a real cluster every peer must agree on PartitionCount, so
+	// there we keep olric's default.
+	if !clustered {
+		c.PartitionCount = embeddedPartitionCount
+	}
 
 	mc := memberlist.DefaultLocalConfig()
 	// memberlist refuses to start if both LogOutput and Logger are set,
@@ -196,8 +322,18 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		c.DMaps.Engine.Config = map[string]interface{}{}
 	}
 	if _, set := c.DMaps.Engine.Config["tableSize"]; !set {
-		c.DMaps.Engine.Config["tableSize"] = uint64(256 << 10) // 256 KiB
+		c.DMaps.Engine.Config["tableSize"] = uint64(olricTableSizeBytes)
 	}
+
+	// Bound the L2 (olric) working set so a high-cardinality query load can't
+	// grow the shared store until the pod is OOMKilled (issue #15). Embedded/
+	// single-pod mode stores no backups (replicaFactor 1); clustered mode
+	// holds replicaCount copies per node, so the cap is divided accordingly.
+	replicaFactor := 1
+	if clustered && opts.Cluster.ReplicaCount > 0 {
+		replicaFactor = opts.Cluster.ReplicaCount
+	}
+	applyL2EvictionConfig(c.DMaps, opts.L2MaxBytesPerNode, replicaFactor)
 
 	if err := c.Sanitize(); err != nil {
 		return nil, fmt.Errorf("cluster runtime: sanitize: %w", err)

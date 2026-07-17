@@ -176,7 +176,7 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	if cfg.CacheConfig != nil {
 		cacheOptions = append(cacheOptions, cosmoguardcache.DefaultTTL(cfg.CacheConfig.TTL))
 	}
-	gcache, err := newResponseCache[string, []byte](cfg.CacheConfig, cfg.OlricClient, name, cacheOptions...)
+	gcache, err := newResponseCache[string, []byte](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}

@@ -59,6 +59,63 @@ type JsonRpcMsg struct {
 	WireSuffix []byte `json:"-" msgpack:"wire_suffix,omitempty"`
 }
 
+// jsonRpcMsgOverheadBytes is a flat per-entry allowance covering the
+// struct, the Version/Method strings, and the interface{} boxes that the
+// byte-length fields below don't capture. Conservative on purpose so the
+// L1 byte budget over-counts rather than under-counts.
+const jsonRpcMsgOverheadBytes uint64 = 128
+
+// CacheCost reports this message's approximate in-memory footprint in
+// bytes so the L1 byte-cost eviction (cache.MaxCost) accounts for it. The
+// large, variable parts are Result and WireSuffix (raw bytes); Method, the
+// ID, and the Error (message + data) are added, plus a fixed overhead for
+// the envelope. ID and Error.Data are interface{} and can carry
+// caller-controlled strings, so they must be charged — otherwise a client
+// sending many distinct large IDs could grow the cache past its budget
+// while being charged near-zero.
+func (j *JsonRpcMsg) CacheCost() uint64 {
+	cost := jsonRpcMsgOverheadBytes
+	cost += uint64(len(j.Result))
+	cost += uint64(len(j.WireSuffix))
+	cost += uint64(len(j.Method))
+	cost += approxInterfaceCost(j.ID)
+	if j.Error != nil {
+		cost += uint64(len(j.Error.Message))
+		cost += approxInterfaceCost(j.Error.Data)
+	}
+	return cost
+}
+
+// approxInterfaceCost estimates the byte footprint of an arbitrary JSON-RPC
+// interface{} field (ID, Error.Data). The common shapes — nil, string, raw
+// bytes — are measured directly with no allocation. A structured value
+// (map/slice from a decoded `error.data` object, or a rare structured ID) is
+// serialized to measure its true size: charging a tiny fixed amount would let
+// a client cache large structured error payloads while accounting for almost
+// nothing, defeating the byte budget. On a marshal error we fall back to a
+// conservative fixed estimate.
+func approxInterfaceCost(v interface{}) uint64 {
+	switch t := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return uint64(len(t))
+	case []byte:
+		return uint64(len(t))
+	case jsoniter.RawMessage:
+		return uint64(len(t))
+	case bool, float64, float32,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64:
+		return 16 // scalar — small and bounded, no need to marshal
+	default:
+		if b, err := json.Marshal(t); err == nil {
+			return uint64(len(b))
+		}
+		return 256 // conservative fallback when the value can't be marshaled
+	}
+}
+
 // rawOrNull is a custom unmarshal target that distinguishes an absent
 // JSON field, an explicit `null`, and any other value. jsoniter's
 // RawMessage unmarshaller collapses `null` and "absent" into the same

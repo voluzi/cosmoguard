@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"encoding/base64"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -330,12 +331,58 @@ type CacheGlobalConfig struct {
 	// in-process L1 (see pkg/cache/tiered.go).
 	TTL time.Duration `yaml:"ttl,omitempty" default:"5s"`
 	Key string        `yaml:"key"`
+	// Memory bounds the cache's memory footprint so a high-cardinality
+	// query load can't grow the working set until the pod is OOMKilled.
+	// See CacheMemoryConfig; when omitted the budget is auto-derived from
+	// the detected cgroup memory limit.
+	Memory CacheMemoryConfig `yaml:"memory,omitempty"`
 	// Cluster controls the embedded olric daemon. When nil, the daemon
 	// runs in embedded-only mode on loopback ephemeral ports (no external
 	// surface, no peers, no replication). When set with Enable: true, the
 	// daemon binds the configured BindAddr:BindPort and joins peers
 	// advertised by the configured Discovery mode.
 	Cluster *ClusterConfig `yaml:"cluster,omitempty"`
+}
+
+// CacheMemoryConfig bounds the response cache's memory use across both
+// tiers that share the pod heap: the in-process L1 (ttlcache) and the
+// olric L2 (which holds this node's partitions plus replicas of peers').
+// Both grow with query cardinality, so both need a ceiling.
+//
+// When a field is nil (unset) the budget is auto-derived from the
+// container's cgroup memory limit using the scaling-reserve model:
+//
+//	reserve = max(128 MiB, reserveFraction × limit)
+//	budget  = limit − reserve
+//	L1      = 40% of budget,  L2 = 60% of budget
+//
+// This scales with pod size (a bigger pod devotes proportionally more to
+// cache) while always holding back a floor for the runtime, request
+// buffers, and cache encoding/replica overhead. GOMEMLIMIT is set
+// separately to 90% of the same limit as a secondary GC backstop (it only
+// helps with reclaimable memory; these caps are the primary OOM defence).
+//
+// An explicit value overrides the auto-derivation for that tier: a
+// positive value is the byte cap; an explicit 0 means "no limit". When no
+// cgroup limit is detected (bare metal, unconstrained host), each tier
+// falls back to a fixed 128 MiB.
+type CacheMemoryConfig struct {
+	// MaxBytes caps the in-process L1 cache by approximate payload bytes
+	// (LRU eviction above the cap). nil → auto; explicit 0 → no limit.
+	// *int64 so an explicit `maxBytes: 0` survives defaults.Set.
+	MaxBytes *int64 `yaml:"maxBytes,omitempty"`
+	// MaxItems is an optional secondary L1 guard on entry count. nil/0 →
+	// no item-count limit (the byte cap does the work).
+	MaxItems *int64 `yaml:"maxItems,omitempty"`
+	// DistributedMaxBytesPerNode caps the olric L2's per-node in-use bytes
+	// for response-cache DMaps, above which olric LRU-evicts. Applies in
+	// both embedded and clustered mode (an embedded olric still holds the
+	// data in this pod's heap). nil → auto; explicit 0 → no limit.
+	DistributedMaxBytesPerNode *int64 `yaml:"distributedMaxBytesPerNode,omitempty"`
+	// ReserveFraction is the fraction of the detected memory limit held
+	// back from the cache budget for the runtime and overhead (auto mode
+	// only). nil → 0.20. Must be in [0, 0.9).
+	ReserveFraction *float64 `yaml:"reserveFraction,omitempty"`
 }
 
 // ClusterConfig configures the olric daemon's networking and replication
@@ -1011,6 +1058,30 @@ func validateListenerPorts(cfg *Config) error {
 	return nil
 }
 
+// validateCacheMemory rejects nonsensical cache memory-budget values.
+// Negative byte caps are meaningless (the *int64 encodes nil=auto, 0=no
+// limit, >0=cap — matching ServerConfig.MaxRequestBody), and
+// reserveFraction must leave room for both the cache budget and the
+// runtime, so it is bounded to [0, 0.9).
+func validateCacheMemory(m *CacheMemoryConfig) error {
+	if m.MaxBytes != nil && *m.MaxBytes < 0 {
+		return fmt.Errorf("cache.memory.maxBytes must be >= 0 (0 means no limit); got %d", *m.MaxBytes)
+	}
+	if m.MaxItems != nil && *m.MaxItems < 0 {
+		return fmt.Errorf("cache.memory.maxItems must be >= 0 (0 means no limit); got %d", *m.MaxItems)
+	}
+	if m.DistributedMaxBytesPerNode != nil && *m.DistributedMaxBytesPerNode < 0 {
+		return fmt.Errorf("cache.memory.distributedMaxBytesPerNode must be >= 0 (0 means no limit); got %d", *m.DistributedMaxBytesPerNode)
+	}
+	if m.ReserveFraction != nil {
+		f := *m.ReserveFraction
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= 0.9 {
+			return fmt.Errorf("cache.memory.reserveFraction must be a finite value in [0, 0.9); got %g", f)
+		}
+	}
+	return nil
+}
+
 // validateCacheBackend enforces the cluster-mode contract when the
 // operator supplied a cache.cluster block:
 //   - bindAddr must be routable per-pod (olric derives its memberlist
@@ -1019,6 +1090,9 @@ func validateListenerPorts(cfg *Config) error {
 //   - a discovery mode must be set explicitly (no environment-agnostic
 //     default that wouldn't silently fail somewhere).
 func validateCacheBackend(c *CacheGlobalConfig) error {
+	if err := validateCacheMemory(&c.Memory); err != nil {
+		return err
+	}
 	if c.Cluster != nil {
 		// A wildcard bindAddr (empty, 0.0.0.0, ::) is incompatible with
 		// clustering: olric's MemberlistConfig.Name is derived from

@@ -135,8 +135,43 @@ The `cache:` block configures the cache, rate-limiter, and (optional) cluster ru
 cache:
   ttl: 5s                                   # global default; rules can override
   key: "cosmoguard-prod"                    # optional key prefix
+  # memory: …                               # cache memory budget (see below)
   # cluster: …                              # presence enables networked cluster mode
 ```
+
+### Memory budget
+
+The cache is bounded so a high-cardinality query load (e.g. `/tx`, `/block_search`, `/tx_search` — one entry per distinct hash / query) can't grow the working set until the pod is OOMKilled. Both cache tiers that share the pod heap are capped: the in-process **L1** (LRU by approximate payload bytes) and the olric **L2** (per-node LRU). The rate-limiter, JWT replay set, and observability DMaps are **never** evicted.
+
+By default the budget is **derived automatically from the pod's memory limit** (read from the cgroup, v1/v2), so it scales with the pod without any configuration:
+
+```
+reserve = max(128 MiB, 0.20 × limit)   # runtime + buffers + cache overhead
+budget  = limit − reserve              # total cache footprint
+L1 = 40% of budget,  L2 = 60% of budget   (L2 also holds replicas)
+```
+
+The total is then split evenly across the response caches that run in the pod (one per proxy). The **caps are the primary OOM defence**. In parallel, `GOMEMLIMIT` is set to **90% of the limit** and `GOMAXPROCS` to the CPU quota — a secondary GC backstop for transient/non-cache allocations (it can only reclaim freeable memory, not the live cache set). When no cgroup limit is detectable (bare metal), each tier falls back to a fixed **128 MiB**.
+
+**The L2 (olric) cap is approximate by construction** — unlike the exact L1 byte bound. olric evicts by *sampled* LRU and cannot hold a partition below one entry, so each cache DMap has a floor of roughly `ownedPartitions × maxEntrySize`, and the aggregate L2 floor is `N_dmaps × ownedPartitions × 256 KiB`. The per-node cap is enforced by two complementary bounds — `MaxInuse` (bytes) and `MaxKeys` (count, derived from the byte budget) — so a flood of tiny entries can't exhaust heap in per-key index structures before the byte counter trips.
+
+- **Embedded/single-pod** mode uses a reduced partition count so the floor fits the L2 budget of the smallest supported pod (~128 MiB with all proxies enabled).
+- **Clustered** mode keeps olric's default partition count (271) because the count is fixed at cluster formation and every peer must agree on it, and a lower count would hurt key distribution as the cluster scales. The trade-off: a *small* cluster (e.g. 2 nodes, `replicaCount: 2`) has a large per-node floor (each node owns nearly every partition as primary or replica), so **a small cluster on small pods can exceed the resolved L2 budget.** Size clustered pods with headroom above `N_dmaps × ownedPartitions × 256 KiB`, or run more/larger nodes.
+
+Size the pod so its L2 budget clears the floor, or raise the memory limit. Entries larger than the 256 KiB fragment `tableSize` are served uncached rather than stored. Clustered deployments also divide the per-node cap by `replicaCount`, since each node holds replica copies that olric's primary-write cap doesn't govern. The L1 byte cap and `GOMEMLIMIT` are unaffected by any of this.
+
+Override any of it explicitly:
+
+```yaml
+cache:
+  memory:
+    maxBytes: 134217728                 # absolute L1 cap (bytes). unset → auto; 0 → no limit
+    maxItems: 0                         # optional L1 entry-count guard. 0 → no limit
+    distributedMaxBytesPerNode: 0       # absolute L2 (olric) per-node cap. unset → auto; 0 → no limit
+    reserveFraction: 0.20               # auto-mode reserve fraction; must be in [0, 0.9)
+```
+
+> **Upgrade note (v4.0.0):** deployments were previously unbounded. After upgrading, entries beyond the budget are LRU-evicted (more upstream traffic under extreme cardinality, never incorrect results), and `GOMEMLIMIT`/`GOMAXPROCS` are set from the container limits. Set `maxBytes: 0` and `distributedMaxBytesPerNode: 0` to restore the old unbounded behavior. Watch `cosmoguard_cache_evictions_total` (which counts budget evictions only, not TTL expiry) — a rising rate means the cap is undersized for your workload.
 
 ### Migration from v3
 
