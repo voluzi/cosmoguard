@@ -79,10 +79,12 @@ config:
   server:
     readHeaderTimeout: 10s
     readTimeout: 30s
-    # writeTimeout defaults to 0 (no limit) so large/slow streamed responses
+    # writeTimeout defaults to 0s (no limit) so large/slow streamed responses
     # (/block_results, /genesis, big eth_getLogs) aren't truncated mid-body.
     # Set an explicit ceiling if exposing cosmoguard to untrusted clients.
-    writeTimeout: 0
+    # Must be a duration string ("0s", "30s") — a bare 0 fails to unmarshal
+    # into the server's time.Duration field.
+    writeTimeout: "0s"
     idleTimeout: 60s
     # 5 MiB accommodates large payloads (e.g. a wasm MsgStoreCode broadcast).
     # 0 means no limit.
@@ -181,6 +183,19 @@ cluster:
   # Alternatively provide the key inline (base64-encoded 16/24/32 bytes). NOT
   # recommended — it lands in the rendered ConfigMap in cleartext.
   encryptionKey: ""
+  # When neither encryptionKey nor existingEncryptionKeySecret is set and
+  # cluster mode is on, the chart generates a random 32-byte key into a
+  # Secret named `<fullname>-cluster-key` and wires every pod to it. The key
+  # is generated ONCE and reused across upgrades via a cluster `lookup`, and
+  # the Secret is annotated `helm.sh/resource-policy: keep` so it survives a
+  # `helm uninstall` — a fresh key would partition a running cluster.
+  #
+  # CAVEAT (GitOps): `helm template` / client-side rendering cannot `lookup`
+  # the existing Secret, so it re-generates on every render and would churn
+  # the key across syncs. If you render client-side (Argo CD/Flux `helm
+  # template` mode), set generateEncryptionKey: false and supply
+  # existingEncryptionKeySecret instead.
+  generateEncryptionKey: true
 
 serviceAccount:
   create: true

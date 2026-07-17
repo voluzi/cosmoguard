@@ -148,8 +148,8 @@ mismatch, peerService disabled without cluster.enable=false).
 {{/* Skip the key check when the config is an externally-managed ConfigMap —
      the chart doesn't render cosmoguard.yaml then, so it can't see the key
      (the operator supplies it in their own ConfigMap/Secret wiring). */}}
-{{- if and (not .Values.existingConfigMap) (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) -}}
-{{- fail "cosmoguard: cluster mode requires an encryption key — set cluster.existingEncryptionKeySecret (recommended: a pre-created Secret with an `encryptionKey` field) or cluster.encryptionKey. The chart does NOT auto-generate one, because a generated key is non-deterministic under client-side / GitOps rendering and would silently partition the cluster across syncs. Generate one with: kubectl create secret generic cosmoguard-cluster --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)" -}}
+{{- if and (not .Values.existingConfigMap) (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) (ne (include "cosmoguard.shouldGenerateKey" .) "true") -}}
+{{- fail "cosmoguard: cluster mode requires an encryption key — set cluster.existingEncryptionKeySecret (recommended: a pre-created Secret with an `encryptionKey` field), set cluster.encryptionKey, or enable cluster.generateEncryptionKey (the chart mints a Secret once and reuses it via lookup). generateEncryptionKey is unsafe under client-side / GitOps rendering, which cannot lookup the existing Secret and would silently partition the cluster across syncs — supply existingEncryptionKeySecret there. Generate one manually with: kubectl create secret generic cosmoguard-cluster --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)" -}}
 {{- end -}}
 {{- if eq $mode "static" -}}
 {{- $peers := dig "discovery" "static" "peers" (list) $c -}}
@@ -195,12 +195,12 @@ podIdentityEnv emits the env entries injected on every workload pod:
   valueFrom:
     fieldRef:
       fieldPath: metadata.name
-{{- $existingSecret := (.Values.cluster | default dict).existingEncryptionKeySecret -}}
-{{- if and (not (include "cosmoguard.clusterInlineKey" .)) $existingSecret }}
+{{- $keySecret := include "cosmoguard.clusterKeySecretName" . -}}
+{{- if $keySecret }}
 - name: CLUSTER_ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ $existingSecret }}
+      name: {{ $keySecret }}
       key: encryptionKey
 {{- end }}
 {{- end }}
@@ -217,6 +217,43 @@ reference / generated Secret is used.
 {{- $fromConfig := dig "cache" "cluster" "encryptionKey" "" .Values.config -}}
 {{- $fromTop := (.Values.cluster | default dict).encryptionKey | default "" -}}
 {{- $fromConfig | default $fromTop -}}
+{{- end -}}
+
+{{/*
+shouldGenerateKey — "true" when the chart must mint a cluster encryption key
+Secret itself: cluster mode is on, the config is chart-rendered (not an
+externally-managed ConfigMap), the operator supplied neither an inline key
+nor an existing Secret, and cluster.generateEncryptionKey is enabled.
+*/}}
+{{- define "cosmoguard.shouldGenerateKey" -}}
+{{- $cluster := .Values.cluster | default (dict) -}}
+{{- if and (eq (include "cosmoguard.clusterEnabled" .) "true") (not .Values.existingConfigMap) (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) (dig "generateEncryptionKey" false $cluster) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+generatedKeySecretName — name of the Secret the chart creates for a
+self-generated cluster encryption key.
+*/}}
+{{- define "cosmoguard.generatedKeySecretName" -}}
+{{- printf "%s-cluster-key" (include "cosmoguard.fullname" .) -}}
+{{- end -}}
+
+{{/*
+clusterKeySecretName — name of the Secret to wire CLUSTER_ENCRYPTION_KEY
+from, or empty. Empty when the key is inlined (rendered straight into the
+config) or when cluster mode is off. Precedence: inline key (no env) >
+existingEncryptionKeySecret > chart-generated Secret.
+*/}}
+{{- define "cosmoguard.clusterKeySecretName" -}}
+{{- $cluster := .Values.cluster | default (dict) -}}
+{{- if include "cosmoguard.clusterInlineKey" . -}}
+{{- else if $cluster.existingEncryptionKeySecret -}}
+{{- $cluster.existingEncryptionKeySecret -}}
+{{- else if eq (include "cosmoguard.shouldGenerateKey" .) "true" -}}
+{{- include "cosmoguard.generatedKeySecretName" . -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
