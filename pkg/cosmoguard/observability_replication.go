@@ -275,6 +275,17 @@ func (r *observabilityReplicator) flush(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("observability replication: marshal: %w", err)
 	}
+	// If the blob is still over the entry cap after trimming history, the
+	// base observability snapshot alone is too large (extreme cardinality).
+	// Skip the write rather than let olric reject it with ErrEntryTooLarge on
+	// every tick — restart-restore is best-effort, so a logged skip is the
+	// right failure mode. Bounding the snapshot's internal cardinality is a
+	// separate observability change, not this cache-memory fix.
+	if len(blob) > maxReplicationBlobBytes {
+		slog.Warn("observability replication: snapshot exceeds entry cap even after trimming history; skipping this cycle's restore write",
+			"bytes", len(blob), "cap", maxReplicationBlobBytes)
+		return nil
+	}
 	if err := r.dm.Put(ctx, r.key(), blob, olric.EX(replicationTTL)); err != nil {
 		return fmt.Errorf("observability replication: put: %w", err)
 	}

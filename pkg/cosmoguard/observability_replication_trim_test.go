@@ -47,6 +47,23 @@ func TestMarshalReplicationPayload_TrimsToFit(t *testing.T) {
 	require.Equal(t, len(payload.Observability), len(out.Observability), "base observability snapshot must be preserved")
 }
 
+// TestMarshalReplicationPayload_OversizedSnapshotStillOverCap: when the base
+// observability snapshot alone exceeds the cap (history trimmed to empty), the
+// helper returns a blob still over the cap — flush then skips the Put rather
+// than erroring (asserted here by confirming the over-cap signal is visible).
+func TestMarshalReplicationPayload_OversizedSnapshotStillOverCap(t *testing.T) {
+	payload := &replicationPayload{
+		Observability: make([]byte, maxReplicationBlobBytes+(32<<10)), // base alone over cap
+		History:       []MetricsSnapshot{{}, {}, {}},
+		WrittenMs:     1,
+	}
+	blob, err := marshalReplicationPayload(payload)
+	require.NoError(t, err)
+	// History is trimmed to nothing but the base snapshot keeps it over cap;
+	// flush uses this len(blob) > cap check to skip the write.
+	require.Greater(t, len(blob), maxReplicationBlobBytes)
+}
+
 // TestMarshalReplicationPayload_SmallPayloadUntouched: a payload already under
 // the cap is returned as-is with its full history.
 func TestMarshalReplicationPayload_SmallPayloadUntouched(t *testing.T) {

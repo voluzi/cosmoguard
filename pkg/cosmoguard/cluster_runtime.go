@@ -45,11 +45,23 @@ var evictionExemptDMaps = []string{
 const olricLRUSamples = 10
 
 // embeddedPartitionCount is the olric partition count used in embedded/
-// single-pod mode. Lower than olric's default (271) to shrink the L2 LRU
-// per-partition overshoot floor (PartitionCount × maxEntrySize per DMap) so
-// the byte cap binds at realistic single-pod budgets. Cluster mode keeps the
-// olric default because all peers must agree on the count.
-const embeddedPartitionCount = 31
+// single-pod mode. Lower than olric's default (271) because the L2 LRU has an
+// unavoidable per-DMap floor: olric can't evict a partition below one entry,
+// so the smallest achievable footprint per cache DMap is
+// ownedPartitions × maxEntrySize (= PartitionCount × olricTableSizeBytes in
+// embedded mode, where this node owns every partition). Across N cache DMaps
+// the aggregate L2 floor is N × PartitionCount × olricTableSizeBytes, which
+// must fit the smallest supported pod's L2 budget:
+//
+//	16 partitions × 256 KiB × 8 DMaps (EVM enabled) = 32 MiB
+//
+// — within the ~38 MiB L2 budget a 128 MiB pod resolves. Pods smaller than
+// that (or with more DMaps) can exceed the L2 cap by this floor; that's a
+// documented characteristic of the approximate olric bound (see CONFIG.md),
+// not something a still-lower count can fix for an arbitrarily tiny pod.
+// Cluster mode keeps olric's default because all peers must agree on the count
+// and each node then owns only PartitionCount/N_nodes partitions.
+const embeddedPartitionCount = 16
 
 // olricTableSizeBytes caps olric's per-fragment table allocation. olric's
 // default (1 MiB per (partition, dmap) fragment, allocated upfront regardless
