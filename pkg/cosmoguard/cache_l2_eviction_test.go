@@ -23,6 +23,12 @@ func TestApplyL2EvictionConfig_ExemptsSecurityDMaps(t *testing.T) {
 	if dmaps.MaxInuse != 256<<20 {
 		t.Fatalf("global MaxInuse = %d, want %d", dmaps.MaxInuse, 256<<20)
 	}
+	// A key-count ceiling must accompany the byte cap so tiny-entry floods
+	// can't exhaust per-key index heap under the byte counter.
+	wantMaxKeys := int((256 << 20) / l2AssumedEntryOverheadBytes)
+	if dmaps.MaxKeys != wantMaxKeys {
+		t.Fatalf("global MaxKeys = %d, want %d", dmaps.MaxKeys, wantMaxKeys)
+	}
 
 	// Every non-cache DMap must be explicitly exempt.
 	for _, name := range evictionExemptDMaps {

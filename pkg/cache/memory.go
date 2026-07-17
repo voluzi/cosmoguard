@@ -37,7 +37,12 @@ func NewMemoryCache[K comparable, V any](namespace string, opts ...Option) (Cach
 			ttlcache.WithMaxCost[namespacedKey[K], V](
 				options.MaxCostBytes,
 				func(item ttlcache.CostItem[namespacedKey[K], V]) uint64 {
-					return costOf(item.Value)
+					// Charge a flat per-entry overhead on TOP of the value's
+					// own size, so a flood of tiny entries (e.g. small gRPC
+					// []byte responses) can't slip millions of map nodes,
+					// hashed keys, and ttlcache Item structs past the byte cap
+					// while each is accounted as only a few payload bytes.
+					return entryOverheadBytes + costOf(item.Value)
 				},
 			),
 		)
@@ -78,6 +83,13 @@ type CacheCoster interface {
 // CacheCoster. A non-zero estimate keeps the byte budget meaningful for
 // unknown types instead of letting them count as free.
 const fallbackCostBytes uint64 = 1024
+
+// entryOverheadBytes approximates the fixed per-entry heap cost the value's
+// own size doesn't capture: the namespaced key string, the map bucket, and
+// ttlcache's Item struct (mutex, timestamps, two list elements). Charged on
+// every cached entry so the byte budget bounds real heap use even under a
+// high-cardinality flood of tiny values, where this overhead dominates.
+const entryOverheadBytes uint64 = 200
 
 // costOf estimates a cached value's in-memory footprint in bytes for
 // byte-cost eviction. []byte is measured directly; anything implementing

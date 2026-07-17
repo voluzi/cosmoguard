@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,15 +27,16 @@ func TestCostOf(t *testing.T) {
 // hook fires for each eviction.
 func TestMemoryCache_ByteCostEviction(t *testing.T) {
 	var evictions atomic.Int64
-	// Cap at 100 bytes; each entry costs 40 → at most 2 fit.
+	// Cap at 10 KiB; each entry costs 4 KiB payload + entryOverheadBytes →
+	// at most 2 fit.
 	c, err := NewMemoryCache[string, []byte](
 		DefaultNamespace,
-		MaxCost(100),
+		MaxCost(10<<10),
 		OnEvict(func() { evictions.Add(1) }),
 	)
 	assert.NoError(t, err)
 
-	val := make([]byte, 40)
+	val := make([]byte, 4<<10)
 	for _, k := range []string{"a", "b", "c", "d"} {
 		assert.NoError(t, c.Set(context.TODO(), k, val, 0))
 	}
@@ -94,6 +96,28 @@ func TestMemoryCache_ItemCapEviction(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 	_, err = c.Get(context.TODO(), "c")
 	assert.NoError(t, err)
+}
+
+// TestMemoryCache_TinyEntriesChargedOverhead: a flood of near-empty values
+// must be bounded by the per-entry overhead, not admitted unbounded because
+// each payload is only a couple of bytes. With a 64 KiB cap and ~200 B
+// overhead per entry, far fewer than "millions" of 2-byte entries survive.
+func TestMemoryCache_TinyEntriesChargedOverhead(t *testing.T) {
+	c, err := NewMemoryCache[string, []byte](DefaultNamespace, MaxCost(64<<10))
+	assert.NoError(t, err)
+	const inserted = 100_000
+	for i := 0; i < inserted; i++ {
+		assert.NoError(t, c.Set(context.TODO(), fmt.Sprintf("k%d", i), []byte("ab"), 0))
+	}
+	// 64 KiB / ~200 B ≈ 300-ish entries can coexist; assert the survivors are
+	// bounded well below what was inserted (overhead did the bounding).
+	present := 0
+	for i := 0; i < inserted; i++ {
+		if _, err := c.Get(context.TODO(), fmt.Sprintf("k%d", i)); err == nil {
+			present++
+		}
+	}
+	assert.Less(t, present, 1000, "per-entry overhead must bound tiny-entry floods (present=%d)", present)
 }
 
 // TestMemoryCache_UnboundedByDefault: without caps, nothing is evicted for

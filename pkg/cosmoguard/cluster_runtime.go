@@ -71,6 +71,14 @@ const embeddedPartitionCount = 16
 // replicator trims its blob to stay under this — see maxReplicationBlobBytes).
 const olricTableSizeBytes uint64 = 256 << 10 // 256 KiB
 
+// l2AssumedEntryOverheadBytes is the assumed per-key heap cost in olric
+// (hashed key, index/access-log slab entry, storage bookkeeping) beyond the
+// value bytes. Used to derive a MaxKeys ceiling alongside the byte cap: a
+// flood of tiny values can exhaust heap in per-key structures while the
+// byte-based Inuse counter stays low, so we also bound the key count to
+// ~budget/overhead. Mirrors the L1 entryOverheadBytes intent for L2.
+const l2AssumedEntryOverheadBytes uint64 = 512
+
 // applyL2EvictionConfig bounds the olric L2 working set (issue #15). LRU is
 // set as the GLOBAL default so every response-cache DMap inherits it; the
 // non-cache DMaps (rate-limit buckets/locks, JWT replay set, observability
@@ -98,6 +106,14 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 	}
 	dmaps.EvictionPolicy = config.LRUEviction
 	dmaps.MaxInuse = int(maxInuse)
+	// Complement the byte cap with a key-count cap so a high-cardinality flood
+	// of tiny values can't exhaust heap in per-key index structures before the
+	// byte-based Inuse counter trips. olric honors MaxInuse and MaxKeys
+	// together (whichever binds first). Derived from the same per-node byte
+	// budget and an assumed per-entry overhead.
+	if maxKeys := maxInuse / l2AssumedEntryOverheadBytes; maxKeys > 0 {
+		dmaps.MaxKeys = int(maxKeys)
+	}
 	dmaps.LRUSamples = olricLRUSamples
 	if dmaps.Custom == nil {
 		dmaps.Custom = map[string]config.DMap{}
