@@ -130,6 +130,23 @@ type CachedResponse struct {
 	UpstreamAge int
 }
 
+// cacheEntryOverheadBytes is a flat per-entry allowance for the Go struct,
+// map header, and key bookkeeping that the payload byte counts don't
+// capture. Deliberately conservative so the byte budget slightly
+// over-counts rather than under-counts (under-counting is what OOMs).
+const cacheEntryOverheadBytes uint64 = 256
+
+// CacheCost reports this entry's approximate in-memory footprint in bytes
+// so the L1 byte-cost eviction (cache.MaxCost) accounts for it. Covers the
+// body, the preserved header keys+values, and a fixed struct/map overhead.
+func (r CachedResponse) CacheCost() uint64 {
+	cost := uint64(len(r.Data)) + cacheEntryOverheadBytes
+	for k, v := range r.Headers {
+		cost += uint64(len(k) + len(v))
+	}
+	return cost
+}
+
 // httpCacheWriteTimeout bounds how long a detached cache-write context
 // stays alive. The response has already been produced and is just as
 // cacheable as one whose client stuck around; a slow/wedged cache
@@ -257,7 +274,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		cacheOptions = append(cacheOptions, cache.DefaultTTL(cfg.CacheConfig.TTL))
 	}
 
-	proxy.cache, err = newResponseCache[string, CachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cacheOptions...)
+	proxy.cache, err = newResponseCache[string, CachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}

@@ -444,6 +444,34 @@ func TestValidateCacheBackend(t *testing.T) {
 		assert.NilError(t, validateCacheBackend(c))
 	})
 
+	t.Run("negative memory caps rejected", func(t *testing.T) {
+		for _, m := range []CacheMemoryConfig{
+			{MaxBytes: int64p(-1)},
+			{MaxItems: int64p(-5)},
+			{DistributedMaxBytesPerNode: int64p(-1)},
+		} {
+			c := &CacheGlobalConfig{Memory: m}
+			assert.Assert(t, validateCacheBackend(c) != nil, "negative cap must be rejected: %+v", m)
+		}
+	})
+
+	t.Run("explicit zero memory caps accepted (unlimited)", func(t *testing.T) {
+		c := &CacheGlobalConfig{Memory: CacheMemoryConfig{
+			MaxBytes:                   int64p(0),
+			DistributedMaxBytesPerNode: int64p(0),
+		}}
+		assert.NilError(t, validateCacheBackend(c))
+	})
+
+	t.Run("reserveFraction out of range rejected", func(t *testing.T) {
+		for _, f := range []float64{-0.1, 0.9, 1.5} {
+			c := &CacheGlobalConfig{Memory: CacheMemoryConfig{ReserveFraction: float64p(f)}}
+			assert.Assert(t, validateCacheBackend(c) != nil, "reserveFraction %g must be rejected", f)
+		}
+		c := &CacheGlobalConfig{Memory: CacheMemoryConfig{ReserveFraction: float64p(0.30)}}
+		assert.NilError(t, validateCacheBackend(c))
+	})
+
 	t.Run("the cluster: block is present without bindAddr rejected", func(t *testing.T) {
 		c := &CacheGlobalConfig{
 			Cluster: &ClusterConfig{},

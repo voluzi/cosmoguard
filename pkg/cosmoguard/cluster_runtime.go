@@ -15,6 +15,57 @@ import (
 	"github.com/olric-data/olric/config"
 )
 
+// Non-cache olric DMap names that must NEVER be subject to the response
+// cache's LRU eviction. Evicting rate-limit buckets, their lock tokens, the
+// JWT replay set, or the observability snapshots under memory pressure would
+// be a correctness/security regression (e.g. a replayed JWT, a reset rate
+// limiter). The response-cache DMaps opt INTO eviction via the global LRU
+// default; these are pinned back to EvictionPolicy=NONE via DMaps.Custom.
+// Referenced by their NewDMap call sites so a rename can't silently drop the
+// exemption. (replicationDMap = "observability" is defined alongside the
+// observability replicator.)
+const (
+	rateLimitDMap      = "ratelimit"
+	rateLimitLocksDMap = "ratelimit-locks"
+	replayJTIDMap      = "cosmoguard:jti"
+)
+
+// evictionExemptDMaps is the set of DMaps kept free of LRU eviction. Kept in
+// one place so the wiring and its regression test share a single source.
+var evictionExemptDMaps = []string{
+	rateLimitDMap,
+	rateLimitLocksDMap,
+	replayJTIDMap,
+	replicationDMap,
+}
+
+// olricLRUSamples is the sample size for olric's approximate (Redis-style)
+// LRU. 10 matches olric's own default and is plenty for a cache whose
+// hot set turns over within the (short) response TTL.
+const olricLRUSamples = 10
+
+// applyL2EvictionConfig bounds the olric L2 working set (issue #15). LRU is
+// set as the GLOBAL default so every response-cache DMap inherits it; the
+// non-cache DMaps (rate-limit buckets/locks, JWT replay set, observability
+// snapshots) are pinned back to no-eviction via Custom so memory pressure
+// can never evict security/correctness state. l2MaxBytesPerNode == 0 leaves
+// eviction disabled (unlimited). Split out so it is unit-testable without
+// standing up a real olric daemon.
+func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64) {
+	if dmaps == nil || l2MaxBytesPerNode == 0 {
+		return
+	}
+	dmaps.EvictionPolicy = config.LRUEviction
+	dmaps.MaxInuse = int(l2MaxBytesPerNode)
+	dmaps.LRUSamples = olricLRUSamples
+	if dmaps.Custom == nil {
+		dmaps.Custom = map[string]config.DMap{}
+	}
+	for _, name := range evictionExemptDMaps {
+		dmaps.Custom[name] = config.DMap{EvictionPolicy: config.EvictionPolicy("NONE")}
+	}
+}
+
 // clusterRuntime owns the in-process olric daemon. It is always running, even
 // in the zero-config single-instance deployment, so the consumers (cache,
 // rate-limiter, observability replication) get a single uniform interface
@@ -51,6 +102,11 @@ type clusterRuntimeOptions struct {
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
 	// don't depend on the host's resolver.
 	Lookup LookupFunc
+	// L2MaxBytesPerNode caps the olric L2's per-node in-use bytes for each
+	// response-cache DMap (LRU eviction above the cap). 0 disables L2
+	// eviction (unlimited). The non-cache DMaps (evictionExemptDMaps) are
+	// always kept exempt regardless of this value.
+	L2MaxBytesPerNode uint64
 }
 
 func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
@@ -198,6 +254,10 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	if _, set := c.DMaps.Engine.Config["tableSize"]; !set {
 		c.DMaps.Engine.Config["tableSize"] = uint64(256 << 10) // 256 KiB
 	}
+
+	// Bound the L2 (olric) working set so a high-cardinality query load can't
+	// grow the shared store until the pod is OOMKilled (issue #15).
+	applyL2EvictionConfig(c.DMaps, opts.L2MaxBytesPerNode)
 
 	if err := c.Sanitize(); err != nil {
 		return nil, fmt.Errorf("cluster runtime: sanitize: %w", err)

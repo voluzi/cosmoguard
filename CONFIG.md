@@ -135,8 +135,36 @@ The `cache:` block configures the cache, rate-limiter, and (optional) cluster ru
 cache:
   ttl: 5s                                   # global default; rules can override
   key: "cosmoguard-prod"                    # optional key prefix
+  # memory: …                               # cache memory budget (see below)
   # cluster: …                              # presence enables networked cluster mode
 ```
+
+### Memory budget
+
+The cache is bounded so a high-cardinality query load (e.g. `/tx`, `/block_search`, `/tx_search` — one entry per distinct hash / query) can't grow the working set until the pod is OOMKilled. Both cache tiers that share the pod heap are capped: the in-process **L1** (LRU by approximate payload bytes) and the olric **L2** (per-node LRU). The rate-limiter, JWT replay set, and observability DMaps are **never** evicted.
+
+By default the budget is **derived automatically from the pod's memory limit** (read from the cgroup, v1/v2), so it scales with the pod without any configuration:
+
+```
+reserve = max(128 MiB, 0.20 × limit)   # runtime + buffers + cache overhead
+budget  = limit − reserve              # total cache footprint
+L1 = 40% of budget,  L2 = 60% of budget   (L2 also holds replicas)
+```
+
+The total is then split evenly across the response caches that run in the pod (one per proxy). In parallel, `GOMEMLIMIT` is set to **90% of the limit** and `GOMAXPROCS` to the CPU quota, so the Go runtime itself defends against the hard limit. When no cgroup limit is detectable (bare metal), each tier falls back to a fixed **128 MiB**.
+
+Override any of it explicitly:
+
+```yaml
+cache:
+  memory:
+    maxBytes: 134217728                 # absolute L1 cap (bytes). unset → auto; 0 → no limit
+    maxItems: 0                         # optional L1 entry-count guard. 0 → no limit
+    distributedMaxBytesPerNode: 0       # absolute L2 (olric) per-node cap. unset → auto; 0 → no limit
+    reserveFraction: 0.20               # auto-mode reserve fraction; must be in [0, 0.9)
+```
+
+> **Upgrade note (v4.0.0):** deployments were previously unbounded. After upgrading, entries beyond the budget are LRU-evicted (more upstream traffic under extreme cardinality, never incorrect results), and `GOMEMLIMIT`/`GOMAXPROCS` are set from the container limits. Set `maxBytes: 0` and `distributedMaxBytesPerNode: 0` to restore the old unbounded behavior. Watch `cosmoguard_cache_evictions_total` (which counts budget evictions only, not TTL expiry) — a rising rate means the cap is undersized for your workload.
 
 ### Migration from v3
 

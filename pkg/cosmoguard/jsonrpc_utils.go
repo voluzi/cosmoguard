@@ -59,6 +59,27 @@ type JsonRpcMsg struct {
 	WireSuffix []byte `json:"-" msgpack:"wire_suffix,omitempty"`
 }
 
+// jsonRpcMsgOverheadBytes is a flat per-entry allowance covering the
+// struct, the Version/Method strings, and the interface{} boxes that the
+// byte-length fields below don't capture. Conservative on purpose so the
+// L1 byte budget over-counts rather than under-counts.
+const jsonRpcMsgOverheadBytes uint64 = 128
+
+// CacheCost reports this message's approximate in-memory footprint in
+// bytes so the L1 byte-cost eviction (cache.MaxCost) accounts for it. The
+// large, variable parts are Result and WireSuffix (raw bytes); Method and
+// the marshalled Error are added, plus a fixed overhead for the envelope.
+func (j *JsonRpcMsg) CacheCost() uint64 {
+	cost := jsonRpcMsgOverheadBytes
+	cost += uint64(len(j.Result))
+	cost += uint64(len(j.WireSuffix))
+	cost += uint64(len(j.Method))
+	if j.Error != nil {
+		cost += uint64(len(j.Error.Message))
+	}
+	return cost
+}
+
 // rawOrNull is a custom unmarshal target that distinguishes an absent
 // JSON field, an explicit `null`, and any other value. jsoniter's
 // RawMessage unmarshaller collapses `null` and "absent" into the same

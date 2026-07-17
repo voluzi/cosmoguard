@@ -40,6 +40,16 @@ var upstreamHealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 when the upstream is in the pool's healthy set, 0 otherwise. Pool + upstream identify the node.",
 }, []string{"pool", "upstream"})
 
+// cacheEvictionsCounter counts entries dropped from an in-process (L1)
+// response cache because it hit its byte/item budget (issue #15) — NOT
+// ordinary TTL expiry. A rising rate is the operator's signal that the L1
+// budget is undersized for the workload (raise cache.memory.maxBytes or the
+// pod's memory limit). Labelled by `cache` (the proxy name).
+var cacheEvictionsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "cosmoguard_cache_evictions_total",
+	Help: "Entries evicted from an in-process response cache because it hit its byte/item budget (excludes TTL expiry), by cache.",
+}, []string{"cache"})
+
 // registerSharedMetricsOnce guards the process-wide registration so
 // multiple cosmoguards in one process (the test harness builds several)
 // don't panic on duplicate Register.
@@ -53,7 +63,14 @@ func registerSharedMetrics() {
 		// Register (not MustRegister) so a re-registration from another
 		// cosmoguard instance is a no-op rather than a panic.
 		_ = prometheus.Register(upstreamHealthyGauge)
+		_ = prometheus.Register(cacheEvictionsCounter)
 	})
+}
+
+// recordCacheEviction bumps the eviction counter for the named cache. Wired
+// into the L1 cache via cache.OnEvict in newResponseCache.
+func recordCacheEviction(name string) {
+	cacheEvictionsCounter.WithLabelValues(name).Inc()
 }
 
 // setUpstreamHealthy is a small wrapper so the call site reads cleanly
