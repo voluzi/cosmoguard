@@ -49,3 +49,57 @@ jobs:
       # Run nightly with FUZZTIME=5m for deeper coverage.
       - name: fuzz
         run: make fuzz FUZZTIME=10s
+
+  helm:
+    name: helm chart renders + config loads
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: helm lint
+        run: helm lint helm/cosmoguard
+
+      - name: cluster mode renders (generated key path)
+        run: |
+          helm template ci helm/cosmoguard \
+            --set config.cache.cluster.enable=true \
+            --set config.cache.cluster.discovery.mode=dns >/dev/null
+
+      - name: cluster mode fails closed without a key
+        run: |
+          if helm template ci helm/cosmoguard \
+              --set config.cache.cluster.enable=true \
+              --set config.cache.cluster.discovery.mode=dns \
+              --set cluster.generateEncryptionKey=false >/dev/null 2>&1; then
+            echo "::error::chart must refuse cluster mode with no encryption key"
+            exit 1
+          fi
+
+      # Renders the default values into a config and boots the real binary
+      # against it. Catches chart/binary schema drift the Go tests can't see
+      # — e.g. a duration field emitted as a bare int that fails to unmarshal.
+      - name: rendered config loads in the binary
+        run: |
+          go build -o /tmp/cosmoguard ./cmd/cosmoguard
+          helm template ci helm/cosmoguard --show-only templates/configmap.yaml \
+            | yq '.data["cosmoguard.yaml"]' > /tmp/cosmoguard.yaml
+          /tmp/cosmoguard --config /tmp/cosmoguard.yaml >/tmp/cg.log 2>&1 &
+          pid=$!
+          sleep 6
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "config loaded; server healthy"
+            kill "$pid" 2>/dev/null || true
+          else
+            echo "::error::cosmoguard exited during startup — chart rendered a config the binary rejects"
+            cat /tmp/cg.log
+            exit 1
+          fi
