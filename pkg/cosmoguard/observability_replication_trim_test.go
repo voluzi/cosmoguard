@@ -62,6 +62,11 @@ func TestMarshalReplicationPayload_OversizedSnapshotStillOverCap(t *testing.T) {
 	// History is trimmed to nothing but the base snapshot keeps it over cap;
 	// flush uses this len(blob) > cap check to skip the write.
 	require.Greater(t, len(blob), maxReplicationBlobBytes)
+	// Regression guard: the trimming actually emptied History (rather than the
+	// blob merely being over cap because of the base snapshot).
+	var out replicationPayload
+	require.NoError(t, msgpack.Unmarshal(blob, &out))
+	require.Len(t, out.History, 0, "history must be fully trimmed when the base snapshot alone exceeds the cap")
 }
 
 // TestMarshalReplicationPayload_SmallPayloadUntouched: a payload already under

@@ -98,6 +98,12 @@ type observabilityReplicator struct {
 	stopOnce  sync.Once
 	startOnce sync.Once
 	wg        sync.WaitGroup
+
+	// oversizedWarned gates the "snapshot exceeds entry cap" warning to the
+	// transition edge, so a persistent extreme-cardinality condition logs
+	// once (and logs recovery once) instead of every flush tick. flush runs
+	// serially on the replication ticker, so no lock is needed.
+	oversizedWarned bool
 }
 
 // newObservabilityReplicator wires up a replicator. The olric client
@@ -282,9 +288,18 @@ func (r *observabilityReplicator) flush(ctx context.Context) error {
 	// right failure mode. Bounding the snapshot's internal cardinality is a
 	// separate observability change, not this cache-memory fix.
 	if len(blob) > maxReplicationBlobBytes {
-		slog.Warn("observability replication: snapshot exceeds entry cap even after trimming history; skipping this cycle's restore write",
-			"bytes", len(blob), "cap", maxReplicationBlobBytes)
+		// Log only on the transition into the oversized state so a persistent
+		// condition doesn't emit a warning every tick (~2880/day/pod).
+		if !r.oversizedWarned {
+			slog.Warn("observability replication: snapshot exceeds entry cap even after trimming history; skipping restore writes until it shrinks",
+				"bytes", len(blob), "cap", maxReplicationBlobBytes)
+			r.oversizedWarned = true
+		}
 		return nil
+	}
+	if r.oversizedWarned {
+		slog.Info("observability replication: snapshot back under entry cap; resuming restore writes")
+		r.oversizedWarned = false
 	}
 	if err := r.dm.Put(ctx, r.key(), blob, olric.EX(replicationTTL)); err != nil {
 		return fmt.Errorf("observability replication: put: %w", err)
