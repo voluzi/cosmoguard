@@ -98,22 +98,28 @@ func TestResolveBudget_ExplicitOverrides(t *testing.T) {
 	})
 }
 
-// TestResolveBudget_HighReserveFractionStaysCoherent: a large reserveFraction
-// must not starve the budget to ~0 (which would reintroduce OOM). The reserve
-// is capped at half the limit, so both tiers stay bounded, non-zero, and
-// L1+L2+reserve never exceeds the limit.
-func TestResolveBudget_HighReserveFractionStaysCoherent(t *testing.T) {
-	const limit = 200 * (1 << 20) // 200 MiB
+// TestResolveBudget_ExplicitReserveFractionHonored: an explicit reserveFraction
+// is applied verbatim (NOT clamped by the default floor/cap), so an operator
+// can deliberately reserve more runtime headroom and shrink the cache — the
+// 50% cap must not silently hand that reserved memory back to the cache.
+func TestResolveBudget_ExplicitReserveFractionHonored(t *testing.T) {
+	var limit uint64 = 1 << 30 // 1 GiB
 	withMemoryLimit(t, limit, true)
-	cfg := &CacheGlobalConfig{Memory: CacheMemoryConfig{ReserveFraction: float64p(0.89)}}
+	cfg := &CacheGlobalConfig{Memory: CacheMemoryConfig{ReserveFraction: float64p(0.80)}}
 	b := cfg.ResolveBudget()
+
+	// reserve = 0.80×limit → budget = 0.20×limit; tiers stay bounded & non-zero.
 	if b.L1MaxBytes == 0 || b.L2MaxBytesPerNode == 0 {
 		t.Fatalf("tiers must stay bounded and non-zero, got L1=%d L2=%d", b.L1MaxBytes, b.L2MaxBytesPerNode)
 	}
-	// Reserve is capped at 50%, so budget is ~50% of the limit; the two
-	// tiers plus the (capped) reserve must fit.
-	reserve := uint64(float64(limit) * maxReserveFraction)
-	if sum := b.L1MaxBytes + b.L2MaxBytesPerNode + reserve; sum > limit {
+	total := b.L1MaxBytes + b.L2MaxBytesPerNode
+	// Total cache must be ~20% of the limit (honoring 0.80 reserve), NOT ~50%
+	// (which would be the bug: cap overriding the explicit value).
+	if total > uint64(0.25*float64(limit)) {
+		t.Fatalf("explicit reserveFraction 0.80 not honored: cache total %d exceeds ~20%% of limit", total)
+	}
+	reserve := uint64(0.80 * float64(limit))
+	if sum := total + reserve; sum > limit {
 		t.Fatalf("L1+L2+reserve (%d) exceeds limit (%d)", sum, limit)
 	}
 }

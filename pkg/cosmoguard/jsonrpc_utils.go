@@ -86,10 +86,14 @@ func (j *JsonRpcMsg) CacheCost() uint64 {
 	return cost
 }
 
-// approxInterfaceCost cheaply estimates the byte footprint of an arbitrary
-// JSON-RPC interface{} field (ID, Error.Data) without marshaling on the hot
-// path. Strings and raw byte slices are measured directly; other scalars get
-// a small fixed charge; nil is free.
+// approxInterfaceCost estimates the byte footprint of an arbitrary JSON-RPC
+// interface{} field (ID, Error.Data). The common shapes — nil, string, raw
+// bytes — are measured directly with no allocation. A structured value
+// (map/slice from a decoded `error.data` object, or a rare structured ID) is
+// serialized to measure its true size: charging a tiny fixed amount would let
+// a client cache large structured error payloads while accounting for almost
+// nothing, defeating the byte budget. On a marshal error we fall back to a
+// conservative fixed estimate.
 func approxInterfaceCost(v interface{}) uint64 {
 	switch t := v.(type) {
 	case nil:
@@ -100,10 +104,15 @@ func approxInterfaceCost(v interface{}) uint64 {
 		return uint64(len(t))
 	case jsoniter.RawMessage:
 		return uint64(len(t))
+	case bool, float64, float32,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64:
+		return 16 // scalar — small and bounded, no need to marshal
 	default:
-		// Numbers/bools and small structured values — charge a modest fixed
-		// amount so they count toward the budget without a marshal.
-		return 16
+		if b, err := json.Marshal(t); err == nil {
+			return uint64(len(b))
+		}
+		return 256 // conservative fallback when the value can't be marshaled
 	}
 }
 

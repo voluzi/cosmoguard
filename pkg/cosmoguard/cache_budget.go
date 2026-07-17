@@ -13,7 +13,10 @@ const (
 	// or exceed the limit, leaving budget≈0 and forcing the tiers over the
 	// limit (reintroducing the OOM). Capping the reserve at half the limit
 	// guarantees budget = limit − reserve ≥ 50% of the limit, so
-	// L1+L2+reserve == limit exactly — coherent by construction at any size.
+	// L1+L2+reserve never exceeds the limit — coherent by construction at any
+	// size (the two tier shares truncate independently, so a few bytes may go
+	// unallocated, but the sum is never over). Applies only to the default
+	// reserve; an explicit reserveFraction is honored verbatim.
 	maxReserveFraction = 0.50
 	// l1ShareOfBudget / l2ShareOfBudget split the cache budget between the
 	// in-process L1 and the olric L2. L2 gets the larger share because it
@@ -89,19 +92,24 @@ func (c *CacheGlobalConfig) ResolveBudget() CacheBudget {
 
 	autoL1, autoL2 := fallbackTierBytes, fallbackTierBytes
 	if limit, ok := memoryLimitProvider(); ok && limit > 0 {
-		reserveFraction := defaultReserveFraction
+		var reserve uint64
 		if m.ReserveFraction != nil {
-			reserveFraction = *m.ReserveFraction
-		}
-		reserve := uint64(float64(limit) * reserveFraction)
-		if reserve < reserveFloorBytes {
-			reserve = reserveFloorBytes
-		}
-		// Cap the reserve at half the limit so budget is always ≥ 50% of the
-		// limit (never 0 or negative on small pods). This makes the whole
-		// model coherent by construction: L1 + L2 + reserve == limit.
-		if maxReserve := uint64(float64(limit) * maxReserveFraction); reserve > maxReserve {
-			reserve = maxReserve
+			// Honor an explicit operator fraction verbatim (validated to
+			// [0, 0.9), so reserve < limit and budget stays positive). This
+			// lets an operator deliberately reserve MORE runtime headroom;
+			// the floor/cap below must NOT override that intent.
+			reserve = uint64(float64(limit) * *m.ReserveFraction)
+		} else {
+			// Default path: a percentage, but at least the floor to protect
+			// the runtime baseline on big pods, capped at half the limit so
+			// that floor can't swallow a small pod (budget stays ≥ 50%).
+			reserve = uint64(float64(limit) * defaultReserveFraction)
+			if reserve < reserveFloorBytes {
+				reserve = reserveFloorBytes
+			}
+			if maxReserve := uint64(float64(limit) * maxReserveFraction); reserve > maxReserve {
+				reserve = maxReserve
+			}
 		}
 		budget := limit - reserve
 		autoL1 = guardNonZero(uint64(float64(budget) * l1ShareOfBudget))
