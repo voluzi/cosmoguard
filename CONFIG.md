@@ -151,7 +151,9 @@ budget  = limit − reserve              # total cache footprint
 L1 = 40% of budget,  L2 = 60% of budget   (L2 also holds replicas)
 ```
 
-The total is then split evenly across the response caches that run in the pod (one per proxy). In parallel, `GOMEMLIMIT` is set to **90% of the limit** and `GOMAXPROCS` to the CPU quota, so the Go runtime itself defends against the hard limit. When no cgroup limit is detectable (bare metal), each tier falls back to a fixed **128 MiB**.
+The total is then split evenly across the response caches that run in the pod (one per proxy). The **caps are the primary OOM defence**. In parallel, `GOMEMLIMIT` is set to **90% of the limit** and `GOMAXPROCS` to the CPU quota — a secondary GC backstop for transient/non-cache allocations (it can only reclaim freeable memory, not the live cache set). When no cgroup limit is detectable (bare metal), each tier falls back to a fixed **128 MiB**.
+
+The L2 caps are approximate: olric evicts by sampled LRU and can't hold a partition below one entry, so the effective L2 floor is roughly `partitionCount × maxEntrySize` per cache DMap. Embedded/single-pod mode uses a reduced partition count to keep that floor small; entries larger than the per-fragment `tableSize` (256 KiB) are served uncached rather than stored. Clustered deployments divide the per-node cap by `replicaCount`, since each node also holds replica copies that olric's cap doesn't govern.
 
 Override any of it explicitly:
 

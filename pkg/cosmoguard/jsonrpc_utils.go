@@ -67,17 +67,44 @@ const jsonRpcMsgOverheadBytes uint64 = 128
 
 // CacheCost reports this message's approximate in-memory footprint in
 // bytes so the L1 byte-cost eviction (cache.MaxCost) accounts for it. The
-// large, variable parts are Result and WireSuffix (raw bytes); Method and
-// the marshalled Error are added, plus a fixed overhead for the envelope.
+// large, variable parts are Result and WireSuffix (raw bytes); Method, the
+// ID, and the Error (message + data) are added, plus a fixed overhead for
+// the envelope. ID and Error.Data are interface{} and can carry
+// caller-controlled strings, so they must be charged — otherwise a client
+// sending many distinct large IDs could grow the cache past its budget
+// while being charged near-zero.
 func (j *JsonRpcMsg) CacheCost() uint64 {
 	cost := jsonRpcMsgOverheadBytes
 	cost += uint64(len(j.Result))
 	cost += uint64(len(j.WireSuffix))
 	cost += uint64(len(j.Method))
+	cost += approxInterfaceCost(j.ID)
 	if j.Error != nil {
 		cost += uint64(len(j.Error.Message))
+		cost += approxInterfaceCost(j.Error.Data)
 	}
 	return cost
+}
+
+// approxInterfaceCost cheaply estimates the byte footprint of an arbitrary
+// JSON-RPC interface{} field (ID, Error.Data) without marshaling on the hot
+// path. Strings and raw byte slices are measured directly; other scalars get
+// a small fixed charge; nil is free.
+func approxInterfaceCost(v interface{}) uint64 {
+	switch t := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return uint64(len(t))
+	case []byte:
+		return uint64(len(t))
+	case jsoniter.RawMessage:
+		return uint64(len(t))
+	default:
+		// Numbers/bools and small structured values — charge a modest fixed
+		// amount so they count toward the budget without a marshal.
+		return 16
+	}
 }
 
 // rawOrNull is a custom unmarshal target that distinguishes an absent

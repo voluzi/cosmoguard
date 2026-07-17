@@ -40,9 +40,16 @@ var evictionExemptDMaps = []string{
 }
 
 // olricLRUSamples is the sample size for olric's approximate (Redis-style)
-// LRU. 10 matches olric's own default and is plenty for a cache whose
-// hot set turns over within the (short) response TTL.
+// LRU. Deliberately 2× olric's own default of 5 (config.DefaultLRUSamples)
+// for tighter eviction accuracy — cheap given the cache's short TTL.
 const olricLRUSamples = 10
+
+// embeddedPartitionCount is the olric partition count used in embedded/
+// single-pod mode. Lower than olric's default (271) to shrink the L2 LRU
+// per-partition overshoot floor (PartitionCount × maxEntrySize per DMap) so
+// the byte cap binds at realistic single-pod budgets. Cluster mode keeps the
+// olric default because all peers must agree on the count.
+const embeddedPartitionCount = 31
 
 // applyL2EvictionConfig bounds the olric L2 working set (issue #15). LRU is
 // set as the GLOBAL default so every response-cache DMap inherits it; the
@@ -51,12 +58,26 @@ const olricLRUSamples = 10
 // can never evict security/correctness state. l2MaxBytesPerNode == 0 leaves
 // eviction disabled (unlimited). Split out so it is unit-testable without
 // standing up a real olric daemon.
-func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64) {
+//
+// olric's LRU cap only governs PRIMARY-partition writes; backup (replica)
+// writes bypass it (putOnReplicaFragment → PutRaw). So a node with
+// replicaFactor copies resident holds ~replicaFactor × MaxInuse. To keep the
+// node's actual in-use bytes within l2MaxBytesPerNode we set MaxInuse to
+// l2MaxBytesPerNode / replicaFactor. replicaFactor is 1 in embedded/single-
+// pod mode (no peers → no backups).
+func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replicaFactor int) {
 	if dmaps == nil || l2MaxBytesPerNode == 0 {
 		return
 	}
+	if replicaFactor < 1 {
+		replicaFactor = 1
+	}
+	maxInuse := l2MaxBytesPerNode / uint64(replicaFactor)
+	if maxInuse == 0 {
+		maxInuse = 1
+	}
 	dmaps.EvictionPolicy = config.LRUEviction
-	dmaps.MaxInuse = int(l2MaxBytesPerNode)
+	dmaps.MaxInuse = int(maxInuse)
 	dmaps.LRUSamples = olricLRUSamples
 	if dmaps.Custom == nil {
 		dmaps.Custom = map[string]config.DMap{}
@@ -123,6 +144,19 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	clustered := opts.Cluster != nil
 
 	c := config.New("local")
+
+	// In embedded/single-pod mode this node owns every partition, so the
+	// olric LRU cap (which can't evict a partition below one entry) has an
+	// effective floor of PartitionCount × maxEntrySize per DMap. olric's
+	// default of 271 partitions would floor a small pod's L2 well above its
+	// budget (271 × 256 KiB ≈ 68 MiB/DMap) and reintroduce the OOM risk this
+	// guards. A smaller count lowers that floor (~8 MiB/DMap) so MaxInuse
+	// actually binds at realistic budgets. Only safe to change in embedded
+	// mode — in a real cluster every peer must agree on PartitionCount, so
+	// there we keep olric's default.
+	if !clustered {
+		c.PartitionCount = embeddedPartitionCount
+	}
 
 	mc := memberlist.DefaultLocalConfig()
 	// memberlist refuses to start if both LogOutput and Logger are set,
@@ -256,8 +290,14 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	}
 
 	// Bound the L2 (olric) working set so a high-cardinality query load can't
-	// grow the shared store until the pod is OOMKilled (issue #15).
-	applyL2EvictionConfig(c.DMaps, opts.L2MaxBytesPerNode)
+	// grow the shared store until the pod is OOMKilled (issue #15). Embedded/
+	// single-pod mode stores no backups (replicaFactor 1); clustered mode
+	// holds replicaCount copies per node, so the cap is divided accordingly.
+	replicaFactor := 1
+	if clustered && opts.Cluster.ReplicaCount > 0 {
+		replicaFactor = opts.Cluster.ReplicaCount
+	}
+	applyL2EvictionConfig(c.DMaps, opts.L2MaxBytesPerNode, replicaFactor)
 
 	if err := c.Sanitize(); err != nil {
 		return nil, fmt.Errorf("cluster runtime: sanitize: %w", err)

@@ -8,6 +8,13 @@ const (
 	// defaultReserveFraction is the fraction of the detected limit held
 	// back when the operator doesn't set cache.memory.reserveFraction.
 	defaultReserveFraction = 0.20
+	// maxReserveFraction caps the reserve so it can never swallow the whole
+	// pod. On a small pod the 128 MiB reserveFloorBytes could otherwise meet
+	// or exceed the limit, leaving budget≈0 and forcing the tiers over the
+	// limit (reintroducing the OOM). Capping the reserve at half the limit
+	// guarantees budget = limit − reserve ≥ 50% of the limit, so
+	// L1+L2+reserve == limit exactly — coherent by construction at any size.
+	maxReserveFraction = 0.50
 	// l1ShareOfBudget / l2ShareOfBudget split the cache budget between the
 	// in-process L1 and the olric L2. L2 gets the larger share because it
 	// also stores replicas of peers' partitions.
@@ -16,10 +23,6 @@ const (
 	// fallbackTierBytes is the per-tier cap used when no cgroup memory
 	// limit can be detected (bare metal / unconstrained host).
 	fallbackTierBytes uint64 = 128 << 20 // 128 MiB
-	// minAutoTierBytes floors each auto-derived tier so a misconfigured
-	// reserveFraction (reserve ≈ limit → budget ≈ 0) can never resolve to
-	// 0, which would mean "unlimited" and reintroduce the OOM it guards.
-	minAutoTierBytes uint64 = 16 << 20 // 16 MiB
 )
 
 // CacheBudget is the resolved, byte-level memory budget for the two cache
@@ -85,7 +88,7 @@ func (c *CacheGlobalConfig) ResolveBudget() CacheBudget {
 	}
 
 	autoL1, autoL2 := fallbackTierBytes, fallbackTierBytes
-	if limit, ok := memoryLimitProvider(); ok {
+	if limit, ok := memoryLimitProvider(); ok && limit > 0 {
 		reserveFraction := defaultReserveFraction
 		if m.ReserveFraction != nil {
 			reserveFraction = *m.ReserveFraction
@@ -94,12 +97,15 @@ func (c *CacheGlobalConfig) ResolveBudget() CacheBudget {
 		if reserve < reserveFloorBytes {
 			reserve = reserveFloorBytes
 		}
-		var budget uint64
-		if limit > reserve {
-			budget = limit - reserve
+		// Cap the reserve at half the limit so budget is always ≥ 50% of the
+		// limit (never 0 or negative on small pods). This makes the whole
+		// model coherent by construction: L1 + L2 + reserve == limit.
+		if maxReserve := uint64(float64(limit) * maxReserveFraction); reserve > maxReserve {
+			reserve = maxReserve
 		}
-		autoL1 = floorBytes(uint64(float64(budget)*l1ShareOfBudget), minAutoTierBytes)
-		autoL2 = floorBytes(uint64(float64(budget)*l2ShareOfBudget), minAutoTierBytes)
+		budget := limit - reserve
+		autoL1 = guardNonZero(uint64(float64(budget) * l1ShareOfBudget))
+		autoL2 = guardNonZero(uint64(float64(budget) * l2ShareOfBudget))
 	}
 
 	return CacheBudget{
@@ -121,9 +127,12 @@ func resolveTierBytes(override *int64, auto uint64) uint64 {
 	return uint64(*override)
 }
 
-func floorBytes(v, floor uint64) uint64 {
-	if v < floor {
-		return floor
+// guardNonZero ensures an auto-derived tier is never 0, since 0 means
+// "unlimited" — a pathologically tiny detected limit rounding a share to 0
+// must not silently disable the cap it's meant to enforce.
+func guardNonZero(v uint64) uint64 {
+	if v == 0 {
+		return 1
 	}
 	return v
 }

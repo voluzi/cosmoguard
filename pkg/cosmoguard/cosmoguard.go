@@ -361,6 +361,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		fmt.Sprintf("%s:%d", cosmoGuard.cfg.Host, cosmoGuard.cfg.LcdPort),
 		cosmoGuard.cfg.Nodes, "lcd",
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
+		WithCacheBudget[HttpProxyOptions](cacheBudget),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 		WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -379,6 +380,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	}
 	cosmoGuard.jsonRpcHandler, err = NewJsonRpcHandler("jsonrpc",
 		WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
+		WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
 		WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 		WithWebSocketEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.RPC.WebSocketIsEnabled()),
 		WithWebSocketBackends[JsonRpcHandlerOptions](rpcWSBackends),
@@ -396,6 +398,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		fmt.Sprintf("%s:%d", cosmoGuard.cfg.Host, cosmoGuard.cfg.RpcPort),
 		cosmoGuard.cfg.Nodes, "rpc",
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
+		WithCacheBudget[HttpProxyOptions](cacheBudget),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 		WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),

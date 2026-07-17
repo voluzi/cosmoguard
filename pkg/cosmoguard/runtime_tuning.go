@@ -45,10 +45,17 @@ func detectMemoryLimit() (uint64, bool) {
 // SetupRuntimeTuning aligns the Go runtime with the container's resource
 // limits: GOMAXPROCS to the CPU quota (avoids scheduler thrash when the pod is
 // capped below the host core count) and GOMEMLIMIT to goMemLimitRatio of the
-// memory limit (the primary defence against cache-driven OOMKills). Both are
-// no-ops when the respective limit is unset, and neither is fatal — a tuning
-// failure must never stop the proxy from starting.
+// memory limit. GOMEMLIMIT is a secondary backstop — it makes the GC work
+// harder against *reclaimable* allocations as the heap approaches the limit,
+// but cannot help with the live/retained cache set. The cache byte/item caps
+// (issue #15) are the primary defence against cache-driven OOMKills; this
+// tuning covers transient and non-cache allocations. Both are no-ops when the
+// respective limit is unset, and neither is fatal — a tuning failure must
+// never stop the proxy from starting.
 func SetupRuntimeTuning(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if _, err := maxprocs.Set(maxprocs.Logger(func(format string, args ...interface{}) {
 		logger.Info(fmt.Sprintf(format, args...), "component", "runtime-tuning")
 	})); err != nil {

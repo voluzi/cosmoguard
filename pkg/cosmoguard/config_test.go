@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -464,7 +465,7 @@ func TestValidateCacheBackend(t *testing.T) {
 	})
 
 	t.Run("reserveFraction out of range rejected", func(t *testing.T) {
-		for _, f := range []float64{-0.1, 0.9, 1.5} {
+		for _, f := range []float64{-0.1, 0.9, 1.5, math.NaN(), math.Inf(1)} {
 			c := &CacheGlobalConfig{Memory: CacheMemoryConfig{ReserveFraction: float64p(f)}}
 			assert.Assert(t, validateCacheBackend(c) != nil, "reserveFraction %g must be rejected", f)
 		}

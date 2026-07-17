@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"encoding/base64"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -358,7 +359,8 @@ type CacheGlobalConfig struct {
 // This scales with pod size (a bigger pod devotes proportionally more to
 // cache) while always holding back a floor for the runtime, request
 // buffers, and cache encoding/replica overhead. GOMEMLIMIT is set
-// separately to 90% of the same limit as the hard-stop safety net.
+// separately to 90% of the same limit as a secondary GC backstop (it only
+// helps with reclaimable memory; these caps are the primary OOM defence).
 //
 // An explicit value overrides the auto-derivation for that tier: a
 // positive value is the byte cap; an explicit 0 means "no limit". When no
@@ -1071,8 +1073,11 @@ func validateCacheMemory(m *CacheMemoryConfig) error {
 	if m.DistributedMaxBytesPerNode != nil && *m.DistributedMaxBytesPerNode < 0 {
 		return fmt.Errorf("cache.memory.distributedMaxBytesPerNode must be >= 0 (0 means no limit); got %d", *m.DistributedMaxBytesPerNode)
 	}
-	if m.ReserveFraction != nil && (*m.ReserveFraction < 0 || *m.ReserveFraction >= 0.9) {
-		return fmt.Errorf("cache.memory.reserveFraction must be in [0, 0.9); got %g", *m.ReserveFraction)
+	if m.ReserveFraction != nil {
+		f := *m.ReserveFraction
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= 0.9 {
+			return fmt.Errorf("cache.memory.reserveFraction must be a finite value in [0, 0.9); got %g", f)
+		}
 	}
 	return nil
 }

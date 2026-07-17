@@ -42,11 +42,15 @@ func TestResolveBudget_ScalingReserve(t *testing.T) {
 			if b.L2MaxBytesPerNode <= b.L1MaxBytes {
 				t.Errorf("expected L2 (%d) > L1 (%d)", b.L2MaxBytesPerNode, b.L1MaxBytes)
 			}
-			// Coherence: both tiers + a runtime reserve must fit under the
-			// limit. The reserve here mirrors the resolver's floor/fraction.
+			// Coherence: both tiers + the runtime reserve must fit under the
+			// limit. Mirror the resolver: reserve = max(floor, fraction) then
+			// capped at half the limit.
 			reserve := uint64(float64(tc.limit) * defaultReserveFraction)
 			if reserve < reserveFloorBytes {
 				reserve = reserveFloorBytes
+			}
+			if maxReserve := uint64(float64(tc.limit) * maxReserveFraction); reserve > maxReserve {
+				reserve = maxReserve
 			}
 			if sum := b.L1MaxBytes + b.L2MaxBytesPerNode + reserve; sum > tc.limit {
 				t.Errorf("L1+L2+reserve (%d) exceeds limit (%d)", sum, tc.limit)
@@ -94,15 +98,23 @@ func TestResolveBudget_ExplicitOverrides(t *testing.T) {
 	})
 }
 
-// TestResolveBudget_MisconfiguredReserveFractionFloored: a reserveFraction so
-// large that the budget would compute to ~0 must NOT resolve to 0 (unlimited)
-// — it floors to minAutoTierBytes so the OOM guard still holds.
-func TestResolveBudget_MisconfiguredReserveFractionFloored(t *testing.T) {
-	withMemoryLimit(t, 200*(1<<20), true) // 200 MiB
+// TestResolveBudget_HighReserveFractionStaysCoherent: a large reserveFraction
+// must not starve the budget to ~0 (which would reintroduce OOM). The reserve
+// is capped at half the limit, so both tiers stay bounded, non-zero, and
+// L1+L2+reserve never exceeds the limit.
+func TestResolveBudget_HighReserveFractionStaysCoherent(t *testing.T) {
+	const limit = 200 * (1 << 20) // 200 MiB
+	withMemoryLimit(t, limit, true)
 	cfg := &CacheGlobalConfig{Memory: CacheMemoryConfig{ReserveFraction: float64p(0.89)}}
 	b := cfg.ResolveBudget()
-	if b.L1MaxBytes < minAutoTierBytes || b.L2MaxBytesPerNode < minAutoTierBytes {
-		t.Fatalf("tiers must floor to %d, got L1=%d L2=%d", minAutoTierBytes, b.L1MaxBytes, b.L2MaxBytesPerNode)
+	if b.L1MaxBytes == 0 || b.L2MaxBytesPerNode == 0 {
+		t.Fatalf("tiers must stay bounded and non-zero, got L1=%d L2=%d", b.L1MaxBytes, b.L2MaxBytesPerNode)
+	}
+	// Reserve is capped at 50%, so budget is ~50% of the limit; the two
+	// tiers plus the (capped) reserve must fit.
+	reserve := uint64(float64(limit) * maxReserveFraction)
+	if sum := b.L1MaxBytes + b.L2MaxBytesPerNode + reserve; sum > limit {
+		t.Fatalf("L1+L2+reserve (%d) exceeds limit (%d)", sum, limit)
 	}
 }
 
