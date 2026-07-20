@@ -412,6 +412,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		WithWebSocketConnections[JsonRpcHandlerOptions](cosmoGuard.cfg.RPC.WebSocketConnections),
 		WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 		WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
+		WithCORSConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.CORS),
 		WithMaxBatchSize[JsonRpcHandlerOptions](*cosmoGuard.cfg.RPC.JsonRpc.MaxBatchSize),
 	)
 	if err != nil {
@@ -454,6 +455,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 			WithWebSocketEnabled[JsonRpcHandlerOptions](false),
 			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 			WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
+			WithCORSConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.CORS),
 			// EVM RPC JsonRpc config reuses the RPC JsonRpc batch cap unless
 			// it has its own (EvmRpcConfig is currently flat; revisit in
 			// Phase C when the schema gets per-protocol overrides).
@@ -501,6 +503,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 			WithUpstreamManager[JsonRpcHandlerOptions](EthUpstreamConnManager),
 			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 			WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
+			WithCORSConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.CORS),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error setting up jsonrpc handler for evm-rpc: %w", err)

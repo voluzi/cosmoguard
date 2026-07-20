@@ -2,6 +2,15 @@ package cosmoguard
 
 import "time"
 
+const maxDuration = time.Duration(1<<63 - 1)
+
+func saturatingDurationAdd(a, b time.Duration) time.Duration {
+	if b > 0 && a > maxDuration-b {
+		return maxDuration
+	}
+	return a + b
+}
+
 // cacheFreshness classifies a cached entry relative to its logical TTL and the
 // stale-while-revalidate window. It is the single policy shared by the HTTP,
 // JSON-RPC, and gRPC cache paths so freshness is decided identically.
@@ -30,7 +39,7 @@ func classifyFreshness(storedAt, now time.Time, ttl, stale time.Duration) cacheF
 	switch {
 	case age < ttl:
 		return freshEntry
-	case age < ttl+stale:
+	case age < saturatingDurationAdd(ttl, stale):
 		return staleEntry
 	default:
 		return expiredEntry
@@ -45,7 +54,7 @@ func physicalTTL(ttl, stale time.Duration) time.Duration {
 	if ttl <= 0 {
 		return ttl
 	}
-	return ttl + stale
+	return saturatingDurationAdd(ttl, stale)
 }
 
 // resolveCoalesce resolves the effective single-flight setting for a rule: its

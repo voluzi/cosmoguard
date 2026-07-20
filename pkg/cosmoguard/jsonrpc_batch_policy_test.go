@@ -426,12 +426,9 @@ func TestHandleHttpBatch_UnmatchedDefaultAllowHonoursDefaultRequire(t *testing.T
 	}
 }
 
-// TestHandleHttpBatch_NotificationCacheHitNoResponse is the regression
-// test for the notification cache-hit leak: the cache key ignores id, so
-// a prior id-bearing call can prime an entry; a later notification (no
-// id) with the same method/params hits that entry but must still get NO
-// response (JSON-RPC 2.0 §4.1).
-func TestHandleHttpBatch_NotificationCacheHitNoResponse(t *testing.T) {
+// Notifications must reach upstream even when an id-bearing call has primed
+// the same cache key, but they still produce no response (§4.1).
+func TestHandleHttpBatch_NotificationBypassesCache(t *testing.T) {
 	h := &JsonRpcHandler{
 		log:           log.WithField("t", "jsonrpc-batch"),
 		cgDashboard:   newDashboardObservability(),
@@ -451,8 +448,9 @@ func TestHandleHttpBatch_NotificationCacheHitNoResponse(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	upstreamCalled := false
 	next := func(http.ResponseWriter, *http.Request) {
-		t.Fatal("cache hit must not reach upstream")
+		upstreamCalled = true
 	}
 
 	h.handleHttpBatch(batch, w, r, next, time.Now())
@@ -467,11 +465,14 @@ func TestHandleHttpBatch_NotificationCacheHitNoResponse(t *testing.T) {
 	if id, _ := arr[0]["id"].(float64); id != 1 {
 		t.Fatalf("the single response must be the id=1 call, got id=%v", arr[0]["id"])
 	}
+	if !upstreamCalled {
+		t.Fatal("notification must bypass the primed cache and reach upstream")
+	}
 }
 
-// TestHandleHttpSingle_NotificationCacheHitNoResponse mirrors the above
-// for the single-request path: a notification cache hit writes no body.
-func TestHandleHttpSingle_NotificationCacheHitNoResponse(t *testing.T) {
+// The single-request path also forwards notifications without consulting a
+// primed cache entry and suppresses the upstream response body.
+func TestHandleHttpSingle_NotificationBypassesCache(t *testing.T) {
 	h := &JsonRpcHandler{
 		log:           log.WithField("t", "jsonrpc-single"),
 		cgDashboard:   newDashboardObservability(),
@@ -487,13 +488,17 @@ func TestHandleHttpSingle_NotificationCacheHitNoResponse(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
-	next := func(http.ResponseWriter, *http.Request) { t.Fatal("cache hit must not reach upstream") }
+	upstreamCalled := false
+	next := func(http.ResponseWriter, *http.Request) { upstreamCalled = true }
 
 	// Notification: no id.
 	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r, next, time.Now())
 
 	if w.Body.Len() != 0 {
-		t.Fatalf("notification cache hit must write no response body, got %q", w.Body.String())
+		t.Fatalf("notification must write no response body, got %q", w.Body.String())
+	}
+	if !upstreamCalled {
+		t.Fatal("notification must bypass the primed cache and reach upstream")
 	}
 }
 

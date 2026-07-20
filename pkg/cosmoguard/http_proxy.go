@@ -96,6 +96,9 @@ type HttpProxy struct {
 	// It carries the buffered upstream response so every coalesced waiter
 	// can replay the single fetch.
 	sf coalescer[bufferedUpstreamResponse]
+	// pendingMisses bridges the short interval between a foreground fetch
+	// returning and its asynchronous cache write completing.
+	pendingMisses sync.Map // request hash -> bufferedUpstreamResponse
 	// now returns the current time; swappable in tests to drive cache
 	// freshness / stale-while-revalidate deterministically. Defaults to
 	// time.Now in NewHttpProxy.
@@ -956,7 +959,7 @@ func (p *HttpProxy) cacheHit(w http.ResponseWriter, r *http.Request, res CachedR
 func (p *HttpProxy) serveStale(w http.ResponseWriter, r *http.Request, res CachedResponse, requestHash string, cache *RuleCache, ruleTag string, startTime time.Time) {
 	p.writeCachedResponse(w, r, res, cacheStale)
 	p.recordOutcome(r, res.StatusCode, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
-	p.sf.refresh(requestHash, p.refreshFetchFn(r, requestHash, cache, ruleTag))
+	p.sf.refresh(requestHash, p.backgroundRefreshFn(r, requestHash, cache, ruleTag))
 }
 
 // writeCachedResponse replays a stored CachedResponse to the client with the
@@ -994,20 +997,27 @@ func (p *HttpProxy) writeCachedResponse(w http.ResponseWriter, r *http.Request, 
 // different shapes depending on rule cache state).
 const cacheStateHeader = "X-Cosmoguard-Cache"
 
-// httpRefreshTimeout bounds a coalesced / background upstream fetch so a wedged
-// upstream can't pin a refresh goroutine forever. Generous for a slow Cosmos
-// node; the transport's own timeouts usually fire first.
+// httpRefreshTimeout bounds background refreshes so a wedged upstream cannot
+// pin a refresh goroutine forever.
 const httpRefreshTimeout = 30 * time.Second
 
 // bufferedUpstreamResponse is a fully-buffered upstream response captured off
-// the client so one fetch can be replayed to every coalesced waiter. Headers
-// are the full committed set (post-CORS), replayed verbatim on the miss
-// response; the stored cache entry keeps only the cacheable subset.
+// the client so one fetch can be replayed to every coalesced waiter. The fetch
+// owner keeps the full header set; shared waiters receive only cache-safe
+// headers so request-specific metadata cannot leak between clients.
 type bufferedUpstreamResponse struct {
-	StatusCode int
-	Headers    http.Header
-	Body       []byte
+	StatusCode    int
+	Headers       http.Header
+	SharedHeaders map[string]string
+	Body          []byte
+	Shareable     bool
+	Owner         *responseOwner
+	Upstream      string
+	Cached        *CachedResponse
+	CacheState    string
 }
+
+type responseOwner struct{ token byte }
 
 // discardResponseWriter keeps a header map (so the reverse-proxy ModifyResponse
 // hook can write to it and we can snapshot the committed headers) but discards
@@ -1029,19 +1039,33 @@ func (d *discardResponseWriter) WriteHeader(int)             {}
 // (the default) — and writes the response. Coalesced waiters share the single
 // buffered fetch.
 func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHash string, cache *RuleCache, ruleTag string, startTime time.Time) {
-	var (
-		out bufferedUpstreamResponse
-		err error
-	)
-	if resolveCoalesce(cache, p.globalCoalesce()) {
-		out, err = p.sf.do(r.Context(), requestHash, p.refreshFetchFn(r, requestHash, cache, ruleTag))
-	} else {
-		out, err = p.fetchAndStore(r, requestHash, cache, ruleTag)
+	if !resolveCoalesce(cache, p.globalCoalesce()) {
+		p.cacheMissStreaming(w, r, requestHash, cache, ruleTag, startTime)
+		return
 	}
+
+	owner := &responseOwner{}
+	if pending, ok := p.pendingMisses.Load(requestHash); ok {
+		out := pending.(bufferedUpstreamResponse)
+		p.applyUpstreamStats(r, out.Upstream)
+		p.writeMissResponse(w, r, out, owner)
+		p.recordOutcome(r, out.StatusCode, cacheMiss, RuleActionAllow, startTime, "request allowed")
+		return
+	}
+
+	out, err := p.sf.do(r.Context(), requestHash, p.foregroundFetchFn(r, requestHash, cache, ruleTag, owner))
 	// A canceled/expired caller context means this waiter's client went away
 	// (or its share of a coalesced fetch timed out) — nothing to write. The
 	// leader's fetch keeps running for the remaining waiters.
 	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return
+	}
+	if out.Cached != nil {
+		if out.CacheState == cacheStale {
+			p.serveStale(w, r, *out.Cached, requestHash, cache, ruleTag, startTime)
+		} else {
+			p.cacheHit(w, r, *out.Cached, startTime)
+		}
 		return
 	}
 	if out.StatusCode <= 0 {
@@ -1049,62 +1073,137 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 		p.recordOutcome(r, http.StatusBadGateway, cacheMiss, RuleActionAllow, startTime, "request allowed (upstream error)")
 		return
 	}
-	p.writeMissResponse(w, out)
+	if !out.Shareable && out.Owner != owner {
+		p.cacheMissStreaming(w, r, requestHash, cache, ruleTag, startTime)
+		return
+	}
+	p.applyUpstreamStats(r, out.Upstream)
+	p.writeMissResponse(w, r, out, owner)
 	p.recordOutcome(r, out.StatusCode, cacheMiss, RuleActionAllow, startTime, "request allowed")
 }
 
-// writeMissResponse replays a buffered upstream response to the client using
-// the full committed header set (CORS already applied by the pool's
-// ModifyResponse hook), plus the cache-state marker.
-func (p *HttpProxy) writeMissResponse(w http.ResponseWriter, out bufferedUpstreamResponse) {
-	for k, vs := range out.Headers {
-		for _, v := range vs {
-			w.Header().Add(k, v)
+func (p *HttpProxy) applyUpstreamStats(r *http.Request, upstream string) {
+	if stats := RequestStatsFromCtx(r.Context()); stats != nil && upstream != "" {
+		stats.Upstream = upstream
+	}
+}
+
+// writeMissResponse gives the fetch owner the exact upstream headers. Shared
+// waiters receive the same header subset as a cache hit, with CORS re-derived
+// for their own Origin.
+func (p *HttpProxy) writeMissResponse(w http.ResponseWriter, r *http.Request, out bufferedUpstreamResponse, owner *responseOwner) {
+	if out.Owner != nil && out.Owner == owner {
+		for k, vs := range out.Headers {
+			w.Header()[k] = append([]string(nil), vs...)
+		}
+	} else {
+		for k, v := range out.SharedHeaders {
+			w.Header().Set(k, v)
 		}
 	}
 	w.Header().Set(cacheStateHeader, cacheMiss)
+	if p.cors != nil {
+		p.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+	}
 	w.WriteHeader(out.StatusCode)
 	_, _ = w.Write(out.Body)
 }
 
-// refreshFetchFn snapshots the request body now (before the caller's r.Body is
-// closed when its handler returns) and returns a closure that fetches upstream
-// under a fresh, detached, bounded context — so a client disconnect can't abort
-// a shared or background fetch. Used by both the coalesced miss and the SWR
-// background refresh.
-func (p *HttpProxy) refreshFetchFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string) func() (bufferedUpstreamResponse, error) {
+func snapshotRequestBody(r *http.Request) []byte {
 	var body []byte
 	if r.Body != nil {
 		body, _ = io.ReadAll(r.Body)
 	}
+	return body
+}
+
+// foregroundFetchFn detaches cancellation while retaining request values. Each
+// waiter still observes its own deadline in coalescer.do; the shared fetch is
+// bounded by the configured HTTP transport rather than an unrelated hard cap.
+func (p *HttpProxy) foregroundFetchFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string, owner *responseOwner) func() (bufferedUpstreamResponse, error) {
+	body := snapshotRequestBody(r)
 	return func() (bufferedUpstreamResponse, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), httpRefreshTimeout)
+		if recent, ok := p.recentHTTPResponse(r, requestHash, cache); ok {
+			return recent, nil
+		}
+		req := r.Clone(context.WithoutCancel(r.Context()))
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		return p.fetchAndStore(req, requestHash, cache, ruleTag, owner, true)
+	}
+}
+
+func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cache *RuleCache) (bufferedUpstreamResponse, bool) {
+	if pending, ok := p.pendingMisses.Load(requestHash); ok {
+		return pending.(bufferedUpstreamResponse), true
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpCacheWriteTimeout)
+	defer cancel()
+	res, err := p.cache.Get(ctx, requestHash)
+	if err != nil {
+		return bufferedUpstreamResponse{}, false
+	}
+	state := classifyFreshness(res.StoredAt, p.timeNow(), effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow()))
+	if state == expiredEntry {
+		return bufferedUpstreamResponse{}, false
+	}
+	cacheState := cacheHit
+	if state == staleEntry {
+		cacheState = cacheStale
+	}
+	return bufferedUpstreamResponse{Cached: &res, CacheState: cacheState}, true
+}
+
+func (p *HttpProxy) backgroundRefreshFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string) func() (bufferedUpstreamResponse, error) {
+	body := snapshotRequestBody(r)
+	return func() (bufferedUpstreamResponse, error) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
 		req.Body = io.NopCloser(bytes.NewReader(body))
 		req.ContentLength = int64(len(body))
-		return p.fetchAndStore(req, requestHash, cache, ruleTag)
+		return p.fetchAndStore(req, requestHash, cache, ruleTag, nil, false)
 	}
 }
 
-// fetchAndStore performs ONE upstream fetch into an off-client buffer, applies
-// the cacheability gates, stores the cacheable subset (with StoredAt and a
-// physical TTL extended by the stale window), and returns the buffered response
-// so the caller and any coalesced waiters can replay it. It never writes to a
-// client, so it is safe to share across single-flight waiters and background
-// refreshes.
-func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *RuleCache, ruleTag string) (bufferedUpstreamResponse, error) {
+func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, requestHash string, cache *RuleCache, ruleTag string, startTime time.Time) {
+	ww := WrapResponseWriter(w)
+	ww.setHeaderOnCommit(cacheStateHeader, cacheMiss)
+	p.pool.ServeHTTP(ww, r)
+	status := ww.GetStatusCode()
+	p.recordOutcome(r, status, cacheMiss, RuleActionAllow, startTime, "request allowed")
+	b, err := ww.GetWrittenBytes()
+	if err != nil {
+		p.log.Errorf("error loading upstream response: %v (response not cached)", err)
+		return
+	}
+	committed := ww.GetCommittedHeaders()
+	if status <= 0 || !p.shouldStore(status, committed, cache) {
+		return
+	}
+	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
+	storedAt := p.timeNow().UTC()
+	go p.persistHTTPResponse(requestHash, cache, ruleTag, cardinalityKey, status, committed, b, storedAt)
+}
+
+// fetchAndStore performs one buffered upstream fetch. Foreground callers publish
+// the cache write asynchronously; background refreshes persist before finishing.
+func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *RuleCache, ruleTag string, owner *responseOwner, asyncStore bool) (bufferedUpstreamResponse, error) {
 	sink := WrapResponseWriter(&discardResponseWriter{})
 	p.pool.ServeHTTP(sink, r)
 
 	status := sink.GetStatusCode()
 	b, err := sink.GetWrittenBytes()
+	upstream := ""
+	if stats := RequestStatsFromCtx(r.Context()); stats != nil {
+		upstream = stats.Upstream
+	}
 	if err != nil {
 		p.log.Errorf("error loading upstream response: %v (response not cached)", err)
-		return bufferedUpstreamResponse{StatusCode: status, Headers: sink.GetCommittedHeaders()}, err
+		return bufferedUpstreamResponse{StatusCode: status, Headers: sink.GetCommittedHeaders(), Owner: owner, Upstream: upstream}, err
 	}
 	committed := sink.GetCommittedHeaders()
-	out := bufferedUpstreamResponse{StatusCode: status, Headers: committed, Body: b}
+	out := bufferedUpstreamResponse{StatusCode: status, Headers: committed, Body: b, Owner: owner, Upstream: upstream}
 	if status <= 0 {
 		return out, nil
 	}
@@ -1119,42 +1218,48 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 	if !p.shouldStore(status, committed, cache) {
 		return out, nil
 	}
+	out.Shareable = true
+	out.SharedHeaders = pickCacheableHeaders(committed, cache.PreserveHeaders)
+	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
+	storedAt := p.timeNow().UTC()
+	if asyncStore {
+		pending := out
+		pending.Headers = nil
+		pending.Owner = nil
+		p.pendingMisses.Store(requestHash, pending)
+		go func() {
+			defer p.pendingMisses.Delete(requestHash)
+			p.persistHTTPResponse(requestHash, cache, ruleTag, cardinalityKey, status, committed, b, storedAt)
+		}()
+		return out, nil
+	}
+	p.persistHTTPResponse(requestHash, cache, ruleTag, cardinalityKey, status, committed, b, storedAt)
+	return out, nil
+}
 
-	// Parse the upstream's Age header (if any) at store time so cache hits can
-	// compute a correct downstream Age (RFC 7234 §5.1).
+func (p *HttpProxy) persistHTTPResponse(requestHash string, cache *RuleCache, ruleTag, cardinalityKey string, status int, committed http.Header, body []byte, storedAt time.Time) {
 	upstreamAge := 0
 	if v := committed.Get("Age"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			upstreamAge = n
 		}
 	}
-	// Store under a physical TTL extended by the stale window so a stale entry
-	// physically survives its logical TTL for stale-while-revalidate (when SWR
-	// is off this is just the logical TTL). Detached context: r.Context() is
-	// canceled when the client disconnects, which would abort a Set that would
-	// otherwise have succeeded.
-	effTTL := cache.TTL
-	if effTTL <= 0 && p.cacheConfig != nil {
-		effTTL = p.cacheConfig.TTL
-	}
+	effTTL := effectiveTTL(cache, p.cacheConfig)
 	stale := resolveStaleWindow(cache, p.globalStaleWindow())
 	writeCtx, cancel := context.WithTimeout(context.Background(), httpCacheWriteTimeout)
 	setErr := p.cache.Set(writeCtx, requestHash, CachedResponse{
-		Data:        b,
+		Data:        body,
 		StatusCode:  status,
 		Headers:     pickCacheableHeaders(committed, cache.PreserveHeaders),
-		StoredAt:    p.timeNow().UTC(),
+		StoredAt:    storedAt,
 		UpstreamAge: upstreamAge,
 	}, physicalTTL(effTTL, stale))
 	cancel()
 	if setErr != nil {
 		p.log.Errorf("error setting cache value: %v", setErr)
-		return out, nil
+		return
 	}
-	// Record the cache-key cardinality for this (section, rule) pair so the
-	// dashboard can surface a rule writing one entry per unique query.
-	p.cgDashboard.RecordCardinality(p.section, ruleTag, r.Method+" "+p.redactedRequestURI(r))
-	return out, nil
+	p.cgDashboard.RecordCardinality(p.section, ruleTag, cardinalityKey)
 }
 
 // shouldStore reports whether an upstream response is cacheable: never cache

@@ -51,6 +51,7 @@ func DefaultGrpcProxyOptions() *GrpcProxyOptions {
 
 type JsonRpcHandlerOptions struct {
 	*SharedOptions
+	CORSConfig *CORSConfig
 	// WebsocketBackend is the single-backend form (v3 compat). Used only
 	// when WebsocketBackends is empty.
 	WebsocketBackend string
@@ -192,12 +193,14 @@ func WithAuthenticator[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOption
 	}
 }
 
-// WithCORSConfig threads the CORS policy into a HttpProxy. nil leaves CORS
-// disabled (upstream's CORS headers pass through unchanged — v3 behavior).
-func WithCORSConfig[T HttpProxyOptions](c *CORSConfig) Option[T] {
+// WithCORSConfig threads the CORS policy into HTTP-facing handlers. nil leaves
+// Cosmoguard's CORS layer disabled.
+func WithCORSConfig[T HttpProxyOptions | JsonRpcHandlerOptions](c *CORSConfig) Option[T] {
 	return func(opts *T) {
 		switch x := any(opts).(type) {
 		case *HttpProxyOptions:
+			x.CORSConfig = c
+		case *JsonRpcHandlerOptions:
 			x.CORSConfig = c
 		default:
 			panic("unexpected use")

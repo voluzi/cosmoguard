@@ -52,9 +52,14 @@ type JsonRpcHandler struct {
 	// cluster-wide coalesce / stale-while-revalidate / ttl defaults a rule
 	// inherits when unset. nil in tests that bypass New.
 	cacheConfig *CacheGlobalConfig
+	// cors re-derives response headers for each coalesced HTTP waiter.
+	cors *CORSConfig
 	// sf coalesces concurrent single-request cache misses and drives
 	// stale-while-revalidate background refreshes, keyed by the cache hash.
-	sf coalescer[*JsonRpcMsg]
+	sf coalescer[bufferedJsonRpcResponse]
+	// pendingSingles keeps a fetched response available while its detached
+	// foreground cache write is still in progress.
+	pendingSingles sync.Map // cache hash -> bufferedJsonRpcResponse
 	// now returns the current time; swappable in tests for deterministic
 	// freshness / SWR. Defaults to time.Now in NewJsonRpcHandler.
 	now func() time.Time
@@ -104,6 +109,7 @@ func NewJsonRpcHandler(name string, opts ...Option[JsonRpcHandlerOptions]) (*Jso
 		olricClient: cfg.OlricClient,
 		proxyName:   name,
 		cacheConfig: cfg.CacheConfig,
+		cors:        cfg.CORSConfig,
 		now:         time.Now,
 	}
 
@@ -649,7 +655,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 				// Match the WS guard so an operator who toggles
 				// cache.enable on a `method: "*"` rule cannot footgun
 				// either transport.
-				cacheable := rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
+				cacheable := request.ID != nil && rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
 				if cacheable {
 					ruleTag := ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
 					// Single round-trip lookup; ErrNotFound = miss, other
@@ -664,23 +670,17 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 						stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(h.cacheConfig))
 						switch classifyFreshness(res.StoredAt, nowOrDefault(h.now), effTTL, stale) {
 						case freshEntry:
-							// Notifications (no id) get no response even on a
-							// hit — the key ignores id, so a prior call could
-							// have primed this entry (JSON-RPC 2.0 §4.1).
-							if request.ID != nil {
-								h.writeSingleResponse(w, res.CloneWithID(request.ID))
-							}
+							h.writeSingleResponse(w, res.CloneWithID(request.ID))
 							h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
 							return
 						case staleEntry:
 							// Serve stale immediately, refresh in the
 							// background (coalesced by key) — the client never
 							// waits on the upstream.
-							if request.ID != nil {
-								h.writeSingleResponse(w, res.CloneWithID(request.ID))
-							}
+							w.Header().Set(cacheStateHeader, cacheStale)
+							h.writeSingleResponse(w, res.CloneWithID(request.ID))
 							h.recordSingle(r, request, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
-							h.sf.refresh(strconv.FormatUint(hash, 16), h.singleRefreshFn(r, next, hash, rule.Cache, ruleTag, request.Method))
+							h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, rule.Cache, ruleTag, request.Method))
 							return
 							// expiredEntry falls through to a miss.
 						}
@@ -799,11 +799,7 @@ func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *htt
 	// window so this entry can be served stale-while-revalidate later.
 	res.StoredAt = nowOrDefault(h.now).UTC()
 	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
-	if err = h.cache.Set(r.Context(), hash, res, physTTL); err != nil {
-		h.log.Errorf("error setting cache value: %v", err)
-		return
-	}
-	h.cgDashboard.RecordCardinality(h.section, ruleTag, method)
+	go h.persistSingleResponse(hash, res, physTTL, ruleTag, method)
 }
 
 // serveSingleMiss handles a single-request cache miss: coalescing concurrent
@@ -818,7 +814,16 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 		return
 	}
-	res, err := h.sf.do(r.Context(), strconv.FormatUint(hash, 16), h.singleRefreshFn(r, next, hash, cache, ruleTag, request.Method))
+	owner := &jsonRpcResponseOwner{}
+	if pending, ok := h.pendingSingles.Load(hash); ok {
+		res := pending.(bufferedJsonRpcResponse)
+		h.applySingleUpstreamStats(r, res.Upstream)
+		h.writeBufferedSingleResponse(w, r, res, request.ID, owner)
+		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
+		return
+	}
+	res, err := h.sf.do(r.Context(), strconv.FormatUint(hash, 16), h.singleForegroundFetchFn(r, next, hash, cache, ruleTag, request.Method, owner))
+	h.applySingleUpstreamStats(r, res.Upstream)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			// This waiter's client went away — nothing to write.
@@ -833,64 +838,182 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed (upstream error)")
 		return
 	}
-	if request.ID != nil {
-		h.writeSingleResponse(w, res.CloneWithID(request.ID))
+	if res.Cached != nil {
+		if res.CacheState == cacheStale {
+			w.Header().Set(cacheStateHeader, cacheStale)
+			h.writeSingleResponse(w, res.Cached.CloneWithID(request.ID))
+			h.recordSingle(r, request, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
+			h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, cache, ruleTag, request.Method))
+		} else {
+			h.writeSingleResponse(w, res.Cached.CloneWithID(request.ID))
+			h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
+		}
+		return
 	}
+	h.writeBufferedSingleResponse(w, r, res, request.ID, owner)
 	h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 }
 
-// singleRefreshFn snapshots the request body now (before r.Body is closed when
-// the caller's handler returns) and returns a closure that fetches the single
-// method upstream under a fresh, detached, bounded context. Used by both the
-// coalesced miss and the stale-while-revalidate background refresh.
-func (h *JsonRpcHandler) singleRefreshFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) func() (*JsonRpcMsg, error) {
-	var body []byte
-	if r.Body != nil {
-		body, _ = io.ReadAll(r.Body)
+type bufferedJsonRpcResponse struct {
+	Message       *JsonRpcMsg
+	StatusCode    int
+	Headers       http.Header
+	SharedHeaders http.Header
+	Owner         *jsonRpcResponseOwner
+	Upstream      string
+	Cached        *JsonRpcMsg
+	CacheState    string
+}
+
+type jsonRpcResponseOwner struct{ token byte }
+
+func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string, owner *jsonRpcResponseOwner) func() (bufferedJsonRpcResponse, error) {
+	body := snapshotRequestBody(r)
+	return func() (bufferedJsonRpcResponse, error) {
+		if recent, ok := h.recentSingleResponse(r, hash, cache); ok {
+			return recent, nil
+		}
+		req := r.Clone(context.WithoutCancel(r.Context()))
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		return h.fetchSingle(req, next, hash, cache, ruleTag, method, owner, true)
 	}
-	return func() (*JsonRpcMsg, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), httpRefreshTimeout)
+}
+
+func (h *JsonRpcHandler) singleBackgroundRefreshFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) func() (bufferedJsonRpcResponse, error) {
+	body := snapshotRequestBody(r)
+	return func() (bufferedJsonRpcResponse, error) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
 		req.Body = io.NopCloser(bytes.NewReader(body))
 		req.ContentLength = int64(len(body))
-		return h.fetchSingle(req, next, hash, cache, ruleTag, method)
+		return h.fetchSingle(req, next, hash, cache, ruleTag, method, nil, false)
 	}
 }
 
-// fetchSingle performs ONE upstream fetch into an off-client buffer, parses the
-// JSON-RPC response, stores it if cacheable (with StoredAt + a physical TTL
-// extended by the stale window), and returns it so the caller and coalesced
-// waiters can replay it. It never writes to a client. r must be a detached
-// clone (see singleRefreshFn) so its context bounds the fetch.
-func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) (*JsonRpcMsg, error) {
+func (h *JsonRpcHandler) recentSingleResponse(r *http.Request, hash uint64, cache *RuleCache) (bufferedJsonRpcResponse, bool) {
+	if pending, ok := h.pendingSingles.Load(hash); ok {
+		return pending.(bufferedJsonRpcResponse), true
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpCacheWriteTimeout)
+	defer cancel()
+	res, err := h.cache.Get(ctx, hash)
+	if err != nil {
+		return bufferedJsonRpcResponse{}, false
+	}
+	state := classifyFreshness(res.StoredAt, nowOrDefault(h.now), effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+	if state == expiredEntry {
+		return bufferedJsonRpcResponse{}, false
+	}
+	cacheState := cacheHit
+	if state == staleEntry {
+		cacheState = cacheStale
+	}
+	return bufferedJsonRpcResponse{Cached: res, CacheState: cacheState}, true
+}
+
+// fetchSingle captures the transport response so coalesced callers keep the
+// upstream status while receiving their own JSON-RPC id. Only the fetch owner
+// receives request-specific headers.
+func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string, owner *jsonRpcResponseOwner, asyncStore bool) (bufferedJsonRpcResponse, error) {
 	sink := WrapResponseWriter(&discardResponseWriter{})
 	next(sink, r)
 	b, err := sink.GetWrittenBytes()
+	out := bufferedJsonRpcResponse{
+		StatusCode:    sink.GetStatusCode(),
+		Headers:       sink.GetCommittedHeaders(),
+		SharedHeaders: pickSharedResponseHeaders(sink.GetCommittedHeaders()),
+		Owner:         owner,
+	}
+	if stats := RequestStatsFromCtx(r.Context()); stats != nil {
+		out.Upstream = stats.Upstream
+	}
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	res, _, perr := ParseJsonRpcMessage(b)
 	if perr != nil || res == nil {
 		if perr != nil {
 			h.log.Warnf("upstream returned unparseable JSON-RPC; skipping cache: %v", perr)
 		}
-		return nil, fmt.Errorf("unparseable upstream JSON-RPC response")
+		return out, fmt.Errorf("unparseable upstream JSON-RPC response")
 	}
+	out.Message = res
 	if suffix := trailingWhitespace(b); len(suffix) > 0 {
 		res.WireSuffix = suffix
 	}
 	// Not cacheable → return to waiters but don't store.
 	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) {
-		return res, nil
+		return out, nil
 	}
 	res.StoredAt = nowOrDefault(h.now).UTC()
 	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
-	if err := h.cache.Set(r.Context(), hash, res, physTTL); err != nil {
+	if asyncStore {
+		pending := out
+		pending.Headers = nil
+		pending.Owner = nil
+		h.pendingSingles.Store(hash, pending)
+		go func() {
+			defer h.pendingSingles.Delete(hash)
+			h.persistSingleResponse(hash, res, physTTL, ruleTag, method)
+		}()
+		return out, nil
+	}
+	h.persistSingleResponse(hash, res, physTTL, ruleTag, method)
+	return out, nil
+}
+
+func (h *JsonRpcHandler) persistSingleResponse(hash uint64, res *JsonRpcMsg, ttl time.Duration, ruleTag, method string) {
+	ctx, cancel := context.WithTimeout(context.Background(), httpCacheWriteTimeout)
+	err := h.cache.Set(ctx, hash, res, ttl)
+	cancel()
+	if err != nil {
 		h.log.Errorf("error setting cache value: %v", err)
+		return
 	}
 	h.cgDashboard.RecordCardinality(h.section, ruleTag, method)
-	return res, nil
+}
+
+func (h *JsonRpcHandler) applySingleUpstreamStats(r *http.Request, upstream string) {
+	if stats := RequestStatsFromCtx(r.Context()); stats != nil && upstream != "" {
+		stats.Upstream = upstream
+	}
+}
+
+func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *http.Request, res bufferedJsonRpcResponse, id interface{}, owner *jsonRpcResponseOwner) {
+	if res.Message == nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	body, err := res.Message.CloneWithID(id).Marshal()
+	if err != nil {
+		h.log.Errorf("error marshalling upstream response: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if res.Owner != nil && res.Owner == owner {
+		for name, values := range res.Headers {
+			w.Header()[name] = append([]string(nil), values...)
+		}
+	} else {
+		for name, values := range res.SharedHeaders {
+			w.Header()[name] = append([]string(nil), values...)
+		}
+	}
+	stripRewrittenRepresentationHeaders(w.Header())
+	if h.cors != nil {
+		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+	}
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	status := res.StatusCode
+	if status <= 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 func (h *JsonRpcHandler) writeSingleResponse(w http.ResponseWriter, res *JsonRpcMsg) {
@@ -993,7 +1116,7 @@ RequestsLoop:
 					// subscription id / success token into a different
 					// client's request). AddPending hits the upstream and
 					// stores nothing.
-					if rule.Cache == nil || !rule.Cache.Enable || hasSubscriptionMethod(req) {
+					if req.ID == nil || rule.Cache == nil || !rule.Cache.Enable || hasSubscriptionMethod(req) {
 						responses.AddPending(req)
 						cacheMisses++
 						h.recordBatchItem(r, req, cacheMiss, "request in batch allowed")
@@ -1025,12 +1148,7 @@ RequestsLoop:
 						stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(h.cacheConfig))
 						if classifyFreshness(res.StoredAt, nowOrDefault(h.now), effTTL, stale) == freshEntry {
 							cacheHits++
-							// Notifications (no id) get no response even on a
-							// hit — the key ignores id, so a prior id-bearing
-							// call could have primed this entry (§4.1).
-							if req.ID != nil {
-								responses.AddResponse(req, res)
-							}
+							responses.AddResponse(req, res)
 							h.recordBatchItem(r, req, cacheHit, "request in batch allowed")
 							continue RequestsLoop
 						}
@@ -1186,7 +1304,13 @@ func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, req
 		return nil, fmt.Errorf("upstream batch response exceeded %d bytes (cap)", maxUpstreamBatchResponse)
 	}
 	b = w.buf.Bytes()
-	single, responses, _ := ParseJsonRpcMessage(b)
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil, nil
+	}
+	single, responses, parseErr := ParseJsonRpcMessage(b)
+	if parseErr != nil {
+		return nil, fmt.Errorf("error parsing upstream batch response: %w", parseErr)
+	}
 	if len(responses) == 0 && single != nil {
 		responses = JsonRpcMsgs{single}
 	}

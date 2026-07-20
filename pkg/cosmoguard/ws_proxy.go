@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ const (
 type JsonRpcWebSocketProxy struct {
 	broker *Broker
 	cache  cache.Cache[uint64, *JsonRpcMsg]
+	sf     coalescer[*JsonRpcMsg]
 	// cacheConfig resolves the cluster-wide stale-while-revalidate / ttl
 	// defaults a rule inherits; now is swappable for deterministic tests.
 	// Both set by the parent JsonRpcHandler. nil/unset falls back safely.
@@ -495,7 +497,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				// than a config-time reject because rule.matches() is
 				// pattern-based and may straddle subscription and
 				// non-subscription methods.
-				cacheable := rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
+				cacheable := request.ID != nil && rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
 				if cacheable {
 					// Single round-trip lookup: ErrNotFound is the miss
 					// signal, any other error is a backend failure that
@@ -506,20 +508,13 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					// partition hit paid two RTTs to find one entry.
 					res, err := p.cache.Get(context.Background(), hash)
 					// Only a FRESH entry is served from cache. A stale entry
-					// (stored under an extended physical TTL for HTTP-path
-					// serve-stale) is revalidated inline here — the WS broker
-					// already coalesces identical subscriptions, so there is no
-					// stampede to serve-stale around.
+					// is revalidated inline; the foreground miss path below
+					// coalesces identical one-shot requests.
 					if err == nil && classifyFreshness(res.StoredAt, nowOrDefault(p.now),
 						effectiveTTL(rule.Cache, p.cacheConfig),
 						resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig))) == freshEntry {
-						// Notifications (no id) get no response, even on a
-						// cache hit — the key ignores id, so a prior call
-						// could have primed this entry (JSON-RPC 2.0 §4.1).
-						if request.ID != nil {
-							if err = client.SendMsg(res.CloneWithID(request.ID)); err != nil {
-								return err
-							}
+						if err = client.SendMsg(res.CloneWithID(request.ID)); err != nil {
+							return err
 						}
 						p.recordOutcome(request, source, cacheHit, RuleActionAllow, ruleID, startTime, "request allowed")
 						return nil
@@ -536,6 +531,16 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					if err != nil {
 						return err
 					}
+				} else if cacheable && resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
+					res, err = p.sf.do(context.Background(), strconv.FormatUint(hash, 16), func() (*JsonRpcMsg, error) {
+						return p.broker.HandleRequest(request)
+					})
+					if err != nil {
+						return err
+					}
+					// The shared response carries the flight leader's ID; every
+					// caller must receive a distinct response matching its request.
+					res = res.CloneWithID(request.ID)
 				} else {
 					res, err = p.broker.HandleRequest(request)
 					if err != nil {

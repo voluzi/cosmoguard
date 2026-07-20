@@ -560,7 +560,8 @@ Both `coalesce` and `staleWhileRevalidate` are per-rule overrides of the global 
 - **`staleWhileRevalidate` (serve-stale)** — off by default (`0`). When set, an entry that has passed its `ttl` but is still within the window is served **immediately** (with `X-Cosmoguard-Cache: stale`, or `x-cosmoguard-cache: stale` metadata for gRPC) while ONE background request refreshes it — so the client never waits on the upstream and the entry stays warm. Requires a positive freshness `ttl` (the rule's `ttl`, or the global default) to extend.
 
 Scope and caveats:
-- Applies to HTTP-family rules (LCD, RPC-HTTP, EVM-RPC-HTTP), gRPC rules, and the JSON-RPC **single**-request path. gRPC responses now also carry an `x-cosmoguard-cache` response-metadata (`hit`/`miss`/`stale`).
+- Coalescing applies to HTTP-family rules (LCD, RPC-HTTP, EVM-RPC-HTTP), gRPC rules, and JSON-RPC **single** requests over HTTP or WebSocket. gRPC responses also carry `x-cosmoguard-cache` response metadata (`hit`/`miss`/`stale`).
+- Serve-stale SWR applies to HTTP-family rules, gRPC, and JSON-RPC single requests over HTTP. WebSocket single requests coalesce stale revalidation but wait for the refreshed response instead of serving stale data.
 - **JSON-RPC batch** items are freshness-aware (a stale entry is revalidated as part of the aggregated batch call) but are not individually coalesced or served stale — a batch already collapses its misses into a single upstream call, so there is nothing to coalesce.
 - Coalescing is **per-pod** (in-process). Across a cluster the shared olric L2 dedups the stored value and serves subsequent reads cluster-wide, so per-pod single-flight already cuts an expiry stampede from N-per-pod to ~1-per-pod.
 - A coalesced miss buffers the upstream response fully before replying (it can't stream to N waiters); for cacheable responses this only shifts first-byte latency. Set `coalesce: false` on a rule if you need streaming on the miss path.

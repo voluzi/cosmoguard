@@ -50,8 +50,9 @@ func (c *coalescer[V]) refresh(key string, fn func() (V, error)) {
 	if _, busy := c.inflight.LoadOrStore(key, struct{}{}); busy {
 		return
 	}
+	ch := c.g.DoChan(key, func() (any, error) { return fn() })
 	go func() {
 		defer c.inflight.Delete(key)
-		_, _, _ = c.g.Do(key, func() (any, error) { return fn() })
+		<-ch
 	}()
 }
