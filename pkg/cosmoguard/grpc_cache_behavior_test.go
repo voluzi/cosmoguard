@@ -225,6 +225,33 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 	}
 }
 
+func TestGRPCCacheForegroundCoalescedMissPreservesCallerDeadline(t *testing.T) {
+	remainingDeadline := make(chan time.Duration, 1)
+	conn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		deadline, ok := stream.Context().Deadline()
+		if !ok {
+			remainingDeadline <- 0
+		} else {
+			remainingDeadline <- time.Until(deadline)
+		}
+		return stream.SendMsg(&rawFrame{Payload: []byte("response")})
+	})
+	p, _ := newGRPCCacheTestProxy(t, conn, &RuleCache{Enable: true, TTL: time.Minute})
+	handler := grpcCacheTestHandler(p)
+
+	stream := newGRPCCacheTestStream([]byte("request"))
+	ctx, cancel := context.WithTimeout(stream.ctx, time.Hour)
+	defer cancel()
+	stream.ctx = ctx
+
+	require.NoError(t, handler(nil, stream))
+	require.Greater(t, <-remainingDeadline, 45*time.Minute)
+}
+
 func TestGRPCCacheStaleResponseRefreshesOnceInBackground(t *testing.T) {
 	request := []byte("request")
 	stalePayload := []byte("version-1")

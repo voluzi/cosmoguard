@@ -188,9 +188,8 @@ func cachingStreamHandler(
 		metaPart := grpcCacheKeyMetaPart(stream.Context(), rule.Cache.EffectiveKeyMetadata())
 		key := grpcCacheKey(rule.Fingerprint, method, req.Payload, rule.Cache.KeyMode, p.canonical, metaPart)
 
-		// The outgoing metadata (credential-stripped) is captured so a
-		// coalesced or background refresh can rebuild a detached outgoing
-		// context that survives the triggering client's disconnect.
+		// Background refreshes keep the credential-stripped metadata but
+		// must not inherit the triggering client's cancellation.
 		md, _ := metadata.FromOutgoingContext(outCtx)
 
 		if cached, err := p.grpcCache.Get(stream.Context(), key); err == nil {
@@ -219,7 +218,7 @@ func cachingStreamHandler(
 			fetchErr error
 		)
 		if resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
-			out, fetchErr = p.sf.do(stream.Context(), key, p.grpcRefreshFn(md, method, req.Payload, key, rule))
+			out, fetchErr = p.sf.do(stream.Context(), key, p.grpcForegroundFetchFn(outCtx, method, req.Payload, key, rule))
 		} else {
 			out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule)
 		}
@@ -231,10 +230,22 @@ func cachingStreamHandler(
 	}
 }
 
-// grpcRefreshFn returns a closure that fetches upstream under a fresh, detached,
-// bounded outgoing context (carrying the credential-stripped metadata) — used
-// by both the coalesced miss and the stale-while-revalidate background refresh
-// so neither is aborted by the triggering client's disconnect.
+// grpcForegroundFetchFn detaches client cancellation while preserving the
+// caller's absolute deadline and credential-stripped outgoing context.
+func (p *GrpcProxy) grpcForegroundFetchFn(outCtx context.Context, method string, reqPayload []byte, key string, rule *GrpcRule) func() (grpcCachedResponse, error) {
+	return func() (grpcCachedResponse, error) {
+		ctx := context.WithoutCancel(outCtx)
+		if deadline, ok := outCtx.Deadline(); ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, deadline)
+			defer cancel()
+		}
+		return p.grpcFetchAndStore(ctx, method, reqPayload, key, rule)
+	}
+}
+
+// grpcRefreshFn bounds detached stale-while-revalidate work so a wedged
+// upstream cannot pin a background goroutine indefinitely.
 func (p *GrpcProxy) grpcRefreshFn(md metadata.MD, method string, reqPayload []byte, key string, rule *GrpcRule) func() (grpcCachedResponse, error) {
 	return func() (grpcCachedResponse, error) {
 		ctx, cancel := context.WithTimeout(metadata.NewOutgoingContext(context.Background(), md), grpcRefreshTimeout)

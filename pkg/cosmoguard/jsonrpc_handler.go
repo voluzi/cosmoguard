@@ -850,15 +850,22 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 		}
 		return
 	}
+	if !res.Shareable && res.Owner != owner {
+		h.getSingleUpstreamResponse(w, r, next, hash, cache, ruleTag, request.Method)
+		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
+		return
+	}
 	h.writeBufferedSingleResponse(w, r, res, request.ID, owner)
 	h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 }
 
 type bufferedJsonRpcResponse struct {
 	Message       *JsonRpcMsg
+	RawBody       []byte
 	StatusCode    int
 	Headers       http.Header
 	SharedHeaders http.Header
+	Shareable     bool
 	Owner         *jsonRpcResponseOwner
 	Upstream      string
 	Cached        *JsonRpcMsg
@@ -924,6 +931,7 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 		StatusCode:    sink.GetStatusCode(),
 		Headers:       sink.GetCommittedHeaders(),
 		SharedHeaders: pickSharedResponseHeaders(sink.GetCommittedHeaders()),
+		RawBody:       append([]byte(nil), b...),
 		Owner:         owner,
 	}
 	if stats := RequestStatsFromCtx(r.Context()); stats != nil {
@@ -937,7 +945,7 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 		if perr != nil {
 			h.log.Warnf("upstream returned unparseable JSON-RPC; skipping cache: %v", perr)
 		}
-		return out, fmt.Errorf("unparseable upstream JSON-RPC response")
+		return out, nil
 	}
 	out.Message = res
 	if suffix := trailingWhitespace(b); len(suffix) > 0 {
@@ -947,11 +955,13 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) {
 		return out, nil
 	}
+	out.Shareable = true
 	res.StoredAt = nowOrDefault(h.now).UTC()
 	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
 	if asyncStore {
 		pending := out
 		pending.Headers = nil
+		pending.RawBody = nil
 		pending.Owner = nil
 		h.pendingSingles.Store(hash, pending)
 		go func() {
@@ -982,16 +992,6 @@ func (h *JsonRpcHandler) applySingleUpstreamStats(r *http.Request, upstream stri
 }
 
 func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *http.Request, res bufferedJsonRpcResponse, id interface{}, owner *jsonRpcResponseOwner) {
-	if res.Message == nil {
-		w.WriteHeader(http.StatusBadGateway)
-		return
-	}
-	body, err := res.Message.CloneWithID(id).Marshal()
-	if err != nil {
-		h.log.Errorf("error marshalling upstream response: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
 	if res.Owner != nil && res.Owner == owner {
 		for name, values := range res.Headers {
 			w.Header()[name] = append([]string(nil), values...)
@@ -1001,13 +1001,24 @@ func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *h
 			w.Header()[name] = append([]string(nil), values...)
 		}
 	}
-	stripRewrittenRepresentationHeaders(w.Header())
+	body := res.RawBody
+	if res.Message != nil {
+		var err error
+		body, err = res.Message.CloneWithID(id).Marshal()
+		if err != nil {
+			h.log.Errorf("error marshalling upstream response: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		stripRewrittenRepresentationHeaders(w.Header())
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json")
+		}
+	}
 	if h.cors != nil {
 		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
 	}
-	if w.Header().Get("Content-Type") == "" {
-		w.Header().Set("Content-Type", "application/json")
-	}
+	w.Header().Set(cacheStateHeader, cacheMiss)
 	status := res.StatusCode
 	if status <= 0 {
 		status = http.StatusOK

@@ -658,7 +658,7 @@ func TestJSONRPCCoalescedMissPreservesStatusAndHeaders(t *testing.T) {
 	rule := &JsonRpcRule{
 		Action:  RuleActionAllow,
 		Methods: []string{"status"},
-		Cache:   &RuleCache{Enable: true, TTL: time.Minute, CacheError: true},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute, CacheError: true, CacheEmptyResult: true},
 	}
 	h := newJSONCacheHandler(t, rule)
 	started := make(chan struct{}, 1)
@@ -690,12 +690,114 @@ func TestJSONRPCCoalescedMissPreservesStatusAndHeaders(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	close(release)
 
-	for id, rec := range map[int]*httptest.ResponseRecorder{9: <-first, 10: <-second} {
+	recA := <-first
+	recB := <-second
+	for id, rec := range map[int]*httptest.ResponseRecorder{9: recA, 10: recB} {
 		require.Equal(t, http.StatusTooManyRequests, rec.Code)
 		require.Equal(t, "3", rec.Header().Get("Retry-After"))
-		require.Equal(t, "node-a", rec.Header().Get("X-Upstream"))
 		require.JSONEq(t, `{"jsonrpc":"2.0","id":`+strconv.Itoa(id)+`,"error":{"code":-32000,"message":"busy"}}`, rec.Body.String())
 	}
+	require.Equal(t, "node-a", recA.Header().Get("X-Upstream"))
+	require.Empty(t, recB.Header().Get("X-Upstream"))
+}
+
+func TestJSONRPCCoalescedMissPreservesNonJSONTransportFailure(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{name: "bad gateway", status: http.StatusBadGateway, contentType: "text/html", body: "<h1>bad gateway</h1>"},
+		{name: "rate limited", status: http.StatusTooManyRequests, contentType: "text/plain", body: "slow down"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rule := &JsonRpcRule{
+				Action:  RuleActionAllow,
+				Methods: []string{"status"},
+				Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+			}
+			h := newJSONCacheHandler(t, rule)
+			next := func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}
+
+			rec := httptest.NewRecorder()
+			req, _ := jsonRequestContext()
+			h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, req, next, time.Now())
+
+			require.Equal(t, tt.status, rec.Code)
+			require.Equal(t, tt.contentType, rec.Header().Get("Content-Type"))
+			require.Equal(t, tt.body, rec.Body.String())
+		})
+	}
+}
+
+func TestJSONRPCCoalescedWaiterRefetchesUncacheableError(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+	}
+	h := newJSONCacheHandler(t, rule)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var upstreamCalls atomic.Int32
+	next := func(w http.ResponseWriter, r *http.Request) {
+		if upstreamCalls.Add(1) == 1 {
+			started <- struct{}{}
+			<-release
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + r.Header.Get("X-Test-ID") + `,"error":{"code":-32000,"message":"` + r.Header.Get("X-User") + `"}}`))
+	}
+
+	first := make(chan *httptest.ResponseRecorder, 1)
+	second := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req, _ := jsonRequestContext()
+		req.Header.Set("X-Test-ID", "1")
+		req.Header.Set("X-User", "alice")
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, req, next, time.Now())
+		first <- rec
+	}()
+	<-started
+	go func() {
+		rec := httptest.NewRecorder()
+		req, _ := jsonRequestContext()
+		req.Header.Set("X-Test-ID", "2")
+		req.Header.Set("X-User", "bob")
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 2, Method: "status"}, rec, req, next, time.Now())
+		second <- rec
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	require.JSONEq(t, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"alice"}}`, (<-first).Body.String())
+	require.JSONEq(t, `{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"bob"}}`, (<-second).Body.String())
+	require.Equal(t, int32(2), upstreamCalls.Load())
+}
+
+func TestJSONRPCCoalescedMissOverridesUpstreamCacheMarker(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+	}
+	h := newJSONCacheHandler(t, rule)
+	next := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(cacheStateHeader, cacheHit)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
+	}
+
+	rec := httptest.NewRecorder()
+	req, _ := jsonRequestContext()
+	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, req, next, time.Now())
+
+	require.Equal(t, cacheMiss, rec.Header().Get(cacheStateHeader))
 }
 
 func TestJSONRPCRewrittenResponsesDropRepresentationValidators(t *testing.T) {

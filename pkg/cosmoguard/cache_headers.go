@@ -129,12 +129,10 @@ func pickCacheableHeaders(upstream http.Header, extra []string) map[string]strin
 	return out
 }
 
-var perRequestResponseHeaders = map[string]struct{}{
-	"Request-Id":       {},
-	"Set-Cookie":       {},
-	"Set-Cookie2":      {},
-	"X-Correlation-Id": {},
-	"X-Request-Id":     {},
+var sharedResponseHeaders = map[string]struct{}{
+	"Cache-Control": {},
+	"Content-Type":  {},
+	"Retry-After":   {},
 }
 
 var rewrittenRepresentationHeaders = map[string]struct{}{
@@ -151,19 +149,10 @@ func pickSharedResponseHeaders(upstream http.Header) http.Header {
 	if upstream == nil {
 		return nil
 	}
-	connectionHeaders := make(map[string]struct{})
-	for _, value := range upstream.Values("Connection") {
-		for _, name := range strings.Split(value, ",") {
-			connectionHeaders[http.CanonicalHeaderKey(strings.TrimSpace(name))] = struct{}{}
-		}
-	}
 	out := make(http.Header)
 	for name, values := range upstream {
 		canonical := http.CanonicalHeaderKey(name)
-		_, connectionSpecific := connectionHeaders[canonical]
-		_, perRequest := perRequestResponseHeaders[canonical]
-		_, representationSpecific := rewrittenRepresentationHeaders[canonical]
-		if connectionSpecific || perRequest || representationSpecific || isHopByHop(canonical) || strings.HasPrefix(canonical, "Access-Control-") {
+		if _, ok := sharedResponseHeaders[canonical]; !ok {
 			continue
 		}
 		out[canonical] = append([]string(nil), values...)
