@@ -696,19 +696,27 @@ type DashboardConfig struct {
 	// IP allowlists before enabling.
 	RequestLog *RequestLogConfig `yaml:"requestLog,omitempty"`
 	// ClusterHistoryRestore opts into cross-pod replication of the
-	// dashboard snapshot so a single pod can restore its counters +
+	// dashboard snapshot so a single pod can RESTORE its counters +
 	// metrics history from a peer after a rolling restart. OFF by
-	// default and deliberately so: the replicator rewrites a large
-	// observability blob to a replicated (RF2) olric DMap every 30s,
-	// and olric's log-structured kvstore accumulates storage tables
-	// from that frequent large-value overwrite without bound — under
-	// real cluster traffic (which grows the blob as request
+	// default and deliberately so: when on, the replicator rewrites a
+	// large observability blob to a replicated (RF2) olric DMap every
+	// 30s, and olric's log-structured kvstore accumulates storage
+	// tables from that frequent large-value overwrite without bound —
+	// under real cluster traffic (which grows the blob as request
 	// cardinality climbs) the heap grows until the pod is OOMKilled.
-	// The live cluster dashboard, peer fan-out, and Prometheus
-	// /metrics do NOT depend on this — only restart-restore of
-	// dashboard history does. Leave it off unless you specifically
-	// need counters to survive a rolling restart and accept the
-	// memory cost.
+	//
+	// This gates ONLY the cross-pod restart-restore. Live dashboard
+	// metrics-history panels (/metrics/history) are fed by an in-process
+	// sampler that runs regardless of this flag, so they populate on a
+	// healthy pod either way — only their SURVIVAL across a restart is
+	// gated. The live cluster dashboard, peer fan-out, and Prometheus
+	// /metrics are likewise unaffected.
+	//
+	// Only meaningful in cluster mode (cache.cluster set): restart-
+	// restore reads a peer's replica, so with no peers the flag is
+	// ignored (it would only reintroduce the leak with nothing to
+	// restore). Leave it off unless you specifically need dashboard
+	// history to survive a rolling restart and accept the memory cost.
 	ClusterHistoryRestore *bool `yaml:"clusterHistoryRestore,omitempty"`
 }
 

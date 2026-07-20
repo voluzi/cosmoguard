@@ -238,7 +238,7 @@ Bare hosts (no `:port`) are accepted — `cluster.gossipPort` is appended at run
 
 #### Dashboard restart-restore (off by default)
 
-`dashboard.clusterHistoryRestore` gates cross-pod replication of the dashboard observability snapshot. It is **off by default**, and you should leave it off unless you specifically need dashboard counters + metrics history to survive a rolling restart.
+`dashboard.clusterHistoryRestore` gates cross-pod replication of the dashboard observability snapshot — the mechanism that lets a pod **restore** its counters + metrics history from a peer after a rolling restart. It is **off by default**, and you should leave it off unless you specifically need that history to survive a restart.
 
 ```yaml
 dashboard:
@@ -246,7 +246,11 @@ dashboard:
   clusterHistoryRestore: false   # default; set true to opt into restart-restore
 ```
 
-**Why it defaults off:** when enabled, each pod rewrites a large observability blob to a replicated (RF2) olric DMap every 30s. olric's log-structured kvstore accumulates storage tables from that frequent large-value overwrite without bound, so under real cluster traffic — where the blob grows as request cardinality climbs — the pod heap grows until it is **OOMKilled**. Only enable it if restart-restore is worth that memory cost in your deployment; the live cluster dashboard, peer fan-out, and Prometheus `/metrics` all keep working with it off. When disabled, a rolling restart simply starts each pod's dashboard counters cold — no functional loss beyond the lost history.
+**What the flag does and does not affect.** It gates *only* the cross-pod restart-restore. The live dashboard time-series panels (`/api/v1/metrics/history`, and the cluster `/api/v1/cluster/metrics/history` fan-out) are fed by an in-process sampler that runs **regardless** of this flag, so they populate normally on a healthy pod either way — only their *survival across a restart* is gated. The live cluster dashboard, peer fan-out, and Prometheus `/metrics` are likewise unaffected.
+
+**Why it defaults off:** when enabled, each pod rewrites a large observability blob to a replicated (RF2) olric DMap every 30s. olric's log-structured kvstore accumulates storage tables from that frequent large-value overwrite without bound, so under real cluster traffic — where the blob grows as request cardinality climbs — the pod heap grows until it is **OOMKilled**. When disabled, a rolling restart simply starts each pod's dashboard counters cold — no functional loss beyond the lost history.
+
+**Requires cluster mode.** Restart-restore reads a peer's replica, so the flag only has an effect when a `cache.cluster` block is present. In a single-pod / embedded deployment there are no peers to restore from, so the flag is ignored (it would otherwise reintroduce the memory growth above with nothing to restore); cosmoguard logs a warning if it is set without cluster mode. Changing the flag on a running pod is rejected on hot-reload as **requires a process restart** — it is wired once at startup.
 
 #### Kubernetes example — StatefulSet + headless Service
 

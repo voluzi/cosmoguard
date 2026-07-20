@@ -37,6 +37,21 @@ import (
 // replicator. Observability writes are mutex-only operations on
 // in-process counters; the replicator only reads those counters on
 // its own ticker and pushes a single DMap.Put per pod per interval.
+//
+// Two independent responsibilities live here, gated separately:
+//
+//   - The metrics-history sampler (sampleMetrics → metricsHistory.Push)
+//     is a purely in-process, bounded ring feed for the live dashboard
+//     time-series panels (/metrics/history). It ALWAYS runs — it has no
+//     olric involvement and no leak.
+//   - The cross-pod DMap flush + restore (the restart-restore feature)
+//     is the ONLY part gated behind dashboard.clusterHistoryRestore.
+//     Its 30s replicated large-value Put is what grows olric's
+//     log-structured store unbounded → OOM, so it is off by default and
+//     only meaningful in cluster mode (peers to restore from).
+//
+// The `replicate` field carries that gate: false → sample only, never
+// touch the DMap.
 
 // replicationDMap is the DMap name where each pod stores its
 // observability blob. Stable across versions — peers in mid-rollout
@@ -90,6 +105,11 @@ type observabilityReplicator struct {
 	// deterministic snapshots without registering live metrics.
 	gather func() (*MetricsSnapshot, error)
 
+	// replicate gates the cross-pod DMap flush + restore. When false the
+	// replicator only samples metrics history (in-process, no leak) and
+	// never writes to or reads from the olric DMap.
+	replicate bool
+
 	podID           string
 	interval        time.Duration
 	metricsInterval time.Duration
@@ -110,19 +130,31 @@ type observabilityReplicator struct {
 // is the same in-process embedded handle the cache + rate limiter use.
 // Returns nil if olricClient is nil (tests / embedded-without-cluster
 // paths) — replication is best-effort, not a hard dependency.
+//
+// replicate controls ONLY the cross-pod DMap flush + restore; the
+// metrics-history sampler runs regardless (it feeds the live dashboard
+// time-series panels and is leak-free). Pass false to sample-only.
 func newObservabilityReplicator(
 	olricClient *olric.EmbeddedClient,
 	dash *dashboardObservability,
 	history *metricsHistory,
 	gather func() (*MetricsSnapshot, error),
 	podID string,
+	replicate bool,
 ) (*observabilityReplicator, error) {
 	if olricClient == nil {
 		return nil, nil
 	}
-	dm, err := olricClient.NewDMap(replicationDMap)
-	if err != nil {
-		return nil, fmt.Errorf("observability replicator: dmap: %w", err)
+	// The DMap handle is only needed for the flush/restore path. When
+	// replication is off we still construct the replicator (for the
+	// sampler) but leave dm nil so no DMap machinery is touched.
+	var dm olric.DMap
+	if replicate {
+		var err error
+		dm, err = olricClient.NewDMap(replicationDMap)
+		if err != nil {
+			return nil, fmt.Errorf("observability replicator: dmap: %w", err)
+		}
 	}
 	if podID == "" {
 		// Pod identity fallback chain: hostname is what K8s gives a
@@ -141,6 +173,7 @@ func newObservabilityReplicator(
 		dash:            dash,
 		history:         history,
 		gather:          gather,
+		replicate:       replicate,
 		podID:           podID,
 		interval:        replicationInterval,
 		metricsInterval: 5 * time.Second, // matches dashboard poll cadence (5min @ 60 entries)
@@ -173,8 +206,12 @@ func (r *observabilityReplicator) Start(ctx context.Context) error {
 	// other error is logged but doesn't fail Start — the dashboard
 	// still works without restored history, just with cold counters.
 	r.startOnce.Do(func() {
-		if err := r.restore(ctx); err != nil {
-			slog.Warn("observability replication: restore failed (continuing with cold state)", "error", err, "pod_id", r.podID)
+		// Restore only when cross-pod replication is on — with it off there
+		// is no DMap snapshot to read (dm is nil) and nothing to restore.
+		if r.replicate {
+			if err := r.restore(ctx); err != nil {
+				slog.Warn("observability replication: restore failed (continuing with cold state)", "error", err, "pod_id", r.podID)
+			}
 		}
 		r.wg.Add(1)
 		go r.run()
@@ -218,22 +255,29 @@ func (r *observabilityReplicator) PodID() string {
 	return r.podID
 }
 
-// run is the periodic flush + metrics-history sampler. Two
-// independent tickers in one goroutine — keeps the resource cost flat
-// (one g, two timers) regardless of which surface is being collected.
+// run is the metrics-history sampler and (when replication is on) the
+// periodic DMap flush. The metrics ticker always fires; the flush ticker
+// is only wired when r.replicate is true — otherwise flushC stays nil and
+// its case blocks forever, so a sample-only replicator never touches the
+// DMap. One goroutine, at most two timers, regardless.
 func (r *observabilityReplicator) run() {
 	defer r.wg.Done()
-	flushT := time.NewTicker(r.interval)
-	defer flushT.Stop()
 	metricsT := time.NewTicker(r.metricsInterval)
 	defer metricsT.Stop()
+
+	var flushC <-chan time.Time
+	if r.replicate {
+		flushT := time.NewTicker(r.interval)
+		defer flushT.Stop()
+		flushC = flushT.C
+	}
 	for {
 		select {
 		case <-r.stop:
 			return
 		case <-metricsT.C:
 			r.sampleMetrics()
-		case <-flushT.C:
+		case <-flushC:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err := r.flush(ctx); err != nil {
 				slog.Warn("observability replication: flush failed", "error", err, "pod_id", r.podID)
@@ -265,7 +309,9 @@ func (r *observabilityReplicator) sampleMetrics() {
 // effort: a partition unreachable in mid-failover is logged but the
 // next interval tries again.
 func (r *observabilityReplicator) flush(ctx context.Context) error {
-	if r == nil || r.dm == nil {
+	// !replicate ⇒ dm is nil; skip all DMap work (also covers the final
+	// flush from Close on a sample-only replicator).
+	if r == nil || !r.replicate || r.dm == nil {
 		return nil
 	}
 	obsBlob, err := r.dash.Snapshot()
