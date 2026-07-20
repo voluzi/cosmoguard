@@ -865,7 +865,7 @@ type bufferedJsonRpcResponse struct {
 	CacheState    string
 }
 
-type jsonRpcResponseOwner struct{ token byte }
+type jsonRpcResponseOwner [1]byte
 
 func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string, owner *jsonRpcResponseOwner) func() (bufferedJsonRpcResponse, error) {
 	body := snapshotRequestBody(r)

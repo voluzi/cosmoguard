@@ -1017,7 +1017,7 @@ type bufferedUpstreamResponse struct {
 	CacheState    string
 }
 
-type responseOwner struct{ token byte }
+type responseOwner [1]byte
 
 // discardResponseWriter keeps a header map (so the reverse-proxy ModifyResponse
 // hook can write to it and we can snapshot the committed headers) but discards
