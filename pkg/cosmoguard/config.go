@@ -712,11 +712,16 @@ type DashboardConfig struct {
 	// gated. The live cluster dashboard, peer fan-out, and Prometheus
 	// /metrics are likewise unaffected.
 	//
-	// Only meaningful in cluster mode (cache.cluster set): restart-
-	// restore reads a peer's replica, so with no peers the flag is
-	// ignored (it would only reintroduce the leak with nothing to
-	// restore). Leave it off unless you specifically need dashboard
-	// history to survive a rolling restart and accept the memory cost.
+	// Takes effect only when a cache.cluster block is present (cluster
+	// mode configured). With no cluster block the flag is ignored — an
+	// embedded loopback olric has no peers to restore from. NOTE: the
+	// gate is on the cluster CONFIG, not on live peer count: a cluster
+	// that is configured but currently solo or degraded (no reachable
+	// peers) still performs the 30s DMap writes — and still incurs the
+	// heap growth — with nothing to restore from. So only enable it on a
+	// healthy multi-pod cluster, and leave it off unless you specifically
+	// need dashboard history to survive a rolling restart and accept the
+	// memory cost.
 	ClusterHistoryRestore *bool `yaml:"clusterHistoryRestore,omitempty"`
 }
 

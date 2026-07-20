@@ -335,8 +335,14 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	// storage tables from that frequent large-value overwrite without
 	// bound — growing the heap under real cluster traffic until the pod is
 	// OOMKilled. The cluster-mode requirement is because restart-restore
-	// reads a peer's replica: with no peers (single-pod / embedded olric)
-	// the flag would only reintroduce the leak with nothing to restore.
+	// reads a peer's replica; in embedded loopback mode (no cache.cluster
+	// block) there are no peers at all, so the flag is ignored. NOTE this
+	// gates on the cluster CONFIG being present, not on live peer count —
+	// a configured-but-solo/degraded cluster still writes the DMap and
+	// still leaks, just with nothing to restore. Gating startup on
+	// transient peer availability would be fragile (peers churn), so the
+	// docs steer operators to only enable it on a healthy multi-pod
+	// cluster instead.
 	replicateObs := cosmoGuard.cfg.Dashboard.ClusterHistoryRestoreEnabled() && cosmoGuard.cfg.Cache.Cluster != nil
 	if cosmoGuard.cfg.Dashboard.ClusterHistoryRestoreEnabled() && cosmoGuard.cfg.Cache.Cluster == nil {
 		slog.Warn("dashboard.clusterHistoryRestore is set but cache.cluster is not configured; " +
