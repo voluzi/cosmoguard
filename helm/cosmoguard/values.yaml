@@ -13,17 +13,19 @@ fullnameOverride: ""
 # Workload kind. Two options:
 #   Deployment   — default, ephemeral pod identities. Cache and rate-limit
 #                  data still survives a single-pod restart via olric DMap
-#                  replication, but per-pod observability snapshots (the
-#                  dashboard panels keyed by pod_id) are lost on pod
-#                  replacement because new pods get new hostnames and
-#                  can't find their old DMap key.
+#                  replication.
 #   StatefulSet  — recommended when running in cluster mode. Stable pod
-#                  hostnames (cosmoguard-0 is always cosmoguard-0) mean
-#                  the observability snapshot key survives pod
-#                  replacement, so panels stay populated across rolling
-#                  restarts. No PVCs are templated — cosmoguard is
-#                  in-memory only by design; replication via olric is
-#                  the durability mechanism, not disk.
+#                  hostnames (cosmoguard-0 is always cosmoguard-0). No PVCs
+#                  are templated — cosmoguard is in-memory only by design;
+#                  replication via olric is the durability mechanism, not
+#                  disk.
+#
+# Note: per-pod observability snapshots (dashboard panels keyed by pod_id)
+# only survive pod replacement when dashboard.clusterHistoryRestore is
+# enabled (off by default — it can OOM pods under real cluster traffic; see
+# config.dashboard below) AND identities are stable (StatefulSet). With the
+# default Deployment + flag off, dashboard counters start cold after a
+# rolling restart; cache and rate-limit are unaffected either way.
 kind: Deployment
 
 # Default 1 because cluster mode is OFF by default (see cache.cluster.enable):
@@ -76,6 +78,16 @@ config:
     #   maxEntries: 10000  # global hard cap (OOM backstop)
     #   includeSuccess: true
     #   includeDenied: true
+    #
+    # Cross-pod restart-restore of dashboard counters + metrics history.
+    # OFF by default and deliberately so: enabling it makes each pod
+    # rewrite a large observability blob to a replicated (RF2) olric
+    # DMap every 30s, and olric's log-structured store grows unbounded
+    # from that under real cluster traffic → the pod is OOMKilled. Only
+    # turn it on if surviving dashboard history across a rolling restart
+    # is worth that memory cost; live dashboard, cluster fan-out, and
+    # /metrics all work with it off. See CONFIG.md.
+    # clusterHistoryRestore: false
   server:
     readHeaderTimeout: 10s
     readTimeout: 30s
