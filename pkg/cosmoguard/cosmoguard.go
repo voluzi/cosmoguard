@@ -322,23 +322,32 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	cosmoGuard.auth = authn
 
 	// Build the observability replicator now that the olric client
-	// exists. Replicator construction is best-effort: in legacy embed
-	// paths the client may be nil, in which case obsReplicator stays
-	// nil and the dashboard runs without restart survival (still
-	// fully functional, just loses counters on restart). The Start +
-	// Close calls below are nil-safe so the rest of the code stays
-	// branchless.
-	cosmoGuard.obsReplicator, err = newObservabilityReplicator(
-		cosmoGuard.cluster.Client(),
-		cosmoGuard.dashboard,
-		cosmoGuard.metricsHistory,
-		func() (*MetricsSnapshot, error) {
-			return gatherMetricsSnapshot(prometheus.DefaultGatherer)
-		},
-		"", // empty → falls through to os.Hostname()
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error setting up observability replicator: %w", err)
+	// exists — but ONLY when cross-pod restart-restore is opted in.
+	// It is off by default: the replicator rewrites a large
+	// observability blob to a replicated (RF2) olric DMap every 30s,
+	// and olric's log-structured kvstore accumulates storage tables
+	// from that frequent large-value overwrite without bound, growing
+	// the heap under real cluster traffic until the pod is OOMKilled.
+	// The live cluster dashboard (peer HTTP fan-out) and Prometheus
+	// /metrics don't depend on this — only restart-restore of
+	// dashboard history does. When disabled, obsReplicator stays nil;
+	// the Start + Close calls below are nil-safe so the rest of the
+	// code stays branchless. Construction is also best-effort: in
+	// legacy embed paths the olric client is nil, in which case
+	// newObservabilityReplicator returns nil too.
+	if cosmoGuard.cfg.Dashboard.ClusterHistoryRestoreEnabled() {
+		cosmoGuard.obsReplicator, err = newObservabilityReplicator(
+			cosmoGuard.cluster.Client(),
+			cosmoGuard.dashboard,
+			cosmoGuard.metricsHistory,
+			func() (*MetricsSnapshot, error) {
+				return gatherMetricsSnapshot(prometheus.DefaultGatherer)
+			},
+			"", // empty → falls through to os.Hostname()
+		)
+		if err != nil {
+			return nil, fmt.Errorf("error setting up observability replicator: %w", err)
+		}
 	}
 
 	// Setup gRPC proxy

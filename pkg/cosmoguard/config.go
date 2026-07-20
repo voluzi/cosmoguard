@@ -695,6 +695,28 @@ type DashboardConfig struct {
 	// audit-log surface — restrict the dashboard with BasicAuth or
 	// IP allowlists before enabling.
 	RequestLog *RequestLogConfig `yaml:"requestLog,omitempty"`
+	// ClusterHistoryRestore opts into cross-pod replication of the
+	// dashboard snapshot so a single pod can restore its counters +
+	// metrics history from a peer after a rolling restart. OFF by
+	// default and deliberately so: the replicator rewrites a large
+	// observability blob to a replicated (RF2) olric DMap every 30s,
+	// and olric's log-structured kvstore accumulates storage tables
+	// from that frequent large-value overwrite without bound — under
+	// real cluster traffic (which grows the blob as request
+	// cardinality climbs) the heap grows until the pod is OOMKilled.
+	// The live cluster dashboard, peer fan-out, and Prometheus
+	// /metrics do NOT depend on this — only restart-restore of
+	// dashboard history does. Leave it off unless you specifically
+	// need counters to survive a rolling restart and accept the
+	// memory cost.
+	ClusterHistoryRestore *bool `yaml:"clusterHistoryRestore,omitempty"`
+}
+
+// ClusterHistoryRestoreEnabled reports whether cross-pod observability
+// replication (dashboard restart-restore) is opted in. Off unless
+// explicitly set to true.
+func (d *DashboardConfig) ClusterHistoryRestoreEnabled() bool {
+	return d != nil && d.ClusterHistoryRestore != nil && *d.ClusterHistoryRestore
 }
 
 // RequestLogConfig configures the time-windowed live-traffic log.

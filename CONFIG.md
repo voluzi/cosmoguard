@@ -179,7 +179,9 @@ cache:
 
 ### Cluster mode
 
-Including a `cache.cluster` block in the config turns the embedded olric daemon into a real cluster. Replicas form a memberlist gossip ring, partition the cache + rate-limiter keyspace, and replicate dashboard observability snapshots through the same DMap layer. Single binary, single daemon, no external dependencies.
+Including a `cache.cluster` block in the config turns the embedded olric daemon into a real cluster. Replicas form a memberlist gossip ring and partition the cache + rate-limiter keyspace. Single binary, single daemon, no external dependencies.
+
+Cross-pod replication of the dashboard observability snapshot (so a restarting pod restores its counters + metrics history from a peer) is **off by default** and opt-in via `dashboard.clusterHistoryRestore: true` — see [Dashboard restart-restore](#dashboard-restart-restore-off-by-default) below. The live cluster dashboard (peer HTTP fan-out) and Prometheus `/metrics` do **not** depend on it.
 
 ```yaml
 cache:
@@ -231,8 +233,20 @@ Bare hosts (no `:port`) are accepted — `cluster.gossipPort` is appended at run
 - **2 vs 3 replicas** — both supported.
   - **3 replicas** *(recommended)*: RF=2, quorum=2, textbook no-split-brain configuration.
   - **2 replicas**: cost-sensitive deploys. Set `replicaCount: 2` and accept a documented trade-off: a brief network partition where the two pods disagree about token-bucket state can double-bill rate-limited callers for the duration of the partition. The cache and observability subsystems are unaffected.
-- **No persistence** — olric runs in-memory only. Single-pod restart survives via DMap replication (the rejoining pod streams its data back from a peer). **Full-cluster restart loses cache + rate-limit + observability state**, which is the explicit v4 design trade-off.
-- **Pod identity matters for observability survival** — the dashboard observability snapshot is keyed by hostname. StatefulSet gives stable identities (`cosmoguard-0` stays `cosmoguard-0`) so a restarting pod finds its own previous snapshot on a peer. Deployment ephemeral identities work but new-pod replacement loses that pod's observability rollover — cache and rate-limit are unaffected.
+- **No persistence** — olric runs in-memory only. Single-pod restart survives via DMap replication (the rejoining pod streams its data back from a peer). **Full-cluster restart loses cache + rate-limit state** (and observability state, when `dashboard.clusterHistoryRestore` is enabled), which is the explicit v4 design trade-off.
+- **Pod identity matters for observability survival** — *only when `dashboard.clusterHistoryRestore` is enabled* (off by default). The dashboard observability snapshot is then keyed by hostname: StatefulSet gives stable identities (`cosmoguard-0` stays `cosmoguard-0`) so a restarting pod finds its own previous snapshot on a peer. Deployment ephemeral identities work but new-pod replacement loses that pod's observability rollover — cache and rate-limit are unaffected.
+
+#### Dashboard restart-restore (off by default)
+
+`dashboard.clusterHistoryRestore` gates cross-pod replication of the dashboard observability snapshot. It is **off by default**, and you should leave it off unless you specifically need dashboard counters + metrics history to survive a rolling restart.
+
+```yaml
+dashboard:
+  enable: true
+  clusterHistoryRestore: false   # default; set true to opt into restart-restore
+```
+
+**Why it defaults off:** when enabled, each pod rewrites a large observability blob to a replicated (RF2) olric DMap every 30s. olric's log-structured kvstore accumulates storage tables from that frequent large-value overwrite without bound, so under real cluster traffic — where the blob grows as request cardinality climbs — the pod heap grows until it is **OOMKilled**. Only enable it if restart-restore is worth that memory cost in your deployment; the live cluster dashboard, peer fan-out, and Prometheus `/metrics` all keep working with it off. When disabled, a rolling restart simply starts each pod's dashboard counters cold — no functional loss beyond the lost history.
 
 #### Kubernetes example — StatefulSet + headless Service
 
