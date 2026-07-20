@@ -40,6 +40,29 @@ func (s spannedServerStream) Context() context.Context { return s.ctx }
 // leaking goroutines.
 const grpcCacheWriteTimeout = 5 * time.Second
 
+// grpcRefreshTimeout bounds a coalesced / background upstream Invoke so a wedged
+// upstream can't pin a refresh goroutine forever.
+const grpcRefreshTimeout = 30 * time.Second
+
+// grpcCacheMetaKey is the response-header metadata cosmoguard adds to indicate
+// cache state (hit / miss / stale) — the gRPC analogue of the HTTP
+// X-Cosmoguard-Cache header. gRPC had no cache signal before; this gives
+// clients and dashboards parity.
+const grpcCacheMetaKey = "x-cosmoguard-cache"
+
+// grpcCachedResponse wraps a cached gRPC response payload with the time it was
+// stored, so the freshness / stale-while-revalidate policy can be applied at
+// read time (the bare []byte value had no timestamp). Old []byte-schema entries
+// fail to decode into this struct and surface as a miss — a safe self-heal.
+type grpcCachedResponse struct {
+	Payload  []byte    `msgpack:"payload"`
+	StoredAt time.Time `msgpack:"stored_at,omitempty"`
+}
+
+// CacheCost implements the L1 cost accounting (cache.CacheCoster). 64 bytes of
+// slack covers the struct header + StoredAt + map/entry bookkeeping.
+func (g grpcCachedResponse) CacheCost() uint64 { return uint64(len(g.Payload)) + 64 }
+
 // rawCodec is the codec cosmoguard installs on the gRPC server + per-call
 // on the upstream client. Hands raw protobuf bytes to handlers without
 // deserializing — the proxy doesn't need to know any .proto definitions.
@@ -165,51 +188,91 @@ func cachingStreamHandler(
 		metaPart := grpcCacheKeyMetaPart(stream.Context(), rule.Cache.EffectiveKeyMetadata())
 		key := grpcCacheKey(rule.Fingerprint, method, req.Payload, rule.Cache.KeyMode, p.canonical, metaPart)
 
+		// The outgoing metadata (credential-stripped) is captured so a
+		// coalesced or background refresh can rebuild a detached outgoing
+		// context that survives the triggering client's disconnect.
+		md, _ := metadata.FromOutgoingContext(outCtx)
+
 		if cached, err := p.grpcCache.Get(stream.Context(), key); err == nil {
-			return stream.SendMsg(&rawFrame{Payload: cached})
+			effTTL := effectiveTTL(rule.Cache, p.cacheConfig)
+			stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig))
+			switch classifyFreshness(cached.StoredAt, nowOrDefault(p.now), effTTL, stale) {
+			case freshEntry:
+				_ = stream.SetHeader(metadata.Pairs(grpcCacheMetaKey, cacheHit))
+				return stream.SendMsg(&rawFrame{Payload: cached.Payload})
+			case staleEntry:
+				// Serve the stale payload immediately and refresh in the
+				// background (coalesced by key) so the client never waits.
+				_ = stream.SetHeader(metadata.Pairs(grpcCacheMetaKey, cacheStale))
+				p.sf.refresh(key, p.grpcRefreshFn(md, method, req.Payload, key, rule))
+				return stream.SendMsg(&rawFrame{Payload: cached.Payload})
+				// expiredEntry falls through to a miss.
+			}
 		}
 
-		// Forward to upstream via grpc.Invoke with our codec, reusing the
-		// credential-stripped outgoing context from enforcePolicy. The
-		// picked upstream's in-flight counter is bumped around the Invoke
-		// so least-conn observes the load.
-		var resp rawFrame
-		upstream := p.pool.Pick()
-		if upstream == nil {
-			return status.Error(codes.Unavailable, "no upstream available")
-		}
-		// Pick already reserved the in-flight lease; release it after Invoke.
-		invokeErr := upstream.conn.Invoke(
-			outCtx, method, &req, &resp,
-			grpc.ForceCodec(rawCodec{}),
+		// Miss: fetch upstream, coalescing concurrent misses for the same key
+		// into ONE Invoke when coalescing is enabled (the default). Coalesced
+		// waiters honor their own stream deadline; the shared fetch runs under
+		// a detached context so one client's disconnect can't abort it.
+		var (
+			out      grpcCachedResponse
+			fetchErr error
 		)
-		upstream.inFlight.Add(-1)
-		// Classify by status code so client-caused / application-level
-		// errors (Canceled, DeadlineExceeded, InvalidArgument, NotFound…)
-		// don't trip the breaker on a healthy upstream.
-		upstream.RecordOutcomeErr(invokeErr)
-		if invokeErr != nil {
-			return invokeErr
+		if resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
+			out, fetchErr = p.sf.do(stream.Context(), key, p.grpcRefreshFn(md, method, req.Payload, key, rule))
+		} else {
+			out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule)
 		}
-
-		// Cache the response. Skip empty payloads — caching an empty
-		// frame poisons the entry until TTL fires, returning an empty
-		// response to every subsequent identical request. Empty bodies
-		// are also indistinguishable from "upstream sent nothing"
-		// errors at the codec level, so refusing to cache them is the
-		// safe default. Use a detached context with a short timeout
-		// so a client that closes its stream right after the response
-		// doesn't abort the write — the payload is already produced
-		// and just as cacheable. Failure to write is non-fatal — the
-		// response still goes back to the client.
-		if len(resp.Payload) > 0 {
-			writeCtx, cancel := context.WithTimeout(context.Background(), grpcCacheWriteTimeout)
-			_ = p.grpcCache.Set(writeCtx, key, resp.Payload, rule.Cache.TTL)
-			cancel()
+		if fetchErr != nil {
+			return fetchErr
 		}
-
-		return stream.SendMsg(&resp)
+		_ = stream.SetHeader(metadata.Pairs(grpcCacheMetaKey, cacheMiss))
+		return stream.SendMsg(&rawFrame{Payload: out.Payload})
 	}
+}
+
+// grpcRefreshFn returns a closure that fetches upstream under a fresh, detached,
+// bounded outgoing context (carrying the credential-stripped metadata) — used
+// by both the coalesced miss and the stale-while-revalidate background refresh
+// so neither is aborted by the triggering client's disconnect.
+func (p *GrpcProxy) grpcRefreshFn(md metadata.MD, method string, reqPayload []byte, key string, rule *GrpcRule) func() (grpcCachedResponse, error) {
+	return func() (grpcCachedResponse, error) {
+		ctx, cancel := context.WithTimeout(metadata.NewOutgoingContext(context.Background(), md), grpcRefreshTimeout)
+		defer cancel()
+		return p.grpcFetchAndStore(ctx, method, reqPayload, key, rule)
+	}
+}
+
+// grpcFetchAndStore performs ONE upstream Invoke and stores the cacheable
+// response (with StoredAt and a physical TTL extended by the stale window). It
+// Picks its own upstream so coalesced waiters don't each burn a selection.
+// Empty payloads are never cached (an empty frame is indistinguishable from an
+// upstream-sent-nothing error and would poison the entry until TTL).
+func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, reqPayload []byte, key string, rule *GrpcRule) (grpcCachedResponse, error) {
+	upstream := p.pool.Pick()
+	if upstream == nil {
+		return grpcCachedResponse{}, status.Error(codes.Unavailable, "no upstream available")
+	}
+	var resp rawFrame
+	// Pick already reserved the in-flight lease; release it after Invoke.
+	invokeErr := upstream.conn.Invoke(fetchCtx, method, &rawFrame{Payload: reqPayload}, &resp, grpc.ForceCodec(rawCodec{}))
+	upstream.inFlight.Add(-1)
+	// Classify by status code so client-caused / application-level errors
+	// (Canceled, DeadlineExceeded, InvalidArgument, NotFound…) don't trip the
+	// breaker on a healthy upstream.
+	upstream.RecordOutcomeErr(invokeErr)
+	if invokeErr != nil {
+		return grpcCachedResponse{}, invokeErr
+	}
+	out := grpcCachedResponse{Payload: resp.Payload, StoredAt: nowOrDefault(p.now).UTC()}
+	if len(resp.Payload) > 0 {
+		effTTL := effectiveTTL(rule.Cache, p.cacheConfig)
+		stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig))
+		writeCtx, cancel := context.WithTimeout(context.Background(), grpcCacheWriteTimeout)
+		_ = p.grpcCache.Set(writeCtx, key, out, physicalTTL(effTTL, stale))
+		cancel()
+	}
+	return out, nil
 }
 
 // findMatchingAllowRule returns the first allow rule matching the method,

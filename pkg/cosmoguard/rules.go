@@ -34,6 +34,34 @@ func writeFingerprintBool(h hash.Hash64, v bool) {
 	}
 }
 
+// validateRuleCacheFeatures rejects nonsensical per-rule cache-feature values.
+// A negative stale window is meaningless (0 = inherit the global default /
+// disabled). Called from each rule's Compile so the check covers startup load,
+// programmatic construction, and every hot-reload.
+func validateRuleCacheFeatures(c *RuleCache, ruleKind string, priority int) error {
+	if c == nil {
+		return nil
+	}
+	if c.StaleWhileRevalidate < 0 {
+		return fmt.Errorf("%s rule (priority %d) cache.staleWhileRevalidate must be >= 0 (0 inherits the global default); got %s", ruleKind, priority, c.StaleWhileRevalidate)
+	}
+	return nil
+}
+
+// writeFingerprintCacheFeatures hashes the single-flight + stale-while-
+// revalidate per-rule knobs. Coalesce is a *bool, so its three states
+// (unset / true / false) are hashed distinctly: an unset rule that inherits the
+// global default stays stable across an unrelated edit, while an explicit
+// per-rule override registers as a rule change. Shared by all three rule
+// fingerprints so cache-feature edits are reflected in the reload delta.
+func writeFingerprintCacheFeatures(h hash.Hash64, c *RuleCache) {
+	writeFingerprintBool(h, c.Coalesce != nil)
+	if c.Coalesce != nil {
+		writeFingerprintBool(h, *c.Coalesce)
+	}
+	writeFingerprintInt(h, int(c.StaleWhileRevalidate))
+}
+
 func writeFingerprintStr(h hash.Hash64, s string) {
 	writeFingerprintInt(h, len(s))
 	_, _ = h.Write([]byte(s))
@@ -234,6 +262,9 @@ func (r *HttpRule) Compile() error {
 		}
 	}
 
+	if err := validateRuleCacheFeatures(r.Cache, "http", r.Priority); err != nil {
+		return err
+	}
 	r.Fingerprint = httpRuleFingerprint(r)
 	return nil
 }
@@ -268,6 +299,7 @@ func httpRuleFingerprint(r *HttpRule) uint64 {
 		writeFingerprintBool(h, r.Cache.CacheError)
 		writeFingerprintBool(h, r.Cache.CacheEmptyResult)
 		writeFingerprintStrSlice(h, r.Cache.PreserveHeaders)
+		writeFingerprintCacheFeatures(h, r.Cache)
 	}
 	if r.RateLimit != nil {
 		writeFingerprintStr(h, "rl:")
@@ -418,6 +450,9 @@ func (r *JsonRpcRule) Compile() error {
 			}
 		}
 	}
+	if err := validateRuleCacheFeatures(r.Cache, "jsonrpc", r.Priority); err != nil {
+		return err
+	}
 	r.Fingerprint = jsonRpcRuleFingerprint(r)
 	return nil
 }
@@ -450,6 +485,14 @@ func jsonRpcRuleFingerprint(r *JsonRpcRule) uint64 {
 			// don't silently produce a hash of zero bytes.
 			writeFingerprintStr(h, fmt.Sprintf("%v", r.Params))
 		}
+	}
+	if r.Cache != nil {
+		writeFingerprintStr(h, "cache:")
+		writeFingerprintBool(h, r.Cache.Enable)
+		writeFingerprintInt(h, int(r.Cache.TTL))
+		writeFingerprintBool(h, r.Cache.CacheError)
+		writeFingerprintBool(h, r.Cache.CacheEmptyResult)
+		writeFingerprintCacheFeatures(h, r.Cache)
 	}
 	if r.RateLimit != nil {
 		writeFingerprintStr(h, "rl:")
@@ -618,6 +661,9 @@ func (r *GrpcRule) Compile() error {
 			return fmt.Errorf("grpc rule (priority %d) cache.keyMode: unknown value %q (want one of: raw, method-only, canonical)", r.Priority, r.Cache.KeyMode)
 		}
 	}
+	if err := validateRuleCacheFeatures(r.Cache, "grpc", r.Priority); err != nil {
+		return err
+	}
 	r.Fingerprint = grpcRuleFingerprint(r)
 	return nil
 }
@@ -631,6 +677,7 @@ func grpcRuleFingerprint(r *GrpcRule) uint64 {
 		writeFingerprintBool(h, r.Cache.Enable)
 		writeFingerprintInt(h, int(r.Cache.TTL))
 		writeFingerprintBool(h, r.Cache.CacheError)
+		writeFingerprintCacheFeatures(h, r.Cache)
 	}
 	if r.RateLimit != nil {
 		writeFingerprintStr(h, "rl:")

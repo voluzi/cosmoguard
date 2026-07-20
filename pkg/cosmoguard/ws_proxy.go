@@ -27,8 +27,13 @@ const (
 )
 
 type JsonRpcWebSocketProxy struct {
-	broker           *Broker
-	cache            cache.Cache[uint64, *JsonRpcMsg]
+	broker *Broker
+	cache  cache.Cache[uint64, *JsonRpcMsg]
+	// cacheConfig resolves the cluster-wide stale-while-revalidate / ttl
+	// defaults a rule inherits; now is swappable for deterministic tests.
+	// Both set by the parent JsonRpcHandler. nil/unset falls back safely.
+	cacheConfig      *CacheGlobalConfig
+	now              func() time.Time
 	wsBackends       []string
 	upgrader         *websocket.Upgrader
 	rules            []*JsonRpcRule
@@ -500,7 +505,14 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					// runs a full Get() internally — so a remote-
 					// partition hit paid two RTTs to find one entry.
 					res, err := p.cache.Get(context.Background(), hash)
-					if err == nil {
+					// Only a FRESH entry is served from cache. A stale entry
+					// (stored under an extended physical TTL for HTTP-path
+					// serve-stale) is revalidated inline here — the WS broker
+					// already coalesces identical subscriptions, so there is no
+					// stampede to serve-stale around.
+					if err == nil && classifyFreshness(res.StoredAt, nowOrDefault(p.now),
+						effectiveTTL(rule.Cache, p.cacheConfig),
+						resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig))) == freshEntry {
 						// Notifications (no id) get no response, even on a
 						// cache hit — the key ignores id, so a prior call
 						// could have primed this entry (JSON-RPC 2.0 §4.1).
@@ -512,7 +524,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 						p.recordOutcome(request, source, cacheHit, RuleActionAllow, ruleID, startTime, "request allowed")
 						return nil
 					}
-					if !errors.Is(err, cache.ErrNotFound) {
+					if err != nil && !errors.Is(err, cache.ErrNotFound) {
 						p.log.Errorf("error getting cached value: %v", err)
 					}
 				}
@@ -556,7 +568,9 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				if res.IsEmptyResult() && !rule.Cache.CacheEmptyResult {
 					return nil
 				}
-				if err = p.cache.Set(context.Background(), hash, res, rule.Cache.TTL); err != nil {
+				res.StoredAt = nowOrDefault(p.now).UTC()
+				physTTL := physicalTTL(effectiveTTL(rule.Cache, p.cacheConfig), resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig)))
+				if err = p.cache.Set(context.Background(), hash, res, physTTL); err != nil {
 					return fmt.Errorf("error storing in cache: %v", err)
 				}
 				p.cgDashboard.RecordCardinality(p.section, ruleID, request.Method)

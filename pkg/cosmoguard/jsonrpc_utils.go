@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/segmentio/fasthash/fnv1a"
@@ -57,6 +58,15 @@ type JsonRpcMsg struct {
 	// itself (json:"-") and carried through Redis-backed caches via
 	// msgpack.
 	WireSuffix []byte `json:"-" msgpack:"wire_suffix,omitempty"`
+
+	// StoredAt is when this response was written to the cache. Like
+	// WireSuffix it is cache-only (never serialized to a client) and
+	// carried through the msgpack-backed L2. The freshness /
+	// stale-while-revalidate policy reads it at lookup time. Zero for
+	// entries written before this field existed → treated as fresh (see
+	// classifyFreshness): those entries have no stale window, so the
+	// backend TTL still evicts them correctly.
+	StoredAt time.Time `json:"-" msgpack:"stored_at,omitempty"`
 }
 
 // jsonRpcMsgOverheadBytes is a flat per-entry allowance covering the
@@ -204,6 +214,7 @@ func (j *JsonRpcMsg) Clone() *JsonRpcMsg {
 		Result:     j.Result,
 		Error:      j.Error.Clone(),
 		WireSuffix: j.WireSuffix,
+		StoredAt:   j.StoredAt,
 	}
 }
 
@@ -216,6 +227,7 @@ func (j *JsonRpcMsg) CloneWithID(id interface{}) *JsonRpcMsg {
 		Result:     j.Result,
 		Error:      j.Error.Clone(),
 		WireSuffix: j.WireSuffix,
+		StoredAt:   j.StoredAt,
 	}
 }
 
@@ -569,7 +581,7 @@ func (l *JsonRpcResponses) Deny(request *JsonRpcMsg) {
 // caller can bump the per-rule cache-cardinality counter (the WS / HTTP
 // single-request paths do this inline; batch fans out through here).
 // onWrite receives the rule tag and the original JSON-RPC method.
-func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], onWrite func(ruleTag, method string)) error {
+func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], now time.Time, global *CacheGlobalConfig, onWrite func(ruleTag, method string)) error {
 	for _, r := range *l {
 		if r.Response != nil && r.Cache != nil && r.Cache.Enable {
 			if r.Response.Error != nil && !r.Cache.CacheError {
@@ -579,7 +591,14 @@ func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], 
 				continue
 			}
 
-			if err := cache.Set(context.Background(), r.CacheKey, r.Response, r.Cache.TTL); err != nil {
+			// Stamp StoredAt and store under a physical TTL extended by the
+			// stale window (StoredAt is json:"-" so it never leaks to the
+			// client) so single-path / WS reads can serve this entry stale
+			// while it revalidates. When SWR is off the physical TTL is just
+			// the logical TTL.
+			r.Response.StoredAt = now
+			ttl := physicalTTL(effectiveTTL(r.Cache, global), resolveStaleWindow(r.Cache, cfgStaleWindow(global)))
+			if err := cache.Set(context.Background(), r.CacheKey, r.Response, ttl); err != nil {
 				return err
 			}
 			if onWrite != nil && r.Request != nil {
