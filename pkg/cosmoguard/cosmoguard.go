@@ -322,11 +322,35 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	cosmoGuard.auth = authn
 
 	// Build the observability replicator now that the olric client
-	// exists. Replicator construction is best-effort: in legacy embed
-	// paths the client may be nil, in which case obsReplicator stays
-	// nil and the dashboard runs without restart survival (still
-	// fully functional, just loses counters on restart). The Start +
-	// Close calls below are nil-safe so the rest of the code stays
+	// exists. It always runs the in-process metrics-history sampler that
+	// feeds the live dashboard time-series panels (/metrics/history) —
+	// that has no olric involvement and no leak. Its cross-pod DMap
+	// flush + restore (dashboard restart-restore) is what leaks and is
+	// gated by `replicate` below.
+	//
+	// replicate is on ONLY when the operator opted in AND cluster mode is
+	// configured. The gate is off by default because the replicator would
+	// otherwise rewrite a large observability blob to a replicated (RF2)
+	// olric DMap every 30s, and olric's log-structured kvstore accumulates
+	// storage tables from that frequent large-value overwrite without
+	// bound — growing the heap under real cluster traffic until the pod is
+	// OOMKilled. The cluster-mode requirement is because restart-restore
+	// reads a peer's replica; in embedded loopback mode (no cache.cluster
+	// block) there are no peers at all, so the flag is ignored. NOTE this
+	// gates on the cluster CONFIG being present, not on live peer count —
+	// a configured-but-solo/degraded cluster still writes the DMap and
+	// still leaks, just with nothing to restore. Gating startup on
+	// transient peer availability would be fragile (peers churn), so the
+	// docs steer operators to only enable it on a healthy multi-pod
+	// cluster instead.
+	replicateObs := cosmoGuard.cfg.Dashboard.ClusterHistoryRestoreEnabled() && cosmoGuard.cfg.Cache.Cluster != nil
+	if cosmoGuard.cfg.Dashboard.ClusterHistoryRestoreEnabled() && cosmoGuard.cfg.Cache.Cluster == nil {
+		slog.Warn("dashboard.clusterHistoryRestore is set but cache.cluster is not configured; " +
+			"restart-restore needs peer replicas, so it is disabled (metrics history still collected locally)")
+	}
+	// Construction is best-effort: in legacy embed paths the olric client
+	// is nil, in which case newObservabilityReplicator returns nil. The
+	// Start + Close calls below are nil-safe so the rest of the code stays
 	// branchless.
 	cosmoGuard.obsReplicator, err = newObservabilityReplicator(
 		cosmoGuard.cluster.Client(),
@@ -336,6 +360,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 			return gatherMetricsSnapshot(prometheus.DefaultGatherer)
 		},
 		"", // empty → falls through to os.Hostname()
+		replicateObs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up observability replicator: %w", err)
@@ -1015,7 +1040,7 @@ func (f *CosmoGuard) tryReload() {
 	// reloadable (applied below). Reject changes to the other dashboard
 	// fields rather than reporting a success that rotates no password.
 	if dashboardRuntimeImmutableChanged(&f.cfg.Dashboard, &newCfg.Dashboard) {
-		err := fmt.Errorf("dashboard config change (enable / port / basicAuth) requires a process restart")
+		err := fmt.Errorf("dashboard config change (enable / port / basicAuth / clusterHistoryRestore) requires a process restart")
 		slog.Warn("config reload rejected", "error", err)
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
@@ -1118,7 +1143,12 @@ func dashboardRuntimeImmutableChanged(old, new *DashboardConfig) bool {
 	return oldEnable != newEnable ||
 		old.Port != new.Port ||
 		old.BasicAuthUser != new.BasicAuthUser ||
-		old.BasicAuthPassword != new.BasicAuthPassword
+		old.BasicAuthPassword != new.BasicAuthPassword ||
+		// clusterHistoryRestore decides at startup whether the replicator
+		// runs its DMap flush/restore; a reload swaps f.cfg but never
+		// rewires the replicator, so a live toggle would report success
+		// yet change nothing until restart. Treat it as restart-required.
+		old.ClusterHistoryRestoreEnabled() != new.ClusterHistoryRestoreEnabled()
 }
 
 // cacheTopologyChange reports whether the cache section between two configs

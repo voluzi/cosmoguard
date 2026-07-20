@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/olric-data/olric"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,7 +34,7 @@ func TestObservabilityReplicator_RoundTrip(t *testing.T) {
 	histA.Push(MetricsSnapshot{TimestampMs: 100})
 	histA.Push(MetricsSnapshot{TimestampMs: 200})
 
-	rA, err := newObservabilityReplicator(cr.Client(), dashA, histA, nil, "pod-A")
+	rA, err := newObservabilityReplicator(cr.Client(), dashA, histA, nil, "pod-A", true)
 	require.NoError(t, err)
 	require.NotNil(t, rA)
 	require.NoError(t, rA.flush(context.Background()))
@@ -42,7 +43,7 @@ func TestObservabilityReplicator_RoundTrip(t *testing.T) {
 	// the DMap.
 	dashB := newDashboardObservability()
 	histB := newMetricsHistory(10)
-	rB, err := newObservabilityReplicator(cr.Client(), dashB, histB, nil, "pod-A")
+	rB, err := newObservabilityReplicator(cr.Client(), dashB, histB, nil, "pod-A", true)
 	require.NoError(t, err)
 	require.NoError(t, rB.restore(context.Background()))
 
@@ -86,7 +87,7 @@ func TestObservabilityReplicator_PodRestartAcrossCluster(t *testing.T) {
 	dashA.RecordDeny(DenyRecord{Section: "lcd", Reason: "rule", Method: "GET"})
 	histA.Push(MetricsSnapshot{TimestampMs: 42})
 
-	rA, err := newObservabilityReplicator(a.Client(), dashA, histA, nil, "cosmoguard-0")
+	rA, err := newObservabilityReplicator(a.Client(), dashA, histA, nil, "cosmoguard-0", true)
 	require.NoError(t, err)
 	require.NoError(t, rA.flush(context.Background()))
 
@@ -102,7 +103,7 @@ func TestObservabilityReplicator_PodRestartAcrossCluster(t *testing.T) {
 	// Crucially: use pod B's client to simulate the partition having
 	// drifted off the local node — the restored data must come back
 	// over the cluster, not from local memory.
-	rRestarted, err := newObservabilityReplicator(b.Client(), dashARestarted, histARestarted, nil, "cosmoguard-0")
+	rRestarted, err := newObservabilityReplicator(b.Client(), dashARestarted, histARestarted, nil, "cosmoguard-0", true)
 	require.NoError(t, err)
 	require.NoError(t, rRestarted.restore(context.Background()))
 
@@ -143,7 +144,7 @@ func TestObservabilityReplicator_TickerLifecycle(t *testing.T) {
 	dash := newDashboardObservability()
 	hist := newMetricsHistory(10)
 
-	r, err := newObservabilityReplicator(cr.Client(), dash, hist, nil, "pod-X")
+	r, err := newObservabilityReplicator(cr.Client(), dash, hist, nil, "pod-X", true)
 	require.NoError(t, err)
 	// Crank the cadence down so a single tick actually fires before
 	// Close — the default 30s is way too slow for a unit test.
@@ -158,6 +159,46 @@ func TestObservabilityReplicator_TickerLifecycle(t *testing.T) {
 	require.NoError(t, r.Close(context.Background()))
 	// Double-close is a no-op, not a panic.
 	require.NoError(t, r.Close(context.Background()))
+}
+
+// TestObservabilityReplicator_SampleOnlyWhenReplicationDisabled locks in
+// the decoupling of the metrics-history sampler from the DMap flush: with
+// replicate=false the live sampler still populates metricsHistory (so the
+// dashboard time-series panels hydrate on a healthy pod) while the
+// replicator never touches the olric DMap — no key is ever written, so
+// there is nothing to grow olric's storage tables and OOM the pod.
+func TestObservabilityReplicator_SampleOnlyWhenReplicationDisabled(t *testing.T) {
+	cr := newEmbeddedClusterRuntimeForTest(t)
+	dash := newDashboardObservability()
+	hist := newMetricsHistory(10)
+
+	gather := func() (*MetricsSnapshot, error) {
+		return &MetricsSnapshot{TimestampMs: 7}, nil
+	}
+
+	r, err := newObservabilityReplicator(cr.Client(), dash, hist, gather, "pod-Y", false)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	// No DMap handle is created when replication is off.
+	require.Nil(t, r.dm)
+
+	// Sampler fires fast so a tick lands before Close.
+	r.interval = 50 * time.Millisecond
+	r.metricsInterval = 20 * time.Millisecond
+
+	require.NoError(t, r.Start(context.Background()))
+	require.Eventually(t, func() bool {
+		return len(hist.Snapshot()) > 0
+	}, 2*time.Second, 20*time.Millisecond, "sampler never populated metrics history")
+	require.NoError(t, r.Close(context.Background()))
+
+	// A direct flush is a no-op, and no key was ever written to the DMap:
+	// a peer/local reader finds nothing under this pod's key.
+	require.NoError(t, r.flush(context.Background()))
+	dm, err := cr.Client().NewDMap(replicationDMap)
+	require.NoError(t, err)
+	_, err = dm.Get(context.Background(), replicationKeyPrefix+"pod-Y")
+	require.ErrorIs(t, err, olric.ErrKeyNotFound)
 }
 
 // TestObservabilityReplicator_DoubleStartDoesNotRehydrate guards the
@@ -178,7 +219,7 @@ func TestObservabilityReplicator_DoubleStartDoesNotRehydrate(t *testing.T) {
 	seedDash.RecordDeny(DenyRecord{Section: "lcd", Reason: "rule", Method: "GET"})
 	seedHist := newMetricsHistory(5)
 	seedHist.Push(MetricsSnapshot{TimestampMs: 1})
-	seeder, err := newObservabilityReplicator(cr.Client(), seedDash, seedHist, nil, "pod-X")
+	seeder, err := newObservabilityReplicator(cr.Client(), seedDash, seedHist, nil, "pod-X", true)
 	require.NoError(t, err)
 	require.NoError(t, seeder.flush(context.Background()))
 
@@ -186,7 +227,7 @@ func TestObservabilityReplicator_DoubleStartDoesNotRehydrate(t *testing.T) {
 	// the seeded snapshot.
 	dash := newDashboardObservability()
 	hist := newMetricsHistory(5)
-	r, err := newObservabilityReplicator(cr.Client(), dash, hist, nil, "pod-X")
+	r, err := newObservabilityReplicator(cr.Client(), dash, hist, nil, "pod-X", true)
 	require.NoError(t, err)
 	// Slow the ticker right down so the periodic flush goroutine
 	// cannot interfere with the rehydrate assertion.
@@ -222,7 +263,7 @@ func TestObservabilityReplicator_DoubleStartDoesNotRehydrate(t *testing.T) {
 // Start/Close are nil-safe so the caller can branchlessly invoke
 // them.
 func TestObservabilityReplicator_NilOlricClient(t *testing.T) {
-	r, err := newObservabilityReplicator(nil, nil, nil, nil, "pod")
+	r, err := newObservabilityReplicator(nil, nil, nil, nil, "pod", true)
 	require.NoError(t, err)
 	require.Nil(t, r)
 	require.NoError(t, r.Start(context.Background()))

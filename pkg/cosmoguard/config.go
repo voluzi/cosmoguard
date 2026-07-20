@@ -695,6 +695,41 @@ type DashboardConfig struct {
 	// audit-log surface — restrict the dashboard with BasicAuth or
 	// IP allowlists before enabling.
 	RequestLog *RequestLogConfig `yaml:"requestLog,omitempty"`
+	// ClusterHistoryRestore opts into cross-pod replication of the
+	// dashboard snapshot so a single pod can RESTORE its counters +
+	// metrics history from a peer after a rolling restart. OFF by
+	// default and deliberately so: when on, the replicator rewrites a
+	// large observability blob to a replicated (RF2) olric DMap every
+	// 30s, and olric's log-structured kvstore accumulates storage
+	// tables from that frequent large-value overwrite without bound —
+	// under real cluster traffic (which grows the blob as request
+	// cardinality climbs) the heap grows until the pod is OOMKilled.
+	//
+	// This gates ONLY the cross-pod restart-restore. Live dashboard
+	// metrics-history panels (/metrics/history) are fed by an in-process
+	// sampler that runs regardless of this flag, so they populate on a
+	// healthy pod either way — only their SURVIVAL across a restart is
+	// gated. The live cluster dashboard, peer fan-out, and Prometheus
+	// /metrics are likewise unaffected.
+	//
+	// Takes effect only when a cache.cluster block is present (cluster
+	// mode configured). With no cluster block the flag is ignored — an
+	// embedded loopback olric has no peers to restore from. NOTE: the
+	// gate is on the cluster CONFIG, not on live peer count: a cluster
+	// that is configured but currently solo or degraded (no reachable
+	// peers) still performs the 30s DMap writes — and still incurs the
+	// heap growth — with nothing to restore from. So only enable it on a
+	// healthy multi-pod cluster, and leave it off unless you specifically
+	// need dashboard history to survive a rolling restart and accept the
+	// memory cost.
+	ClusterHistoryRestore *bool `yaml:"clusterHistoryRestore,omitempty"`
+}
+
+// ClusterHistoryRestoreEnabled reports whether cross-pod observability
+// replication (dashboard restart-restore) is opted in. Off unless
+// explicitly set to true.
+func (d *DashboardConfig) ClusterHistoryRestoreEnabled() bool {
+	return d != nil && d.ClusterHistoryRestore != nil && *d.ClusterHistoryRestore
 }
 
 // RequestLogConfig configures the time-windowed live-traffic log.
