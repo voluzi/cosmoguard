@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -295,5 +296,98 @@ func TestBuildHttpUpstream_HealthcheckService(t *testing.T) {
 	bad.Healthcheck = &NodeHealthcheckConfig{Enable: &enabled, Path: "/status", Service: "nope"}
 	if _, err := buildHttpUpstream(bad, "lcd", nil); err == nil {
 		t.Fatalf("expected error for unknown healthcheck.service, got nil")
+	}
+}
+
+// A healthcheck-backed upstream must start UNHEALTHY so /readyz gates the pod
+// out of the load balancer until the first probe confirms the upstream is
+// reachable — otherwise a fresh/scaled-up pod is marked Ready and 502s traffic
+// before its upstream connection is warm. Without a healthcheck the upstream
+// stays optimistically healthy (nothing to confirm).
+func TestHealthcheckGatesReadinessUntilFirstProbe(t *testing.T) {
+	on := true
+	hc := &NodeHealthcheckConfig{Enable: &on, Path: "/status", Service: "rpc"}
+
+	gated, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "hc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9, Healthcheck: hc}},
+		"rpc", nil, log.WithField("test", "readyz-gate"))
+	if err != nil {
+		t.Fatalf("build gated pool: %v", err)
+	}
+	if gated.AnyHealthy() {
+		t.Fatal("healthcheck-backed upstream must start unhealthy so /readyz gates until the first probe")
+	}
+
+	optimistic, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "nohc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9}},
+		"rpc", nil, log.WithField("test", "readyz-nohc"))
+	if err != nil {
+		t.Fatalf("build optimistic pool: %v", err)
+	}
+	if !optimistic.AnyHealthy() {
+		t.Fatal("no-healthcheck upstream must stay optimistically healthy")
+	}
+}
+
+// The cold-start readiness gate must clear on the FIRST successful probe, even
+// when HealthyAfter > 1 — that threshold is runtime flap protection, not a
+// startup delay. Without the success-counter seed this needs HealthyAfter probes.
+func TestColdStartGateClearsOnFirstProbe(t *testing.T) {
+	on := true
+	hc := &NodeHealthcheckConfig{Enable: &on, Path: "/status", Service: "rpc", HealthyAfter: 3}
+	pool, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "hc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9, Healthcheck: hc}},
+		"rpc", nil, log.WithField("test", "coldstart-firstprobe"))
+	if err != nil {
+		t.Fatalf("build pool: %v", err)
+	}
+	if pool.AnyHealthy() {
+		t.Fatal("must start gated (unhealthy) with a healthcheck configured")
+	}
+	pool.recordProbeResult(pool.Upstreams()[0], true, nil) // one successful probe
+	if !pool.AnyHealthy() {
+		t.Fatal("first successful probe must clear the cold-start gate even with HealthyAfter=3")
+	}
+}
+
+// healthyAfter / unhealthyAfter must fit the int32 probe counters — an
+// out-of-range value would overflow the cold-start seed and leave a pod
+// permanently NotReady, so config prep rejects it.
+func TestValidateNodeHealthcheckThresholdRange(t *testing.T) {
+	on := true
+	tooBig := &NodeConfig{Healthcheck: &NodeHealthcheckConfig{Enable: &on, HealthyAfter: math.MaxInt32 + 1, UnhealthyAfter: 3}}
+	if err := validateNodeHealthcheck(tooBig); err == nil {
+		t.Fatal("healthyAfter beyond int32 range must be rejected")
+	}
+	tooBigFail := &NodeConfig{Healthcheck: &NodeHealthcheckConfig{Enable: &on, HealthyAfter: 2, UnhealthyAfter: math.MaxInt32 + 1}}
+	if err := validateNodeHealthcheck(tooBigFail); err == nil {
+		t.Fatal("unhealthyAfter beyond int32 range must be rejected")
+	}
+	ok := &NodeConfig{Healthcheck: &NodeHealthcheckConfig{Enable: &on, HealthyAfter: 2, UnhealthyAfter: 3}}
+	if err := validateNodeHealthcheck(ok); err != nil {
+		t.Fatalf("valid thresholds must pass: %v", err)
+	}
+}
+
+// The cold-start gate must clear on the first SUCCESS even if an early probe
+// fails first (the upstream-warming-up race) — the everHealthy flag preserves
+// the cold-start semantic that a fragile success-counter seed would lose.
+func TestColdStartGateSurvivesEarlyProbeFailure(t *testing.T) {
+	on := true
+	hc := &NodeHealthcheckConfig{Enable: &on, Path: "/status", Service: "rpc", HealthyAfter: 3}
+	pool, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "hc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9, Healthcheck: hc}},
+		"rpc", nil, log.WithField("test", "coldstart-early-fail"))
+	if err != nil {
+		t.Fatalf("build pool: %v", err)
+	}
+	u := pool.Upstreams()[0]
+	pool.recordProbeResult(u, false, nil) // early failure while the upstream warms up
+	if pool.AnyHealthy() {
+		t.Fatal("must stay gated after a failed probe")
+	}
+	pool.recordProbeResult(u, true, nil) // first success
+	if !pool.AnyHealthy() {
+		t.Fatal("first success after an early failure must still clear the cold-start gate")
 	}
 }

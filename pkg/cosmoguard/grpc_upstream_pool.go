@@ -41,7 +41,11 @@ type GrpcUpstream struct {
 	// (the old behaviour, kept for back-compat with single-node configs).
 	hcConfig     *NodeHealthcheckConfig
 	probeAddr    string
-	healthy      atomic.Bool
+	healthy atomic.Bool
+	// everHealthy: whether confirmed healthy at least once. While false, the
+	// first successful probe clears the cold-start readiness gate; HealthyAfter
+	// applies only to runtime recovery. Mirrors HttpUpstream.
+	everHealthy  atomic.Bool
 	successCount atomic.Int32
 	failCount    atomic.Int32
 
@@ -350,13 +354,16 @@ func NewGrpcUpstreamPool(name string, nodes []NodeConfig, logger *Entry, opts ..
 			}
 			return nil, fmt.Errorf("grpc upstream %s: %w", n.Name, err)
 		}
-		// Optimistic: assume healthy until the first probe says
-		// otherwise. Matches HttpUpstream so a single Pick before the
-		// initial probe lands doesn't get filtered out.
-		u.healthy.Store(true)
-		// Seed the gauge with the optimistic verdict so operators see
-		// every configured upstream in /metrics from boot.
-		setUpstreamHealthy(pool.name, u.Name, true)
+		// Optimistic ONLY when no healthcheck is configured. With a
+		// healthcheck, start unhealthy so /readyz gates the pod out of the
+		// load balancer until the first probe confirms reachability — matches
+		// HttpUpstream and stops a fresh/scaled-up pod from erroring traffic
+		// before its upstream is proven usable.
+		initialHealthy := u.hcConfig == nil
+		u.healthy.Store(initialHealthy)
+		// Seed the gauge with that verdict so operators see every configured
+		// upstream in /metrics from boot.
+		setUpstreamHealthy(pool.name, u.Name, initialHealthy)
 		initial = append(initial, u)
 	}
 	pool.storeUpstreams(initial)
@@ -440,8 +447,9 @@ func (p *GrpcUpstreamPool) AddUpstream(n NodeConfig) error {
 	if err != nil {
 		return err
 	}
-	u.healthy.Store(true)
-	setUpstreamHealthy(p.name, u.Name, true)
+	addHealthy := u.hcConfig == nil
+	u.healthy.Store(addHealthy)
+	setUpstreamHealthy(p.name, u.Name, addHealthy)
 
 	next := make([]*GrpcUpstream, 0, len(current)+1)
 	next = append(next, current...)
@@ -734,8 +742,9 @@ func (p *GrpcUpstreamPool) recordProbeResult(u *GrpcUpstream, ok bool, err error
 	if ok {
 		u.failCount.Store(0)
 		s := u.successCount.Add(1)
-		if !u.healthy.Load() && int(s) >= u.hcConfig.HealthyAfter {
+		if !u.healthy.Load() && (!u.everHealthy.Load() || int(s) >= u.hcConfig.HealthyAfter) {
 			u.healthy.Store(true)
+			u.everHealthy.Store(true)
 			setUpstreamHealthy(p.name, u.Name, true)
 			p.log.WithFields(Fields{
 				"upstream": u.Name,

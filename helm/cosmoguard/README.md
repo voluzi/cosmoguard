@@ -14,12 +14,14 @@ helm upgrade --install cosmoguard oci://ghcr.io/voluzi/helm/cosmoguard \
 
 See `values.yaml` for the full reference. Highlights:
 
-- `kind:` — `Deployment` (default) or `StatefulSet`. Cluster mode benefits
-  from `StatefulSet` because pod identities are stable: per-pod
-  observability snapshots (dashboard panels keyed by `pod_id`) survive
-  rolling restarts via olric DMap replication. `Deployment` keeps cache
-  + rate-limit data through replication too, but loses per-pod
-  observability when pods are replaced.
+- `kind:` — `StatefulSet` (default) or `Deployment`. `StatefulSet` is the
+  default because cluster mode is on by default and benefits from stable pod
+  identities: stable pod DNS for gossip, and per-pod observability snapshots
+  (dashboard panels keyed by `pod_id`) that survive rolling restarts.
+  `Deployment` keeps cache + rate-limit data through olric replication too,
+  but loses per-pod observability when pods are replaced. (Gentle,
+  olric-friendly scale-down comes from `autoscaling.behavior`, not the
+  StatefulSet, which uses `podManagementPolicy: Parallel`.)
 - `config:` — the cosmoguard YAML, rendered into a ConfigMap mounted at
   `/etc/cosmoguard/cosmoguard.yaml`. See [CONFIG.md] for the schema.
 - `existingConfigMap:` / `existingSecret:` — bring your own ConfigMap and

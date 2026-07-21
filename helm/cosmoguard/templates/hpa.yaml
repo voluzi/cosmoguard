@@ -31,4 +31,12 @@ spec:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
     {{- end }}
+  {{- with .Values.autoscaling.behavior }}
+  # Scale-down policy matters for cluster mode: removing several pods at
+  # once forces olric to rebalance many partitions simultaneously. A
+  # conservative scaleDown (stabilization window + one pod per period)
+  # lets partitions hand off gracefully between removals.
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- end -}}

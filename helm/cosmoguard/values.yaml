@@ -25,23 +25,24 @@ fullnameOverride: ""
 # (config.cache.cluster.enable: true — there must be peers to restore
 # from), dashboard.clusterHistoryRestore is enabled (off by default — it
 # can OOM pods under real cluster traffic; see config.dashboard below), and
-# identities are stable (StatefulSet). Miss any one — including the default
-# Deployment or the default flag-off — and dashboard counters start cold
-# after a rolling restart; cache and rate-limit are unaffected either way.
-# Live metrics-history panels populate regardless; only survival is gated.
-kind: Deployment
+# identities are stable (StatefulSet, the default — it pairs with cluster mode
+# being on by default: stable pod DNS for gossip and dashboard counters that
+# survive a rolling restart). Gentle, olric-friendly scale-down (one pod at a
+# time) comes from the autoscaling.behavior default, NOT the StatefulSet — the
+# workload uses podManagementPolicy: Parallel for fast cluster formation.
+# Override to `kind: Deployment` for a stateless rollout; counters then start
+# cold after a restart, but cache and rate-limit are unaffected either way.
+# Live metrics-history panels populate regardless.
+kind: StatefulSet
 
-# Default 1 because cluster mode is OFF by default (see cache.cluster.enable):
-# with cluster mode off each pod runs an ISOLATED loopback olric daemon, so
-# running multiple replicas would load-balance across independent cache,
-# rate-limit, and JWT-replay stores — replay protection would be bypassable
-# per-pod and rate limits would multiply by the replica count.
-#
-# For HA, enable cluster mode (cache.cluster.enable: true + an encryption key)
-# AND raise replicaCount to 3 — the textbook olric shape (RF=2, quorum=2 = no
-# split-brain). The chart ships no default affinity so single-node clusters
-# (kind, k3s, minikube) just work; for production multi-node add a soft
-# pod-anti-affinity via `affinity:` below or a topologySpreadConstraint.
+# Default 1: a single-pod cluster works and performs identically to loopback.
+# Cluster mode is ON by default, so scaling up is safe — every replica shares
+# one olric-backed cache / rate-limit / JWT-replay store (no per-pod divergence,
+# no rate-limit multiplication). For HA raise this to 3 — the textbook olric
+# shape (RF=2, quorum=2 = no split-brain) — or enable autoscaling below. The
+# chart ships no default affinity so single-node clusters (kind, k3s, minikube)
+# just work; for production multi-node add a soft pod-anti-affinity via
+# `affinity:` below or a topologySpreadConstraint.
 replicaCount: 1
 
 # Cosmoguard config rendered as a ConfigMap and mounted at /etc/cosmoguard.
@@ -135,13 +136,20 @@ config:
   cache:
     # ttl: 5s
     cluster:
-      # Default OFF: a bare `helm install` runs olric in embedded loopback
-      # mode (single pod, no peers), which needs no encryption key. Turn this
-      # on for multi-replica HA — and then you MUST supply an encryption key
-      # via cluster.encryptionKey or cluster.existingEncryptionKeySecret (the
-      # chart does NOT auto-generate one: a generated key is non-deterministic
-      # under client-side / GitOps rendering and would partition the cluster).
-      enable: false
+      # Default ON: cosmoguard runs as a networked olric cluster. The chart
+      # auto-wires everything a standard Kubernetes install needs — ${POD_IP}
+      # bind addr, DNS discovery via the headless peer Service, and a
+      # generated+persisted gossip key (cluster.generateEncryptionKey, below).
+      # A single replica works and performs identically to embedded loopback,
+      # so this is safe even for one-pod installs; scale up (or enable HPA) and
+      # every replica shares one olric store. Memory note: a one-pod cluster
+      # owns every olric partition, so its L2 floor (~68 MiB/DMap) is higher
+      # than embedded mode's 16-partition floor — the default `resources` limit
+      # is sized for this. Set enable: false for embedded loopback mode (no
+      # gossip, no peer Service, no key, lower partition count). GitOps note:
+      # client-side rendering can't look up the generated key — set
+      # cluster.existingEncryptionKeySecret there.
+      enable: true
       # bindAddr defaults to "${POD_IP}" via the chart's downward-API
       # wire-up. Override only on bare metal / non-K8s installs.
       # bindAddr: "${POD_IP}"
@@ -185,12 +193,14 @@ existingSecret: ""
 env: {}
   # JWT_SECRET: "..."   # don't put real secrets here; use existingSecret
 
-# Cluster gossip/data encryption key wiring. REQUIRED in cluster mode
-# (config.cache.cluster.enable: true). The chart does NOT auto-generate a key:
-# a generated key is non-deterministic under client-side / GitOps rendering
-# (helm template, ArgoCD without cluster access), so each sync would produce a
-# different key and partition the cluster. Supply one of the two below (every
-# replica must share the same value):
+# Cluster gossip/data encryption key wiring. Cluster mode
+# (config.cache.cluster.enable: true — the default) needs a shared key across
+# every replica. By DEFAULT the chart generates one and persists it
+# (cluster.generateEncryptionKey below, minted once and reused via lookup,
+# resource-policy: keep). CAVEAT: client-side / GitOps rendering (helm template,
+# Argo CD without cluster access) can't look up the existing Secret and would
+# mint a different key each sync, partitioning the cluster — there, supply one
+# of the two below instead (every replica must share the same value):
 cluster:
   # RECOMMENDED: reference a pre-created Secret with a base64-encoded
   # `encryptionKey` data field (16/24/32 bytes). Create it once with e.g.:
@@ -394,13 +404,25 @@ podDisruptionBudget:
   minAvailable: 1
   # maxUnavailable: 1
 
+# Sized for the default clustered runtime (config.cache.cluster.enable: true).
+# A single-replica cluster owns all of olric's partitions, so its L2 cache
+# floors at ~68 MiB/DMap (271 partitions x 256 KiB); the memory limit drives
+# the auto-derived L2 budget (see CacheGlobalConfig.ResolveBudget), so 1Gi
+# keeps that floor comfortably inside budget for the non-EVM DMap set. The
+# request stays modest because the idle/light-load footprint is ~10 MiB —
+# it only grows toward the floor under a full cache of large entries.
+# Minimal single-pod installs that don't need clustering can set
+# config.cache.cluster.enable: false (embedded, 16 partitions) and drop the
+# limit back to 512Mi. EVM-enabled single-pod installs (8 DMaps) should raise
+# the limit further or run >=2 replicas, which spreads partitions and lowers
+# the per-node floor.
 resources:
   limits:
     cpu: 1
-    memory: 512Mi
+    memory: 1Gi
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 256Mi
 
 # NetworkPolicy for the cluster-mode peer surface. Restricts the
 # peer-api port (dashboard fan-out aggregator) AND the gossip / RESP
@@ -438,6 +460,21 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
   # targetMemoryUtilizationPercentage: 80
+  # behavior is passed straight through to the HPA spec. It only takes effect
+  # when autoscaling.enabled is true (the HPA object isn't rendered otherwise),
+  # so it ships as a real default. Only scaleDown is tuned: removing several
+  # pods at once forces olric to rebalance many partitions simultaneously, so
+  # one pod every 2 minutes lets partitions hand off gracefully. scaleUp is left
+  # to the Kubernetes default (fast) — adding members is additive, and you don't
+  # want to throttle capacity while responding to a load spike. Override as
+  # needed, or set behavior: {} for the full Kubernetes defaults on both.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
 
 # ServiceMonitor for the Prometheus operator. Disabled by default;
 # enable when prometheus-operator is installed in the cluster.

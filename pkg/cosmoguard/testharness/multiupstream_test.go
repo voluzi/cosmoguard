@@ -161,13 +161,20 @@ func TestE_MultiUpstream_HealthcheckFailover(t *testing.T) {
 
 	h := testharness.New(t, testharness.WithConfig(cfg))
 
-	// Wait for the sick node to be marked unhealthy. 2 failed probes × 50ms
-	// interval = ~150ms; add slack. The first probe runs immediately on
-	// pool start so this converges fast.
-	deadline := time.Now().Add(3 * time.Second)
+	// Readiness gating: both nodes start unhealthy until their first probe, so
+	// first WAIT for the healthy node to be confirmed up (2 successes × 50ms ≈
+	// 100ms), then assert it STAYS up while the sick node's probes fail it out.
+	readyDeadline := time.Now().Add(3 * time.Second)
+	for !h.CosmoGuard.LcdPool().AnyHealthy() {
+		if time.Now().After(readyDeadline) {
+			t.Fatal("healthy node never became ready after its healthcheck probes")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	deadline := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
 		if !h.CosmoGuard.LcdPool().AnyHealthy() {
-			t.Fatal("both upstreams marked unhealthy — at least the healthy one should be up")
+			t.Fatal("healthy node flapped to unhealthy — it should stay up while only the sick node fails")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
