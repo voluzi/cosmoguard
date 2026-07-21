@@ -887,6 +887,14 @@ func WithRequestStats(ctx context.Context) (context.Context, *RequestStats) {
 //     belongs in the JSON-RPC handler, not here.
 func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stats := RequestStatsFromCtx(r.Context())
+	// Exactly one real upstream fetch per ServeHTTP call (internal retries
+	// collapse to one logical fetch). Cache hits and coalesced single-flight
+	// waiters never reach this method, so this counts only genuine upstream
+	// calls. Deferred so the labels reflect the upstream ultimately dispatched
+	// to; no-ops when no upstream was selected.
+	if stats != nil {
+		defer func() { recordUpstreamRequest(p.name, stats.Upstream, stats.RuleTag) }()
+	}
 	current := p.upstreamsSnapshot()
 	// Fast path — single upstream, no retry/load logic.
 	if len(current) == 1 {

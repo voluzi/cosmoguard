@@ -194,6 +194,7 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 	readBarrier := newGRPCCacheReadBarrier(p.grpcCache, waiters)
 	p.grpcCache = readBarrier
 	handler := grpcCacheTestHandler(p)
+	upstreamRequestsBefore := sumUpstreamRequests(t)
 
 	streams := make([]*grpcCacheTestStream, waiters)
 	errs := make(chan error, waiters)
@@ -220,6 +221,8 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 		require.NoError(t, <-errs)
 	}
 	require.Equal(t, int32(1), invokes.Load())
+	require.Equal(t, 1.0, sumUpstreamRequests(t)-upstreamRequestsBefore,
+		"upstream_requests_total must count exactly one Invoke for the coalesced batch")
 	for _, stream := range streams {
 		cacheState, response := stream.result()
 		require.Equal(t, cacheMiss, cacheState)

@@ -12,8 +12,73 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dtopb "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
+
+// sumUpstreamRequests totals cosmoguard_upstream_requests_total across all
+// label series. Package tests run sequentially, so a before/after delta within
+// one test isolates that test's upstream fetches regardless of label values.
+func sumUpstreamRequests(t *testing.T) float64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 512)
+	upstreamRequestsCounter.Collect(ch)
+	close(ch)
+	var sum float64
+	for m := range ch {
+		var dm dtopb.Metric
+		require.NoError(t, m.Write(&dm))
+		sum += dm.GetCounter().GetValue()
+	}
+	return sum
+}
+
+// The upstream-request counter must count exactly ONE fetch when single-flight
+// collapses N concurrent misses — this is the metric that makes coalescing
+// measurable in production (misses − upstream_requests = coalesced-away calls).
+func TestHTTPUpstreamRequestsCounterCollapsesWithCoalescing(t *testing.T) {
+	p, hits := newCacheTestProxy(t, 60*time.Millisecond, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute}) // coalesce defaults on
+
+	before := sumUpstreamRequests(t)
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() { defer wg.Done(); cacheRequest(p, rule, nil) }()
+	}
+	wg.Wait()
+
+	require.Equal(t, int32(1), hits.Load(), "coalescing: N concurrent misses collapse to one upstream call")
+	require.Equal(t, 1.0, sumUpstreamRequests(t)-before,
+		"upstream_requests_total must count exactly one fetch for N coalesced misses")
+}
+
+// With coalescing off, every miss is its own counted upstream fetch — the
+// counter tracks the un-collapsed case too.
+func TestHTTPUpstreamRequestsCounterMatchesUncoalescedFetches(t *testing.T) {
+	off := false
+	p, hits := newCacheTestProxy(t, 40*time.Millisecond, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute, Coalesce: &off})
+
+	before := sumUpstreamRequests(t)
+	const n = 8
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() { defer wg.Done(); cacheRequest(p, rule, nil) }()
+	}
+	wg.Wait()
+
+	require.Greater(t, hits.Load(), int32(1))
+	require.Equal(t, float64(hits.Load()), sumUpstreamRequests(t)-before,
+		"with coalescing off, every miss is its own counted upstream fetch")
+}
 
 func TestClassifyFreshness(t *testing.T) {
 	base := time.Unix(1_000_000, 0)
