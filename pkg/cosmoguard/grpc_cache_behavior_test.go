@@ -554,13 +554,13 @@ func TestGRPCStaleRefreshDoesNotClobberNewerForegroundWrite(t *testing.T) {
 	// Foreground miss: newer snapshot, stored first.
 	p.now = func() time.Time { return newer }
 	payloads <- []byte("new")
-	_, err := p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule)
+	_, err := p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule, true)
 	require.NoError(t, err)
 
 	// Older refresh completes afterwards — must be rejected as stale.
 	p.now = func() time.Time { return older }
 	payloads <- []byte("old")
-	_, err = p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule)
+	_, err = p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule, true)
 	require.NoError(t, err)
 
 	got, err := p.grpcCache.Get(context.Background(), key)
@@ -571,9 +571,67 @@ func TestGRPCStaleRefreshDoesNotClobberNewerForegroundWrite(t *testing.T) {
 	// Sanity: a genuinely newer write still replaces the entry.
 	p.now = func() time.Time { return newer.Add(time.Second) }
 	payloads <- []byte("newest")
-	_, err = p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule)
+	_, err = p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule, true)
 	require.NoError(t, err)
 	got, err = p.grpcCache.Get(context.Background(), key)
 	require.NoError(t, err)
 	require.Equal(t, "newest", string(got.Payload))
+}
+
+// A proxy-imposed foreground/refresh timeout (caller cancellation severed) on a
+// wedged upstream must count as a breaker failure — otherwise the pool keeps
+// re-selecting the hung node. A caller-tied deadline must stay neutral.
+func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
+	build := func(t *testing.T) (*GrpcProxy, *GrpcRule, *GrpcUpstream) {
+		t.Helper()
+		conn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+			var frame rawFrame
+			if err := stream.RecvMsg(&frame); err != nil {
+				return err
+			}
+			<-stream.Context().Done() // hang until the deadline fires
+			return stream.Context().Err()
+		})
+		rule := &GrpcRule{Priority: 1, Action: RuleActionAllow, Methods: []string{grpcCacheTestMethod}, Cache: &RuleCache{Enable: true, TTL: time.Minute}}
+		require.NoError(t, rule.Compile())
+		responseCache, err := newResponseCache[string, grpcCachedResponse](nil, nil, t.Name(), CacheBudget{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
+		up := newTestGrpcUpstream("raw", 1)
+		up.conn = conn
+		up.cbConfig = enabledBreaker(1, time.Minute)
+		p := &GrpcProxy{
+			defaultAction: RuleActionDeny,
+			rules:         []*GrpcRule{rule},
+			pool:          newTestGrpcPool("weighted-round-robin", up),
+			log:           log.WithField("test", t.Name()),
+			grpcCache:     responseCache,
+			now:           time.Now,
+			cgDashboard:   newDashboardObservability(),
+			section:       "grpc",
+		}
+		return p, rule, up
+	}
+
+	t.Run("proxy deadline trips breaker", func(t *testing.T) {
+		p, rule, up := build(t)
+		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		_, err := p.grpcFetchAndStore(ctx, grpcCacheTestMethod, []byte("req"), key, rule, true)
+		require.Error(t, err)
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+		require.True(t, up.cbOpen.Load(), "proxy foreground/refresh timeout must trip the breaker")
+	})
+
+	t.Run("caller deadline stays neutral", func(t *testing.T) {
+		p, rule, up := build(t)
+		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		_, err := p.grpcFetchAndStore(ctx, grpcCacheTestMethod, []byte("req"), key, rule, false)
+		require.Error(t, err)
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+		require.False(t, up.cbOpen.Load(), "caller cancellation/deadline must not trip the breaker")
+	})
 }

@@ -240,10 +240,10 @@ func cachingStreamHandler(
 				return fetchErr
 			}
 			if out.owner != owner && (!out.shareable || fetchErr != nil) {
-				out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule)
+				out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule, false)
 			}
 		} else {
-			out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule)
+			out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule, false)
 		}
 		if fetchErr != nil {
 			return fetchErr
@@ -259,7 +259,7 @@ func (p *GrpcProxy) grpcForegroundFetchFn(outCtx context.Context, method string,
 	return func() (grpcCachedResponse, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(outCtx), configuredGRPCForegroundFetchTimeout(p.cacheConfig))
 		defer cancel()
-		out, err := p.grpcFetchAndStore(ctx, method, reqPayload, key, rule)
+		out, err := p.grpcFetchAndStore(ctx, method, reqPayload, key, rule, true)
 		out.owner = owner
 		return out, err
 	}
@@ -271,7 +271,7 @@ func (p *GrpcProxy) grpcRefreshFn(md metadata.MD, method string, reqPayload []by
 	return func() (grpcCachedResponse, error) {
 		ctx, cancel := context.WithTimeout(metadata.NewOutgoingContext(context.Background(), md), grpcRefreshTimeout)
 		defer cancel()
-		return p.grpcFetchAndStore(ctx, method, reqPayload, key, rule)
+		return p.grpcFetchAndStore(ctx, method, reqPayload, key, rule, true)
 	}
 }
 
@@ -280,7 +280,7 @@ func (p *GrpcProxy) grpcRefreshFn(md metadata.MD, method string, reqPayload []by
 // Picks its own upstream so coalesced waiters don't each burn a selection.
 // Empty payloads are never cached (an empty frame is indistinguishable from an
 // upstream-sent-nothing error and would poison the entry until TTL).
-func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, reqPayload []byte, key string, rule *GrpcRule) (grpcCachedResponse, error) {
+func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, reqPayload []byte, key string, rule *GrpcRule, proxyDeadline bool) (grpcCachedResponse, error) {
 	upstream := p.pool.Pick()
 	if upstream == nil {
 		return grpcCachedResponse{}, status.Error(codes.Unavailable, "no upstream available")
@@ -291,8 +291,17 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 	upstream.inFlight.Add(-1)
 	// Classify by status code so client-caused / application-level errors
 	// (Canceled, DeadlineExceeded, InvalidArgument, NotFound…) don't trip the
-	// breaker on a healthy upstream.
-	upstream.RecordOutcomeErr(invokeErr)
+	// breaker on a healthy upstream. The exception: when this ran under a
+	// proxy-owned foreground/refresh deadline (caller cancellation severed via
+	// WithoutCancel / Background), an expiry means the UPSTREAM failed to answer
+	// within our budget — a genuine health failure the breaker must count, not
+	// caller noise. Without this a wedged node keeps getting re-selected for
+	// every coalesced miss/refresh.
+	if invokeErr != nil && proxyDeadline && fetchCtx.Err() == context.DeadlineExceeded {
+		upstream.RecordOutcome(false)
+	} else {
+		upstream.RecordOutcomeErr(invokeErr)
+	}
 	if invokeErr != nil {
 		return grpcCachedResponse{}, invokeErr
 	}
