@@ -471,11 +471,40 @@ func (l *JsonRpcResponses) GetFinal() JsonRpcMsgs {
 	return responses
 }
 
+// pendingRuleTag returns the rule tag shared by every still-pending upstream
+// request, or "batch" when they span multiple rules (or any pending item
+// carries no tag). Used to attribute the single multiplexed batch upstream
+// fetch in cosmoguard_upstream_requests_total.
+func (l *JsonRpcResponses) pendingRuleTag() string {
+	tag := ""
+	for _, r := range *l {
+		if r.Response != nil {
+			continue // already resolved (cache hit / deny)
+		}
+		if r.RuleTag == "" || (tag != "" && tag != r.RuleTag) {
+			return "batch"
+		}
+		tag = r.RuleTag
+	}
+	if tag == "" {
+		return "batch"
+	}
+	return tag
+}
+
 func (l *JsonRpcResponses) AddPending(request *JsonRpcMsg) {
 	res := &JsonRpcResponse{
 		Request: request,
 	}
 	*l = append(*l, res)
+}
+
+// AddPendingWithRuleTag is AddPending for a non-cacheable item that still
+// matched a rule (or the default action), recording that rule tag so the item
+// contributes its rule to pendingRuleTag / cosmoguard_upstream_requests_total
+// even though nothing is cached for it.
+func (l *JsonRpcResponses) AddPendingWithRuleTag(request *JsonRpcMsg, ruleTag string) {
+	*l = append(*l, &JsonRpcResponse{Request: request, RuleTag: ruleTag})
 }
 
 func (l *JsonRpcResponses) AddResponse(request, response *JsonRpcMsg) {

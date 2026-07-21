@@ -289,6 +289,9 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 	// Pick already reserved the in-flight lease; release it after Invoke.
 	invokeErr := upstream.conn.Invoke(fetchCtx, method, &rawFrame{Payload: reqPayload}, &resp, grpc.ForceCodec(rawCodec{}))
 	upstream.inFlight.Add(-1)
+	// One real upstream fetch. Coalesced single-flight waiters and cache hits
+	// never reach grpcFetchAndStore, so this counts only genuine Invokes.
+	recordUpstreamRequest(p.pool.name, upstream.Name, ruleTagOrFingerprint(rule.Tag, rule.Fingerprint))
 	// Classify by status code so client-caused / application-level errors
 	// (Canceled, DeadlineExceeded, InvalidArgument, NotFound…) don't trip the
 	// breaker on a healthy upstream. The exception: when this ran under a

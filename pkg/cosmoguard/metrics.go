@@ -50,6 +50,30 @@ var cacheEvictionsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Entries evicted from an in-process response cache because it hit its byte/item budget (excludes TTL expiry), by cache.",
 }, []string{"cache"})
 
+// upstreamRequestsCounter counts requests cosmoguard actually forwarded to an
+// upstream — i.e. the real network fetch, NOT the client request. A cache hit
+// and a coalesced single-flight waiter never reach the upstream, so they are
+// NOT counted here. That makes this the counterpart to the per-request
+// histogram's cache="miss" count: the difference
+//
+//	rpc_request_duration_seconds_count{cache="miss",rule_id=R,upstream=U}
+//	  − cosmoguard_upstream_requests_total{rule_id=R,upstream=U}
+//
+// is the number of misses that single-flight collapsed onto a shared fetch
+// (exact when stale-while-revalidate is off; background refreshes also count
+// here since they are genuine upstream calls). Labels:
+//   - pool: the proxy/service ("lcd", "rpc", "grpc", "evm_rpc", …). Bounded.
+//   - upstream: the node the request was dispatched to. Bounded.
+//   - rule_id: the matched rule's tag ("default" when none). Bounded.
+//
+// Scope note: covers the HTTP transport family (LCD / RPC / JSON-RPC-over-HTTP,
+// which all fetch through the HTTP upstream pool) and gRPC. WebSocket upstream
+// calls are not yet counted (tracked separately).
+var upstreamRequestsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "cosmoguard_upstream_requests_total",
+	Help: "Upstream fetches cosmoguard performed, by pool, upstream, and rule. Excludes cache hits and coalesced single-flight waiters; internal HTTP retries within one request collapse to a single logical fetch (so misses − this = coalesced-away calls).",
+}, []string{"pool", "upstream", "rule_id"})
+
 // registerSharedMetricsOnce guards the process-wide registration so
 // multiple cosmoguards in one process (the test harness builds several)
 // don't panic on duplicate Register.
@@ -64,7 +88,21 @@ func registerSharedMetrics() {
 		// cosmoguard instance is a no-op rather than a panic.
 		_ = prometheus.Register(upstreamHealthyGauge)
 		_ = prometheus.Register(cacheEvictionsCounter)
+		_ = prometheus.Register(upstreamRequestsCounter)
 	})
+}
+
+// recordUpstreamRequest bumps the upstream-request counter for one real fetch.
+// No-op when no upstream was selected (empty upstream), so failed selections
+// don't create a meaningless unlabelled series.
+func recordUpstreamRequest(pool, upstream, ruleID string) {
+	if upstream == "" {
+		return
+	}
+	if ruleID == "" {
+		ruleID = "default"
+	}
+	upstreamRequestsCounter.WithLabelValues(pool, upstream, ruleID).Inc()
 }
 
 // recordCacheEviction bumps the eviction counter for the named cache. Wired

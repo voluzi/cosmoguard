@@ -116,6 +116,12 @@ func applyEnvOverrides(cfg *Config) error {
 	envStr("COSMOGUARD_DASHBOARD_AUTH_USER", &cfg.Dashboard.BasicAuthUser)
 	envStr("COSMOGUARD_DASHBOARD_AUTH_PASSWORD", &cfg.Dashboard.BasicAuthPassword)
 
+	// Cluster (cache.cluster) is global, not node-scoped, so it is applied
+	// before the node section's early return for a node-less config.
+	if err := applyClusterEnvOverrides(cfg); err != nil {
+		return err
+	}
+
 	// Node-side overrides target Nodes[0]. PrepareConfig guarantees at
 	// least one entry exists (via the v3→v4 promotion) by the time
 	// this function runs, but guard defensively so a future refactor
@@ -188,6 +194,167 @@ func applyEnvOverrides(cfg *Config) error {
 	return nil
 }
 
+// applyClusterEnvOverrides overlays the COSMOGUARD_CLUSTER_* vars onto
+// cfg.Cache.Cluster (the embedded olric daemon config). Its main use is
+// an operator (cosmopilot) that runs cosmoguard as a replicated,
+// shared-cache StatefulSet: it needs to enable cluster mode, point the
+// member at a per-pod bind address, target a headless peer service for
+// DNS discovery, and inject the gossip encryption key from a Secret —
+// none of which fit the user-owned rules YAML.
+//
+//	COSMOGUARD_CLUSTER_ENABLE                        create the cache.cluster block
+//	COSMOGUARD_CLUSTER_BIND_ADDR                     Cluster.BindAddr (e.g. the pod IP)
+//	COSMOGUARD_CLUSTER_BIND_PORT                     Cluster.BindPort
+//	COSMOGUARD_CLUSTER_GOSSIP_PORT                   Cluster.GossipPort
+//	COSMOGUARD_CLUSTER_PEER_API_PORT                 Cluster.PeerApiPort
+//	COSMOGUARD_CLUSTER_REPLICA_COUNT                 Cluster.ReplicaCount
+//	COSMOGUARD_CLUSTER_QUORUM                        Cluster.Quorum
+//	COSMOGUARD_CLUSTER_ENCRYPTION_KEY                Cluster.EncryptionKey
+//	COSMOGUARD_CLUSTER_DISCOVERY_MODE                Cluster.Discovery.Mode
+//	COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST            Cluster.Discovery.DNS.Host
+//	COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT            Cluster.Discovery.DNS.Port
+//	COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL Cluster.Discovery.DNS.RefreshInterval
+//
+// Setting any COSMOGUARD_CLUSTER_* var (or an explicitly-true
+// COSMOGUARD_CLUSTER_ENABLE) creates the cluster block on demand, seeded
+// with the same defaults the struct tags apply for a YAML-defined block
+// (bindPort 3320, gossipPort 3322, replicaCount 2, quorum 1). An
+// explicit COSMOGUARD_CLUSTER_ENABLE=false suppresses cluster mode and
+// ignores the other cluster vars, so a templated deployment can toggle
+// clustering off without editing the rest of its env.
+func applyClusterEnvOverrides(cfg *Config) error {
+	enableVal, enableSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_ENABLE")
+	enable := false
+	if enableSet {
+		if err := envBoolFromValue("COSMOGUARD_CLUSTER_ENABLE", enableVal, &enable); err != nil {
+			return err
+		}
+		if !enable {
+			// Explicit opt-out. cfg.Cache.Cluster != nil IS the cluster-mode
+			// toggle (see cluster_runtime.go clustered := opts.Cluster != nil),
+			// so a YAML-defined block must be CLEARED, not just skipped —
+			// otherwise ENABLE=false would still validate and start clustering.
+			cfg.Cache.Cluster = nil
+			return nil
+		}
+	}
+
+	clusterVars := []string{
+		"COSMOGUARD_CLUSTER_BIND_ADDR", "COSMOGUARD_CLUSTER_BIND_PORT",
+		"COSMOGUARD_CLUSTER_GOSSIP_PORT", "COSMOGUARD_CLUSTER_PEER_API_PORT",
+		"COSMOGUARD_CLUSTER_REPLICA_COUNT", "COSMOGUARD_CLUSTER_QUORUM",
+		"COSMOGUARD_CLUSTER_ENCRYPTION_KEY", "COSMOGUARD_CLUSTER_DISCOVERY_MODE",
+		"COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST", "COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT",
+		"COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL",
+	}
+	anySet := enable
+	for _, name := range clusterVars {
+		if _, ok := lookupNonEmptyEnv(name); ok {
+			anySet = true
+			break
+		}
+	}
+	if !anySet {
+		return nil
+	}
+
+	if cfg.Cache.Cluster == nil {
+		cfg.Cache.Cluster = &ClusterConfig{
+			BindPort:     3320,
+			GossipPort:   3322,
+			ReplicaCount: 2,
+			Quorum:       1,
+		}
+	}
+	c := cfg.Cache.Cluster
+
+	envStr("COSMOGUARD_CLUSTER_BIND_ADDR", &c.BindAddr)
+	envStr("COSMOGUARD_CLUSTER_ENCRYPTION_KEY", &c.EncryptionKey)
+	if err := envPort("COSMOGUARD_CLUSTER_BIND_PORT", &c.BindPort); err != nil {
+		return err
+	}
+	if err := envPort("COSMOGUARD_CLUSTER_GOSSIP_PORT", &c.GossipPort); err != nil {
+		return err
+	}
+	// PeerApiPort accepts 0: it's the documented "inherit BindPort+1" sentinel
+	// (see ClusterConfig.PeerApiPort), so an env-driven deployment must be able
+	// to express it — envPort's 1..65535 range would wrongly reject it.
+	if err := envPortAllowZero("COSMOGUARD_CLUSTER_PEER_API_PORT", &c.PeerApiPort); err != nil {
+		return err
+	}
+	if err := envInt("COSMOGUARD_CLUSTER_REPLICA_COUNT", &c.ReplicaCount); err != nil {
+		return err
+	}
+	if err := envInt("COSMOGUARD_CLUSTER_QUORUM", &c.Quorum); err != nil {
+		return err
+	}
+
+	mode, modeSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_MODE")
+	dnsHost, dnsHostSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST")
+	_, dnsPortSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT")
+	_, dnsRefreshSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL")
+	if modeSet || dnsHostSet || dnsPortSet || dnsRefreshSet {
+		if c.Discovery == nil {
+			c.Discovery = &ClusterDiscoveryConfig{}
+		}
+		if modeSet {
+			c.Discovery.Mode = strings.TrimSpace(mode)
+		}
+		if dnsHostSet || dnsPortSet || dnsRefreshSet {
+			if c.Discovery.DNS == nil {
+				c.Discovery.DNS = &DNSDiscoveryConfig{RefreshInterval: 10 * time.Second}
+			}
+			if dnsHostSet {
+				c.Discovery.DNS.Host = strings.TrimSpace(dnsHost)
+			}
+			// DNS.Port 0 is the documented "inherit GossipPort" sentinel, so it
+			// must be expressible through env too (see DNSDiscoveryConfig.Port).
+			if err := envPortAllowZero("COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT", &c.Discovery.DNS.Port); err != nil {
+				return err
+			}
+			if err := envDuration("COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL", &c.Discovery.DNS.RefreshInterval); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// envInt assigns *dst from the env var named name parsed as a plain
+// integer (used for counts like replica factor and quorum). A malformed
+// value is a startup-fatal error pointing at the offending env var.
+func envInt(name string, dst *int) error {
+	v, ok := lookupNonEmptyEnv(name)
+	if !ok {
+		return nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return fmt.Errorf("%s: invalid integer %q: %w", name, v, err)
+	}
+	*dst = n
+	return nil
+}
+
+// envDuration assigns *dst from the env var named name parsed as a Go
+// duration. A zero/negative or malformed value fails at startup rather
+// than degenerating into a tight refresh loop later.
+func envDuration(name string, dst *time.Duration) error {
+	v, ok := lookupNonEmptyEnv(name)
+	if !ok {
+		return nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(v))
+	if err != nil {
+		return fmt.Errorf("%s: invalid duration %q: %w", name, v, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s: got %s, must be > 0", name, d)
+	}
+	*dst = d
+	return nil
+}
+
 // envStr assigns *dst from the env var named name when it is set
 // to a non-empty value. Surrounding whitespace is trimmed — a
 // stray `COSMOGUARD_NODE_HOST=" 10.0.0.1"` from a misquoted YAML
@@ -216,6 +383,25 @@ func envPort(name string, dst *int) error {
 	}
 	if n < 1 || n > 65535 {
 		return fmt.Errorf("%s: port %d out of range (want 1..65535)", name, n)
+	}
+	*dst = n
+	return nil
+}
+
+// envPortAllowZero is envPort but permits 0, for port fields whose zero value
+// is a meaningful "inherit/derive" sentinel (e.g. Cluster.PeerApiPort = 0 ⇒
+// BindPort+1). Any other out-of-range value still fails startup.
+func envPortAllowZero(name string, dst *int) error {
+	v, ok := lookupNonEmptyEnv(name)
+	if !ok {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fmt.Errorf("%s: invalid integer %q: %w", name, v, err)
+	}
+	if n < 0 || n > 65535 {
+		return fmt.Errorf("%s: port %d out of range (want 0..65535)", name, n)
 	}
 	*dst = n
 	return nil

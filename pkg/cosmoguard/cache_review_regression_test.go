@@ -1980,3 +1980,108 @@ func TestJSONRPCCoalescedMissForwardsUpstreamAge(t *testing.T) {
 	require.Equal(t, "30", out.SharedHeaders.Get("Age"), "shared waiters must receive the upstream Age")
 	require.Equal(t, "max-age=60", out.SharedHeaders.Get("Cache-Control"))
 }
+
+// JSON-RPC single-request SWR refreshes create fresh RequestStats; they must
+// seed the rule tag so the upstream pool counts them under their rule.
+func TestJSONRPCSingleRefreshSeedsRuleTag(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+	}
+	h := newJSONCacheHandler(t, rule)
+	var gotTag string
+	next := func(w http.ResponseWriter, r *http.Request) {
+		if s := RequestStatsFromCtx(r.Context()); s != nil {
+			gotTag = s.RuleTag
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
+	}
+	request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+	req, _ := jsonRequestContext()
+	fn := h.singleBackgroundRefreshFn(req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rpc-status", request.Method)
+	_, err := fn()
+	require.NoError(t, err)
+	require.Equal(t, "rpc-status", gotTag, "SWR refresh must seed the rule tag before the pool fetch")
+}
+
+// A JSON-RPC batch collapses its pending items into one upstream fetch; the
+// stats seeded before that fetch must carry the shared rule tag (or "batch").
+func TestJSONRPCBatchSeedsRuleTagForUpstreamFetch(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+		Tag:     "rpc-batch",
+	}
+	h := newJSONCacheHandler(t, rule)
+	var gotTag string
+	next := func(w http.ResponseWriter, r *http.Request) {
+		if s := RequestStatsFromCtx(r.Context()); s != nil {
+			gotTag = s.RuleTag
+		}
+		_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+	}
+	req, _ := jsonRequestContext()
+	h.handleHttpBatch(JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "status"}}, httptest.NewRecorder(), req, next, time.Now())
+	require.Equal(t, "rpc-batch", gotTag, "uniform batch must attribute its upstream fetch to the shared rule")
+}
+
+func TestJsonRpcResponsesPendingRuleTag(t *testing.T) {
+	msg := func(id int) *JsonRpcMsg { return &JsonRpcMsg{Version: "2.0", ID: id, Method: "status"} }
+
+	uniform := JsonRpcResponses{}
+	uniform.AddPendingWithCacheConfig(msg(1), 1, &RuleCache{}, "rule-a")
+	uniform.AddPendingWithCacheConfig(msg(2), 2, &RuleCache{}, "rule-a")
+	require.Equal(t, "rule-a", uniform.pendingRuleTag())
+
+	mixed := JsonRpcResponses{}
+	mixed.AddPendingWithCacheConfig(msg(1), 1, &RuleCache{}, "rule-a")
+	mixed.AddPendingWithCacheConfig(msg(2), 2, &RuleCache{}, "rule-b")
+	require.Equal(t, "batch", mixed.pendingRuleTag())
+
+	// Non-cacheable pending items now carry their tag via AddPendingWithRuleTag,
+	// so a uniform non-cacheable batch attributes to its rule.
+	uniformNonCacheable := JsonRpcResponses{}
+	uniformNonCacheable.AddPendingWithRuleTag(msg(1), "rule-c")
+	uniformNonCacheable.AddPendingWithRuleTag(msg(2), "rule-c")
+	require.Equal(t, "rule-c", uniformNonCacheable.pendingRuleTag())
+
+	// A genuinely untagged pending item (bare AddPending) still yields "batch".
+	withUntagged := JsonRpcResponses{}
+	withUntagged.AddPendingWithCacheConfig(msg(1), 1, &RuleCache{}, "rule-a")
+	withUntagged.AddPending(msg(2))
+	require.Equal(t, "batch", withUntagged.pendingRuleTag())
+
+	// Mixed cacheable + non-cacheable across rules → batch.
+	mixedKinds := JsonRpcResponses{}
+	mixedKinds.AddPendingWithCacheConfig(msg(1), 1, &RuleCache{}, "rule-a")
+	mixedKinds.AddPendingWithRuleTag(msg(2), "rule-b")
+	require.Equal(t, "batch", mixedKinds.pendingRuleTag())
+
+	resolvedIgnored := JsonRpcResponses{}
+	resolvedIgnored.AddResponse(msg(1), msg(1)) // cache hit, already resolved
+	resolvedIgnored.AddPendingWithCacheConfig(msg(2), 2, &RuleCache{}, "rule-a")
+	require.Equal(t, "rule-a", resolvedIgnored.pendingRuleTag())
+}
+
+// A uniform batch of NON-cacheable calls from a tagged rule must attribute its
+// single upstream fetch to that rule, not "batch".
+func TestJSONRPCNonCacheableBatchSeedsRuleTag(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Tag:     "rpc-nc", // no Cache block => non-cacheable path (AddPendingWithRuleTag)
+	}
+	h := newJSONCacheHandler(t, rule)
+	var gotTag string
+	next := func(w http.ResponseWriter, r *http.Request) {
+		if s := RequestStatsFromCtx(r.Context()); s != nil {
+			gotTag = s.RuleTag
+		}
+		_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+	}
+	req, _ := jsonRequestContext()
+	h.handleHttpBatch(JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "status"}}, httptest.NewRecorder(), req, next, time.Now())
+	require.Equal(t, "rpc-nc", gotTag, "uniform non-cacheable batch must attribute to its rule, not batch")
+}

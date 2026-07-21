@@ -194,6 +194,7 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 	readBarrier := newGRPCCacheReadBarrier(p.grpcCache, waiters)
 	p.grpcCache = readBarrier
 	handler := grpcCacheTestHandler(p)
+	upstreamRequestsBefore := sumUpstreamRequests(t)
 
 	streams := make([]*grpcCacheTestStream, waiters)
 	errs := make(chan error, waiters)
@@ -220,6 +221,8 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 		require.NoError(t, <-errs)
 	}
 	require.Equal(t, int32(1), invokes.Load())
+	require.Equal(t, 1.0, sumUpstreamRequests(t)-upstreamRequestsBefore,
+		"upstream_requests_total must count exactly one Invoke for the coalesced batch")
 	for _, stream := range streams {
 		cacheState, response := stream.result()
 		require.Equal(t, cacheMiss, cacheState)
@@ -634,4 +637,25 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
 		require.False(t, up.cbOpen.Load(), "caller cancellation/deadline must not trip the breaker")
 	})
+}
+
+// The transparent (non-cached / streaming / reflection) forwarder must also
+// count its upstream fetch, so the counter isn't blind to non-cached gRPC.
+func TestGRPCTransparentForwardCountsUpstreamRequest(t *testing.T) {
+	up := newTestGrpcUpstream("g1", 1)
+	p := &GrpcProxy{
+		log:           log.WithField("test", t.Name()),
+		defaultAction: RuleActionAllow,
+		pool:          newTestGrpcPool("weighted-round-robin", up),
+		cgDashboard:   newDashboardObservability(),
+		section:       "grpc",
+	}
+
+	before := sumUpstreamRequests(t)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.MD{})
+	_, conn, err := p.Handle(ctx, "/cosmos.bank.v1beta1.Query/Balance")
+	require.NoError(t, err)
+	require.Equal(t, up.conn, conn)
+	require.Equal(t, 1.0, sumUpstreamRequests(t)-before,
+		"transparent gRPC forward must count one upstream request")
 }

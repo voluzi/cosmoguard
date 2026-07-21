@@ -1201,7 +1201,11 @@ func cachedResponseAge(res CachedResponse, now time.Time) (int, bool) {
 func (p *HttpProxy) backgroundRefreshFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string) func() (bufferedUpstreamResponse, error) {
 	return func() (bufferedUpstreamResponse, error) {
 		body := snapshotRequestBody(r)
-		ctx, _ := WithRequestStats(context.WithoutCancel(r.Context()))
+		// Fresh stats for the detached refresh, but seed the rule tag so the
+		// upstream-request counter attributes this SWR fetch to its rule
+		// instead of "default".
+		ctx, stats := WithRequestStats(context.WithoutCancel(r.Context()))
+		stats.RuleTag = ruleTag
 		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
