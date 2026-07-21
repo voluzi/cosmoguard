@@ -472,6 +472,55 @@ func TestWSCacheCoalescedWaiterRefetchesUncacheableResponse(t *testing.T) {
 	}
 }
 
+func TestWSCacheCoalescedWaiterCachesRetryAfterUnshareableResponse(t *testing.T) {
+	proxy, rule, upstream := newWSCacheProxy(t, nil, 0)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	upstream.makeResponse = func(request *JsonRpcMsg, call int32) (*JsonRpcMsg, error) {
+		if call == 1 {
+			startedOnce.Do(func() { close(started) })
+			<-release
+			return ErrorResponse(request, -32000, "transient upstream error", nil), nil
+		}
+		return WithResult(request, map[string]interface{}{"height": "2"}), nil
+	}
+
+	hash := wsCacheRequest(1).HashWithRule(rule.Fingerprint)
+	type outcome struct {
+		message *JsonRpcMsg
+		err     error
+	}
+	first := make(chan outcome, 1)
+	second := make(chan outcome, 1)
+	go func() {
+		message, err := proxy.coalescedWSRequest(context.Background(), hash, wsCacheRequest(1), rule.Cache, "test")
+		first <- outcome{message: message, err: err}
+	}()
+	<-started
+	waiterObserved := make(chan struct{})
+	waiterCtx := &observedDoneContext{Context: context.Background(), observed: waiterObserved}
+	go func() {
+		message, err := proxy.coalescedWSRequest(waiterCtx, hash, wsCacheRequest(2), rule.Cache, "test")
+		second <- outcome{message: message, err: err}
+	}()
+	<-waiterObserved
+	releaseOnce.Do(func() { close(release) })
+
+	firstResult := <-first
+	secondResult := <-second
+	require.NoError(t, firstResult.err)
+	require.NotNil(t, firstResult.message.Error)
+	require.NoError(t, secondResult.err)
+	require.JSONEq(t, `{"height":"2"}`, string(secondResult.message.Result))
+
+	thirdMessage, err := proxy.coalescedWSRequest(context.Background(), hash, wsCacheRequest(3), rule.Cache, "test")
+	require.NoError(t, err)
+	require.JSONEq(t, `{"height":"2"}`, string(thirdMessage.Result))
+	require.Equal(t, int32(2), upstream.calls.Load())
+}
+
 func TestWSCacheCoalescedWaiterRefetchesTransportError(t *testing.T) {
 	proxy, rule, upstream := newWSCacheProxy(t, nil, 0)
 	started := make(chan struct{})

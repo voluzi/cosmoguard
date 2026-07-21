@@ -727,7 +727,11 @@ func (p *JsonRpcWebSocketProxy) coalescedWSRequest(ctx context.Context, hash uin
 		return nil, err
 	}
 	if !out.shareable && out.owner != owner {
-		return p.broker.HandleRequest(request)
+		message, requestErr := p.broker.HandleRequest(request)
+		if requestErr == nil && wsResponseShareable(message, cacheRule) {
+			p.storeWSResponseAsync(hash, message, cacheRule, ruleID, request.Method)
+		}
+		return message, requestErr
 	}
 	return out.message.CloneWithID(request.ID), nil
 }
