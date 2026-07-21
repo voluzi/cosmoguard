@@ -2,6 +2,8 @@ package cosmoguard
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"sync"
 
 	"golang.org/x/sync/singleflight"
@@ -24,6 +26,24 @@ type coalescer[V any] struct {
 	inflight sync.Map // key(string) -> struct{}; guards background refreshes
 }
 
+type coalescedPanic struct {
+	value any
+	stack []byte
+}
+
+func (p *coalescedPanic) Error() string {
+	return fmt.Sprintf("%v\n\n%s", p.value, p.stack)
+}
+
+func runCoalesced[V any](fn func() (V, error)) (value V, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &coalescedPanic{value: recovered, stack: debug.Stack()}
+		}
+	}()
+	return fn()
+}
+
 // do runs fn under single-flight for key: the first caller executes fn and
 // concurrent callers for the same key block until it returns and share the
 // result. Each caller honors ITS OWN ctx — a waiter whose client disconnects
@@ -31,12 +51,15 @@ type coalescer[V any] struct {
 // fn should use a detached context so a leader disconnect doesn't abort the
 // shared fetch for the remaining waiters.
 func (c *coalescer[V]) do(ctx context.Context, key string, fn func() (V, error)) (V, error) {
-	ch := c.g.DoChan(key, func() (any, error) { return fn() })
+	ch := c.g.DoChan(key, func() (any, error) { return runCoalesced(fn) })
 	select {
 	case <-ctx.Done():
 		var zero V
 		return zero, ctx.Err()
 	case res := <-ch:
+		if panicErr, ok := res.Err.(*coalescedPanic); ok {
+			panic(panicErr)
+		}
 		v, _ := res.Val.(V)
 		return v, res.Err
 	}
@@ -51,9 +74,16 @@ func (c *coalescer[V]) refresh(key string, fn func() (V, error)) {
 	if _, busy := c.inflight.LoadOrStore(key, struct{}{}); busy {
 		return
 	}
-	ch := c.refreshG.DoChan(key, func() (any, error) { return fn() })
+	ch := c.refreshG.DoChan(key, func() (any, error) { return runCoalesced(fn) })
 	go func() {
 		defer c.inflight.Delete(key)
-		<-ch
+		res := <-ch
+		if panicErr, ok := res.Err.(*coalescedPanic); ok {
+			log.WithFields(Fields{
+				"key":   key,
+				"panic": panicErr.value,
+				"stack": string(panicErr.stack),
+			}).Error("panic in background cache refresh")
+		}
 	}()
 }
