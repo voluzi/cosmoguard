@@ -305,10 +305,17 @@ func NewHttpUpstreamPool(
 		if err != nil {
 			return nil, err
 		}
-		u.healthy.Store(true) // optimistic: assume healthy until first probe says otherwise
+		// Optimistic ONLY when no healthcheck is configured (there's no way
+		// to confirm, so assume usable). When a healthcheck IS configured,
+		// start unhealthy so /readyz gates the pod out of the load balancer
+		// until the first probe confirms the upstream is actually reachable —
+		// otherwise a fresh/scaled-up pod is marked Ready and 502s a burst of
+		// traffic before its upstream connection is warm.
+		initialHealthy := u.hcConfig == nil
+		u.healthy.Store(initialHealthy)
 		// Seed the gauge so operators see every configured upstream in
 		// /metrics from boot — even those that never receive traffic.
-		setUpstreamHealthy(pool.name, u.Name, true)
+		setUpstreamHealthy(pool.name, u.Name, initialHealthy)
 		initial = append(initial, u)
 	}
 	pool.storeUpstreams(initial)
@@ -376,8 +383,12 @@ func (p *HttpUpstreamPool) AddUpstream(n NodeConfig) error {
 			p.errorHandler(u, w, r, err)
 		}
 	}
-	u.healthy.Store(true)
-	setUpstreamHealthy(p.name, u.Name, true)
+	// Same gate as the constructor: a healthcheck-backed upstream added at
+	// runtime (DNS discovery) starts unhealthy until its first probe confirms
+	// reachability, so /readyz doesn't flip green on an unproven endpoint.
+	addHealthy := u.hcConfig == nil
+	u.healthy.Store(addHealthy)
+	setUpstreamHealthy(p.name, u.Name, addHealthy)
 
 	next := make([]*HttpUpstream, 0, len(current)+1)
 	next = append(next, current...)

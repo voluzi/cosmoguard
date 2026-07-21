@@ -297,3 +297,33 @@ func TestBuildHttpUpstream_HealthcheckService(t *testing.T) {
 		t.Fatalf("expected error for unknown healthcheck.service, got nil")
 	}
 }
+
+// A healthcheck-backed upstream must start UNHEALTHY so /readyz gates the pod
+// out of the load balancer until the first probe confirms the upstream is
+// reachable — otherwise a fresh/scaled-up pod is marked Ready and 502s traffic
+// before its upstream connection is warm. Without a healthcheck the upstream
+// stays optimistically healthy (nothing to confirm).
+func TestHealthcheckGatesReadinessUntilFirstProbe(t *testing.T) {
+	on := true
+	hc := &NodeHealthcheckConfig{Enable: &on, Path: "/status", Service: "rpc"}
+
+	gated, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "hc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9, Healthcheck: hc}},
+		"rpc", nil, log.WithField("test", "readyz-gate"))
+	if err != nil {
+		t.Fatalf("build gated pool: %v", err)
+	}
+	if gated.AnyHealthy() {
+		t.Fatal("healthcheck-backed upstream must start unhealthy so /readyz gates until the first probe")
+	}
+
+	optimistic, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "nohc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9}},
+		"rpc", nil, log.WithField("test", "readyz-nohc"))
+	if err != nil {
+		t.Fatalf("build optimistic pool: %v", err)
+	}
+	if !optimistic.AnyHealthy() {
+		t.Fatal("no-healthcheck upstream must stay optimistically healthy")
+	}
+}

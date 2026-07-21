@@ -350,13 +350,16 @@ func NewGrpcUpstreamPool(name string, nodes []NodeConfig, logger *Entry, opts ..
 			}
 			return nil, fmt.Errorf("grpc upstream %s: %w", n.Name, err)
 		}
-		// Optimistic: assume healthy until the first probe says
-		// otherwise. Matches HttpUpstream so a single Pick before the
-		// initial probe lands doesn't get filtered out.
-		u.healthy.Store(true)
-		// Seed the gauge with the optimistic verdict so operators see
-		// every configured upstream in /metrics from boot.
-		setUpstreamHealthy(pool.name, u.Name, true)
+		// Optimistic ONLY when no healthcheck is configured. With a
+		// healthcheck, start unhealthy so /readyz gates the pod out of the
+		// load balancer until the first probe confirms reachability — matches
+		// HttpUpstream and stops a fresh/scaled-up pod from erroring traffic
+		// before its upstream is proven usable.
+		initialHealthy := u.hcConfig == nil
+		u.healthy.Store(initialHealthy)
+		// Seed the gauge with that verdict so operators see every configured
+		// upstream in /metrics from boot.
+		setUpstreamHealthy(pool.name, u.Name, initialHealthy)
 		initial = append(initial, u)
 	}
 	pool.storeUpstreams(initial)
@@ -440,8 +443,9 @@ func (p *GrpcUpstreamPool) AddUpstream(n NodeConfig) error {
 	if err != nil {
 		return err
 	}
-	u.healthy.Store(true)
-	setUpstreamHealthy(p.name, u.Name, true)
+	addHealthy := u.hcConfig == nil
+	u.healthy.Store(addHealthy)
+	setUpstreamHealthy(p.name, u.Name, addHealthy)
 
 	next := make([]*GrpcUpstream, 0, len(current)+1)
 	next = append(next, current...)
