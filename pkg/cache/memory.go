@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
@@ -20,6 +22,8 @@ func (k namespacedKey[K]) String() string {
 type MemoryCache[K comparable, V any] struct {
 	Namespace string
 	cache     *ttlcache.Cache[namespacedKey[K], V]
+	startDone chan struct{}
+	closeOnce *sync.Once
 }
 
 func NewMemoryCache[K comparable, V any](namespace string, opts ...Option) (Cache[K, V], error) {
@@ -52,9 +56,12 @@ func NewMemoryCache[K comparable, V any](namespace string, opts ...Option) (Cach
 			ttlcache.WithCapacity[namespacedKey[K], V](options.MaxItems),
 		)
 	}
+	startDone := make(chan struct{})
 	c := MemoryCache[K, V]{
 		Namespace: namespace,
 		cache:     ttlcache.New[namespacedKey[K], V](cacheOptions...),
+		startDone: startDone,
+		closeOnce: &sync.Once{},
 	}
 	if options.OnEvict != nil {
 		c.cache.OnEviction(func(_ context.Context, reason ttlcache.EvictionReason, _ *ttlcache.Item[namespacedKey[K], V]) {
@@ -67,7 +74,10 @@ func NewMemoryCache[K comparable, V any](namespace string, opts ...Option) (Cach
 			}
 		})
 	}
-	go c.cache.Start()
+	go func() {
+		defer close(startDone)
+		c.cache.Start()
+	}()
 	return c, nil
 }
 
@@ -139,10 +149,20 @@ func (c MemoryCache[K, V]) Has(_ context.Context, key K) (bool, error) {
 	return c.cache.Has(c.key(key)), nil
 }
 
-// Close stops the ttlcache background expiration goroutine. Idempotent —
-// ttlcache.Cache.Stop() handles repeated calls safely.
+// Close waits for the ttlcache cleanup goroutine to exit, including when
+// called immediately after construction. Repeated calls are safe.
 func (c MemoryCache[K, V]) Close() error {
-	c.cache.Stop()
+	c.closeOnce.Do(func() {
+		for {
+			c.cache.Stop()
+			select {
+			case <-c.startDone:
+				return
+			default:
+				runtime.Gosched()
+			}
+		}
+	})
 	return nil
 }
 
