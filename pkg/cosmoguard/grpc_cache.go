@@ -304,11 +304,43 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 	if len(resp.Payload) > 0 {
 		effTTL := effectiveTTL(rule.Cache, p.cacheConfig)
 		stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig))
-		writeCtx, cancel := context.WithTimeout(context.Background(), grpcCacheWriteTimeout)
-		_ = p.grpcCache.Set(writeCtx, key, out, physicalTTL(effTTL, stale))
-		cancel()
+		p.storeNewestGRPCResponse(key, out, physicalTTL(effTTL, stale))
 	}
 	return out, nil
+}
+
+// storeNewestGRPCResponse persists out under a per-key lock, refusing to
+// overwrite an entry whose StoredAt is already at least as new. Foreground
+// misses and background SWR refreshes share this write path through
+// independent single-flight groups, so a slow refresh carrying an older
+// snapshot can complete after a fresher foreground fetch. Without newest-wins
+// it would clobber the newer payload and re-extend its physical TTL, leaving
+// the cache serving stale data as fresh.
+func (p *GrpcProxy) storeNewestGRPCResponse(key string, out grpcCachedResponse, ttl time.Duration) {
+	mu := &p.writeLocks[grpcWriteStripe(key)]
+	mu.Lock()
+	defer mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), grpcCacheWriteTimeout)
+	defer cancel()
+	if existing, err := p.grpcCache.Get(ctx, key); err == nil && !out.StoredAt.After(existing.StoredAt) {
+		return
+	}
+	_ = p.grpcCache.Set(ctx, key, out, ttl)
+}
+
+// grpcWriteStripe maps a cache key to a write-lock stripe with FNV-1a.
+func grpcWriteStripe(key string) uint64 {
+	const (
+		offset = 1469598103934665603
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= prime
+	}
+	return h % grpcWriteStripes
 }
 
 // findMatchingAllowRule returns the first allow rule matching the method,

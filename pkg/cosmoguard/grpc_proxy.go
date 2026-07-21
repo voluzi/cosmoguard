@@ -118,7 +118,18 @@ type GrpcProxy struct {
 	olricClient *olric.EmbeddedClient
 	proxyName   string
 	setRulesMu  sync.Mutex
+	// writeLocks serializes cache writes per key (striped). The foreground
+	// single-flight group and the background SWR refresh group are
+	// independent, so both can Set the same key concurrently; without this a
+	// slow older refresh could land after — and clobber, plus re-extend the
+	// TTL of — a fresher foreground write. Zero-value ready; no wiring needed.
+	writeLocks [grpcWriteStripes]sync.Mutex
 }
+
+// grpcWriteStripes bounds the per-key write-lock table so it never grows with
+// the cardinality of cache keys. Distinct keys occasionally share a stripe and
+// serialize a write; harmless, since writes are off the cache-hit hot path.
+const grpcWriteStripes = 64
 
 // SetDashboard wires the dashboard observability sink and section
 // name. Called by cosmoguard.New after construction.

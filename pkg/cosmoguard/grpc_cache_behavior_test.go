@@ -528,3 +528,52 @@ func TestGRPCCacheStaleResponseRefreshesOnceInBackground(t *testing.T) {
 	require.Equal(t, refreshedPayload, response)
 	require.Equal(t, int32(2), invokes.Load())
 }
+
+// A slow background SWR refresh carrying an OLDER snapshot must never clobber a
+// fresher foreground write (nor re-extend its TTL). Foreground and refresh use
+// independent single-flight groups, both writing the same key — newest-wins is
+// the only thing keeping the cache from serving stale data as fresh.
+func TestGRPCStaleRefreshDoesNotClobberNewerForegroundWrite(t *testing.T) {
+	payloads := make(chan []byte, 2)
+	conn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		return stream.SendMsg(&rawFrame{Payload: <-payloads})
+	})
+	p, rule := newGRPCCacheTestProxy(t, conn, &RuleCache{
+		Enable: true, TTL: time.Minute, StaleWhileRevalidate: time.Hour,
+	})
+	reqPayload := []byte("req")
+	key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, reqPayload, rule.Cache.KeyMode, p.canonical, "")
+
+	older := time.Unix(1000, 0).UTC()
+	newer := time.Unix(2000, 0).UTC()
+
+	// Foreground miss: newer snapshot, stored first.
+	p.now = func() time.Time { return newer }
+	payloads <- []byte("new")
+	_, err := p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule)
+	require.NoError(t, err)
+
+	// Older refresh completes afterwards — must be rejected as stale.
+	p.now = func() time.Time { return older }
+	payloads <- []byte("old")
+	_, err = p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule)
+	require.NoError(t, err)
+
+	got, err := p.grpcCache.Get(context.Background(), key)
+	require.NoError(t, err)
+	require.Equal(t, "new", string(got.Payload), "older refresh clobbered newer foreground write")
+	require.Equal(t, newer, got.StoredAt)
+
+	// Sanity: a genuinely newer write still replaces the entry.
+	p.now = func() time.Time { return newer.Add(time.Second) }
+	payloads <- []byte("newest")
+	_, err = p.grpcFetchAndStore(context.Background(), grpcCacheTestMethod, reqPayload, key, rule)
+	require.NoError(t, err)
+	got, err = p.grpcCache.Get(context.Background(), key)
+	require.NoError(t, err)
+	require.Equal(t, "newest", string(got.Payload))
+}
