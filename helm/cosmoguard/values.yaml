@@ -443,23 +443,27 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
   # targetMemoryUtilizationPercentage: 80
-  # behavior: passed straight through to the HPA spec. Matters in cluster mode —
-  # removing several pods at once forces olric to rebalance many partitions
-  # simultaneously, so a conservative scaleDown (stabilization window + one pod
-  # per period) lets partitions hand off gracefully between removals.
-  # behavior:
-  #   scaleDown:
-  #     stabilizationWindowSeconds: 300
-  #     policies:
-  #       - type: Pods
-  #         value: 1
-  #         periodSeconds: 120
-  #   scaleUp:
-  #     stabilizationWindowSeconds: 15
-  #     policies:
-  #       - type: Pods
-  #         value: 2
-  #         periodSeconds: 60
+  # behavior is passed straight through to the HPA spec. It only takes effect
+  # when autoscaling.enabled is true (the HPA object isn't rendered otherwise),
+  # so it ships as a real default: enabling HPA then gets an olric-safe
+  # conservative scaleDown out of the box instead of Kubernetes' aggressive
+  # default (which can remove every excess pod at once after the stabilization
+  # window — forcing olric to rebalance many partitions simultaneously). One
+  # pod every 2 minutes lets partitions hand off gracefully between removals.
+  # Override for a faster fleet, or set behavior: {} for the Kubernetes defaults.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
 
 # ServiceMonitor for the Prometheus operator. Disabled by default;
 # enable when prometheus-operator is installed in the cluster.
