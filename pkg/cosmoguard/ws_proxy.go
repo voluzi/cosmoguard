@@ -717,6 +717,9 @@ func (p *JsonRpcWebSocketProxy) coalescedWSRequest(ctx context.Context, hash uin
 		return response, requestErr
 	})
 	if err != nil {
+		if out.owner != nil && out.owner != owner {
+			return p.broker.HandleRequest(request)
+		}
 		return nil, err
 	}
 	if !out.shareable && out.owner != owner {
