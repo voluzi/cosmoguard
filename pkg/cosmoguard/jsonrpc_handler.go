@@ -688,7 +688,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 					h.serveSingleMiss(w, r, next, hash, rule.Cache, ruleTag, request, startTime)
 					return
 				}
-				forwardSingleUpstream(request, w, r, next)
+				h.forwardSingleUpstream(request, w, r, next)
 				h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 				return
 
@@ -731,7 +731,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 			h.recordSingle(r, request, "", RuleActionDeny, startTime, "request denied (auth)")
 			return
 		}
-		forwardSingleUpstream(request, w, r, next)
+		h.forwardSingleUpstream(request, w, r, next)
 		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 	} else {
 		h.cgDashboard.RecordDeny(DenyRecord{
@@ -748,8 +748,11 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 	}
 }
 
-func forwardSingleUpstream(request *JsonRpcMsg, w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request)) {
+func (h *JsonRpcHandler) forwardSingleUpstream(request *JsonRpcMsg, w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request)) {
 	if request.ID == nil {
+		if h.cors != nil {
+			h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+		}
 		next(&discardResponseWriter{}, r)
 		return
 	}
@@ -806,7 +809,8 @@ func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *htt
 	// Stamp StoredAt and store under a physical TTL extended by the stale
 	// window so this entry can be served stale-while-revalidate later.
 	res.StoredAt = nowOrDefault(h.now).UTC()
-	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+	stale := upstreamHTTPStaleWindow(ww.GetCommittedHeaders(), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), stale)
 	go h.persistSingleResponse(hash, res, physTTL, ruleTag, method)
 }
 
@@ -871,6 +875,7 @@ type bufferedJsonRpcResponse struct {
 	Upstream      string
 	Cached        *JsonRpcMsg
 	CacheState    string
+	StaleWindow   time.Duration
 }
 
 type jsonRpcResponseOwner [1]byte
@@ -912,7 +917,7 @@ func (h *JsonRpcHandler) singleBackgroundRefreshFn(r *http.Request, next func(ht
 func (h *JsonRpcHandler) recentSingleResponse(r *http.Request, hash uint64, cache *RuleCache) (bufferedJsonRpcResponse, bool) {
 	if pending, ok := h.pendingSingles.Load(hash); ok {
 		entry := pending.(*jsonPendingResponse)
-		state := classifyFreshness(entry.response.Message.StoredAt, nowOrDefault(h.now), effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+		state := classifyFreshness(entry.response.Message.StoredAt, nowOrDefault(h.now), effectiveTTL(cache, h.cacheConfig), entry.response.StaleWindow)
 		switch state {
 		case freshEntry:
 			return entry.response, true
@@ -974,7 +979,8 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 	}
 	out.Shareable = true
 	res.StoredAt = nowOrDefault(h.now).UTC()
-	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+	out.StaleWindow = upstreamHTTPStaleWindow(out.Headers, resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), out.StaleWindow)
 	pendingResponse := out
 	pendingResponse.Headers = nil
 	pendingResponse.RawBody = nil
@@ -1267,7 +1273,7 @@ RequestsLoop:
 	pendingRequests := responses.GetPendingRequests()
 	if len(pendingRequests) > 0 {
 		h.log.Debug("getting from upstream")
-		upstreamResponses, err := h.getResponsesFromUpstream(r, pendingRequests, next)
+		upstreamResponses, upstreamHeaders, err := h.getResponsesFromUpstream(r, pendingRequests, next)
 		if err != nil {
 			// Don't fail the whole batch with a non-JSON 500: that breaks
 			// batch semantics and discards cache hits already resolved
@@ -1279,7 +1285,7 @@ RequestsLoop:
 			// Correlate by id (Set) — per JSON-RPC 2.0 batch responses
 			// match by id, not position; notifications get none.
 			responses.Set(pendingRequests, upstreamResponses)
-			if err = responses.StoreInCache(h.cache, nowOrDefault(h.now).UTC(), h.cacheConfig, func(ruleTag, method string) {
+			if err = responses.StoreInCache(h.cache, nowOrDefault(h.now).UTC(), h.cacheConfig, upstreamHeaders, func(ruleTag, method string) {
 				h.cgDashboard.RecordCardinality(h.section, ruleTag, method)
 			}); err != nil {
 				h.log.Errorf("error caching responses: %v", err)
@@ -1329,10 +1335,10 @@ RequestsLoop:
 	}).Info("processed batch of requests")
 }
 
-func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, requests JsonRpcMsgs, next func(http.ResponseWriter, *http.Request)) (JsonRpcMsgs, error) {
+func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, requests JsonRpcMsgs, next func(http.ResponseWriter, *http.Request)) (JsonRpcMsgs, http.Header, error) {
 	b, err := requests.Marshal()
 	if err != nil {
-		return nil, fmt.Errorf("error marshalling requests to upstream: %v", err)
+		return nil, nil, fmt.Errorf("error marshalling requests to upstream: %v", err)
 	}
 	req := httpRequest.Clone(httpRequest.Context())
 	req.Body = io.NopCloser(bytes.NewReader(b))
@@ -1350,20 +1356,20 @@ func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, req
 	w := newCappedResponseWriter(maxUpstreamBatchResponse)
 	next(w, req)
 	if w.overflowed {
-		return nil, fmt.Errorf("upstream batch response exceeded %d bytes (cap)", maxUpstreamBatchResponse)
+		return nil, nil, fmt.Errorf("upstream batch response exceeded %d bytes (cap)", maxUpstreamBatchResponse)
 	}
 	b = w.buf.Bytes()
 	if len(bytes.TrimSpace(b)) == 0 {
-		return nil, nil
+		return nil, w.Header().Clone(), nil
 	}
 	single, responses, parseErr := ParseJsonRpcMessage(b)
 	if parseErr != nil {
-		return nil, fmt.Errorf("error parsing upstream batch response: %w", parseErr)
+		return nil, nil, fmt.Errorf("error parsing upstream batch response: %w", parseErr)
 	}
 	if len(responses) == 0 && single != nil {
 		responses = JsonRpcMsgs{single}
 	}
-	return responses, nil
+	return responses, w.Header().Clone(), nil
 }
 
 // cappedResponseWriter is an http.ResponseWriter that buffers the body up

@@ -129,9 +129,8 @@ func approxInterfaceCost(v interface{}) uint64 {
 // rawOrNull is a custom unmarshal target that distinguishes an absent
 // JSON field, an explicit `null`, and any other value. jsoniter's
 // RawMessage unmarshaller collapses `null` and "absent" into the same
-// empty slice (unlike encoding/json), so we need this shim to recover
-// the "explicit null was on the wire" signal for `"result":null`
-// preservation.
+// empty slice (unlike encoding/json), so callers use this shim when
+// wire-level field presence affects JSON-RPC semantics.
 type rawOrNull struct {
 	raw    []byte
 	isNull bool
@@ -151,8 +150,8 @@ func (j *JsonRpcMsg) UnmarshalJSON(b []byte) error {
 
 	var dest = struct {
 		*msg
-		ID     jsoniter.RawMessage `json:"id,omitempty"`
-		Result rawOrNull           `json:"result,omitempty"`
+		ID     rawOrNull `json:"id,omitempty"`
+		Result rawOrNull `json:"result,omitempty"`
 	}{
 		msg: (*msg)(j),
 	}
@@ -161,17 +160,20 @@ func (j *JsonRpcMsg) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	if len(dest.ID) >= 1 {
-		i, err := strconv.Atoi(string(dest.ID))
+	switch {
+	case dest.ID.isNull:
+		j.ID = explicitNullID
+	case len(dest.ID.raw) >= 1:
+		i, err := strconv.Atoi(string(dest.ID.raw))
 		if err == nil {
 			j.ID = i
 		} else {
-			j.ID, err = strconv.Unquote(string(dest.ID))
+			j.ID, err = strconv.Unquote(string(dest.ID.raw))
 			if err != nil {
 				return err
 			}
 		}
-	} else {
+	default:
 		j.ID = nil
 	}
 
@@ -522,6 +524,9 @@ func (l *JsonRpcResponses) Set(requests, responses JsonRpcMsgs) {
 		if res == nil {
 			continue
 		}
+		if req == nil || req.ID == nil {
+			continue
+		}
 		if matched, ok := byID[normalizeJsonRpcID(req.ID)]; ok {
 			res.Response = matched
 			continue
@@ -581,7 +586,7 @@ func (l *JsonRpcResponses) Deny(request *JsonRpcMsg) {
 // caller can bump the per-rule cache-cardinality counter (the WS / HTTP
 // single-request paths do this inline; batch fans out through here).
 // onWrite receives the rule tag and the original JSON-RPC method.
-func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], now time.Time, global *CacheGlobalConfig, onWrite func(ruleTag, method string)) error {
+func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], now time.Time, global *CacheGlobalConfig, upstreamHeaders http.Header, onWrite func(ruleTag, method string)) error {
 	for _, r := range *l {
 		if r.Response != nil && r.Cache != nil && r.Cache.Enable {
 			if r.Response.Error != nil && !r.Cache.CacheError {
@@ -597,7 +602,8 @@ func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], 
 			// while it revalidates. When SWR is off the physical TTL is just
 			// the logical TTL.
 			r.Response.StoredAt = now
-			ttl := physicalTTL(effectiveTTL(r.Cache, global), resolveStaleWindow(r.Cache, cfgStaleWindow(global)))
+			stale := upstreamHTTPStaleWindow(upstreamHeaders, resolveStaleWindow(r.Cache, cfgStaleWindow(global)))
+			ttl := physicalTTL(effectiveTTL(r.Cache, global), stale)
 			if err := cache.Set(context.Background(), r.CacheKey, r.Response, ttl); err != nil {
 				return err
 			}

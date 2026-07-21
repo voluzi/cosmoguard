@@ -1460,6 +1460,152 @@ func (c *blockingJSONCache) Close() error {
 	return nil
 }
 
+type capturedJSONStore struct {
+	response *JsonRpcMsg
+	ttl      time.Duration
+}
+
+type capturingJSONCache struct {
+	set chan capturedJSONStore
+}
+
+func (c *capturingJSONCache) Set(_ context.Context, _ uint64, response *JsonRpcMsg, ttl time.Duration) error {
+	c.set <- capturedJSONStore{response: response, ttl: ttl}
+	return nil
+}
+
+func (*capturingJSONCache) Get(context.Context, uint64) (*JsonRpcMsg, error) {
+	return nil, cachepkg.ErrNotFound
+}
+
+func (*capturingJSONCache) Has(context.Context, uint64) (bool, error) { return false, nil }
+func (*capturingJSONCache) Close() error                              { return nil }
+
+func receiveJSONStore(t *testing.T, cache *capturingJSONCache) capturedJSONStore {
+	t.Helper()
+	select {
+	case stored := <-cache.set:
+		return stored
+	case <-time.After(time.Second):
+		t.Fatal("JSON-RPC cache persistence did not run")
+		return capturedJSONStore{}
+	}
+}
+
+func TestJSONRPCRevalidationDirectivesDisableStaleStorage(t *testing.T) {
+	for _, directive := range []string{"must-revalidate", "proxy-revalidate"} {
+		t.Run(directive, func(t *testing.T) {
+			newHandler := func(t *testing.T) (*JsonRpcHandler, *JsonRpcRule, *capturingJSONCache) {
+				t.Helper()
+				rule := &JsonRpcRule{
+					Action:  RuleActionAllow,
+					Methods: []string{"status"},
+					Cache:   &RuleCache{Enable: true, TTL: 5 * time.Second, StaleWhileRevalidate: time.Minute},
+				}
+				h := newJSONCacheHandler(t, rule)
+				capturing := &capturingJSONCache{set: make(chan capturedJSONStore, 1)}
+				h.cache = capturing
+				return h, rule, capturing
+			}
+			next := func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", "public, "+directive)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
+			}
+
+			t.Run("coalesced single", func(t *testing.T) {
+				h, rule, capturing := newHandler(t)
+				request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+				req, _ := jsonRequestContext()
+				_, err := h.fetchSingle(req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rule", request.Method, &jsonRpcResponseOwner{}, false)
+				require.NoError(t, err)
+				require.Equal(t, 5*time.Second, receiveJSONStore(t, capturing).ttl)
+			})
+
+			t.Run("non-coalesced single", func(t *testing.T) {
+				h, rule, capturing := newHandler(t)
+				request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+				req, _ := jsonRequestContext()
+				h.getSingleUpstreamResponse(httptest.NewRecorder(), req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rule", request.Method)
+				require.Equal(t, 5*time.Second, receiveJSONStore(t, capturing).ttl)
+			})
+
+			t.Run("batch", func(t *testing.T) {
+				h, _, capturing := newHandler(t)
+				req, _ := jsonRequestContext()
+				h.handleHttpBatch(
+					JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "status"}},
+					httptest.NewRecorder(),
+					req,
+					func(w http.ResponseWriter, _ *http.Request) {
+						w.Header().Set("Cache-Control", "public, "+directive)
+						_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+					},
+					time.Now(),
+				)
+				require.Equal(t, 5*time.Second, receiveJSONStore(t, capturing).ttl)
+			})
+		})
+	}
+}
+
+func TestJSONRPCPendingRevalidationRequiredResponseIsNotServedStale(t *testing.T) {
+	for _, directive := range []string{"must-revalidate", "proxy-revalidate"} {
+		t.Run(directive, func(t *testing.T) {
+			rule := &JsonRpcRule{
+				Action:  RuleActionAllow,
+				Methods: []string{"status"},
+				Cache:   &RuleCache{Enable: true, TTL: time.Second, StaleWhileRevalidate: time.Minute},
+			}
+			h := newJSONCacheHandler(t, rule)
+			blocking := newBlockingJSONCache()
+			t.Cleanup(func() { _ = blocking.Close() })
+			h.cache = blocking
+			base := time.Unix(2_000_000, 0)
+			var clock atomic.Int64
+			clock.Store(base.UnixNano())
+			h.now = func() time.Time { return time.Unix(0, clock.Load()) }
+			var upstreamCalls atomic.Int32
+			next := func(w http.ResponseWriter, _ *http.Request) {
+				call := strconv.Itoa(int(upstreamCalls.Add(1)))
+				w.Header().Set("Cache-Control", "public, "+directive)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + call + `,"result":"response-` + call + `"}`))
+			}
+
+			first := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				req, _ := jsonRequestContext()
+				h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, req, next, time.Now())
+				first <- rec
+			}()
+			select {
+			case <-blocking.setStarted:
+			case <-time.After(time.Second):
+				t.Fatal("cache persistence did not start")
+			}
+			require.JSONEq(t, `{"jsonrpc":"2.0","id":1,"result":"response-1"}`, (<-first).Body.String())
+
+			clock.Store(base.Add(2 * time.Second).UnixNano())
+			second := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				req, _ := jsonRequestContext()
+				h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 2, Method: "status"}, rec, req, next, time.Now())
+				second <- rec
+			}()
+			select {
+			case rec := <-second:
+				require.Equal(t, cacheMiss, rec.Header().Get(cacheStateHeader))
+				require.JSONEq(t, `{"jsonrpc":"2.0","id":2,"result":"response-2"}`, rec.Body.String())
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("revalidation-required pending response did not refetch")
+			}
+			require.Equal(t, int32(2), upstreamCalls.Load())
+			_ = blocking.Close()
+		})
+	}
+}
+
 func TestJSONRPCMissResponseDoesNotWaitForCachePersistence(t *testing.T) {
 	rule := &JsonRpcRule{
 		Action:  RuleActionAllow,
