@@ -415,6 +415,15 @@ func (h *JsonRpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 
 func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 	next func(http.ResponseWriter, *http.Request), startTime time.Time) {
+	// Apply CORS up front so EVERY exit carries Access-Control-* for allowed
+	// browser origins — including the direct parse / empty-batch / maxBatchSize
+	// and auth / rate-limit error returns below, which never reach the reverse
+	// proxy (whose ModifyResponse/ErrorHandler is the only other CORS source).
+	// ApplyToResponse is idempotent (Del+Set), so the buffered hit/miss paths
+	// that re-derive it per waiter Origin stay correct.
+	if h.cors != nil {
+		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+	}
 	// The body was wrapped in http.MaxBytesReader by HttpProxy.ServeHTTP
 	// before this handler runs. ReusableReader drains it now; a drain
 	// error is the body-size cap tripping (oversized chunked / mismatched

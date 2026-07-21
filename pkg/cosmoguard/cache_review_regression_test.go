@@ -1926,3 +1926,35 @@ func TestJSONRPCCoalescedForegroundTimeoutStillAnswersLiveCaller(t *testing.T) {
 
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 }
+
+// Direct JSON-RPC error exits (parse / empty-batch / oversized-batch) bypass
+// the reverse proxy, so the handler itself must apply CORS — otherwise a
+// browser sees a CORS failure masking the real JSON-RPC error.
+func TestJSONRPCDirectErrorExitsApplyCORS(t *testing.T) {
+	cors := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://app.example"}}
+	require.NoError(t, cors.Compile())
+	cases := []struct{ name, body string }{
+		{"unparseable json", "not json at all"},
+		{"empty batch", "[]"},
+		{"oversized batch", `[{"jsonrpc":"2.0","id":1,"method":"q"},{"jsonrpc":"2.0","id":2,"method":"q"}]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &JsonRpcHandler{
+				log:           log.WithField("t", "jsonrpc-cors"),
+				cgDashboard:   newDashboardObservability(),
+				section:       "rpc.jsonrpc",
+				defaultAction: RuleActionAllow,
+				cors:          cors,
+				maxBatchSize:  1,
+			}
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+			r.Header.Set("Origin", "https://app.example")
+			h.handleHttp(w, r, func(http.ResponseWriter, *http.Request) {}, time.Now())
+			require.Equal(t, "https://app.example", w.Header().Get("Access-Control-Allow-Origin"),
+				"direct error exit must carry Access-Control-Allow-Origin")
+		})
+	}
+}
+
