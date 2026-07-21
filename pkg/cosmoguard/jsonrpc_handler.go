@@ -677,10 +677,10 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 							// Serve stale immediately, refresh in the
 							// background (coalesced by key) — the client never
 							// waits on the upstream.
+							h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, rule.Cache, ruleTag, request.Method))
 							w.Header().Set(cacheStateHeader, cacheStale)
 							h.writeSingleResponse(w, r, res.CloneWithID(request.ID))
 							h.recordSingle(r, request, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
-							h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, rule.Cache, ruleTag, request.Method))
 							return
 							// expiredEntry falls through to a miss.
 						}
@@ -833,10 +833,10 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 	}
 	if res.Cached != nil {
 		if res.CacheState == cacheStale {
+			h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, cache, ruleTag, request.Method))
 			w.Header().Set(cacheStateHeader, cacheStale)
 			h.writeSingleResponse(w, r, res.Cached.CloneWithID(request.ID))
 			h.recordSingle(r, request, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
-			h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, cache, ruleTag, request.Method))
 		} else {
 			h.writeSingleResponse(w, r, res.Cached.CloneWithID(request.ID))
 			h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
@@ -878,7 +878,9 @@ func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http
 		if recent, ok := h.recentSingleResponse(r, hash, cache); ok {
 			return recent, nil
 		}
-		req := r.Clone(context.WithoutCancel(r.Context()))
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), configuredHTTPForegroundFetchTimeout(h.cacheConfig))
+		defer cancel()
+		req := r.Clone(ctx)
 		req.Body = io.NopCloser(bytes.NewReader(body))
 		req.ContentLength = int64(len(body))
 		return h.fetchSingle(req, next, hash, cache, ruleTag, method, owner, true)
@@ -888,7 +890,8 @@ func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http
 func (h *JsonRpcHandler) singleBackgroundRefreshFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) func() (bufferedJsonRpcResponse, error) {
 	body := snapshotRequestBody(r)
 	return func() (bufferedJsonRpcResponse, error) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpRefreshTimeout)
+		ctx, _ := WithRequestStats(context.WithoutCancel(r.Context()))
+		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
 		req.Body = io.NopCloser(bytes.NewReader(body))

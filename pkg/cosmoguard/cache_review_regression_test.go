@@ -1008,29 +1008,106 @@ func TestJSONRPCCoalescedWaitersReapplyCORS(t *testing.T) {
 	require.Equal(t, "https://b.example", (<-second).Header().Get("Access-Control-Allow-Origin"))
 }
 
-func TestJSONRPCForegroundMissHasNoArtificialRefreshDeadline(t *testing.T) {
+func TestJSONRPCForegroundMissUsesConfiguredProxyDeadline(t *testing.T) {
 	rule := &JsonRpcRule{
 		Action:  RuleActionAllow,
 		Methods: []string{"status"},
 		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
 	}
 	h := newJSONCacheHandler(t, rule)
-	next := func(w http.ResponseWriter, r *http.Request) {
-		result := "no-artificial-deadline"
-		if _, hasDeadline := r.Context().Deadline(); hasDeadline {
-			result = "artificial-deadline"
-		}
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"` + result + `"}`))
+	type deadlineObservation struct {
+		remaining time.Duration
+		ok        bool
 	}
+	observedDeadline := make(chan deadlineObservation, 1)
+	next := func(w http.ResponseWriter, r *http.Request) {
+		deadline, ok := r.Context().Deadline()
+		remaining := time.Duration(0)
+		if ok {
+			remaining = time.Until(deadline)
+		}
+		observedDeadline <- deadlineObservation{remaining: remaining, ok: ok}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"bounded"}`))
+	}
+	configuredTimeout := 45 * time.Minute
+	h.cacheConfig = &CacheGlobalConfig{HTTPForegroundFetchTimeout: configuredTimeout}
 
 	rec := httptest.NewRecorder()
 	req, _ := jsonRequestContext()
-	ctx, cancel := context.WithTimeout(req.Context(), time.Hour)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
 	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, req, next, time.Now())
 
-	require.JSONEq(t, `{"jsonrpc":"2.0","id":1,"result":"no-artificial-deadline"}`, rec.Body.String())
+	require.JSONEq(t, `{"jsonrpc":"2.0","id":1,"result":"bounded"}`, rec.Body.String())
+	observed := <-observedDeadline
+	require.True(t, observed.ok)
+	require.Greater(t, observed.remaining, 44*time.Minute)
+	require.LessOrEqual(t, observed.remaining, configuredTimeout)
+}
+
+func TestHTTPBackgroundRefreshUsesIndependentRequestStats(t *testing.T) {
+	observedStats := make(chan *RequestStats, 1)
+	target, err := url.Parse("http://upstream.invalid")
+	require.NoError(t, err)
+	reverseProxy := httputil.NewSingleHostReverseProxy(target)
+	reverseProxy.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		observedStats <- RequestStatsFromCtx(r.Context())
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("fresh")),
+			Request:    r,
+		}, nil
+	})
+	upstream := &HttpUpstream{Name: "up", Target: target, proxy: reverseProxy}
+	upstream.healthy.Store(true)
+	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "stats-test", CacheBudget{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = responseCache.Close() })
+	p := &HttpProxy{
+		log:   log.WithField("test", "refresh-stats"),
+		pool:  newTestHTTPPool("weighted-round-robin", 0, upstream),
+		cache: responseCache,
+		now:   time.Now,
+	}
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	ctx, originalStats := WithRequestStats(req.Context())
+	req = req.WithContext(ctx)
+
+	_, err = p.backgroundRefreshFn(req, "key", &RuleCache{Enable: true, TTL: time.Minute}, "rule")()
+	require.NoError(t, err)
+	refreshStats := <-observedStats
+	require.NotNil(t, refreshStats)
+	require.NotSame(t, originalStats, refreshStats)
+	require.Equal(t, "up", refreshStats.Upstream)
+	require.Empty(t, originalStats.Upstream)
+}
+
+func TestJSONRPCBackgroundRefreshUsesIndependentRequestStats(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+	}
+	h := newJSONCacheHandler(t, rule)
+	observedStats := make(chan *RequestStats, 1)
+	next := func(w http.ResponseWriter, r *http.Request) {
+		stats := RequestStatsFromCtx(r.Context())
+		stats.Upstream = "json-up"
+		observedStats <- stats
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"fresh"}`))
+	}
+	req, originalStats := jsonRequestContext()
+	request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+
+	_, err := h.singleBackgroundRefreshFn(req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rule", request.Method)()
+	require.NoError(t, err)
+	refreshStats := <-observedStats
+	require.NotNil(t, refreshStats)
+	require.NotSame(t, originalStats, refreshStats)
+	require.Equal(t, "json-up", refreshStats.Upstream)
+	require.Empty(t, originalStats.Upstream)
 }
 
 type deadlineObservingJSONCache struct {

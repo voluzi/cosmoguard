@@ -1173,7 +1173,8 @@ func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cach
 func (p *HttpProxy) backgroundRefreshFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string) func() (bufferedUpstreamResponse, error) {
 	body := snapshotRequestBody(r)
 	return func() (bufferedUpstreamResponse, error) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpRefreshTimeout)
+		ctx, _ := WithRequestStats(context.WithoutCancel(r.Context()))
+		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
 		req.Body = io.NopCloser(bytes.NewReader(body))

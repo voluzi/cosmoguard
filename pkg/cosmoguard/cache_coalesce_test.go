@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -255,6 +256,86 @@ func TestHTTPServeStaleStartsRefreshBeforeClientWriteCompletes(t *testing.T) {
 			t.Fatal("background refresh never started")
 		}
 		t.Fatal("background refresh started only after the stale body write completed")
+	}
+}
+
+func TestJSONRPCStaleStartsRefreshBeforeClientWriteCompletes(t *testing.T) {
+	tests := []struct {
+		name   string
+		invoke func(*JsonRpcHandler, http.ResponseWriter, *http.Request, func(http.ResponseWriter, *http.Request), uint64, *JsonRpcRule, *JsonRpcMsg)
+	}{
+		{
+			name: "direct cache hit",
+			invoke: func(h *JsonRpcHandler, w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request), _ uint64, _ *JsonRpcRule, request *JsonRpcMsg) {
+				h.handleHttpSingle(request, w, r, next, time.Now())
+			},
+		},
+		{
+			name: "coalesced stale replay",
+			invoke: func(h *JsonRpcHandler, w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, rule *JsonRpcRule, request *JsonRpcMsg) {
+				h.serveSingleMiss(w, r, next, hash, rule.Cache, "rule", request, time.Now())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rule := &JsonRpcRule{
+				Action:  RuleActionAllow,
+				Methods: []string{"status"},
+				Cache:   &RuleCache{Enable: true, TTL: time.Minute, StaleWhileRevalidate: time.Minute},
+			}
+			h := newJSONCacheHandler(t, rule)
+			base := time.Unix(2_000_000, 0)
+			h.now = func() time.Time { return base }
+			request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+			hash := request.HashWithRule(rule.Fingerprint)
+			require.NoError(t, h.cache.Set(context.Background(), hash, &JsonRpcMsg{
+				Version:  "2.0",
+				ID:       1,
+				Result:   []byte(`"stale"`),
+				StoredAt: base.Add(-90 * time.Second),
+			}, time.Hour))
+
+			refreshStarted := make(chan struct{})
+			var refreshOnce sync.Once
+			next := func(w http.ResponseWriter, _ *http.Request) {
+				refreshOnce.Do(func() { close(refreshStarted) })
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"fresh"}`))
+			}
+			releaseWrite := make(chan struct{})
+			var releaseOnce sync.Once
+			t.Cleanup(func() { releaseOnce.Do(func() { close(releaseWrite) }) })
+			w := &blockingCachedResponseWriter{
+				header:       make(http.Header),
+				writeStarted: make(chan struct{}),
+				releaseWrite: releaseWrite,
+			}
+			req, _ := jsonRequestContext()
+			done := make(chan struct{})
+			go func() {
+				tt.invoke(h, w, req, next, hash, rule, request)
+				close(done)
+			}()
+
+			<-w.writeStarted
+			refreshBeforeWriteCompleted := false
+			select {
+			case <-refreshStarted:
+				refreshBeforeWriteCompleted = true
+			case <-time.After(250 * time.Millisecond):
+			}
+			releaseOnce.Do(func() { close(releaseWrite) })
+			<-done
+			if !refreshBeforeWriteCompleted {
+				select {
+				case <-refreshStarted:
+				case <-time.After(time.Second):
+					t.Fatal("background refresh never started")
+				}
+				t.Fatal("background refresh started only after the stale body write completed")
+			}
+		})
 	}
 }
 
