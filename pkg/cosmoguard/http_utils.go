@@ -145,6 +145,7 @@ type ResponseWriterWrapper struct {
 	multi            io.Writer
 	statusCode       int
 	committedHeaders http.Header // snapshot taken at WriteHeader / first Write
+	commitHeaders    http.Header
 }
 
 func WrapResponseWriter(w http.ResponseWriter) *ResponseWriterWrapper {
@@ -157,12 +158,22 @@ func WrapResponseWriter(w http.ResponseWriter) *ResponseWriterWrapper {
 	}
 }
 
+func (w *ResponseWriterWrapper) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *ResponseWriterWrapper) setHeaderOnCommit(name, value string) {
+	if w.commitHeaders == nil {
+		w.commitHeaders = make(http.Header)
+	}
+	w.commitHeaders.Set(name, value)
+}
+
 func (w *ResponseWriterWrapper) Write(p []byte) (int, error) {
 	if w.statusCode == 0 {
 		// http.ResponseWriter implicitly writes a 200 on first Write; mirror
 		// that semantics here so the snapshot captures the headers the
 		// client actually sees.
 		w.statusCode = http.StatusOK
+		w.applyCommitHeaders()
 		w.snapshotHeaders()
 	}
 	return w.multi.Write(p)
@@ -170,8 +181,15 @@ func (w *ResponseWriterWrapper) Write(p []byte) (int, error) {
 
 func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
+	w.applyCommitHeaders()
 	w.snapshotHeaders()
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *ResponseWriterWrapper) applyCommitHeaders() {
+	for name, values := range w.commitHeaders {
+		w.ResponseWriter.Header()[name] = append([]string(nil), values...)
+	}
 }
 
 func (w *ResponseWriterWrapper) snapshotHeaders() {

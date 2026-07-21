@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"gotest.tools/assert"
 )
@@ -257,6 +258,30 @@ func TestHttpRule_Fingerprint(t *testing.T) {
 	assert.NilError(t, b.Compile())
 	assert.Assert(t, a.Fingerprint != b.Fingerprint,
 		"rules differing only in cacheError must have different fingerprints")
+}
+
+func TestRuleCacheDisableStaleWhileRevalidateValidationAndFingerprint(t *testing.T) {
+	mkRule := func(cache *RuleCache) *HttpRule {
+		return &HttpRule{
+			Priority: 100,
+			Action:   RuleActionAllow,
+			Paths:    []string{"/x"},
+			Methods:  []string{"GET"},
+			Cache:    cache,
+		}
+	}
+
+	inherited := mkRule(&RuleCache{})
+	disabled := mkRule(&RuleCache{DisableStaleWhileRevalidate: true})
+	assert.NilError(t, inherited.Compile())
+	assert.NilError(t, disabled.Compile())
+	assert.Assert(t, inherited.Fingerprint != disabled.Fingerprint)
+
+	conflicting := mkRule(&RuleCache{
+		StaleWhileRevalidate:        time.Minute,
+		DisableStaleWhileRevalidate: true,
+	})
+	assert.ErrorContains(t, conflicting.Compile(), "cannot set both")
 }
 
 func TestJsonRpcRule_Match(t *testing.T) {

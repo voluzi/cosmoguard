@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/segmentio/fasthash/fnv1a"
@@ -57,6 +58,15 @@ type JsonRpcMsg struct {
 	// itself (json:"-") and carried through Redis-backed caches via
 	// msgpack.
 	WireSuffix []byte `json:"-" msgpack:"wire_suffix,omitempty"`
+
+	// StoredAt is when this response was written to the cache. Like
+	// WireSuffix it is cache-only (never serialized to a client) and
+	// carried through the msgpack-backed L2. The freshness /
+	// stale-while-revalidate policy reads it at lookup time. Zero for
+	// entries written before this field existed → treated as fresh (see
+	// classifyFreshness): those entries have no stale window, so the
+	// backend TTL still evicts them correctly.
+	StoredAt time.Time `json:"-" msgpack:"stored_at,omitempty"`
 }
 
 // jsonRpcMsgOverheadBytes is a flat per-entry allowance covering the
@@ -119,9 +129,8 @@ func approxInterfaceCost(v interface{}) uint64 {
 // rawOrNull is a custom unmarshal target that distinguishes an absent
 // JSON field, an explicit `null`, and any other value. jsoniter's
 // RawMessage unmarshaller collapses `null` and "absent" into the same
-// empty slice (unlike encoding/json), so we need this shim to recover
-// the "explicit null was on the wire" signal for `"result":null`
-// preservation.
+// empty slice (unlike encoding/json), so callers use this shim when
+// wire-level field presence affects JSON-RPC semantics.
 type rawOrNull struct {
 	raw    []byte
 	isNull bool
@@ -141,8 +150,8 @@ func (j *JsonRpcMsg) UnmarshalJSON(b []byte) error {
 
 	var dest = struct {
 		*msg
-		ID     jsoniter.RawMessage `json:"id,omitempty"`
-		Result rawOrNull           `json:"result,omitempty"`
+		ID     rawOrNull `json:"id,omitempty"`
+		Result rawOrNull `json:"result,omitempty"`
 	}{
 		msg: (*msg)(j),
 	}
@@ -151,17 +160,20 @@ func (j *JsonRpcMsg) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	if len(dest.ID) >= 1 {
-		i, err := strconv.Atoi(string(dest.ID))
+	switch {
+	case dest.ID.isNull:
+		j.ID = explicitNullID
+	case len(dest.ID.raw) >= 1:
+		i, err := strconv.Atoi(string(dest.ID.raw))
 		if err == nil {
 			j.ID = i
 		} else {
-			j.ID, err = strconv.Unquote(string(dest.ID))
+			j.ID, err = strconv.Unquote(string(dest.ID.raw))
 			if err != nil {
 				return err
 			}
 		}
-	} else {
+	default:
 		j.ID = nil
 	}
 
@@ -204,6 +216,7 @@ func (j *JsonRpcMsg) Clone() *JsonRpcMsg {
 		Result:     j.Result,
 		Error:      j.Error.Clone(),
 		WireSuffix: j.WireSuffix,
+		StoredAt:   j.StoredAt,
 	}
 }
 
@@ -216,6 +229,7 @@ func (j *JsonRpcMsg) CloneWithID(id interface{}) *JsonRpcMsg {
 		Result:     j.Result,
 		Error:      j.Error.Clone(),
 		WireSuffix: j.WireSuffix,
+		StoredAt:   j.StoredAt,
 	}
 }
 
@@ -510,6 +524,9 @@ func (l *JsonRpcResponses) Set(requests, responses JsonRpcMsgs) {
 		if res == nil {
 			continue
 		}
+		if req == nil || req.ID == nil {
+			continue
+		}
 		if matched, ok := byID[normalizeJsonRpcID(req.ID)]; ok {
 			res.Response = matched
 			continue
@@ -569,7 +586,15 @@ func (l *JsonRpcResponses) Deny(request *JsonRpcMsg) {
 // caller can bump the per-rule cache-cardinality counter (the WS / HTTP
 // single-request paths do this inline; batch fans out through here).
 // onWrite receives the rule tag and the original JSON-RPC method.
-func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], onWrite func(ruleTag, method string)) error {
+func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], now time.Time, global *CacheGlobalConfig, upstreamHeaders http.Header, onWrite func(ruleTag, method string)) error {
+	// A batch shares one HTTP response, so its Cache-Control governs every
+	// message in it. Anti-cache directives (no-store/no-cache/private/zero
+	// max-age) forbid storage: entries here are written under a stale-extended
+	// TTL for single-path / WS serve-stale, so a stored no-cache reply would be
+	// served stale without the revalidation it requires. Mirror the HTTP path.
+	if !cacheableByUpstream(upstreamHeaders) {
+		return nil
+	}
 	for _, r := range *l {
 		if r.Response != nil && r.Cache != nil && r.Cache.Enable {
 			if r.Response.Error != nil && !r.Cache.CacheError {
@@ -579,7 +604,15 @@ func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], 
 				continue
 			}
 
-			if err := cache.Set(context.Background(), r.CacheKey, r.Response, r.Cache.TTL); err != nil {
+			// Stamp StoredAt and store under a physical TTL extended by the
+			// stale window (StoredAt is json:"-" so it never leaks to the
+			// client) so single-path / WS reads can serve this entry stale
+			// while it revalidates. When SWR is off the physical TTL is just
+			// the logical TTL.
+			r.Response.StoredAt = now
+			stale := upstreamHTTPStaleWindow(upstreamHeaders, resolveStaleWindow(r.Cache, cfgStaleWindow(global)))
+			ttl := physicalTTL(effectiveTTL(r.Cache, global), stale)
+			if err := cache.Set(context.Background(), r.CacheKey, r.Response, ttl); err != nil {
 				return err
 			}
 			if onWrite != nil && r.Request != nil {

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/olric-data/olric"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -83,10 +84,20 @@ type GrpcProxy struct {
 	pool          *GrpcUpstreamPool
 	rulesMutex    sync.RWMutex
 	log           *Entry
-	// grpcCache holds cached response bytes keyed by per-rule fingerprint
-	// + method + request bytes. Populated when any rule has cache.enable
+	// grpcCache holds cached responses keyed by per-rule fingerprint +
+	// method + request bytes. Populated when any rule has cache.enable
 	// configured; nil otherwise (no overhead).
-	grpcCache cosmoguardcache.Cache[string, []byte]
+	grpcCache cosmoguardcache.Cache[string, grpcCachedResponse]
+	// cacheConfig is the global cache config; used to resolve the
+	// cluster-wide coalesce / stale-while-revalidate / ttl defaults a rule
+	// inherits when it leaves them unset. nil in tests that bypass New.
+	cacheConfig *CacheGlobalConfig
+	// sf coalesces concurrent cache misses (single-flight) and drives
+	// stale-while-revalidate background refreshes, keyed by cache key.
+	sf coalescer[grpcCachedResponse]
+	// now returns the current time; swappable in tests for deterministic
+	// freshness / SWR. Defaults to time.Now in NewGrpcProxy.
+	now func() time.Time
 	// canonical holds protobuf method descriptors loaded from operator-
 	// supplied protoset files. Used by rules with cache.keyMode:
 	// canonical to decode + re-encode request payloads deterministically
@@ -107,7 +118,18 @@ type GrpcProxy struct {
 	olricClient *olric.EmbeddedClient
 	proxyName   string
 	setRulesMu  sync.Mutex
+	// writeLocks serializes cache writes per key (striped). The foreground
+	// single-flight group and the background SWR refresh group are
+	// independent, so both can Set the same key concurrently; without this a
+	// slow older refresh could land after — and clobber, plus re-extend the
+	// TTL of — a fresher foreground write. Zero-value ready; no wiring needed.
+	writeLocks [grpcWriteStripes]sync.Mutex
 }
+
+// grpcWriteStripes bounds the per-key write-lock table so it never grows with
+// the cardinality of cache keys. Distinct keys occasionally share a stripe and
+// serialize a write; harmless, since writes are off the cache-hit hot path.
+const grpcWriteStripes = 64
 
 // SetDashboard wires the dashboard observability sink and section
 // name. Called by cosmoguard.New after construction.
@@ -140,8 +162,10 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	}
 
 	proxy := GrpcProxy{
-		log:      log.WithField("proxy", name),
-		listener: lis,
+		log:         log.WithField("proxy", name),
+		listener:    lis,
+		cacheConfig: cfg.CacheConfig,
+		now:         time.Now,
 	}
 
 	if len(protosets) > 0 {
@@ -176,7 +200,7 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	if cfg.CacheConfig != nil {
 		cacheOptions = append(cacheOptions, cosmoguardcache.DefaultTTL(cfg.CacheConfig.TTL))
 	}
-	gcache, err := newResponseCache[string, []byte](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
+	gcache, err := newResponseCache[string, grpcCachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}

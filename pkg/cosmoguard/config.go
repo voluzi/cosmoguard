@@ -17,6 +17,11 @@ import (
 const (
 	cacheHit  = "hit"
 	cacheMiss = "miss"
+	// cacheStale is emitted when a request is served from an expired-but-
+	// still-serveable entry (stale-while-revalidate) while a background
+	// refresh runs. Distinct from "hit" so operators can see the SWR path
+	// working and size the stale window.
+	cacheStale = "stale"
 	// cacheError is emitted when the cache backend itself failed (Redis
 	// timeout, connection refused, etc.) — distinct from a clean
 	// "key not found" miss. Without this, a Redis outage looks
@@ -331,6 +336,27 @@ type CacheGlobalConfig struct {
 	// in-process L1 (see pkg/cache/tiered.go).
 	TTL time.Duration `yaml:"ttl,omitempty" default:"5s"`
 	Key string        `yaml:"key"`
+	// Coalesce is the cluster-wide default for single-flight: when a
+	// cacheable key is a hard miss, only one request fetches upstream and
+	// concurrent requests for the same key share that result (per pod).
+	// *bool so an explicit `coalesce: false` survives defaults; nil → ON.
+	// A rule may override via its own cache.coalesce. Changing this global
+	// default requires a process restart (same as cache.ttl).
+	Coalesce *bool `yaml:"coalesce,omitempty"`
+	// StaleWhileRevalidate is the cluster-wide default stale window: how
+	// long past a cached entry's TTL it may still be served (immediately,
+	// with X-Cosmoguard-Cache: stale) while one background request
+	// refreshes it. 0 (default) disables SWR. A rule may override via its
+	// own cache.staleWhileRevalidate. Restart-required, like cache.ttl.
+	StaleWhileRevalidate time.Duration `yaml:"staleWhileRevalidate,omitempty"`
+	// HTTPForegroundFetchTimeout bounds a detached shared HTTP cache miss.
+	// Increase it for endpoints that legitimately run longer than the five-minute
+	// default without coupling the shared fetch to one caller's deadline.
+	HTTPForegroundFetchTimeout time.Duration `yaml:"httpForegroundFetchTimeout,omitempty" default:"5m"`
+	// GRPCForegroundFetchTimeout bounds a detached shared gRPC cache miss.
+	// Increase it for methods that legitimately run longer than the five-minute
+	// default without coupling the shared fetch to one caller's deadline.
+	GRPCForegroundFetchTimeout time.Duration `yaml:"grpcForegroundFetchTimeout,omitempty" default:"5m"`
 	// Memory bounds the cache's memory footprint so a high-cardinality
 	// query load can't grow the working set until the pod is OOMKilled.
 	// See CacheMemoryConfig; when omitted the budget is auto-derived from
@@ -514,6 +540,19 @@ type RuleCache struct {
 	TTL              time.Duration `yaml:"ttl,omitempty"`
 	CacheError       bool          `yaml:"cacheError,omitempty"`
 	CacheEmptyResult bool          `yaml:"cacheEmptyResult,omitempty"`
+
+	// Coalesce overrides the global cache.coalesce default for this rule
+	// (single-flight of concurrent misses). nil → inherit the global
+	// default (which is ON); set explicitly to force on/off on this rule.
+	Coalesce *bool `yaml:"coalesce,omitempty"`
+	// StaleWhileRevalidate overrides the global stale window for this rule.
+	// 0 (unset) → inherit the global cache.staleWhileRevalidate, exactly as
+	// an unset per-rule ttl inherits cache.ttl. >0 serves an expired entry
+	// for up to this long while one background request refreshes it.
+	StaleWhileRevalidate time.Duration `yaml:"staleWhileRevalidate,omitempty"`
+	// DisableStaleWhileRevalidate opts this rule out of an inherited global
+	// stale window. It cannot be combined with a positive per-rule window.
+	DisableStaleWhileRevalidate bool `yaml:"disableStaleWhileRevalidate,omitempty"`
 	// PreserveHeaders is the list of upstream response header names that
 	// should be replayed verbatim on a cache hit, in addition to the
 	// always-preserved set (Content-Type, Content-Encoding, Cache-Control,
@@ -1127,6 +1166,15 @@ func validateCacheMemory(m *CacheMemoryConfig) error {
 func validateCacheBackend(c *CacheGlobalConfig) error {
 	if err := validateCacheMemory(&c.Memory); err != nil {
 		return err
+	}
+	if c.StaleWhileRevalidate < 0 {
+		return fmt.Errorf("cache.staleWhileRevalidate must be >= 0 (0 disables it); got %s", c.StaleWhileRevalidate)
+	}
+	if c.HTTPForegroundFetchTimeout < 0 {
+		return fmt.Errorf("cache.httpForegroundFetchTimeout must be >= 0; got %s", c.HTTPForegroundFetchTimeout)
+	}
+	if c.GRPCForegroundFetchTimeout < 0 {
+		return fmt.Errorf("cache.grpcForegroundFetchTimeout must be >= 0; got %s", c.GRPCForegroundFetchTimeout)
 	}
 	if c.Cluster != nil {
 		// A wildcard bindAddr (empty, 0.0.0.0, ::) is incompatible with

@@ -77,7 +77,7 @@ nodes:
     grpcPort: 9090
     evmRpcPort: 8545                # only when enableEvm: true
     evmRpcWsPort: 8546
-    weight: 1                       # reserved for weighted-RR; ignored today
+    weight: 1                       # relative share under weighted-round-robin (the default strategy)
     healthcheck:
       enable: true
       path: /status                 # URL path probed (e.g. /status, /node_info)
@@ -135,9 +135,17 @@ The `cache:` block configures the cache, rate-limiter, and (optional) cluster ru
 cache:
   ttl: 5s                                   # global default; rules can override
   key: "cosmoguard-prod"                    # optional key prefix
+  coalesce: true                            # global default for single-flight (on); rules can override
+  staleWhileRevalidate: 0s                  # global default stale window (0 = off); rules can override
+  httpForegroundFetchTimeout: 5m            # detached coalesced HTTP miss safety bound
+  grpcForegroundFetchTimeout: 5m            # detached coalesced gRPC miss safety bound
   # memory: …                               # cache memory budget (see below)
   # cluster: …                              # presence enables networked cluster mode
 ```
+
+`coalesce` and `staleWhileRevalidate` are cluster-wide **defaults** that each rule inherits unless it sets its own — exactly like `ttl`. Both are covered in [Cache features](#cache-features) below. Changing the global `cache:` block requires a process restart (like `cache.ttl`); per-rule overrides hot-reload.
+
+`httpForegroundFetchTimeout` and `grpcForegroundFetchTimeout` bound the detached upstream calls shared by coalesced HTTP and gRPC misses. Both default to `5m`, are independent of any one caller's deadline, and can be increased for cacheable endpoints or unary methods that legitimately take longer. Each caller still stops waiting under its own request context.
 
 ### Memory budget
 
@@ -539,12 +547,30 @@ cache:
   ttl: 1h                            # 0 means use global cache.ttl
   cacheError: false                  # cache non-2xx responses?
   cacheEmptyResult: false            # cache JSON-RPC results that came back null?
+  coalesce: true                     # single-flight concurrent misses (0/unset = inherit global, default on)
+  staleWhileRevalidate: 30s          # serve stale up to this long while refreshing (0/unset = inherit global)
+  disableStaleWhileRevalidate: false # set true to opt this rule out of an inherited global stale window
   preserveHeaders:                   # additional headers to replay on hit
     - Content-Encoding               # (Content-Type / Cache-Control / ETag / Vary
     - X-Custom-Header                #  are always preserved)
 ```
 
 Cache keys are namespaced per rule fingerprint — two rules matching the same request never share entries.
+
+##### Cache features
+
+Both `coalesce` and `staleWhileRevalidate` are per-rule overrides of the global `cache.*` defaults, inherited when unset (an unset/`0` value falls through to the global, exactly as `ttl: 0` inherits `cache.ttl`).
+
+- **`coalesce` (single-flight)** — on by default. When a cacheable key is a hard miss, only ONE request fetches upstream; concurrent requests for the same key wait and share that result. This collapses the thundering herd that hits the upstream every time a hot key expires. Set `coalesce: false` to disable per rule (each concurrent miss then fetches independently — the previous behaviour).
+- **`staleWhileRevalidate` (serve-stale)** — off by default (`0`). When set, an entry that has passed its `ttl` but is still within the window is served **immediately** (with `X-Cosmoguard-Cache: stale`, or `x-cosmoguard-cache: stale` metadata for gRPC) while ONE background request refreshes it — so the client never waits on the upstream and the entry stays warm. Requires a positive freshness `ttl` (the rule's `ttl`, or the global default) to extend. Set `disableStaleWhileRevalidate: true` on a rule that must opt out of a positive global window; it cannot be combined with a positive per-rule window.
+
+Scope and caveats:
+- Coalescing applies to HTTP-family rules (LCD, RPC-HTTP, EVM-RPC-HTTP), gRPC rules, and JSON-RPC **single** requests over HTTP or WebSocket. gRPC responses also carry `x-cosmoguard-cache` response metadata (`hit`/`miss`/`stale`).
+- Serve-stale SWR applies to HTTP-family rules, gRPC, and JSON-RPC single requests over HTTP. WebSocket single requests coalesce stale revalidation but wait for the refreshed response instead of serving stale data.
+- HTTP responses carrying `Cache-Control: must-revalidate` or `proxy-revalidate` are never served stale, even when SWR is enabled.
+- **JSON-RPC batch** items are freshness-aware (a stale entry is revalidated as part of the aggregated batch call) but are not individually coalesced or served stale — a batch already collapses its misses into a single upstream call, so there is nothing to coalesce.
+- Coalescing is **per-pod** (in-process). Across a cluster the shared olric L2 dedups the stored value and serves subsequent reads cluster-wide, so per-pod single-flight already cuts an expiry stampede from N-per-pod to ~1-per-pod.
+- A coalesced miss buffers the upstream response fully before replying (it can't stream to N waiters); for cacheable responses this only shifts first-byte latency. Set `coalesce: false` on a rule if you need streaming on the miss path.
 
 #### Rate limit
 

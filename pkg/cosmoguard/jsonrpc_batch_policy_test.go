@@ -33,6 +33,30 @@ func TestJsonRpcResponses_NotificationBatchNotDropped(t *testing.T) {
 	}
 }
 
+func TestJsonRpcResponses_NotificationIgnoresUpstreamReply(t *testing.T) {
+	var l JsonRpcResponses
+	call := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "a"}
+	notification := &JsonRpcMsg{Version: "2.0", Method: "b"}
+	l.AddPending(call)
+	l.AddPending(notification)
+
+	l.Set(
+		JsonRpcMsgs{call, notification},
+		JsonRpcMsgs{
+			{Version: "2.0", ID: 1, Result: []byte(`"ok"`)},
+			{Version: "2.0", ID: explicitNullID, Result: []byte(`"unexpected"`)},
+		},
+	)
+
+	final := l.GetFinal()
+	if len(final) != 1 {
+		t.Fatalf("notification reply must be suppressed, got %d responses", len(final))
+	}
+	if final[0].ID != 1 {
+		t.Fatalf("expected only the id=1 call response, got id=%v", final[0].ID)
+	}
+}
+
 // TestJsonRpcResponses_DroppedCallFlagged confirms the guard still fires
 // when a real id-bearing call goes unanswered (the case the original
 // count check protected against).
@@ -259,6 +283,60 @@ func TestHandleHttpBatch_AllNotificationsEmptyBody(t *testing.T) {
 	}
 }
 
+func TestHandleHttpBatch_AppliesCORS(t *testing.T) {
+	cors := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://app.example"}}
+	if err := cors.Compile(); err != nil {
+		t.Fatalf("compile CORS config: %v", err)
+	}
+	tests := []struct {
+		name      string
+		batch     JsonRpcMsgs
+		next      func(http.ResponseWriter, *http.Request)
+		wantEmpty bool
+	}{
+		{
+			name:  "response body",
+			batch: JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "q"}},
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+			},
+		},
+		{
+			name:      "all notifications",
+			batch:     JsonRpcMsgs{{Version: "2.0", Method: "q"}},
+			next:      func(http.ResponseWriter, *http.Request) {},
+			wantEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &JsonRpcHandler{
+				log:           log.WithField("t", "jsonrpc-batch"),
+				cgDashboard:   newDashboardObservability(),
+				section:       "rpc.jsonrpc",
+				defaultAction: RuleActionAllow,
+				cors:          cors,
+			}
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/", nil)
+			r.Header.Set("Origin", "https://app.example")
+
+			h.handleHttpBatch(tt.batch, w, r, tt.next, time.Now())
+
+			if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+				t.Fatalf("batch response missing CORS origin, got %q", got)
+			}
+			if !corsVaryHasOrigin(w.Header()) {
+				t.Fatalf("batch response missing Vary: Origin: %v", w.Header().Values("Vary"))
+			}
+			if tt.wantEmpty && w.Body.Len() != 0 {
+				t.Fatalf("notification-only batch must remain empty, got %q", w.Body.String())
+			}
+		})
+	}
+}
+
 // TestHandleHttpBatch_CacheDisabledNotServed is the regression test for
 // the cache.enable gap: a rule with a cache: block but enable:false must
 // forward to upstream, never serve a pre-existing cached entry. The
@@ -426,12 +504,9 @@ func TestHandleHttpBatch_UnmatchedDefaultAllowHonoursDefaultRequire(t *testing.T
 	}
 }
 
-// TestHandleHttpBatch_NotificationCacheHitNoResponse is the regression
-// test for the notification cache-hit leak: the cache key ignores id, so
-// a prior id-bearing call can prime an entry; a later notification (no
-// id) with the same method/params hits that entry but must still get NO
-// response (JSON-RPC 2.0 §4.1).
-func TestHandleHttpBatch_NotificationCacheHitNoResponse(t *testing.T) {
+// Notifications must reach upstream even when an id-bearing call has primed
+// the same cache key, but they still produce no response (§4.1).
+func TestHandleHttpBatch_NotificationBypassesCache(t *testing.T) {
 	h := &JsonRpcHandler{
 		log:           log.WithField("t", "jsonrpc-batch"),
 		cgDashboard:   newDashboardObservability(),
@@ -451,8 +526,9 @@ func TestHandleHttpBatch_NotificationCacheHitNoResponse(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	upstreamCalled := false
 	next := func(http.ResponseWriter, *http.Request) {
-		t.Fatal("cache hit must not reach upstream")
+		upstreamCalled = true
 	}
 
 	h.handleHttpBatch(batch, w, r, next, time.Now())
@@ -467,11 +543,14 @@ func TestHandleHttpBatch_NotificationCacheHitNoResponse(t *testing.T) {
 	if id, _ := arr[0]["id"].(float64); id != 1 {
 		t.Fatalf("the single response must be the id=1 call, got id=%v", arr[0]["id"])
 	}
+	if !upstreamCalled {
+		t.Fatal("notification must bypass the primed cache and reach upstream")
+	}
 }
 
-// TestHandleHttpSingle_NotificationCacheHitNoResponse mirrors the above
-// for the single-request path: a notification cache hit writes no body.
-func TestHandleHttpSingle_NotificationCacheHitNoResponse(t *testing.T) {
+// The single-request path also forwards notifications without consulting a
+// primed cache entry and suppresses the upstream response body.
+func TestHandleHttpSingle_NotificationBypassesCache(t *testing.T) {
 	h := &JsonRpcHandler{
 		log:           log.WithField("t", "jsonrpc-single"),
 		cgDashboard:   newDashboardObservability(),
@@ -487,13 +566,134 @@ func TestHandleHttpSingle_NotificationCacheHitNoResponse(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
-	next := func(http.ResponseWriter, *http.Request) { t.Fatal("cache hit must not reach upstream") }
+	upstreamCalled := false
+	next := func(uw http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		uw.Header().Set("X-Upstream", "must-not-leak")
+		uw.WriteHeader(http.StatusBadGateway)
+		_, _ = uw.Write([]byte(`<html>bad gateway</html>`))
+	}
 
 	// Notification: no id.
 	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r, next, time.Now())
 
 	if w.Body.Len() != 0 {
-		t.Fatalf("notification cache hit must write no response body, got %q", w.Body.String())
+		t.Fatalf("notification must write no response body, got %q", w.Body.String())
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("notification must suppress upstream status, got %d", w.Code)
+	}
+	if got := w.Header().Get("X-Upstream"); got != "" {
+		t.Fatalf("notification must suppress upstream headers, got %q", got)
+	}
+	if !upstreamCalled {
+		t.Fatal("notification must bypass the primed cache and reach upstream")
+	}
+}
+
+func TestHandleHttpSingle_DefaultAllowedNotificationSuppressesUpstreamResponse(t *testing.T) {
+	h := &JsonRpcHandler{
+		log:           log.WithField("t", "jsonrpc-single"),
+		cgDashboard:   newDashboardObservability(),
+		section:       "rpc.jsonrpc",
+		defaultAction: RuleActionAllow,
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	upstreamCalled := false
+	next := func(uw http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		uw.Header().Set("X-Upstream", "must-not-leak")
+		uw.WriteHeader(http.StatusBadGateway)
+		_, _ = uw.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32603}}`))
+	}
+
+	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r, next, time.Now())
+
+	if !upstreamCalled {
+		t.Fatal("default-allowed notification must reach upstream")
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("notification must write no response body, got %q", w.Body.String())
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("notification must suppress upstream status, got %d", w.Code)
+	}
+	if got := w.Header().Get("X-Upstream"); got != "" {
+		t.Fatalf("notification must suppress upstream headers, got %q", got)
+	}
+}
+
+func TestHandleHttpSingle_ExplicitNullIDReceivesUpstreamResponse(t *testing.T) {
+	request, batch, err := ParseJsonRpcMessage([]byte(`{"jsonrpc":"2.0","id":null,"method":"q"}`))
+	if err != nil {
+		t.Fatalf("parse explicit-null request: %v", err)
+	}
+	if len(batch) != 0 || request == nil {
+		t.Fatalf("expected a single request, got request=%v batch=%v", request, batch)
+	}
+	if request.ID == nil {
+		t.Error("explicit null id must remain distinguishable from an absent id")
+	}
+	encoded, err := request.Marshal()
+	if err != nil {
+		t.Fatalf("marshal explicit-null request: %v", err)
+	}
+	if string(encoded) != `{"jsonrpc":"2.0","id":null,"method":"q"}` {
+		t.Errorf("explicit null id was not preserved: %s", encoded)
+	}
+
+	h := &JsonRpcHandler{
+		log:           log.WithField("t", "jsonrpc-single"),
+		cgDashboard:   newDashboardObservability(),
+		section:       "rpc.jsonrpc",
+		defaultAction: RuleActionAllow,
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	next := func(uw http.ResponseWriter, _ *http.Request) {
+		uw.Header().Set("Content-Type", "application/json")
+		_, _ = uw.Write([]byte(`{"jsonrpc":"2.0","id":null,"result":"ok"}`))
+	}
+
+	h.handleHttpSingle(request, w, r, next, time.Now())
+
+	if w.Body.String() != `{"jsonrpc":"2.0","id":null,"result":"ok"}` {
+		t.Fatalf("explicit-null call response was suppressed: %q", w.Body.String())
+	}
+}
+
+func TestHandleHttpSingle_AllowedNotificationAppliesCORS(t *testing.T) {
+	cors := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://app.example"}}
+	if err := cors.Compile(); err != nil {
+		t.Fatalf("compile CORS config: %v", err)
+	}
+	h := &JsonRpcHandler{
+		log:           log.WithField("t", "jsonrpc-single"),
+		cgDashboard:   newDashboardObservability(),
+		section:       "rpc.jsonrpc",
+		defaultAction: RuleActionAllow,
+		cors:          cors,
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	r.Header.Set("Origin", "https://app.example")
+	next := func(uw http.ResponseWriter, upstreamRequest *http.Request) {
+		cors.ApplyToResponse(uw.Header(), upstreamRequest.Header.Get("Origin"))
+		uw.WriteHeader(http.StatusBadGateway)
+		_, _ = uw.Write([]byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603}}`))
+	}
+
+	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r, next, time.Now())
+
+	if w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Fatalf("notification response must remain empty 200, got status=%d body=%q", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+		t.Fatalf("notification response missing CORS origin, got %q", got)
+	}
+	if !corsVaryHasOrigin(w.Header()) {
+		t.Fatalf("notification response missing Vary: Origin: %v", w.Header().Values("Vary"))
 	}
 }
 

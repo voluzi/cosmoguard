@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"net/http"
 	"strings"
+	"time"
 )
 
 // alwaysPreservedHeaders is the set of upstream response headers always
@@ -30,6 +31,30 @@ var alwaysPreservedHeaders = []string{
 	// would re-emit the stale upstream value on every replay, leaving
 	// downstream caches with no signal that the response actually aged
 	// while sitting in cosmoguard's cache.
+}
+
+func cacheControlRequiresRevalidation(value string) bool {
+	for _, raw := range strings.Split(value, ",") {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "must-revalidate", "proxy-revalidate":
+			return true
+		}
+	}
+	return false
+}
+
+func upstreamHTTPStaleWindow(headers http.Header, configured time.Duration) time.Duration {
+	if cacheControlRequiresRevalidation(strings.Join(headers.Values("Cache-Control"), ",")) {
+		return 0
+	}
+	return configured
+}
+
+func cachedHTTPStaleWindow(response CachedResponse, configured time.Duration) time.Duration {
+	if cacheControlRequiresRevalidation(response.Headers[http.CanonicalHeaderKey("Cache-Control")]) {
+		return 0
+	}
+	return configured
 }
 
 // hopByHopHeaders are RFC 7230 section 6.1 hop-by-hop headers that must
@@ -127,6 +152,43 @@ func pickCacheableHeaders(upstream http.Header, extra []string) map[string]strin
 		out[c] = strings.Join(vals, ", ")
 	}
 	return out
+}
+
+var sharedResponseHeaders = map[string]struct{}{
+	"Cache-Control": {},
+	"Content-Type":  {},
+	"Retry-After":   {},
+}
+
+var rewrittenRepresentationHeaders = map[string]struct{}{
+	"Content-Digest": {},
+	"Content-Length": {},
+	"Content-Md5":    {},
+	"Digest":         {},
+	"Etag":           {},
+	"Last-Modified":  {},
+	"Repr-Digest":    {},
+}
+
+func pickSharedResponseHeaders(upstream http.Header) http.Header {
+	if upstream == nil {
+		return nil
+	}
+	out := make(http.Header)
+	for name, values := range upstream {
+		canonical := http.CanonicalHeaderKey(name)
+		if _, ok := sharedResponseHeaders[canonical]; !ok {
+			continue
+		}
+		out[canonical] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func stripRewrittenRepresentationHeaders(headers http.Header) {
+	for name := range rewrittenRepresentationHeaders {
+		headers.Del(name)
+	}
 }
 
 func isHopByHop(canonicalName string) bool {

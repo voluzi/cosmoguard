@@ -83,3 +83,23 @@ func TestMemoryCacheStringStruct(t *testing.T) {
 	}
 	testMemoryCache(t, items)
 }
+
+func TestMemoryCacheCloseWaitsForCleanupLoop(t *testing.T) {
+	for range 100 {
+		cacheInterface, err := NewMemoryCache[string, string](DefaultNamespace)
+		if !assert.NoError(t, err) {
+			continue
+		}
+		cache, ok := cacheInterface.(MemoryCache[string, string])
+		if !assert.True(t, ok) {
+			continue
+		}
+
+		assert.NoError(t, cache.Close())
+		select {
+		case <-cache.startDone:
+		case <-time.After(time.Second):
+			t.Fatal("Close returned before the cleanup loop exited")
+		}
+	}
+}
