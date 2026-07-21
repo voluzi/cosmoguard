@@ -1456,6 +1456,18 @@ func validateNodeHealthcheck(n *NodeConfig) error {
 	if n == nil || !n.Healthcheck.IsEnabled() {
 		return nil
 	}
+	// healthyAfter / unhealthyAfter drive int32 success/failure counters (and
+	// the cold-start readiness seed = healthyAfter-1). A value outside int32
+	// range truncates/overflows the counter — a pod could then never clear its
+	// readiness gate. Reject it here with a clear message rather than surface
+	// as a silent, permanently-NotReady pod. defaults.Set has already filled
+	// unset values (2 / 3) by the time this runs.
+	if v := n.Healthcheck.HealthyAfter; v < 1 || v > math.MaxInt32 {
+		return fmt.Errorf("healthcheck.healthyAfter: %d out of range (want 1..%d)", v, math.MaxInt32)
+	}
+	if v := n.Healthcheck.UnhealthyAfter; v < 1 || v > math.MaxInt32 {
+		return fmt.Errorf("healthcheck.unhealthyAfter: %d out of range (want 1..%d)", v, math.MaxInt32)
+	}
 	switch n.Healthcheck.Service {
 	case "", "lcd", "rpc", "evm_rpc", "evm_rpc_ws":
 		return nil

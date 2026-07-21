@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -346,5 +347,24 @@ func TestColdStartGateClearsOnFirstProbe(t *testing.T) {
 	pool.recordProbeResult(pool.Upstreams()[0], true, nil) // one successful probe
 	if !pool.AnyHealthy() {
 		t.Fatal("first successful probe must clear the cold-start gate even with HealthyAfter=3")
+	}
+}
+
+// healthyAfter / unhealthyAfter must fit the int32 probe counters — an
+// out-of-range value would overflow the cold-start seed and leave a pod
+// permanently NotReady, so config prep rejects it.
+func TestValidateNodeHealthcheckThresholdRange(t *testing.T) {
+	on := true
+	tooBig := &NodeConfig{Healthcheck: &NodeHealthcheckConfig{Enable: &on, HealthyAfter: math.MaxInt32 + 1, UnhealthyAfter: 3}}
+	if err := validateNodeHealthcheck(tooBig); err == nil {
+		t.Fatal("healthyAfter beyond int32 range must be rejected")
+	}
+	tooBigFail := &NodeConfig{Healthcheck: &NodeHealthcheckConfig{Enable: &on, HealthyAfter: 2, UnhealthyAfter: math.MaxInt32 + 1}}
+	if err := validateNodeHealthcheck(tooBigFail); err == nil {
+		t.Fatal("unhealthyAfter beyond int32 range must be rejected")
+	}
+	ok := &NodeConfig{Healthcheck: &NodeHealthcheckConfig{Enable: &on, HealthyAfter: 2, UnhealthyAfter: 3}}
+	if err := validateNodeHealthcheck(ok); err != nil {
+		t.Fatalf("valid thresholds must pass: %v", err)
 	}
 }
