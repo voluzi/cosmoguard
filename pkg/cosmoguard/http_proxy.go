@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -972,11 +973,7 @@ func (p *HttpProxy) writeCachedResponse(w http.ResponseWriter, r *http.Request, 
 	for k, v := range res.Headers {
 		w.Header().Set(k, v)
 	}
-	if !res.StoredAt.IsZero() {
-		age := int(p.timeNow().Sub(res.StoredAt).Seconds()) + res.UpstreamAge
-		if age < 0 {
-			age = 0
-		}
+	if age, ok := cachedResponseAge(res, p.timeNow()); ok {
 		w.Header().Set("Age", strconv.Itoa(age))
 	}
 	w.Header().Set(cacheStateHeader, state)
@@ -1145,10 +1142,19 @@ func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cach
 	if pending, ok := p.pendingMisses.Load(requestHash); ok {
 		entry := pending.(*httpPendingResponse)
 		stale := cachedHTTPStaleWindow(entry.cached, resolveStaleWindow(cache, p.globalStaleWindow()))
-		state := classifyFreshness(entry.cached.StoredAt, p.timeNow(), effectiveTTL(cache, p.cacheConfig), stale)
+		now := p.timeNow()
+		state := classifyFreshness(entry.cached.StoredAt, now, effectiveTTL(cache, p.cacheConfig), stale)
 		switch state {
 		case freshEntry:
-			return entry.response, true
+			response := entry.response
+			response.SharedHeaders = maps.Clone(response.SharedHeaders)
+			if response.SharedHeaders == nil {
+				response.SharedHeaders = make(map[string]string)
+			}
+			if age, ok := cachedResponseAge(entry.cached, now); ok {
+				response.SharedHeaders["Age"] = strconv.Itoa(age)
+			}
+			return response, true
 		case staleEntry:
 			cached := entry.cached
 			return bufferedUpstreamResponse{Cached: &cached, CacheState: cacheStale}, true
@@ -1170,6 +1176,17 @@ func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cach
 		cacheState = cacheStale
 	}
 	return bufferedUpstreamResponse{Cached: &res, CacheState: cacheState}, true
+}
+
+func cachedResponseAge(res CachedResponse, now time.Time) (int, bool) {
+	if res.StoredAt.IsZero() {
+		return 0, false
+	}
+	age := int(now.Sub(res.StoredAt).Seconds()) + res.UpstreamAge
+	if age < 0 {
+		age = 0
+	}
+	return age, true
 }
 
 func (p *HttpProxy) backgroundRefreshFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string) func() (bufferedUpstreamResponse, error) {

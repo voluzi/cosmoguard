@@ -523,6 +523,64 @@ func TestHTTPMissResponseDoesNotWaitForCachePersistence(t *testing.T) {
 	_ = blocking.Close()
 }
 
+func TestHTTPPendingResponseRecomputesAge(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		upstreamAge string
+		initialAge  string
+		pendingAge  string
+	}{
+		{name: "without upstream age", pendingAge: "5"},
+		{name: "with upstream age", upstreamAge: "37", initialAge: "37", pendingAge: "42"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+				if tc.upstreamAge != "" {
+					w.Header().Set("Age", tc.upstreamAge)
+				}
+				w.Header().Set("Cache-Control", "public, max-age=60")
+				_, _ = w.Write([]byte("ok"))
+			})
+			blocking := newBlockingResponseCache()
+			t.Cleanup(func() { _ = blocking.Close() })
+			p.cache = blocking
+			base := time.Unix(2_000_000, 0)
+			var clock atomic.Int64
+			clock.Store(base.UnixNano())
+			p.now = func() time.Time { return time.Unix(0, clock.Load()) }
+			rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute})
+
+			first := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec, _ := cacheRequest(p, rule, nil)
+				first <- rec
+			}()
+			select {
+			case <-blocking.setStarted:
+			case <-time.After(time.Second):
+				t.Fatal("cache persistence did not start")
+			}
+			require.Equal(t, tc.initialAge, (<-first).Header().Get("Age"))
+
+			clock.Store(base.Add(5 * time.Second).UnixNano())
+			second := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec, _ := cacheRequest(p, rule, nil)
+				second <- rec
+			}()
+			select {
+			case rec := <-second:
+				require.Equal(t, cacheMiss, rec.Header().Get(cacheStateHeader))
+				require.Equal(t, tc.pendingAge, rec.Header().Get("Age"))
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("pending response waited for cache persistence")
+			}
+			require.Equal(t, int32(1), hits.Load(), "pending persistence must not open a second upstream miss")
+			_ = blocking.Close()
+		})
+	}
+}
+
 func TestHTTPPendingResponseExpiresBeforePersistenceCompletes(t *testing.T) {
 	var responses atomic.Int32
 	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
