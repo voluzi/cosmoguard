@@ -325,6 +325,15 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 // snapshot can complete after a fresher foreground fetch. Without newest-wins
 // it would clobber the newer payload and re-extend its physical TTL, leaving
 // the cache serving stale data as fresh.
+//
+// Scope is per-pod, by design. The lock serializes THIS pod's foreground and
+// refresh writers, and the Get reflects this pod's own last write (TieredCache
+// Set populates L1). Across pods the Get may hit a stale L1 copy that lags
+// another pod's L2 write, so cross-pod write ordering stays eventually
+// consistent — matching the coalescer's per-pod model (a cluster-wide lock is
+// intentionally out of scope). The residual is bounded staleness the TTL
+// already permits, not a new failure mode; strict cross-pod ordering would
+// need a distributed lock or versioned L2 writes and is deliberately not done.
 func (p *GrpcProxy) storeNewestGRPCResponse(key string, out grpcCachedResponse, ttl time.Duration) {
 	mu := &p.writeLocks[grpcWriteStripe(key)]
 	mu.Lock()
