@@ -921,7 +921,10 @@ func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http
 func (h *JsonRpcHandler) singleBackgroundRefreshFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) func() (bufferedJsonRpcResponse, error) {
 	return func() (bufferedJsonRpcResponse, error) {
 		body := snapshotRequestBody(r)
-		ctx, _ := WithRequestStats(context.WithoutCancel(r.Context()))
+		// Seed the detached refresh stats with the rule tag so the upstream
+		// pool counts this SWR fetch under its rule, not rule_id="default".
+		ctx, stats := WithRequestStats(context.WithoutCancel(r.Context()))
+		stats.RuleTag = ruleTag
 		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
@@ -1306,6 +1309,13 @@ RequestsLoop:
 	pendingRequests := responses.GetPendingRequests()
 	if len(pendingRequests) > 0 {
 		h.log.Debug("getting from upstream")
+		// The batch collapses its pending items into ONE upstream fetch. Attribute
+		// that fetch in cosmoguard_upstream_requests_total to the shared rule when
+		// every pending item matches it, or "batch" for a mixed-rule batch — so
+		// per-rule accounting isn't polluted by the fronting/default tag.
+		if stats := RequestStatsFromCtx(r.Context()); stats != nil {
+			stats.RuleTag = responses.pendingRuleTag()
+		}
 		upstreamResponses, upstreamHeaders, err := h.getResponsesFromUpstream(r, pendingRequests, next)
 		if err != nil {
 			// Don't fail the whole batch with a non-JSON 500: that breaks
