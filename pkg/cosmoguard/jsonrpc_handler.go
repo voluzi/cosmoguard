@@ -1018,7 +1018,8 @@ func (h *JsonRpcHandler) applySingleUpstreamStats(r *http.Request, upstream stri
 }
 
 func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *http.Request, res bufferedJsonRpcResponse, id interface{}, owner *jsonRpcResponseOwner) {
-	if res.Owner != nil && res.Owner == owner {
+	ownsRawResponse := res.Owner != nil && res.Owner == owner
+	if ownsRawResponse {
 		for name, values := range res.Headers {
 			w.Header()[name] = append([]string(nil), values...)
 		}
@@ -1028,7 +1029,7 @@ func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *h
 		}
 	}
 	body := res.RawBody
-	if res.Message != nil {
+	if res.Message != nil && !ownsRawResponse {
 		var err error
 		body, err = res.Message.CloneWithID(id).Marshal()
 		if err != nil {

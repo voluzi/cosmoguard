@@ -671,7 +671,7 @@ func TestJSONRPCNotificationDoesNotCoalesceWithCall(t *testing.T) {
 			<-release
 			return
 		}
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":7,"result":"ok"}`))
 	}
 
 	notificationDone := make(chan struct{}, 1)
@@ -716,7 +716,7 @@ func TestJSONRPCCoalescedMissPreservesStatusAndHeaders(t *testing.T) {
 		w.Header().Set("Retry-After", "3")
 		w.Header().Set("X-Upstream", "node-a")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"busy"}}`))
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"busy"}}`))
 	}
 
 	first := make(chan *httptest.ResponseRecorder, 1)
@@ -854,20 +854,42 @@ func TestJSONRPCRewrittenResponsesDropRepresentationValidators(t *testing.T) {
 		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
 	}
 	h := newJSONCacheHandler(t, rule)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
 	next := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("ETag", `"upstream-wire"`)
 		w.Header().Set("Last-Modified", "Sun, 20 Jul 2026 20:00:00 GMT")
 		w.Header().Set("Content-MD5", "upstream-digest")
+		started <- struct{}{}
+		<-release
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0", "id":1, "result":"ok"}`))
 	}
 
-	rec := httptest.NewRecorder()
-	req, _ := jsonRequestContext()
-	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 999, Method: "status"}, rec, req, next, time.Now())
+	ownerResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req, _ := jsonRequestContext()
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, req, next, time.Now())
+		ownerResult <- rec
+	}()
+	<-started
+	waiterResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req, _ := jsonRequestContext()
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 999, Method: "status"}, rec, req, next, time.Now())
+		waiterResult <- rec
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	owner := <-ownerResult
+	rec := <-waiterResult
 
+	require.Equal(t, `"upstream-wire"`, owner.Header().Get("ETag"))
 	require.Empty(t, rec.Header().Get("ETag"))
 	require.Empty(t, rec.Header().Get("Last-Modified"))
 	require.Empty(t, rec.Header().Get("Content-MD5"))
+	require.JSONEq(t, `{"jsonrpc":"2.0","id":999,"result":"ok"}`, rec.Body.String())
 }
 
 func TestJSONRPCCoalescedWaitersKeepUpstreamStats(t *testing.T) {
@@ -1288,8 +1310,8 @@ func TestJSONRPCPendingResponseExpiresBeforePersistenceCompletes(t *testing.T) {
 	h.now = func() time.Time { return time.Unix(0, clock.Load()) }
 	var upstreamCalls atomic.Int32
 	next := func(w http.ResponseWriter, _ *http.Request) {
-		result := strconv.Itoa(int(upstreamCalls.Add(1)))
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"response-` + result + `"}`))
+		call := strconv.Itoa(int(upstreamCalls.Add(1)))
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + call + `,"result":"response-` + call + `"}`))
 	}
 
 	first := make(chan *httptest.ResponseRecorder, 1)
