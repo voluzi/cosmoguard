@@ -801,6 +801,50 @@ func TestHTTPCoalesceDisabledStreamsMisses(t *testing.T) {
 	require.Equal(t, cacheMiss, resp.Header.Get(cacheStateHeader))
 }
 
+func TestHTTPCoalescedWaiterPreservesRetryAfter(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.Header().Set("Retry-After", "3")
+		w.Header().Set("X-Upstream", "node-a")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("busy"))
+	})
+	blocking := newBlockingResponseCache()
+	t.Cleanup(func() { _ = blocking.Close() })
+	p.cache = blocking
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute, CacheError: true})
+
+	ownerResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec, _ := cacheRequest(p, rule, nil)
+		ownerResult <- rec
+	}()
+	<-started
+	waiterResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec, _ := cacheRequest(p, rule, nil)
+		waiterResult <- rec
+	}()
+	releaseOnce.Do(func() { close(release) })
+
+	owner := <-ownerResult
+	waiter := <-waiterResult
+	for _, rec := range []*httptest.ResponseRecorder{owner, waiter} {
+		require.Equal(t, http.StatusTooManyRequests, rec.Code)
+		require.Equal(t, "3", rec.Header().Get("Retry-After"))
+		require.Equal(t, cacheMiss, rec.Header().Get(cacheStateHeader))
+		require.Equal(t, "busy", rec.Body.String())
+	}
+	require.Equal(t, "node-a", owner.Header().Get("X-Upstream"))
+	require.Empty(t, waiter.Header().Get("X-Upstream"))
+	require.Equal(t, int32(1), hits.Load())
+}
+
 func newJSONCacheHandler(t *testing.T, rule *JsonRpcRule) *JsonRpcHandler {
 	t.Helper()
 	cache, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, "json-review", CacheBudget{})
@@ -822,6 +866,56 @@ func jsonRequestContext() (*http.Request, *RequestStats) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	ctx, stats := WithRequestStats(req.Context())
 	return req.WithContext(ctx), stats
+}
+
+func TestJSONRPCFreshResponsesCarryCacheHeader(t *testing.T) {
+	tests := []struct {
+		name   string
+		invoke func(*JsonRpcHandler, http.ResponseWriter, *http.Request, func(http.ResponseWriter, *http.Request), uint64, *JsonRpcRule, *JsonRpcMsg)
+	}{
+		{
+			name: "direct cache hit",
+			invoke: func(h *JsonRpcHandler, w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request), _ uint64, _ *JsonRpcRule, request *JsonRpcMsg) {
+				h.handleHttpSingle(request, w, r, next, time.Now())
+			},
+		},
+		{
+			name: "coalesced cache replay",
+			invoke: func(h *JsonRpcHandler, w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, rule *JsonRpcRule, request *JsonRpcMsg) {
+				h.serveSingleMiss(w, r, next, hash, rule.Cache, "rule", request, time.Now())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rule := &JsonRpcRule{
+				Action:  RuleActionAllow,
+				Methods: []string{"status"},
+				Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+			}
+			h := newJSONCacheHandler(t, rule)
+			base := time.Unix(2_000_000, 0)
+			h.now = func() time.Time { return base }
+			request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+			hash := request.HashWithRule(rule.Fingerprint)
+			require.NoError(t, h.cache.Set(context.Background(), hash, &JsonRpcMsg{
+				Version:  "2.0",
+				ID:       1,
+				Result:   []byte(`"fresh"`),
+				StoredAt: base,
+			}, time.Hour))
+
+			rec := httptest.NewRecorder()
+			req, _ := jsonRequestContext()
+			tt.invoke(h, rec, req, func(http.ResponseWriter, *http.Request) {
+				t.Fatal("fresh cache hit reached upstream")
+			}, hash, rule, request)
+
+			require.Equal(t, cacheHit, rec.Header().Get(cacheStateHeader))
+			require.JSONEq(t, `{"jsonrpc":"2.0","id":1,"result":"fresh"}`, rec.Body.String())
+		})
+	}
 }
 
 func TestJSONRPCStaleResponseCarriesCacheHeader(t *testing.T) {

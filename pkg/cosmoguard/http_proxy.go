@@ -1265,6 +1265,9 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 	}
 	out.Shareable = true
 	out.SharedHeaders = pickCacheableHeaders(committed, cache.PreserveHeaders)
+	if retryAfter := committed.Get("Retry-After"); retryAfter != "" {
+		out.SharedHeaders["Retry-After"] = retryAfter
+	}
 	if upstreamAge, ok := parseUpstreamAge(committed); ok {
 		out.SharedHeaders["Age"] = strconv.Itoa(upstreamAge)
 	}

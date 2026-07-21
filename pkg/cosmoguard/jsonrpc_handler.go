@@ -670,6 +670,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 						stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(h.cacheConfig))
 						switch classifyFreshness(res.StoredAt, nowOrDefault(h.now), effTTL, stale) {
 						case freshEntry:
+							w.Header().Set(cacheStateHeader, cacheHit)
 							h.writeSingleResponse(w, r, res.CloneWithID(request.ID))
 							h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
 							return
@@ -850,6 +851,7 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 			h.writeSingleResponse(w, r, res.Cached.CloneWithID(request.ID))
 			h.recordSingle(r, request, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
 		} else {
+			w.Header().Set(cacheStateHeader, cacheHit)
 			h.writeSingleResponse(w, r, res.Cached.CloneWithID(request.ID))
 			h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
 		}
