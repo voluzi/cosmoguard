@@ -103,6 +103,34 @@ func TestApplyEnvOverrides_ClusterExplicitOptOut(t *testing.T) {
 	assert.Assert(t, cfg.Cache.Cluster == nil)
 }
 
+func TestApplyEnvOverrides_ClusterOptOutClearsExistingYAMLBlock(t *testing.T) {
+	// ENABLE=false must disable a cluster block that came from YAML, not just
+	// skip creating one — cfg.Cache.Cluster != nil is the cluster-mode toggle.
+	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "false")
+	cfg := &Config{}
+	cfg.Cache.Cluster = &ClusterConfig{BindAddr: "10.0.0.9", EncryptionKey: testClusterKey}
+	assert.NilError(t, applyClusterEnvOverrides(cfg))
+	assert.Assert(t, cfg.Cache.Cluster == nil, "ENABLE=false must clear a YAML-defined cluster block")
+}
+
+func TestApplyEnvOverrides_ClusterInheritedPortsAcceptZero(t *testing.T) {
+	// PeerApiPort=0 (⇒ BindPort+1) and DNS.Port=0 (⇒ GossipPort) are documented
+	// inherit sentinels and must be expressible through env.
+	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "true")
+	t.Setenv("COSMOGUARD_CLUSTER_BIND_ADDR", "10.0.0.8")
+	t.Setenv("COSMOGUARD_CLUSTER_ENCRYPTION_KEY", testClusterKey)
+	t.Setenv("COSMOGUARD_CLUSTER_DISCOVERY_MODE", "dns")
+	t.Setenv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST", "peer")
+	t.Setenv("COSMOGUARD_CLUSTER_PEER_API_PORT", "0")
+	t.Setenv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT", "0")
+
+	c := freshConfig(t).Cache.Cluster
+	assert.Assert(t, c != nil)
+	assert.Equal(t, c.PeerApiPort, 0)
+	assert.Assert(t, c.Discovery != nil && c.Discovery.DNS != nil)
+	assert.Equal(t, c.Discovery.DNS.Port, 0)
+}
+
 func TestApplyEnvOverrides_ClusterInvalidReplicaCount(t *testing.T) {
 	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "true")
 	t.Setenv("COSMOGUARD_CLUSTER_REPLICA_COUNT", "not-a-number")

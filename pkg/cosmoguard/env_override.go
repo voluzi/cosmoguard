@@ -230,7 +230,11 @@ func applyClusterEnvOverrides(cfg *Config) error {
 			return err
 		}
 		if !enable {
-			// Explicit opt-out: never create the block, ignore other cluster vars.
+			// Explicit opt-out. cfg.Cache.Cluster != nil IS the cluster-mode
+			// toggle (see cluster_runtime.go clustered := opts.Cluster != nil),
+			// so a YAML-defined block must be CLEARED, not just skipped —
+			// otherwise ENABLE=false would still validate and start clustering.
+			cfg.Cache.Cluster = nil
 			return nil
 		}
 	}
@@ -272,7 +276,10 @@ func applyClusterEnvOverrides(cfg *Config) error {
 	if err := envPort("COSMOGUARD_CLUSTER_GOSSIP_PORT", &c.GossipPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_CLUSTER_PEER_API_PORT", &c.PeerApiPort); err != nil {
+	// PeerApiPort accepts 0: it's the documented "inherit BindPort+1" sentinel
+	// (see ClusterConfig.PeerApiPort), so an env-driven deployment must be able
+	// to express it — envPort's 1..65535 range would wrongly reject it.
+	if err := envPortAllowZero("COSMOGUARD_CLUSTER_PEER_API_PORT", &c.PeerApiPort); err != nil {
 		return err
 	}
 	if err := envInt("COSMOGUARD_CLUSTER_REPLICA_COUNT", &c.ReplicaCount); err != nil {
@@ -300,7 +307,9 @@ func applyClusterEnvOverrides(cfg *Config) error {
 			if dnsHostSet {
 				c.Discovery.DNS.Host = strings.TrimSpace(dnsHost)
 			}
-			if err := envPort("COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT", &c.Discovery.DNS.Port); err != nil {
+			// DNS.Port 0 is the documented "inherit GossipPort" sentinel, so it
+			// must be expressible through env too (see DNSDiscoveryConfig.Port).
+			if err := envPortAllowZero("COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT", &c.Discovery.DNS.Port); err != nil {
 				return err
 			}
 			if err := envDuration("COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL", &c.Discovery.DNS.RefreshInterval); err != nil {
@@ -374,6 +383,25 @@ func envPort(name string, dst *int) error {
 	}
 	if n < 1 || n > 65535 {
 		return fmt.Errorf("%s: port %d out of range (want 1..65535)", name, n)
+	}
+	*dst = n
+	return nil
+}
+
+// envPortAllowZero is envPort but permits 0, for port fields whose zero value
+// is a meaningful "inherit/derive" sentinel (e.g. Cluster.PeerApiPort = 0 ⇒
+// BindPort+1). Any other out-of-range value still fails startup.
+func envPortAllowZero(name string, dst *int) error {
+	v, ok := lookupNonEmptyEnv(name)
+	if !ok {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fmt.Errorf("%s: invalid integer %q: %w", name, v, err)
+	}
+	if n < 0 || n > 65535 {
+		return fmt.Errorf("%s: port %d out of range (want 0..65535)", name, n)
 	}
 	*dst = n
 	return nil
