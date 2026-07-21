@@ -327,3 +327,24 @@ func TestHealthcheckGatesReadinessUntilFirstProbe(t *testing.T) {
 		t.Fatal("no-healthcheck upstream must stay optimistically healthy")
 	}
 }
+
+// The cold-start readiness gate must clear on the FIRST successful probe, even
+// when HealthyAfter > 1 — that threshold is runtime flap protection, not a
+// startup delay. Without the success-counter seed this needs HealthyAfter probes.
+func TestColdStartGateClearsOnFirstProbe(t *testing.T) {
+	on := true
+	hc := &NodeHealthcheckConfig{Enable: &on, Path: "/status", Service: "rpc", HealthyAfter: 3}
+	pool, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "hc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9, Healthcheck: hc}},
+		"rpc", nil, log.WithField("test", "coldstart-firstprobe"))
+	if err != nil {
+		t.Fatalf("build pool: %v", err)
+	}
+	if pool.AnyHealthy() {
+		t.Fatal("must start gated (unhealthy) with a healthcheck configured")
+	}
+	pool.recordProbeResult(pool.Upstreams()[0], true, nil) // one successful probe
+	if !pool.AnyHealthy() {
+		t.Fatal("first successful probe must clear the cold-start gate even with HealthyAfter=3")
+	}
+}

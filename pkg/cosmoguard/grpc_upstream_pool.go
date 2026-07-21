@@ -357,6 +357,11 @@ func NewGrpcUpstreamPool(name string, nodes []NodeConfig, logger *Entry, opts ..
 		// before its upstream is proven usable.
 		initialHealthy := u.hcConfig == nil
 		u.healthy.Store(initialHealthy)
+		if !initialHealthy {
+			// Gated on a healthcheck: preload the counter so the first probe
+			// success (not HealthyAfter of them) clears the cold-start gate.
+			u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
+		}
 		// Seed the gauge with that verdict so operators see every configured
 		// upstream in /metrics from boot.
 		setUpstreamHealthy(pool.name, u.Name, initialHealthy)
@@ -445,6 +450,9 @@ func (p *GrpcUpstreamPool) AddUpstream(n NodeConfig) error {
 	}
 	addHealthy := u.hcConfig == nil
 	u.healthy.Store(addHealthy)
+	if !addHealthy {
+		u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
+	}
 	setUpstreamHealthy(p.name, u.Name, addHealthy)
 
 	next := make([]*GrpcUpstream, 0, len(current)+1)

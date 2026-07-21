@@ -313,6 +313,11 @@ func NewHttpUpstreamPool(
 		// traffic before its upstream connection is warm.
 		initialHealthy := u.hcConfig == nil
 		u.healthy.Store(initialHealthy)
+		if !initialHealthy {
+			// Gated on a healthcheck: preload the counter so the first probe
+			// success (not HealthyAfter of them) clears the cold-start gate.
+			u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
+		}
 		// Seed the gauge so operators see every configured upstream in
 		// /metrics from boot — even those that never receive traffic.
 		setUpstreamHealthy(pool.name, u.Name, initialHealthy)
@@ -388,6 +393,9 @@ func (p *HttpUpstreamPool) AddUpstream(n NodeConfig) error {
 	// reachability, so /readyz doesn't flip green on an unproven endpoint.
 	addHealthy := u.hcConfig == nil
 	u.healthy.Store(addHealthy)
+	if !addHealthy {
+		u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
+	}
 	setUpstreamHealthy(p.name, u.Name, addHealthy)
 
 	next := make([]*HttpUpstream, 0, len(current)+1)
@@ -1301,6 +1309,19 @@ func probeAborted(ctx context.Context, stop <-chan struct{}) bool {
 	default:
 		return false
 	}
+}
+
+// coldStartSuccessSeed returns the value to preload an upstream's success
+// counter with when it starts gated-unhealthy (a healthcheck is configured but
+// hasn't run yet). Seeding it to HealthyAfter-1 means the FIRST successful
+// probe clears the cold-start readiness gate, rather than waiting for
+// HealthyAfter probes — HealthyAfter is flap protection for RUNTIME recovery
+// (a probe failure resets the counter to 0), not a cold-start delay.
+func coldStartSuccessSeed(hc *NodeHealthcheckConfig) int32 {
+	if hc == nil || hc.HealthyAfter <= 1 {
+		return 0
+	}
+	return int32(hc.HealthyAfter - 1)
 }
 
 // recordProbeResult applies the consecutive-success / consecutive-failure

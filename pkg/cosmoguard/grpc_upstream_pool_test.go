@@ -200,3 +200,27 @@ func TestHealthcheckProbeURL(t *testing.T) {
 		}
 	}
 }
+
+// gRPC readiness gating mirrors HTTP: a healthcheck-backed upstream starts
+// unhealthy (so /readyz gates the pod) until its first probe; without a
+// healthcheck it stays optimistically healthy.
+func TestGrpcHealthcheckGatesReadinessUntilFirstProbe(t *testing.T) {
+	on := true
+	hc := &NodeHealthcheckConfig{Enable: &on, Path: "/status", Service: "rpc"}
+
+	gated, err := NewGrpcUpstreamPool("grpc",
+		[]NodeConfig{{Name: "hc", Host: "127.0.0.1", GrpcPort: 9, RpcPort: 9, Healthcheck: hc}},
+		log.WithField("test", "grpc-readyz-gate"))
+	assert.NilError(t, err)
+	if gated.AnyHealthy() {
+		t.Fatal("healthcheck-backed gRPC upstream must start unhealthy so /readyz gates until the first probe")
+	}
+
+	optimistic, err := NewGrpcUpstreamPool("grpc",
+		[]NodeConfig{{Name: "nohc", Host: "127.0.0.1", GrpcPort: 9, RpcPort: 9}},
+		log.WithField("test", "grpc-readyz-nohc"))
+	assert.NilError(t, err)
+	if !optimistic.AnyHealthy() {
+		t.Fatal("no-healthcheck gRPC upstream must stay optimistically healthy")
+	}
+}
