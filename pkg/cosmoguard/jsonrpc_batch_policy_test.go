@@ -283,6 +283,60 @@ func TestHandleHttpBatch_AllNotificationsEmptyBody(t *testing.T) {
 	}
 }
 
+func TestHandleHttpBatch_AppliesCORS(t *testing.T) {
+	cors := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://app.example"}}
+	if err := cors.Compile(); err != nil {
+		t.Fatalf("compile CORS config: %v", err)
+	}
+	tests := []struct {
+		name      string
+		batch     JsonRpcMsgs
+		next      func(http.ResponseWriter, *http.Request)
+		wantEmpty bool
+	}{
+		{
+			name:  "response body",
+			batch: JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "q"}},
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+			},
+		},
+		{
+			name:      "all notifications",
+			batch:     JsonRpcMsgs{{Version: "2.0", Method: "q"}},
+			next:      func(http.ResponseWriter, *http.Request) {},
+			wantEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &JsonRpcHandler{
+				log:           log.WithField("t", "jsonrpc-batch"),
+				cgDashboard:   newDashboardObservability(),
+				section:       "rpc.jsonrpc",
+				defaultAction: RuleActionAllow,
+				cors:          cors,
+			}
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/", nil)
+			r.Header.Set("Origin", "https://app.example")
+
+			h.handleHttpBatch(tt.batch, w, r, tt.next, time.Now())
+
+			if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+				t.Fatalf("batch response missing CORS origin, got %q", got)
+			}
+			if !corsVaryHasOrigin(w.Header()) {
+				t.Fatalf("batch response missing Vary: Origin: %v", w.Header().Values("Vary"))
+			}
+			if tt.wantEmpty && w.Body.Len() != 0 {
+				t.Fatalf("notification-only batch must remain empty, got %q", w.Body.String())
+			}
+		})
+	}
+}
+
 // TestHandleHttpBatch_CacheDisabledNotServed is the regression test for
 // the cache.enable gap: a rule with a cache: block but enable:false must
 // forward to upstream, never serve a pre-existing cached entry. The

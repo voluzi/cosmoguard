@@ -1204,7 +1204,7 @@ func (p *HttpProxy) backgroundRefreshFn(r *http.Request, requestHash string, cac
 }
 
 func stripHTTPPreconditions(headers http.Header) {
-	for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+	for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range", "Range"} {
 		headers.Del(name)
 	}
 }

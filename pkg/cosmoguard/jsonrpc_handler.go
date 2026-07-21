@@ -1089,6 +1089,9 @@ func (h *JsonRpcHandler) writeSingleResponse(w http.ResponseWriter, r *http.Requ
 
 func (h *JsonRpcHandler) handleHttpBatch(requests JsonRpcMsgs, w http.ResponseWriter, r *http.Request,
 	next func(http.ResponseWriter, *http.Request), startTime time.Time) {
+	if h.cors != nil {
+		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+	}
 	responses := JsonRpcResponses{}
 
 	var cacheHits, cacheMisses, allowed, denied int

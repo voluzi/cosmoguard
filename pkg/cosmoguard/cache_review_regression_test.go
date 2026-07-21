@@ -1391,8 +1391,13 @@ func TestHTTPBackgroundRefreshUsesIndependentRequestStats(t *testing.T) {
 	require.Empty(t, originalStats.Upstream)
 }
 
-func TestHTTPBackgroundRefreshDropsClientPreconditions(t *testing.T) {
+func TestHTTPBackgroundRefreshDropsClientRangeAndPreconditions(t *testing.T) {
 	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("partial"))
+			return
+		}
 		for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
 			if r.Header.Get(name) != "" {
 				w.WriteHeader(http.StatusNotModified)
@@ -1407,6 +1412,7 @@ func TestHTTPBackgroundRefreshDropsClientPreconditions(t *testing.T) {
 	req.Header.Set("If-Modified-Since", time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat))
 	req.Header.Set("If-Unmodified-Since", time.Now().UTC().Format(http.TimeFormat))
 	req.Header.Set("If-Range", `"old"`)
+	req.Header.Set("Range", "bytes=0-4")
 
 	out, err := p.backgroundRefreshFn(req, "key", &RuleCache{Enable: true, TTL: time.Minute}, "rule")()
 	require.NoError(t, err)
