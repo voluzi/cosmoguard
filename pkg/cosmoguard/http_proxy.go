@@ -1072,6 +1072,15 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 		return
 	}
 	if out.StatusCode <= 0 {
+		// Defensive fallback: the pool always writes a status, so this is
+		// normally unreachable — but if a future no-write path makes it
+		// live, keep it consistent with writeMissResponse and the upstream
+		// ErrorHandler. Apply CORS so a browser sees the real 502 instead of
+		// a masking CORS failure, and set the miss marker for state parity.
+		w.Header().Set(cacheStateHeader, cacheMiss)
+		if p.cors != nil {
+			p.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+		}
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		p.recordOutcome(r, http.StatusBadGateway, cacheMiss, RuleActionAllow, startTime, "request allowed (upstream error)")
 		return
