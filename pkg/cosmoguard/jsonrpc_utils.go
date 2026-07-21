@@ -499,6 +499,14 @@ func (l *JsonRpcResponses) AddPending(request *JsonRpcMsg) {
 	*l = append(*l, res)
 }
 
+// AddPendingWithRuleTag is AddPending for a non-cacheable item that still
+// matched a rule (or the default action), recording that rule tag so the item
+// contributes its rule to pendingRuleTag / cosmoguard_upstream_requests_total
+// even though nothing is cached for it.
+func (l *JsonRpcResponses) AddPendingWithRuleTag(request *JsonRpcMsg, ruleTag string) {
+	*l = append(*l, &JsonRpcResponse{Request: request, RuleTag: ruleTag})
+}
+
 func (l *JsonRpcResponses) AddResponse(request, response *JsonRpcMsg) {
 	res := &JsonRpcResponse{
 		Request: request,

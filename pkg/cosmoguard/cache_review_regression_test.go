@@ -2040,13 +2040,48 @@ func TestJsonRpcResponsesPendingRuleTag(t *testing.T) {
 	mixed.AddPendingWithCacheConfig(msg(2), 2, &RuleCache{}, "rule-b")
 	require.Equal(t, "batch", mixed.pendingRuleTag())
 
+	// Non-cacheable pending items now carry their tag via AddPendingWithRuleTag,
+	// so a uniform non-cacheable batch attributes to its rule.
+	uniformNonCacheable := JsonRpcResponses{}
+	uniformNonCacheable.AddPendingWithRuleTag(msg(1), "rule-c")
+	uniformNonCacheable.AddPendingWithRuleTag(msg(2), "rule-c")
+	require.Equal(t, "rule-c", uniformNonCacheable.pendingRuleTag())
+
+	// A genuinely untagged pending item (bare AddPending) still yields "batch".
 	withUntagged := JsonRpcResponses{}
 	withUntagged.AddPendingWithCacheConfig(msg(1), 1, &RuleCache{}, "rule-a")
-	withUntagged.AddPending(msg(2)) // non-cached pending, no tag
+	withUntagged.AddPending(msg(2))
 	require.Equal(t, "batch", withUntagged.pendingRuleTag())
+
+	// Mixed cacheable + non-cacheable across rules → batch.
+	mixedKinds := JsonRpcResponses{}
+	mixedKinds.AddPendingWithCacheConfig(msg(1), 1, &RuleCache{}, "rule-a")
+	mixedKinds.AddPendingWithRuleTag(msg(2), "rule-b")
+	require.Equal(t, "batch", mixedKinds.pendingRuleTag())
 
 	resolvedIgnored := JsonRpcResponses{}
 	resolvedIgnored.AddResponse(msg(1), msg(1)) // cache hit, already resolved
 	resolvedIgnored.AddPendingWithCacheConfig(msg(2), 2, &RuleCache{}, "rule-a")
 	require.Equal(t, "rule-a", resolvedIgnored.pendingRuleTag())
+}
+
+// A uniform batch of NON-cacheable calls from a tagged rule must attribute its
+// single upstream fetch to that rule, not "batch".
+func TestJSONRPCNonCacheableBatchSeedsRuleTag(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Tag:     "rpc-nc", // no Cache block => non-cacheable path (AddPendingWithRuleTag)
+	}
+	h := newJSONCacheHandler(t, rule)
+	var gotTag string
+	next := func(w http.ResponseWriter, r *http.Request) {
+		if s := RequestStatsFromCtx(r.Context()); s != nil {
+			gotTag = s.RuleTag
+		}
+		_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+	}
+	req, _ := jsonRequestContext()
+	h.handleHttpBatch(JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "status"}}, httptest.NewRecorder(), req, next, time.Now())
+	require.Equal(t, "rpc-nc", gotTag, "uniform non-cacheable batch must attribute to its rule, not batch")
 }

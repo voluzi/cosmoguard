@@ -1154,7 +1154,7 @@ RequestsLoop:
 					h.recordBatchItem(r, req, "", "request in batch denied (auth)")
 					continue RequestsLoop
 				}
-				responses.AddPending(req)
+				responses.AddPendingWithRuleTag(req, "default")
 				allowed++
 				h.recordBatchItem(r, req, cacheMiss, "request in batch allowed")
 			} else {
@@ -1208,7 +1208,7 @@ RequestsLoop:
 					// client's request). AddPending hits the upstream and
 					// stores nothing.
 					if req.ID == nil || rule.Cache == nil || !rule.Cache.Enable || hasSubscriptionMethod(req) {
-						responses.AddPending(req)
+						responses.AddPendingWithRuleTag(req, ruleTagOrFingerprint(rule.Tag, rule.Fingerprint))
 						cacheMisses++
 						h.recordBatchItem(r, req, cacheMiss, "request in batch allowed")
 						continue RequestsLoop
@@ -1285,7 +1285,7 @@ RequestsLoop:
 				h.recordBatchItem(r, req, "", "request in batch denied (auth)")
 				continue RequestsLoop
 			}
-			responses.AddPending(req)
+			responses.AddPendingWithRuleTag(req, "default")
 			allowed++
 			h.recordBatchItem(r, req, "", "request in batch allowed")
 		} else {
