@@ -587,6 +587,14 @@ func (l *JsonRpcResponses) Deny(request *JsonRpcMsg) {
 // single-request paths do this inline; batch fans out through here).
 // onWrite receives the rule tag and the original JSON-RPC method.
 func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], now time.Time, global *CacheGlobalConfig, upstreamHeaders http.Header, onWrite func(ruleTag, method string)) error {
+	// A batch shares one HTTP response, so its Cache-Control governs every
+	// message in it. Anti-cache directives (no-store/no-cache/private/zero
+	// max-age) forbid storage: entries here are written under a stale-extended
+	// TTL for single-path / WS serve-stale, so a stored no-cache reply would be
+	// served stale without the revalidation it requires. Mirror the HTTP path.
+	if !cacheableByUpstream(upstreamHeaders) {
+		return nil
+	}
 	for _, r := range *l {
 		if r.Response != nil && r.Cache != nil && r.Cache.Enable {
 			if r.Response.Error != nil && !r.Cache.CacheError {

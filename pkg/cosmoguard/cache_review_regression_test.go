@@ -1648,6 +1648,75 @@ func TestJSONRPCRevalidationDirectivesDisableStaleStorage(t *testing.T) {
 	}
 }
 
+func assertNoJSONStore(t *testing.T, cache *capturingJSONCache) {
+	t.Helper()
+	select {
+	case stored := <-cache.set:
+		t.Fatalf("expected no JSON-RPC cache store, got ttl=%v", stored.ttl)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A JSON-RPC upstream that forbids caching (no-store / no-cache / private)
+// must not be stored: entries drop their response headers, so a cached
+// no-cache reply would be replayed — fresh or, with SWR, stale — without the
+// revalidation its Cache-Control demands. Covers every store path.
+func TestJSONRPCUncacheableDirectivesAreNotStored(t *testing.T) {
+	for _, directive := range []string{"no-cache", "no-store", "private"} {
+		t.Run(directive, func(t *testing.T) {
+			newHandler := func(t *testing.T) (*JsonRpcHandler, *JsonRpcRule, *capturingJSONCache) {
+				t.Helper()
+				rule := &JsonRpcRule{
+					Action:  RuleActionAllow,
+					Methods: []string{"status"},
+					Cache:   &RuleCache{Enable: true, TTL: 5 * time.Second, StaleWhileRevalidate: time.Minute},
+				}
+				h := newJSONCacheHandler(t, rule)
+				capturing := &capturingJSONCache{set: make(chan capturedJSONStore, 1)}
+				h.cache = capturing
+				return h, rule, capturing
+			}
+			next := func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", "public, "+directive)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
+			}
+
+			t.Run("coalesced single", func(t *testing.T) {
+				h, rule, capturing := newHandler(t)
+				request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+				req, _ := jsonRequestContext()
+				_, err := h.fetchSingle(req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rule", request.Method, &jsonRpcResponseOwner{}, false)
+				require.NoError(t, err)
+				assertNoJSONStore(t, capturing)
+			})
+
+			t.Run("non-coalesced single", func(t *testing.T) {
+				h, rule, capturing := newHandler(t)
+				request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+				req, _ := jsonRequestContext()
+				h.getSingleUpstreamResponse(httptest.NewRecorder(), req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rule", request.Method)
+				assertNoJSONStore(t, capturing)
+			})
+
+			t.Run("batch", func(t *testing.T) {
+				h, _, capturing := newHandler(t)
+				req, _ := jsonRequestContext()
+				h.handleHttpBatch(
+					JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "status"}},
+					httptest.NewRecorder(),
+					req,
+					func(w http.ResponseWriter, _ *http.Request) {
+						w.Header().Set("Cache-Control", "public, "+directive)
+						_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+					},
+					time.Now(),
+				)
+				assertNoJSONStore(t, capturing)
+			})
+		})
+	}
+}
+
 func TestJSONRPCPendingRevalidationRequiredResponseIsNotServedStale(t *testing.T) {
 	for _, directive := range []string{"must-revalidate", "proxy-revalidate"} {
 		t.Run(directive, func(t *testing.T) {

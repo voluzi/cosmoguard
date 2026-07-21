@@ -806,6 +806,13 @@ func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *htt
 	if res.IsEmptyResult() && !cache.CacheEmptyResult {
 		return
 	}
+	// Anti-cache Cache-Control directives (no-store/no-cache/private/zero
+	// max-age) forbid storage: JSON-RPC entries drop response headers, so a
+	// cached no-cache reply would be served without the revalidation it
+	// requires. Mirror the HTTP path's cacheableByUpstream gate.
+	if !cacheableByUpstream(ww.GetCommittedHeaders()) {
+		return
+	}
 
 	// Stamp StoredAt and store under a physical TTL extended by the stale
 	// window so this entry can be served stale-while-revalidate later.
@@ -975,8 +982,13 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 	if suffix := trailingWhitespace(b); len(suffix) > 0 {
 		res.WireSuffix = suffix
 	}
-	// Not cacheable → return to waiters but don't store.
-	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) {
+	// Not cacheable → return to waiters but don't store. Anti-cache
+	// Cache-Control directives (no-store/no-cache/private/zero max-age) are a
+	// hard veto: JSON-RPC entries don't retain response headers, so a stored
+	// no-cache reply would later be replayed — fresh or, with SWR, stale —
+	// without the revalidation its Cache-Control demands. Mirror the HTTP
+	// path's cacheableByUpstream gate.
+	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) || !cacheableByUpstream(out.Headers) {
 		return out, nil
 	}
 	out.Shareable = true
