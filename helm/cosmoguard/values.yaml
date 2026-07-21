@@ -142,8 +142,11 @@ config:
       # generated+persisted gossip key (cluster.generateEncryptionKey, below).
       # A single replica works and performs identically to embedded loopback,
       # so this is safe even for one-pod installs; scale up (or enable HPA) and
-      # every replica shares one olric store. Set enable: false for embedded
-      # loopback mode (no gossip, no peer Service, no key). GitOps note:
+      # every replica shares one olric store. Memory note: a one-pod cluster
+      # owns every olric partition, so its L2 floor (~68 MiB/DMap) is higher
+      # than embedded mode's 16-partition floor — the default `resources` limit
+      # is sized for this. Set enable: false for embedded loopback mode (no
+      # gossip, no peer Service, no key, lower partition count). GitOps note:
       # client-side rendering can't look up the generated key — set
       # cluster.existingEncryptionKeySecret there.
       enable: true
@@ -401,13 +404,25 @@ podDisruptionBudget:
   minAvailable: 1
   # maxUnavailable: 1
 
+# Sized for the default clustered runtime (config.cache.cluster.enable: true).
+# A single-replica cluster owns all of olric's partitions, so its L2 cache
+# floors at ~68 MiB/DMap (271 partitions x 256 KiB); the memory limit drives
+# the auto-derived L2 budget (see CacheGlobalConfig.ResolveBudget), so 1Gi
+# keeps that floor comfortably inside budget for the non-EVM DMap set. The
+# request stays modest because the idle/light-load footprint is ~10 MiB —
+# it only grows toward the floor under a full cache of large entries.
+# Minimal single-pod installs that don't need clustering can set
+# config.cache.cluster.enable: false (embedded, 16 partitions) and drop the
+# limit back to 512Mi. EVM-enabled single-pod installs (8 DMaps) should raise
+# the limit further or run >=2 replicas, which spreads partitions and lowers
+# the per-node floor.
 resources:
   limits:
     cpu: 1
-    memory: 512Mi
+    memory: 1Gi
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 256Mi
 
 # NetworkPolicy for the cluster-mode peer surface. Restricts the
 # peer-api port (dashboard fan-out aggregator) AND the gossip / RESP
