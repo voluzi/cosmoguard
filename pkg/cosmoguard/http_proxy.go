@@ -1127,11 +1127,11 @@ func snapshotRequestBody(r *http.Request) []byte {
 // waiter still observes its own deadline in coalescer.do; the shared fetch uses
 // a proxy-owned timeout so a disconnected caller cannot leave it running forever.
 func (p *HttpProxy) foregroundFetchFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string, owner *responseOwner) func() (bufferedUpstreamResponse, error) {
-	body := snapshotRequestBody(r)
 	return func() (bufferedUpstreamResponse, error) {
 		if recent, ok := p.recentHTTPResponse(r, requestHash, cache); ok {
 			return recent, nil
 		}
+		body := snapshotRequestBody(r)
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), configuredHTTPForegroundFetchTimeout(p.cacheConfig))
 		defer cancel()
 		req := r.Clone(ctx)
@@ -1171,8 +1171,8 @@ func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cach
 }
 
 func (p *HttpProxy) backgroundRefreshFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string) func() (bufferedUpstreamResponse, error) {
-	body := snapshotRequestBody(r)
 	return func() (bufferedUpstreamResponse, error) {
+		body := snapshotRequestBody(r)
 		ctx, _ := WithRequestStats(context.WithoutCancel(r.Context()))
 		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()

@@ -873,11 +873,11 @@ type jsonPendingResponse struct {
 }
 
 func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string, owner *jsonRpcResponseOwner) func() (bufferedJsonRpcResponse, error) {
-	body := snapshotRequestBody(r)
 	return func() (bufferedJsonRpcResponse, error) {
 		if recent, ok := h.recentSingleResponse(r, hash, cache); ok {
 			return recent, nil
 		}
+		body := snapshotRequestBody(r)
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), configuredHTTPForegroundFetchTimeout(h.cacheConfig))
 		defer cancel()
 		req := r.Clone(ctx)
@@ -888,8 +888,8 @@ func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http
 }
 
 func (h *JsonRpcHandler) singleBackgroundRefreshFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) func() (bufferedJsonRpcResponse, error) {
-	body := snapshotRequestBody(r)
 	return func() (bufferedJsonRpcResponse, error) {
+		body := snapshotRequestBody(r)
 		ctx, _ := WithRequestStats(context.WithoutCancel(r.Context()))
 		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()
