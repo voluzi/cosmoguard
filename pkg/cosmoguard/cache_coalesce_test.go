@@ -199,6 +199,65 @@ func TestHTTPServeStale_ServesStaleAndRefreshesOnce(t *testing.T) {
 	require.Equal(t, int32(2), hits.Load(), "fresh hit does not reach upstream")
 }
 
+type blockingCachedResponseWriter struct {
+	header       http.Header
+	writeStarted chan struct{}
+	releaseWrite <-chan struct{}
+	startedOnce  sync.Once
+}
+
+func (w *blockingCachedResponseWriter) Header() http.Header { return w.header }
+func (*blockingCachedResponseWriter) WriteHeader(int)       {}
+func (w *blockingCachedResponseWriter) Write(p []byte) (int, error) {
+	w.startedOnce.Do(func() { close(w.writeStarted) })
+	<-w.releaseWrite
+	return len(p), nil
+}
+
+func TestHTTPServeStaleStartsRefreshBeforeClientWriteCompletes(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	var refreshOnce sync.Once
+	p, _ := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+		refreshOnce.Do(func() { close(refreshStarted) })
+		_, _ = w.Write([]byte("fresh"))
+	})
+
+	releaseWrite := make(chan struct{})
+	w := &blockingCachedResponseWriter{
+		header:       make(http.Header),
+		writeStarted: make(chan struct{}),
+		releaseWrite: releaseWrite,
+	}
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	done := make(chan struct{})
+	go func() {
+		p.serveStale(w, req, CachedResponse{
+			StatusCode: http.StatusOK,
+			Data:       []byte("stale"),
+			StoredAt:   time.Now().Add(-time.Minute),
+		}, "key", &RuleCache{Enable: true, TTL: time.Minute}, "rule", time.Now())
+		close(done)
+	}()
+
+	<-w.writeStarted
+	refreshBeforeWriteCompleted := false
+	select {
+	case <-refreshStarted:
+		refreshBeforeWriteCompleted = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(releaseWrite)
+	<-done
+	if !refreshBeforeWriteCompleted {
+		select {
+		case <-refreshStarted:
+		case <-time.After(time.Second):
+			t.Fatal("background refresh never started")
+		}
+		t.Fatal("background refresh started only after the stale body write completed")
+	}
+}
+
 // TestJSONRPCSingleCoalesce_OneUpstreamCall proves the JSON-RPC single-request
 // path coalesces concurrent misses for the same method into one upstream call.
 func TestJSONRPCSingleCoalesce_OneUpstreamCall(t *testing.T) {

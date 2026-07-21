@@ -63,6 +63,7 @@ func TestReadConfigFromFile_DefaultValues(t *testing.T) {
 
 	// Cache defaults
 	assert.Equal(t, cfg.Cache.TTL, 5*time.Second)
+	assert.Equal(t, cfg.Cache.HTTPForegroundFetchTimeout, 5*time.Minute)
 	assert.Equal(t, cfg.Cache.GRPCForegroundFetchTimeout, 5*time.Minute)
 
 	// Metrics defaults
@@ -95,6 +96,7 @@ node:
 cache:
   ttl: 30s
   key: "test-prefix"
+  httpForegroundFetchTimeout: 30m
   grpcForegroundFetchTimeout: 45m
 
 metrics:
@@ -124,6 +126,7 @@ lcd:
 
 	assert.Equal(t, cfg.Cache.TTL, 30*time.Second)
 	assert.Equal(t, cfg.Cache.Key, "test-prefix")
+	assert.Equal(t, cfg.Cache.HTTPForegroundFetchTimeout, 30*time.Minute)
 	assert.Equal(t, cfg.Cache.GRPCForegroundFetchTimeout, 45*time.Minute)
 
 	// Note: The 'enable' field has default:true, so when explicitly set to false
@@ -450,6 +453,11 @@ func TestValidateCacheBackend(t *testing.T) {
 
 	t.Run("negative gRPC foreground timeout rejected", func(t *testing.T) {
 		c := &CacheGlobalConfig{GRPCForegroundFetchTimeout: -time.Second}
+		assert.Assert(t, validateCacheBackend(c) != nil)
+	})
+
+	t.Run("negative HTTP foreground timeout rejected", func(t *testing.T) {
+		c := &CacheGlobalConfig{HTTPForegroundFetchTimeout: -time.Second}
 		assert.Assert(t, validateCacheBackend(c) != nil)
 	})
 

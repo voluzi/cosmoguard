@@ -203,21 +203,26 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestHTTPForegroundMissHasNoArtificialRefreshDeadline(t *testing.T) {
+func TestHTTPForegroundMissUsesConfiguredProxyDeadline(t *testing.T) {
 	target, err := url.Parse("http://upstream.invalid")
 	require.NoError(t, err)
+	type deadlineObservation struct {
+		remaining time.Duration
+		ok        bool
+	}
+	observedDeadline := make(chan deadlineObservation, 1)
 	reverseProxy := httputil.NewSingleHostReverseProxy(target)
 	reverseProxy.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-		status := http.StatusOK
-		body := "no-artificial-deadline"
-		if _, hasDeadline := r.Context().Deadline(); hasDeadline {
-			status = http.StatusGatewayTimeout
-			body = "artificial-deadline"
+		deadline, ok := r.Context().Deadline()
+		remaining := time.Duration(0)
+		if ok {
+			remaining = time.Until(deadline)
 		}
+		observedDeadline <- deadlineObservation{remaining: remaining, ok: ok}
 		return &http.Response{
-			StatusCode: status,
+			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(body)),
+			Body:       io.NopCloser(strings.NewReader("bounded")),
 			Request:    r,
 		}, nil
 	})
@@ -233,17 +238,23 @@ func TestHTTPForegroundMissHasNoArtificialRefreshDeadline(t *testing.T) {
 		cache: cache,
 		now:   time.Now,
 	}
+	configuredTimeout := 45 * time.Minute
+	p.cacheConfig = &CacheGlobalConfig{HTTPForegroundFetchTimeout: configuredTimeout}
 	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
-	ctx, cancel := context.WithTimeout(req.Context(), time.Hour)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
 	p.allow(rec, req, rule, time.Now())
 
 	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, "no-artificial-deadline", rec.Body.String())
+	require.Equal(t, "bounded", rec.Body.String())
+	observed := <-observedDeadline
+	require.True(t, observed.ok)
+	require.Greater(t, observed.remaining, 44*time.Minute)
+	require.LessOrEqual(t, observed.remaining, configuredTimeout)
 }
 
 type blockingResponseCache struct {

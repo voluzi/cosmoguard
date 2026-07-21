@@ -951,15 +951,12 @@ func (p *HttpProxy) cacheHit(w http.ResponseWriter, r *http.Request, res CachedR
 	p.recordOutcome(r, res.StatusCode, cacheHit, RuleActionAllow, startTime, "request allowed")
 }
 
-// serveStale serves an expired-but-still-serveable cached response immediately
-// (stale-while-revalidate) with X-Cosmoguard-Cache: stale, then fires ONE
-// background refresh so the entry is fresh for later requests. The refresh is
-// coalesced by request hash via p.sf, so a stampede of stale requests triggers
-// exactly one upstream fetch and the stale-serving client never waits.
+// serveStale starts one coalesced background refresh before writing the cached
+// response so slow client egress cannot delay revalidation.
 func (p *HttpProxy) serveStale(w http.ResponseWriter, r *http.Request, res CachedResponse, requestHash string, cache *RuleCache, ruleTag string, startTime time.Time) {
+	p.sf.refresh(requestHash, p.backgroundRefreshFn(r, requestHash, cache, ruleTag))
 	p.writeCachedResponse(w, r, res, cacheStale)
 	p.recordOutcome(r, res.StatusCode, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
-	p.sf.refresh(requestHash, p.backgroundRefreshFn(r, requestHash, cache, ruleTag))
 }
 
 // writeCachedResponse replays a stored CachedResponse to the client with the
@@ -1000,6 +997,17 @@ const cacheStateHeader = "X-Cosmoguard-Cache"
 // httpRefreshTimeout bounds background refreshes so a wedged upstream cannot
 // pin a refresh goroutine forever.
 const httpRefreshTimeout = 30 * time.Second
+
+// httpForegroundFetchTimeout bounds detached foreground flights without
+// coupling them to any one caller's deadline.
+const httpForegroundFetchTimeout = 5 * time.Minute
+
+func configuredHTTPForegroundFetchTimeout(cacheConfig *CacheGlobalConfig) time.Duration {
+	if cacheConfig != nil && cacheConfig.HTTPForegroundFetchTimeout > 0 {
+		return cacheConfig.HTTPForegroundFetchTimeout
+	}
+	return httpForegroundFetchTimeout
+}
 
 // bufferedUpstreamResponse is a fully-buffered upstream response captured off
 // the client so one fetch can be replayed to every coalesced waiter. The fetch
@@ -1116,15 +1124,17 @@ func snapshotRequestBody(r *http.Request) []byte {
 }
 
 // foregroundFetchFn detaches cancellation while retaining request values. Each
-// waiter still observes its own deadline in coalescer.do; the shared fetch is
-// bounded by the configured HTTP transport rather than an unrelated hard cap.
+// waiter still observes its own deadline in coalescer.do; the shared fetch uses
+// a proxy-owned timeout so a disconnected caller cannot leave it running forever.
 func (p *HttpProxy) foregroundFetchFn(r *http.Request, requestHash string, cache *RuleCache, ruleTag string, owner *responseOwner) func() (bufferedUpstreamResponse, error) {
 	body := snapshotRequestBody(r)
 	return func() (bufferedUpstreamResponse, error) {
 		if recent, ok := p.recentHTTPResponse(r, requestHash, cache); ok {
 			return recent, nil
 		}
-		req := r.Clone(context.WithoutCancel(r.Context()))
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), configuredHTTPForegroundFetchTimeout(p.cacheConfig))
+		defer cancel()
+		req := r.Clone(ctx)
 		req.Body = io.NopCloser(bytes.NewReader(body))
 		req.ContentLength = int64(len(body))
 		return p.fetchAndStore(req, requestHash, cache, ruleTag, owner, true)

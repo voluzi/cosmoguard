@@ -349,6 +349,10 @@ type CacheGlobalConfig struct {
 	// refreshes it. 0 (default) disables SWR. A rule may override via its
 	// own cache.staleWhileRevalidate. Restart-required, like cache.ttl.
 	StaleWhileRevalidate time.Duration `yaml:"staleWhileRevalidate,omitempty"`
+	// HTTPForegroundFetchTimeout bounds a detached shared HTTP cache miss.
+	// Increase it for endpoints that legitimately run longer than the five-minute
+	// default without coupling the shared fetch to one caller's deadline.
+	HTTPForegroundFetchTimeout time.Duration `yaml:"httpForegroundFetchTimeout,omitempty" default:"5m"`
 	// GRPCForegroundFetchTimeout bounds a detached shared gRPC cache miss.
 	// Increase it for methods that legitimately run longer than the five-minute
 	// default without coupling the shared fetch to one caller's deadline.
@@ -1162,6 +1166,9 @@ func validateCacheBackend(c *CacheGlobalConfig) error {
 	}
 	if c.StaleWhileRevalidate < 0 {
 		return fmt.Errorf("cache.staleWhileRevalidate must be >= 0 (0 disables it); got %s", c.StaleWhileRevalidate)
+	}
+	if c.HTTPForegroundFetchTimeout < 0 {
+		return fmt.Errorf("cache.httpForegroundFetchTimeout must be >= 0; got %s", c.HTTPForegroundFetchTimeout)
 	}
 	if c.GRPCForegroundFetchTimeout < 0 {
 		return fmt.Errorf("cache.grpcForegroundFetchTimeout must be >= 0; got %s", c.GRPCForegroundFetchTimeout)
