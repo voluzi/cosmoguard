@@ -87,11 +87,17 @@ jobs:
       # Renders the default values into a config and boots the real binary
       # against it. Catches chart/binary schema drift the Go tests can't see
       # — e.g. a duration field emitted as a bare int that fails to unmarshal.
+      # The default is cluster mode, so supply the same runtime env the workload
+      # injects (POD_IP for bindAddr, CLUSTER_ENCRYPTION_KEY for the gossip key);
+      # the peer-service DNS won't resolve here, which cosmoguard tolerates as a
+      # single-node cluster (initial peer lookup warns + retries, non-fatal).
       - name: rendered config loads in the binary
         run: |
           go build -o /tmp/cosmoguard ./cmd/cosmoguard
           helm template ci helm/cosmoguard --show-only templates/configmap.yaml \
             | yq '.data["cosmoguard.yaml"]' > /tmp/cosmoguard.yaml
+          POD_IP=127.0.0.1 \
+          CLUSTER_ENCRYPTION_KEY="$(head -c32 /dev/urandom | base64)" \
           /tmp/cosmoguard --config /tmp/cosmoguard.yaml >/tmp/cg.log 2>&1 &
           pid=$!
           sleep 6
