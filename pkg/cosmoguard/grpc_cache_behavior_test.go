@@ -638,3 +638,24 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		require.False(t, up.cbOpen.Load(), "caller cancellation/deadline must not trip the breaker")
 	})
 }
+
+// The transparent (non-cached / streaming / reflection) forwarder must also
+// count its upstream fetch, so the counter isn't blind to non-cached gRPC.
+func TestGRPCTransparentForwardCountsUpstreamRequest(t *testing.T) {
+	up := newTestGrpcUpstream("g1", 1)
+	p := &GrpcProxy{
+		log:           log.WithField("test", t.Name()),
+		defaultAction: RuleActionAllow,
+		pool:          newTestGrpcPool("weighted-round-robin", up),
+		cgDashboard:   newDashboardObservability(),
+		section:       "grpc",
+	}
+
+	before := sumUpstreamRequests(t)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.MD{})
+	_, conn, err := p.Handle(ctx, "/cosmos.bank.v1beta1.Query/Balance")
+	require.NoError(t, err)
+	require.Equal(t, up.conn, conn)
+	require.Equal(t, 1.0, sumUpstreamRequests(t)-before,
+		"transparent gRPC forward must count one upstream request")
+}

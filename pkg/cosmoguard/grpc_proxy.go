@@ -545,6 +545,15 @@ func (p *GrpcProxy) Handle(ctx context.Context, method string) (context.Context,
 		trace.SpanFromContext(ctx).SetStatus(otelcodes.Error, "no upstream available")
 		return ctx, nil, status.Error(codes.Unavailable, "no upstream available")
 	}
+	// Count the transparent (non-cached / streaming / reflection) forward as a
+	// real upstream request. The cache path counts its own Invoke in
+	// grpcFetchAndStore and never reaches Handle, so the two don't overlap —
+	// together they cover all gRPC upstream traffic, matching the HTTP pool.
+	ruleID := "default"
+	if rule := p.findMatchingAllowRule(method); rule != nil {
+		ruleID = ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
+	}
+	recordUpstreamRequest(p.pool.name, up.Name, ruleID)
 	// Stash the picked upstream so rawTransparentHandler can bump
 	// inFlight (for least-conn) and RecordOutcome (for the circuit
 	// breaker) — otherwise transparent gRPC traffic never affects load

@@ -71,7 +71,7 @@ var cacheEvictionsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 // calls are not yet counted (tracked separately).
 var upstreamRequestsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "cosmoguard_upstream_requests_total",
-	Help: "Requests actually forwarded to an upstream (excludes cache hits and coalesced single-flight waiters), by pool, upstream, and rule.",
+	Help: "Upstream fetches cosmoguard performed, by pool, upstream, and rule. Excludes cache hits and coalesced single-flight waiters; internal HTTP retries within one request collapse to a single logical fetch (so misses − this = coalesced-away calls).",
 }, []string{"pool", "upstream", "rule_id"})
 
 // registerSharedMetricsOnce guards the process-wide registration so

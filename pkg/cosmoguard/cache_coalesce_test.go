@@ -34,6 +34,45 @@ func sumUpstreamRequests(t *testing.T) float64 {
 	return sum
 }
 
+// upstreamRequestsForRule sums cosmoguard_upstream_requests_total series whose
+// rule_id label equals ruleID.
+func upstreamRequestsForRule(t *testing.T, ruleID string) float64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 512)
+	upstreamRequestsCounter.Collect(ch)
+	close(ch)
+	var sum float64
+	for m := range ch {
+		var dm dtopb.Metric
+		require.NoError(t, m.Write(&dm))
+		for _, lp := range dm.GetLabel() {
+			if lp.GetName() == "rule_id" && lp.GetValue() == ruleID {
+				sum += dm.GetCounter().GetValue()
+			}
+		}
+	}
+	return sum
+}
+
+// A stale-while-revalidate background refresh must attribute its upstream fetch
+// to the triggering rule, not rule_id="default".
+func TestHTTPRefreshCounterAttributesToRule(t *testing.T) {
+	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute})
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+
+	before := upstreamRequestsForRule(t, "my-rule")
+	fn := p.backgroundRefreshFn(req, "hash1", rule.Cache, "my-rule")
+	_, err := fn()
+	require.NoError(t, err)
+
+	require.Equal(t, int32(1), hits.Load())
+	require.Equal(t, 1.0, upstreamRequestsForRule(t, "my-rule")-before,
+		"SWR refresh must record the upstream fetch under its rule tag")
+}
+
 // The upstream-request counter must count exactly ONE fetch when single-flight
 // collapses N concurrent misses — this is the metric that makes coalescing
 // measurable in production (misses − upstream_requests = coalesced-away calls).
