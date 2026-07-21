@@ -26,11 +26,13 @@ fullnameOverride: ""
 # from), dashboard.clusterHistoryRestore is enabled (off by default — it
 # can OOM pods under real cluster traffic; see config.dashboard below), and
 # identities are stable (StatefulSet, the default — it pairs with cluster mode
-# being on by default: stable pod DNS for gossip, ordered graceful scale-down
-# so olric hands off partitions cleanly, and dashboard counters that survive a
-# rolling restart). Override to `kind: Deployment` for a stateless rollout;
-# counters then start cold after a restart, but cache and rate-limit are
-# unaffected either way. Live metrics-history panels populate regardless.
+# being on by default: stable pod DNS for gossip and dashboard counters that
+# survive a rolling restart). Gentle, olric-friendly scale-down (one pod at a
+# time) comes from the autoscaling.behavior default, NOT the StatefulSet — the
+# workload uses podManagementPolicy: Parallel for fast cluster formation.
+# Override to `kind: Deployment` for a stateless rollout; counters then start
+# cold after a restart, but cache and rate-limit are unaffected either way.
+# Live metrics-history panels populate regardless.
 kind: StatefulSet
 
 # Default 1: a single-pod cluster works and performs identically to loopback.
