@@ -1366,7 +1366,7 @@ func (p *HttpProxy) redactedRequestURI(r *http.Request) string {
 //   - max-age=0: caller wants a freshness window of zero. Only honored
 //     when s-maxage is absent (s-maxage wins for shared caches).
 func cacheableByUpstream(h http.Header) bool {
-	cc := h.Get("Cache-Control")
+	cc := strings.Join(h.Values("Cache-Control"), ",")
 	if cc == "" {
 		return true
 	}
