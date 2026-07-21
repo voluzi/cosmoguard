@@ -1958,3 +1958,25 @@ func TestJSONRPCDirectErrorExitsApplyCORS(t *testing.T) {
 	}
 }
 
+// Coalesced non-owner waiters receive only SharedHeaders; the upstream Age must
+// travel with Cache-Control, else a downstream cache treats an already-aged
+// response as fresh for the full max-age.
+func TestJSONRPCCoalescedMissForwardsUpstreamAge(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+	}
+	h := newJSONCacheHandler(t, rule)
+	next := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.Header().Set("Age", "30")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
+	}
+	request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+	req, _ := jsonRequestContext()
+	out, err := h.fetchSingle(req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rule", request.Method, &jsonRpcResponseOwner{}, false)
+	require.NoError(t, err)
+	require.Equal(t, "30", out.SharedHeaders.Get("Age"), "shared waiters must receive the upstream Age")
+	require.Equal(t, "max-age=60", out.SharedHeaders.Get("Cache-Control"))
+}

@@ -1001,6 +1001,13 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 		return out, nil
 	}
 	out.Shareable = true
+	if age, ok := parseUpstreamAge(out.Headers); ok && out.SharedHeaders != nil {
+		// Coalesced non-owner waiters only receive SharedHeaders (which carries
+		// Cache-Control). Forward the upstream Age too, else a downstream cache
+		// treats an already-aged response as fresh for the full max-age. Mirrors
+		// the HTTP miss path (fetchAndStore).
+		out.SharedHeaders.Set("Age", strconv.Itoa(age))
+	}
 	res.StoredAt = nowOrDefault(h.now).UTC()
 	out.StaleWindow = upstreamHTTPStaleWindow(out.Headers, resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
 	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), out.StaleWindow)
