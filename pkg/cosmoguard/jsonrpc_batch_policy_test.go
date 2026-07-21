@@ -489,7 +489,12 @@ func TestHandleHttpSingle_NotificationBypassesCache(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
 	upstreamCalled := false
-	next := func(http.ResponseWriter, *http.Request) { upstreamCalled = true }
+	next := func(uw http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		uw.Header().Set("X-Upstream", "must-not-leak")
+		uw.WriteHeader(http.StatusBadGateway)
+		_, _ = uw.Write([]byte(`<html>bad gateway</html>`))
+	}
 
 	// Notification: no id.
 	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r, next, time.Now())
@@ -497,8 +502,47 @@ func TestHandleHttpSingle_NotificationBypassesCache(t *testing.T) {
 	if w.Body.Len() != 0 {
 		t.Fatalf("notification must write no response body, got %q", w.Body.String())
 	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("notification must suppress upstream status, got %d", w.Code)
+	}
+	if got := w.Header().Get("X-Upstream"); got != "" {
+		t.Fatalf("notification must suppress upstream headers, got %q", got)
+	}
 	if !upstreamCalled {
 		t.Fatal("notification must bypass the primed cache and reach upstream")
+	}
+}
+
+func TestHandleHttpSingle_DefaultAllowedNotificationSuppressesUpstreamResponse(t *testing.T) {
+	h := &JsonRpcHandler{
+		log:           log.WithField("t", "jsonrpc-single"),
+		cgDashboard:   newDashboardObservability(),
+		section:       "rpc.jsonrpc",
+		defaultAction: RuleActionAllow,
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	upstreamCalled := false
+	next := func(uw http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		uw.Header().Set("X-Upstream", "must-not-leak")
+		uw.WriteHeader(http.StatusBadGateway)
+		_, _ = uw.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32603}}`))
+	}
+
+	h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", Method: "q"}, w, r, next, time.Now())
+
+	if !upstreamCalled {
+		t.Fatal("default-allowed notification must reach upstream")
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("notification must write no response body, got %q", w.Body.String())
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("notification must suppress upstream status, got %d", w.Code)
+	}
+	if got := w.Header().Get("X-Upstream"); got != "" {
+		t.Fatalf("notification must suppress upstream headers, got %q", got)
 	}
 }
 

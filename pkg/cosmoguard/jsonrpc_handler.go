@@ -688,7 +688,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 					h.serveSingleMiss(w, r, next, hash, rule.Cache, ruleTag, request, startTime)
 					return
 				}
-				next(w, r)
+				forwardSingleUpstream(request, w, r, next)
 				h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 				return
 
@@ -731,7 +731,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 			h.recordSingle(r, request, "", RuleActionDeny, startTime, "request denied (auth)")
 			return
 		}
-		next(w, r)
+		forwardSingleUpstream(request, w, r, next)
 		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
 	} else {
 		h.cgDashboard.RecordDeny(DenyRecord{
@@ -746,6 +746,14 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 		}
 		h.recordSingle(r, request, cacheMiss, RuleActionDeny, startTime, "request denied")
 	}
+}
+
+func forwardSingleUpstream(request *JsonRpcMsg, w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request)) {
+	if request.ID == nil {
+		next(&discardResponseWriter{}, r)
+		return
+	}
+	next(w, r)
 }
 
 func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) {
