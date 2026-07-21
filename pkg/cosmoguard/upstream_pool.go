@@ -20,10 +20,16 @@ type HttpUpstream struct {
 	Name      string
 	Target    *url.URL
 	Weight    int // for weighted round-robin (default 1)
-	proxy     *httputil.ReverseProxy
-	healthy   atomic.Bool
-	hcConfig  *NodeHealthcheckConfig
-	probeAddr string // full URL for the healthcheck GET
+	proxy   *httputil.ReverseProxy
+	healthy atomic.Bool
+	// everHealthy records whether this upstream has been confirmed healthy at
+	// least once. While false (cold start, gated on a healthcheck), the FIRST
+	// successful probe clears the readiness gate — HealthyAfter is flap
+	// protection for RUNTIME recovery, not a startup delay. Robust to early
+	// probe failures that reset successCount.
+	everHealthy atomic.Bool
+	hcConfig    *NodeHealthcheckConfig
+	probeAddr   string // full URL for the healthcheck GET
 
 	// rolling counters for healthcheck state transitions
 	failCount    atomic.Int32
@@ -313,11 +319,6 @@ func NewHttpUpstreamPool(
 		// traffic before its upstream connection is warm.
 		initialHealthy := u.hcConfig == nil
 		u.healthy.Store(initialHealthy)
-		if !initialHealthy {
-			// Gated on a healthcheck: preload the counter so the first probe
-			// success (not HealthyAfter of them) clears the cold-start gate.
-			u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
-		}
 		// Seed the gauge so operators see every configured upstream in
 		// /metrics from boot — even those that never receive traffic.
 		setUpstreamHealthy(pool.name, u.Name, initialHealthy)
@@ -393,9 +394,6 @@ func (p *HttpUpstreamPool) AddUpstream(n NodeConfig) error {
 	// reachability, so /readyz doesn't flip green on an unproven endpoint.
 	addHealthy := u.hcConfig == nil
 	u.healthy.Store(addHealthy)
-	if !addHealthy {
-		u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
-	}
 	setUpstreamHealthy(p.name, u.Name, addHealthy)
 
 	next := make([]*HttpUpstream, 0, len(current)+1)
@@ -1311,28 +1309,18 @@ func probeAborted(ctx context.Context, stop <-chan struct{}) bool {
 	}
 }
 
-// coldStartSuccessSeed returns the value to preload an upstream's success
-// counter with when it starts gated-unhealthy (a healthcheck is configured but
-// hasn't run yet). Seeding it to HealthyAfter-1 means the FIRST successful
-// probe clears the cold-start readiness gate, rather than waiting for
-// HealthyAfter probes — HealthyAfter is flap protection for RUNTIME recovery
-// (a probe failure resets the counter to 0), not a cold-start delay.
-func coldStartSuccessSeed(hc *NodeHealthcheckConfig) int32 {
-	if hc == nil || hc.HealthyAfter <= 1 {
-		return 0
-	}
-	return int32(hc.HealthyAfter - 1)
-}
-
 // recordProbeResult applies the consecutive-success / consecutive-failure
 // thresholds so transient blips don't flap the upstream in/out of the
-// picker.
+// picker. On cold start (never yet healthy) the first success clears the
+// gate; after that, HealthyAfter consecutive successes are required to
+// recover from a runtime failure.
 func (p *HttpUpstreamPool) recordProbeResult(u *HttpUpstream, ok bool, err error) {
 	if ok {
 		u.failCount.Store(0)
 		s := u.successCount.Add(1)
-		if !u.healthy.Load() && int(s) >= u.hcConfig.HealthyAfter {
+		if !u.healthy.Load() && (!u.everHealthy.Load() || int(s) >= u.hcConfig.HealthyAfter) {
 			u.healthy.Store(true)
+			u.everHealthy.Store(true)
 			setUpstreamHealthy(p.name, u.Name, true)
 			p.log.WithFields(Fields{
 				"upstream": u.Name,

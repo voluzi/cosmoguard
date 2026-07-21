@@ -368,3 +368,26 @@ func TestValidateNodeHealthcheckThresholdRange(t *testing.T) {
 		t.Fatalf("valid thresholds must pass: %v", err)
 	}
 }
+
+// The cold-start gate must clear on the first SUCCESS even if an early probe
+// fails first (the upstream-warming-up race) — the everHealthy flag preserves
+// the cold-start semantic that a fragile success-counter seed would lose.
+func TestColdStartGateSurvivesEarlyProbeFailure(t *testing.T) {
+	on := true
+	hc := &NodeHealthcheckConfig{Enable: &on, Path: "/status", Service: "rpc", HealthyAfter: 3}
+	pool, err := NewHttpUpstreamPool(
+		[]NodeConfig{{Name: "hc", Host: "127.0.0.1", RpcPort: 9, LcdPort: 9, GrpcPort: 9, Healthcheck: hc}},
+		"rpc", nil, log.WithField("test", "coldstart-early-fail"))
+	if err != nil {
+		t.Fatalf("build pool: %v", err)
+	}
+	u := pool.Upstreams()[0]
+	pool.recordProbeResult(u, false, nil) // early failure while the upstream warms up
+	if pool.AnyHealthy() {
+		t.Fatal("must stay gated after a failed probe")
+	}
+	pool.recordProbeResult(u, true, nil) // first success
+	if !pool.AnyHealthy() {
+		t.Fatal("first success after an early failure must still clear the cold-start gate")
+	}
+}

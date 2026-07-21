@@ -41,7 +41,11 @@ type GrpcUpstream struct {
 	// (the old behaviour, kept for back-compat with single-node configs).
 	hcConfig     *NodeHealthcheckConfig
 	probeAddr    string
-	healthy      atomic.Bool
+	healthy atomic.Bool
+	// everHealthy: whether confirmed healthy at least once. While false, the
+	// first successful probe clears the cold-start readiness gate; HealthyAfter
+	// applies only to runtime recovery. Mirrors HttpUpstream.
+	everHealthy  atomic.Bool
 	successCount atomic.Int32
 	failCount    atomic.Int32
 
@@ -357,11 +361,6 @@ func NewGrpcUpstreamPool(name string, nodes []NodeConfig, logger *Entry, opts ..
 		// before its upstream is proven usable.
 		initialHealthy := u.hcConfig == nil
 		u.healthy.Store(initialHealthy)
-		if !initialHealthy {
-			// Gated on a healthcheck: preload the counter so the first probe
-			// success (not HealthyAfter of them) clears the cold-start gate.
-			u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
-		}
 		// Seed the gauge with that verdict so operators see every configured
 		// upstream in /metrics from boot.
 		setUpstreamHealthy(pool.name, u.Name, initialHealthy)
@@ -450,9 +449,6 @@ func (p *GrpcUpstreamPool) AddUpstream(n NodeConfig) error {
 	}
 	addHealthy := u.hcConfig == nil
 	u.healthy.Store(addHealthy)
-	if !addHealthy {
-		u.successCount.Store(coldStartSuccessSeed(u.hcConfig))
-	}
 	setUpstreamHealthy(p.name, u.Name, addHealthy)
 
 	next := make([]*GrpcUpstream, 0, len(current)+1)
@@ -746,8 +742,9 @@ func (p *GrpcUpstreamPool) recordProbeResult(u *GrpcUpstream, ok bool, err error
 	if ok {
 		u.failCount.Store(0)
 		s := u.successCount.Add(1)
-		if !u.healthy.Load() && int(s) >= u.hcConfig.HealthyAfter {
+		if !u.healthy.Load() && (!u.everHealthy.Load() || int(s) >= u.hcConfig.HealthyAfter) {
 			u.healthy.Store(true)
+			u.everHealthy.Store(true)
 			setUpstreamHealthy(p.name, u.Name, true)
 			p.log.WithFields(Fields{
 				"upstream": u.Name,
