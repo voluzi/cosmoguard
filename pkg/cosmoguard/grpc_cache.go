@@ -49,6 +49,13 @@ const grpcRefreshTimeout = 30 * time.Second
 // the background refresh budget so slow but legitimate unary calls can finish.
 const grpcForegroundFetchTimeout = 5 * time.Minute
 
+func configuredGRPCForegroundFetchTimeout(cacheConfig *CacheGlobalConfig) time.Duration {
+	if cacheConfig != nil && cacheConfig.GRPCForegroundFetchTimeout > 0 {
+		return cacheConfig.GRPCForegroundFetchTimeout
+	}
+	return grpcForegroundFetchTimeout
+}
+
 // grpcCacheMetaKey is the response-header metadata cosmoguard adds to indicate
 // cache state (hit / miss / stale) — the gRPC analogue of the HTTP
 // X-Cosmoguard-Cache header. gRPC had no cache signal before; this gives
@@ -250,7 +257,7 @@ func cachingStreamHandler(
 // waiter's cancellation or deadline while preserving outgoing metadata.
 func (p *GrpcProxy) grpcForegroundFetchFn(outCtx context.Context, method string, reqPayload []byte, key string, rule *GrpcRule, owner *grpcResponseOwner) func() (grpcCachedResponse, error) {
 	return func() (grpcCachedResponse, error) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(outCtx), grpcForegroundFetchTimeout)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(outCtx), configuredGRPCForegroundFetchTimeout(p.cacheConfig))
 		defer cancel()
 		out, err := p.grpcFetchAndStore(ctx, method, reqPayload, key, rule)
 		out.owner = owner

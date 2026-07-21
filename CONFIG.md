@@ -137,11 +137,14 @@ cache:
   key: "cosmoguard-prod"                    # optional key prefix
   coalesce: true                            # global default for single-flight (on); rules can override
   staleWhileRevalidate: 0s                  # global default stale window (0 = off); rules can override
+  grpcForegroundFetchTimeout: 5m            # detached coalesced gRPC miss safety bound
   # memory: …                               # cache memory budget (see below)
   # cluster: …                              # presence enables networked cluster mode
 ```
 
 `coalesce` and `staleWhileRevalidate` are cluster-wide **defaults** that each rule inherits unless it sets its own — exactly like `ttl`. Both are covered in [Cache features](#cache-features) below. Changing the global `cache:` block requires a process restart (like `cache.ttl`); per-rule overrides hot-reload.
+
+`grpcForegroundFetchTimeout` bounds the detached upstream call shared by coalesced gRPC misses. It defaults to `5m`, is independent of any one caller's deadline, and can be increased for cacheable unary methods that legitimately take longer. Each caller still stops waiting under its own RPC context.
 
 ### Memory budget
 

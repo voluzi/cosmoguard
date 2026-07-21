@@ -257,6 +257,34 @@ func TestGRPCCacheForegroundCoalescedMissUsesProxyDeadline(t *testing.T) {
 	require.LessOrEqual(t, observed.remaining, grpcForegroundFetchTimeout)
 }
 
+func TestGRPCCacheForegroundCoalescedMissUsesConfiguredProxyDeadline(t *testing.T) {
+	type deadlineObservation struct {
+		remaining time.Duration
+		ok        bool
+	}
+	observedDeadline := make(chan deadlineObservation, 1)
+	conn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		deadline, ok := stream.Context().Deadline()
+		observedDeadline <- deadlineObservation{remaining: time.Until(deadline), ok: ok}
+		return stream.SendMsg(&rawFrame{Payload: []byte("response")})
+	})
+	p, _ := newGRPCCacheTestProxy(t, conn, &RuleCache{Enable: true, TTL: time.Minute})
+	configuredTimeout := 45 * time.Minute
+	p.cacheConfig = &CacheGlobalConfig{GRPCForegroundFetchTimeout: configuredTimeout}
+	handler := grpcCacheTestHandler(p)
+
+	stream := newGRPCCacheTestStream([]byte("request"))
+	require.NoError(t, handler(nil, stream))
+	observed := <-observedDeadline
+	require.True(t, observed.ok)
+	require.Greater(t, observed.remaining, 44*time.Minute)
+	require.LessOrEqual(t, observed.remaining, configuredTimeout)
+}
+
 func TestGRPCCacheShortLeaderDeadlineDoesNotCapWaiter(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})

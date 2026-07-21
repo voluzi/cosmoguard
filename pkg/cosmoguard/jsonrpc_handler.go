@@ -59,7 +59,7 @@ type JsonRpcHandler struct {
 	sf coalescer[bufferedJsonRpcResponse]
 	// pendingSingles keeps a fetched response available while its detached
 	// foreground cache write is still in progress.
-	pendingSingles sync.Map // cache hash -> bufferedJsonRpcResponse
+	pendingSingles sync.Map // cache hash -> *jsonPendingResponse
 	// now returns the current time; swappable in tests for deterministic
 	// freshness / SWR. Defaults to time.Now in NewJsonRpcHandler.
 	now func() time.Time
@@ -670,7 +670,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 						stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(h.cacheConfig))
 						switch classifyFreshness(res.StoredAt, nowOrDefault(h.now), effTTL, stale) {
 						case freshEntry:
-							h.writeSingleResponse(w, res.CloneWithID(request.ID))
+							h.writeSingleResponse(w, r, res.CloneWithID(request.ID))
 							h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
 							return
 						case staleEntry:
@@ -678,7 +678,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 							// background (coalesced by key) — the client never
 							// waits on the upstream.
 							w.Header().Set(cacheStateHeader, cacheStale)
-							h.writeSingleResponse(w, res.CloneWithID(request.ID))
+							h.writeSingleResponse(w, r, res.CloneWithID(request.ID))
 							h.recordSingle(r, request, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
 							h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, rule.Cache, ruleTag, request.Method))
 							return
@@ -702,7 +702,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 				})
 				// Notifications (no id) get no response, even on deny (§4.1).
 				if request.ID != nil {
-					h.writeSingleResponse(w, UnauthorizedResponse(request))
+					h.writeSingleResponse(w, r, UnauthorizedResponse(request))
 				}
 				h.recordSingle(r, request, cacheMiss, RuleActionDeny, startTime, "request denied")
 				return
@@ -742,7 +742,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 		})
 		// Notifications (no id) get no response, even on deny (§4.1).
 		if request.ID != nil {
-			h.writeSingleResponse(w, UnauthorizedResponse(request))
+			h.writeSingleResponse(w, r, UnauthorizedResponse(request))
 		}
 		h.recordSingle(r, request, cacheMiss, RuleActionDeny, startTime, "request denied")
 	}
@@ -815,13 +815,6 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	owner := &jsonRpcResponseOwner{}
-	if pending, ok := h.pendingSingles.Load(hash); ok {
-		res := pending.(bufferedJsonRpcResponse)
-		h.applySingleUpstreamStats(r, res.Upstream)
-		h.writeBufferedSingleResponse(w, r, res, request.ID, owner)
-		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed")
-		return
-	}
 	res, err := h.sf.do(r.Context(), strconv.FormatUint(hash, 16), h.singleForegroundFetchFn(r, next, hash, cache, ruleTag, request.Method, owner))
 	h.applySingleUpstreamStats(r, res.Upstream)
 	if err != nil {
@@ -833,7 +826,7 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 		// garbage). Reply with a JSON-RPC internal error so the client still
 		// gets a valid response.
 		if request.ID != nil {
-			h.writeSingleResponse(w, ErrorResponse(request, -32603, "upstream error", nil))
+			h.writeSingleResponse(w, r, ErrorResponse(request, -32603, "upstream error", nil))
 		}
 		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed (upstream error)")
 		return
@@ -841,11 +834,11 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 	if res.Cached != nil {
 		if res.CacheState == cacheStale {
 			w.Header().Set(cacheStateHeader, cacheStale)
-			h.writeSingleResponse(w, res.Cached.CloneWithID(request.ID))
+			h.writeSingleResponse(w, r, res.Cached.CloneWithID(request.ID))
 			h.recordSingle(r, request, cacheStale, RuleActionAllow, startTime, "request allowed (stale)")
 			h.sf.refresh(strconv.FormatUint(hash, 16), h.singleBackgroundRefreshFn(r, next, hash, cache, ruleTag, request.Method))
 		} else {
-			h.writeSingleResponse(w, res.Cached.CloneWithID(request.ID))
+			h.writeSingleResponse(w, r, res.Cached.CloneWithID(request.ID))
 			h.recordSingle(r, request, cacheHit, RuleActionAllow, startTime, "request allowed")
 		}
 		return
@@ -874,6 +867,11 @@ type bufferedJsonRpcResponse struct {
 
 type jsonRpcResponseOwner [1]byte
 
+type jsonPendingResponse struct {
+	response bufferedJsonRpcResponse
+	writeMu  *sync.Mutex
+}
+
 func (h *JsonRpcHandler) singleForegroundFetchFn(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string, owner *jsonRpcResponseOwner) func() (bufferedJsonRpcResponse, error) {
 	body := snapshotRequestBody(r)
 	return func() (bufferedJsonRpcResponse, error) {
@@ -901,7 +899,14 @@ func (h *JsonRpcHandler) singleBackgroundRefreshFn(r *http.Request, next func(ht
 
 func (h *JsonRpcHandler) recentSingleResponse(r *http.Request, hash uint64, cache *RuleCache) (bufferedJsonRpcResponse, bool) {
 	if pending, ok := h.pendingSingles.Load(hash); ok {
-		return pending.(bufferedJsonRpcResponse), true
+		entry := pending.(*jsonPendingResponse)
+		state := classifyFreshness(entry.response.Message.StoredAt, nowOrDefault(h.now), effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+		switch state {
+		case freshEntry:
+			return entry.response, true
+		case staleEntry:
+			return bufferedJsonRpcResponse{Cached: entry.response.Message, CacheState: cacheStale}, true
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpCacheWriteTimeout)
 	defer cancel()
@@ -958,20 +963,37 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 	out.Shareable = true
 	res.StoredAt = nowOrDefault(h.now).UTC()
 	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+	pendingResponse := out
+	pendingResponse.Headers = nil
+	pendingResponse.RawBody = nil
+	pendingResponse.Owner = nil
+	pending := h.stageSingleResponse(hash, pendingResponse)
 	if asyncStore {
-		pending := out
-		pending.Headers = nil
-		pending.RawBody = nil
-		pending.Owner = nil
-		h.pendingSingles.Store(hash, pending)
-		go func() {
-			defer h.pendingSingles.Delete(hash)
-			h.persistSingleResponse(hash, res, physTTL, ruleTag, method)
-		}()
+		go h.persistPendingSingleResponse(hash, pending, physTTL, ruleTag, method)
 		return out, nil
 	}
-	h.persistSingleResponse(hash, res, physTTL, ruleTag, method)
+	h.persistPendingSingleResponse(hash, pending, physTTL, ruleTag, method)
 	return out, nil
+}
+
+func (h *JsonRpcHandler) stageSingleResponse(hash uint64, response bufferedJsonRpcResponse) *jsonPendingResponse {
+	writeMu := &sync.Mutex{}
+	if current, ok := h.pendingSingles.Load(hash); ok {
+		writeMu = current.(*jsonPendingResponse).writeMu
+	}
+	pending := &jsonPendingResponse{response: response, writeMu: writeMu}
+	h.pendingSingles.Store(hash, pending)
+	return pending
+}
+
+func (h *JsonRpcHandler) persistPendingSingleResponse(hash uint64, pending *jsonPendingResponse, ttl time.Duration, ruleTag, method string) {
+	pending.writeMu.Lock()
+	defer pending.writeMu.Unlock()
+	if current, ok := h.pendingSingles.Load(hash); !ok || current != pending {
+		return
+	}
+	h.persistSingleResponse(hash, pending.response.Message, ttl, ruleTag, method)
+	h.pendingSingles.CompareAndDelete(hash, pending)
 }
 
 func (h *JsonRpcHandler) persistSingleResponse(hash uint64, res *JsonRpcMsg, ttl time.Duration, ruleTag, method string) {
@@ -1027,7 +1049,7 @@ func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *h
 	_, _ = w.Write(body)
 }
 
-func (h *JsonRpcHandler) writeSingleResponse(w http.ResponseWriter, res *JsonRpcMsg) {
+func (h *JsonRpcHandler) writeSingleResponse(w http.ResponseWriter, r *http.Request, res *JsonRpcMsg) {
 	b, err := res.Marshal()
 	if err != nil {
 		h.log.Errorf("error marshalling response from cache: %v", err)
@@ -1037,6 +1059,9 @@ func (h *JsonRpcHandler) writeSingleResponse(w http.ResponseWriter, res *JsonRpc
 
 	// set the proper content type before writing
 	w.Header().Set("Content-Type", "application/json")
+	if h.cors != nil {
+		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+	}
 
 	w.Write(b)
 }

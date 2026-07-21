@@ -98,7 +98,7 @@ type HttpProxy struct {
 	sf coalescer[bufferedUpstreamResponse]
 	// pendingMisses bridges the short interval between a foreground fetch
 	// returning and its asynchronous cache write completing.
-	pendingMisses sync.Map // request hash -> bufferedUpstreamResponse
+	pendingMisses sync.Map // request hash -> *httpPendingResponse
 	// now returns the current time; swappable in tests to drive cache
 	// freshness / stale-while-revalidate deterministically. Defaults to
 	// time.Now in NewHttpProxy.
@@ -1019,6 +1019,12 @@ type bufferedUpstreamResponse struct {
 
 type responseOwner [1]byte
 
+type httpPendingResponse struct {
+	response bufferedUpstreamResponse
+	cached   CachedResponse
+	writeMu  *sync.Mutex
+}
+
 // discardResponseWriter keeps a header map (so the reverse-proxy ModifyResponse
 // hook can write to it and we can snapshot the committed headers) but discards
 // the body. Used as the sink for a buffered fetch that must not stream to any
@@ -1045,14 +1051,6 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 	}
 
 	owner := &responseOwner{}
-	if pending, ok := p.pendingMisses.Load(requestHash); ok {
-		out := pending.(bufferedUpstreamResponse)
-		p.applyUpstreamStats(r, out.Upstream)
-		p.writeMissResponse(w, r, out, owner)
-		p.recordOutcome(r, out.StatusCode, cacheMiss, RuleActionAllow, startTime, "request allowed")
-		return
-	}
-
 	out, err := p.sf.do(r.Context(), requestHash, p.foregroundFetchFn(r, requestHash, cache, ruleTag, owner))
 	// A canceled/expired caller context means this waiter's client went away
 	// (or its share of a coalesced fetch timed out) — nothing to write. The
@@ -1135,7 +1133,15 @@ func (p *HttpProxy) foregroundFetchFn(r *http.Request, requestHash string, cache
 
 func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cache *RuleCache) (bufferedUpstreamResponse, bool) {
 	if pending, ok := p.pendingMisses.Load(requestHash); ok {
-		return pending.(bufferedUpstreamResponse), true
+		entry := pending.(*httpPendingResponse)
+		state := classifyFreshness(entry.cached.StoredAt, p.timeNow(), effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow()))
+		switch state {
+		case freshEntry:
+			return entry.response, true
+		case staleEntry:
+			cached := entry.cached
+			return bufferedUpstreamResponse{Cached: &cached, CacheState: cacheStale}, true
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpCacheWriteTimeout)
 	defer cancel()
@@ -1183,7 +1189,8 @@ func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, r
 	}
 	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
 	storedAt := p.timeNow().UTC()
-	go p.persistHTTPResponse(requestHash, cache, ruleTag, cardinalityKey, status, committed, b, storedAt)
+	cached := p.buildCachedHTTPResponse(cache, status, committed, b, storedAt)
+	go p.persistCachedHTTPResponse(requestHash, cached, physicalTTL(effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow())), ruleTag, cardinalityKey)
 }
 
 // fetchAndStore performs one buffered upstream fetch. Foreground callers publish
@@ -1222,38 +1229,59 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 	out.SharedHeaders = pickCacheableHeaders(committed, cache.PreserveHeaders)
 	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
 	storedAt := p.timeNow().UTC()
+	cached := p.buildCachedHTTPResponse(cache, status, committed, b, storedAt)
+	ttl := physicalTTL(effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow()))
+	pendingResponse := out
+	pendingResponse.Headers = nil
+	pendingResponse.Owner = nil
+	pending := p.stageHTTPResponse(requestHash, pendingResponse, cached)
 	if asyncStore {
-		pending := out
-		pending.Headers = nil
-		pending.Owner = nil
-		p.pendingMisses.Store(requestHash, pending)
-		go func() {
-			defer p.pendingMisses.Delete(requestHash)
-			p.persistHTTPResponse(requestHash, cache, ruleTag, cardinalityKey, status, committed, b, storedAt)
-		}()
+		go p.persistPendingHTTPResponse(requestHash, pending, ttl, ruleTag, cardinalityKey)
 		return out, nil
 	}
-	p.persistHTTPResponse(requestHash, cache, ruleTag, cardinalityKey, status, committed, b, storedAt)
+	p.persistPendingHTTPResponse(requestHash, pending, ttl, ruleTag, cardinalityKey)
 	return out, nil
 }
 
-func (p *HttpProxy) persistHTTPResponse(requestHash string, cache *RuleCache, ruleTag, cardinalityKey string, status int, committed http.Header, body []byte, storedAt time.Time) {
+func (p *HttpProxy) buildCachedHTTPResponse(cache *RuleCache, status int, committed http.Header, body []byte, storedAt time.Time) CachedResponse {
 	upstreamAge := 0
 	if v := committed.Get("Age"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			upstreamAge = n
 		}
 	}
-	effTTL := effectiveTTL(cache, p.cacheConfig)
-	stale := resolveStaleWindow(cache, p.globalStaleWindow())
-	writeCtx, cancel := context.WithTimeout(context.Background(), httpCacheWriteTimeout)
-	setErr := p.cache.Set(writeCtx, requestHash, CachedResponse{
+	return CachedResponse{
 		Data:        body,
 		StatusCode:  status,
 		Headers:     pickCacheableHeaders(committed, cache.PreserveHeaders),
 		StoredAt:    storedAt,
 		UpstreamAge: upstreamAge,
-	}, physicalTTL(effTTL, stale))
+	}
+}
+
+func (p *HttpProxy) stageHTTPResponse(requestHash string, response bufferedUpstreamResponse, cached CachedResponse) *httpPendingResponse {
+	writeMu := &sync.Mutex{}
+	if current, ok := p.pendingMisses.Load(requestHash); ok {
+		writeMu = current.(*httpPendingResponse).writeMu
+	}
+	pending := &httpPendingResponse{response: response, cached: cached, writeMu: writeMu}
+	p.pendingMisses.Store(requestHash, pending)
+	return pending
+}
+
+func (p *HttpProxy) persistPendingHTTPResponse(requestHash string, pending *httpPendingResponse, ttl time.Duration, ruleTag, cardinalityKey string) {
+	pending.writeMu.Lock()
+	defer pending.writeMu.Unlock()
+	if current, ok := p.pendingMisses.Load(requestHash); !ok || current != pending {
+		return
+	}
+	p.persistCachedHTTPResponse(requestHash, pending.cached, ttl, ruleTag, cardinalityKey)
+	p.pendingMisses.CompareAndDelete(requestHash, pending)
+}
+
+func (p *HttpProxy) persistCachedHTTPResponse(requestHash string, cached CachedResponse, ttl time.Duration, ruleTag, cardinalityKey string) {
+	writeCtx, cancel := context.WithTimeout(context.Background(), httpCacheWriteTimeout)
+	setErr := p.cache.Set(writeCtx, requestHash, cached, ttl)
 	cancel()
 	if setErr != nil {
 		p.log.Errorf("error setting cache value: %v", setErr)

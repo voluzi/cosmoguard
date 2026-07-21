@@ -349,6 +349,10 @@ type CacheGlobalConfig struct {
 	// refreshes it. 0 (default) disables SWR. A rule may override via its
 	// own cache.staleWhileRevalidate. Restart-required, like cache.ttl.
 	StaleWhileRevalidate time.Duration `yaml:"staleWhileRevalidate,omitempty"`
+	// GRPCForegroundFetchTimeout bounds a detached shared gRPC cache miss.
+	// Increase it for methods that legitimately run longer than the five-minute
+	// default without coupling the shared fetch to one caller's deadline.
+	GRPCForegroundFetchTimeout time.Duration `yaml:"grpcForegroundFetchTimeout,omitempty" default:"5m"`
 	// Memory bounds the cache's memory footprint so a high-cardinality
 	// query load can't grow the working set until the pod is OOMKilled.
 	// See CacheMemoryConfig; when omitted the budget is auto-derived from
@@ -1158,6 +1162,9 @@ func validateCacheBackend(c *CacheGlobalConfig) error {
 	}
 	if c.StaleWhileRevalidate < 0 {
 		return fmt.Errorf("cache.staleWhileRevalidate must be >= 0 (0 disables it); got %s", c.StaleWhileRevalidate)
+	}
+	if c.GRPCForegroundFetchTimeout < 0 {
+		return fmt.Errorf("cache.grpcForegroundFetchTimeout must be >= 0; got %s", c.GRPCForegroundFetchTimeout)
 	}
 	if c.Cluster != nil {
 		// A wildcard bindAddr (empty, 0.0.0.0, ::) is incompatible with

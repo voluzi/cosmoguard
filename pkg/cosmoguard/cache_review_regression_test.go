@@ -427,6 +427,47 @@ func TestHTTPMissResponseDoesNotWaitForCachePersistence(t *testing.T) {
 	_ = blocking.Close()
 }
 
+func TestHTTPPendingResponseExpiresBeforePersistenceCompletes(t *testing.T) {
+	var responses atomic.Int32
+	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("response-" + strconv.Itoa(int(responses.Add(1)))))
+	})
+	blocking := newBlockingResponseCache()
+	t.Cleanup(func() { _ = blocking.Close() })
+	p.cache = blocking
+	base := time.Unix(2_000_000, 0)
+	var clock atomic.Int64
+	clock.Store(base.UnixNano())
+	p.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Second})
+
+	first := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec, _ := cacheRequest(p, rule, nil)
+		first <- rec
+	}()
+	select {
+	case <-blocking.setStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cache persistence did not start")
+	}
+	require.Equal(t, "response-1", (<-first).Body.String())
+
+	clock.Store(base.Add(2 * time.Second).UnixNano())
+	second := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec, _ := cacheRequest(p, rule, nil)
+		second <- rec
+	}()
+	select {
+	case rec := <-second:
+		require.Equal(t, "response-2", rec.Body.String())
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("expired pending response did not refetch")
+	}
+	require.Equal(t, int32(2), hits.Load())
+}
+
 func TestHTTPPendingPersistenceCannotOpenDuplicateMiss(t *testing.T) {
 	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -588,6 +629,9 @@ func TestJSONRPCStaleResponseCarriesCacheHeader(t *testing.T) {
 		Cache:   &RuleCache{Enable: true, TTL: 5 * time.Second, StaleWhileRevalidate: time.Minute},
 	}
 	h := newJSONCacheHandler(t, rule)
+	cors := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://app.example"}}
+	require.NoError(t, cors.Compile())
+	h.cors = cors
 	base := time.Unix(2_000_000, 0)
 	h.now = func() time.Time { return base }
 	request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
@@ -601,9 +645,11 @@ func TestJSONRPCStaleResponseCarriesCacheHeader(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req, _ := jsonRequestContext()
+	req.Header.Set("Origin", "https://app.example")
 	h.handleHttpSingle(request, rec, req, func(http.ResponseWriter, *http.Request) {}, time.Now())
 
 	require.Equal(t, cacheStale, rec.Header().Get(cacheStateHeader))
+	require.Equal(t, "https://app.example", rec.Header().Get("Access-Control-Allow-Origin"))
 }
 
 func TestJSONRPCNotificationDoesNotCoalesceWithCall(t *testing.T) {
@@ -1025,11 +1071,14 @@ type blockingJSONCache struct {
 }
 
 func newBlockingJSONCache() *blockingJSONCache {
-	return &blockingJSONCache{setStarted: make(chan struct{}), releaseSet: make(chan struct{})}
+	return &blockingJSONCache{setStarted: make(chan struct{}, 4), releaseSet: make(chan struct{})}
 }
 
 func (c *blockingJSONCache) Set(context.Context, uint64, *JsonRpcMsg, time.Duration) error {
-	close(c.setStarted)
+	select {
+	case c.setStarted <- struct{}{}:
+	default:
+	}
 	<-c.releaseSet
 	return nil
 }
@@ -1078,4 +1127,55 @@ func TestJSONRPCMissResponseDoesNotWaitForCachePersistence(t *testing.T) {
 		t.Fatal("JSON-RPC response waited for cache persistence")
 	}
 	_ = blocking.Close()
+}
+
+func TestJSONRPCPendingResponseExpiresBeforePersistenceCompletes(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Second},
+	}
+	h := newJSONCacheHandler(t, rule)
+	blocking := newBlockingJSONCache()
+	t.Cleanup(func() { _ = blocking.Close() })
+	h.cache = blocking
+	base := time.Unix(2_000_000, 0)
+	var clock atomic.Int64
+	clock.Store(base.UnixNano())
+	h.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	var upstreamCalls atomic.Int32
+	next := func(w http.ResponseWriter, _ *http.Request) {
+		result := strconv.Itoa(int(upstreamCalls.Add(1)))
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"response-` + result + `"}`))
+	}
+
+	first := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req, _ := jsonRequestContext()
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, req, next, time.Now())
+		first <- rec
+	}()
+	select {
+	case <-blocking.setStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cache persistence did not start")
+	}
+	require.JSONEq(t, `{"jsonrpc":"2.0","id":1,"result":"response-1"}`, (<-first).Body.String())
+
+	clock.Store(base.Add(2 * time.Second).UnixNano())
+	second := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req, _ := jsonRequestContext()
+		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 2, Method: "status"}, rec, req, next, time.Now())
+		second <- rec
+	}()
+	select {
+	case rec := <-second:
+		require.JSONEq(t, `{"jsonrpc":"2.0","id":2,"result":"response-2"}`, rec.Body.String())
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("expired pending JSON-RPC response did not refetch")
+	}
+	require.Equal(t, int32(2), upstreamCalls.Load())
 }

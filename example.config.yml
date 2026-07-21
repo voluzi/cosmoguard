@@ -72,6 +72,7 @@ cache:
   ttl: 5s
   # coalesce: true                   # global default: single-flight concurrent misses (on). Rules can override.
   # staleWhileRevalidate: 30s        # global default stale window (0 = off): serve stale while refreshing. Rules can override.
+  # grpcForegroundFetchTimeout: 5m   # safety bound for detached coalesced gRPC misses; raise for longer-running methods.
   # memory:                          # cache memory budget (bounds OOM risk)
   #   # Defaults auto-derive from the pod's memory limit; override if needed:
   #   maxBytes: 0                    # absolute L1 cap (bytes); unset → auto; 0 → unlimited
