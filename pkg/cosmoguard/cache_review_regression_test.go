@@ -1860,3 +1860,69 @@ func TestJSONRPCPendingResponseExpiresBeforePersistenceCompletes(t *testing.T) {
 	}
 	require.Equal(t, int32(2), upstreamCalls.Load())
 }
+
+// When the DETACHED foreground fetch times out but the caller's context is
+// still live, the caller must receive the upstream-failure 502 — never a
+// silent/blank response. sf.do only returns an error via the caller's own
+// ctx.Done(); the reverse proxy turns a fetch timeout into a 502 written to
+// the sink (nil error), so a live caller never trips the cancellation guard.
+func TestHTTPCoalescedForegroundTimeoutStillAnswersLiveCaller(t *testing.T) {
+	target, err := url.Parse("http://upstream.invalid")
+	require.NoError(t, err)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	rp.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done() // block until the detached fetch deadline fires
+		return nil, r.Context().Err()
+	})
+	upstream := &HttpUpstream{Name: "up", Target: target, proxy: rp}
+	upstream.healthy.Store(true)
+
+	cache, err := newResponseCache[string, CachedResponse](nil, nil, "fg-timeout", CacheBudget{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cache.Close() })
+
+	p := &HttpProxy{
+		log:   log.WithField("test", "fg-timeout"),
+		pool:  newTestHTTPPool("weighted-round-robin", 0, upstream),
+		cache: cache,
+		now:   time.Now,
+	}
+	p.cacheConfig = &CacheGlobalConfig{HTTPForegroundFetchTimeout: 30 * time.Millisecond}
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second) // caller stays live
+	defer cancel()
+	req = req.WithContext(ctx)
+	p.allow(rec, req, rule, time.Now())
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Equal(t, cacheMiss, rec.Header().Get(cacheStateHeader))
+}
+
+// JSON-RPC counterpart: a live caller whose coalesced foreground fetch times
+// out gets the upstream 502, not a silent drop.
+func TestJSONRPCCoalescedForegroundTimeoutStillAnswersLiveCaller(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+	}
+	h := newJSONCacheHandler(t, rule)
+	h.cacheConfig = &CacheGlobalConfig{HTTPForegroundFetchTimeout: 30 * time.Millisecond}
+	next := func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		w.WriteHeader(http.StatusBadGateway)
+	}
+
+	request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+	rec := httptest.NewRecorder()
+	req, _ := jsonRequestContext()
+	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+	h.serveSingleMiss(rec, req, next, request.HashWithRule(rule.Fingerprint), rule.Cache, "rule", request, time.Now())
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+}
