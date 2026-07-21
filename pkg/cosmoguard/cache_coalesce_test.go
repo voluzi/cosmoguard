@@ -57,6 +57,7 @@ func TestResolveCoalesceAndStaleWindow(t *testing.T) {
 	require.Equal(t, time.Duration(0), resolveStaleWindow(nil, 0))
 	require.Equal(t, 30*time.Second, resolveStaleWindow(&RuleCache{}, 30*time.Second))                                     // inherit global
 	require.Equal(t, 5*time.Second, resolveStaleWindow(&RuleCache{StaleWhileRevalidate: 5 * time.Second}, 30*time.Second)) // rule overrides
+	require.Equal(t, time.Duration(0), resolveStaleWindow(&RuleCache{DisableStaleWhileRevalidate: true}, 30*time.Second))  // rule disables global
 }
 
 func TestPhysicalTTL(t *testing.T) {

@@ -810,7 +810,7 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 				if effTTL <= 0 && p.cacheConfig != nil {
 					effTTL = p.cacheConfig.TTL
 				}
-				stale := resolveStaleWindow(ruleCache, p.globalStaleWindow())
+				stale := cachedHTTPStaleWindow(res, resolveStaleWindow(ruleCache, p.globalStaleWindow()))
 				switch classifyFreshness(res.StoredAt, p.timeNow(), effTTL, stale) {
 				case freshEntry:
 					p.cacheHit(w, r, res, startTime)
@@ -1144,7 +1144,8 @@ func (p *HttpProxy) foregroundFetchFn(r *http.Request, requestHash string, cache
 func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cache *RuleCache) (bufferedUpstreamResponse, bool) {
 	if pending, ok := p.pendingMisses.Load(requestHash); ok {
 		entry := pending.(*httpPendingResponse)
-		state := classifyFreshness(entry.cached.StoredAt, p.timeNow(), effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow()))
+		stale := cachedHTTPStaleWindow(entry.cached, resolveStaleWindow(cache, p.globalStaleWindow()))
+		state := classifyFreshness(entry.cached.StoredAt, p.timeNow(), effectiveTTL(cache, p.cacheConfig), stale)
 		switch state {
 		case freshEntry:
 			return entry.response, true
@@ -1159,7 +1160,8 @@ func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cach
 	if err != nil {
 		return bufferedUpstreamResponse{}, false
 	}
-	state := classifyFreshness(res.StoredAt, p.timeNow(), effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow()))
+	stale := cachedHTTPStaleWindow(res, resolveStaleWindow(cache, p.globalStaleWindow()))
+	state := classifyFreshness(res.StoredAt, p.timeNow(), effectiveTTL(cache, p.cacheConfig), stale)
 	if state == expiredEntry {
 		return bufferedUpstreamResponse{}, false
 	}
@@ -1208,7 +1210,8 @@ func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, r
 	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
 	storedAt := p.timeNow().UTC()
 	cached := p.buildCachedHTTPResponse(cache, status, committed, b, storedAt)
-	go p.persistCachedHTTPResponse(requestHash, cached, physicalTTL(effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow())), ruleTag, cardinalityKey)
+	stale := upstreamHTTPStaleWindow(committed, resolveStaleWindow(cache, p.globalStaleWindow()))
+	go p.persistCachedHTTPResponse(requestHash, cached, physicalTTL(effectiveTTL(cache, p.cacheConfig), stale), ruleTag, cardinalityKey)
 }
 
 // fetchAndStore performs one buffered upstream fetch. Foreground callers publish
@@ -1245,10 +1248,14 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 	}
 	out.Shareable = true
 	out.SharedHeaders = pickCacheableHeaders(committed, cache.PreserveHeaders)
+	if upstreamAge, ok := parseUpstreamAge(committed); ok {
+		out.SharedHeaders["Age"] = strconv.Itoa(upstreamAge)
+	}
 	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
 	storedAt := p.timeNow().UTC()
 	cached := p.buildCachedHTTPResponse(cache, status, committed, b, storedAt)
-	ttl := physicalTTL(effectiveTTL(cache, p.cacheConfig), resolveStaleWindow(cache, p.globalStaleWindow()))
+	stale := upstreamHTTPStaleWindow(committed, resolveStaleWindow(cache, p.globalStaleWindow()))
+	ttl := physicalTTL(effectiveTTL(cache, p.cacheConfig), stale)
 	pendingResponse := out
 	pendingResponse.Headers = nil
 	pendingResponse.Owner = nil
@@ -1263,10 +1270,8 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 
 func (p *HttpProxy) buildCachedHTTPResponse(cache *RuleCache, status int, committed http.Header, body []byte, storedAt time.Time) CachedResponse {
 	upstreamAge := 0
-	if v := committed.Get("Age"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
-			upstreamAge = n
-		}
+	if age, ok := parseUpstreamAge(committed); ok {
+		upstreamAge = age
 	}
 	return CachedResponse{
 		Data:        body,
@@ -1275,6 +1280,18 @@ func (p *HttpProxy) buildCachedHTTPResponse(cache *RuleCache, status int, commit
 		StoredAt:    storedAt,
 		UpstreamAge: upstreamAge,
 	}
+}
+
+func parseUpstreamAge(headers http.Header) (int, bool) {
+	value := headers.Get("Age")
+	if value == "" {
+		return 0, false
+	}
+	age, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || age < 0 {
+		return 0, false
+	}
+	return age, true
 }
 
 func (p *HttpProxy) stageHTTPResponse(requestHash string, response bufferedUpstreamResponse, cached CachedResponse) *httpPendingResponse {

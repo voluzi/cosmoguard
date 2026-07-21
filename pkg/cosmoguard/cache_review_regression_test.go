@@ -161,6 +161,48 @@ func TestHTTPCoalescedWaitersDoNotReceiveLeaderHeaders(t *testing.T) {
 	require.NotContains(t, recB.Header().Values("Set-Cookie"), "session=alice")
 }
 
+func TestHTTPCoalescedWaitersPreserveUpstreamAge(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	base := time.Unix(2_000_000, 0)
+	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.Header().Set("Age", "37")
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		_, _ = w.Write([]byte("shared"))
+	})
+	p.now = func() time.Time { return base }
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute})
+
+	first := make(chan *httptest.ResponseRecorder, 1)
+	second := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec, _ := cacheRequest(p, rule, nil)
+		first <- rec
+	}()
+	<-started
+	go func() {
+		rec, _ := cacheRequest(p, rule, nil)
+		second <- rec
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	recA := <-first
+	recB := <-second
+	require.Equal(t, int32(1), hits.Load())
+	require.Equal(t, "37", recA.Header().Get("Age"))
+	require.Equal(t, "37", recB.Header().Get("Age"))
+
+	p.now = func() time.Time { return base.Add(5 * time.Second) }
+	require.Eventually(t, func() bool {
+		rec := doGet(p, rule)
+		return rec.Header().Get(cacheStateHeader) == cacheHit && rec.Header().Get("Age") == "42"
+	}, time.Second, 5*time.Millisecond)
+	require.Equal(t, int32(1), hits.Load())
+}
+
 func TestHTTPCoalescedWaitersKeepUpstreamStats(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -253,12 +295,17 @@ type blockingResponseCache struct {
 	closeOnce  sync.Once
 }
 
-type capturingResponseCache struct {
-	set chan CachedResponse
+type capturedResponseStore struct {
+	response CachedResponse
+	ttl      time.Duration
 }
 
-func (c *capturingResponseCache) Set(_ context.Context, _ string, value CachedResponse, _ time.Duration) error {
-	c.set <- value
+type capturingResponseCache struct {
+	set chan capturedResponseStore
+}
+
+func (c *capturingResponseCache) Set(_ context.Context, _ string, value CachedResponse, ttl time.Duration) error {
+	c.set <- capturedResponseStore{response: value, ttl: ttl}
 	return nil
 }
 
@@ -276,7 +323,7 @@ func TestHTTPAsyncPersistenceUsesFetchCompletionTime(t *testing.T) {
 	p, _ := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
-	capturing := &capturingResponseCache{set: make(chan CachedResponse, 1)}
+	capturing := &capturingResponseCache{set: make(chan capturedResponseStore, 1)}
 	p.cache = capturing
 	fetchedAt := time.Unix(2_000_000, 0)
 	advancedAt := fetchedAt.Add(time.Minute)
@@ -293,9 +340,57 @@ func TestHTTPAsyncPersistenceUsesFetchCompletionTime(t *testing.T) {
 
 	select {
 	case stored := <-capturing.set:
-		require.Equal(t, fetchedAt.UTC(), stored.StoredAt)
+		require.Equal(t, fetchedAt.UTC(), stored.response.StoredAt)
 	case <-time.After(time.Second):
 		t.Fatal("cache persistence did not run")
+	}
+}
+
+func TestHTTPRevalidationDirectivesDisableStaleStorage(t *testing.T) {
+	for _, directive := range []string{"must-revalidate", "proxy-revalidate"} {
+		t.Run(directive, func(t *testing.T) {
+			p, _ := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", "public, "+directive)
+				_, _ = w.Write([]byte("ok"))
+			})
+			capturing := &capturingResponseCache{set: make(chan capturedResponseStore, 1)}
+			p.cache = capturing
+			cache := &RuleCache{Enable: true, TTL: 5 * time.Second, StaleWhileRevalidate: time.Minute}
+
+			_, err := p.fetchAndStore(httptest.NewRequest(http.MethodGet, "/status", nil), "key", cache, "rule", nil, false)
+			require.NoError(t, err)
+
+			stored := <-capturing.set
+			require.Equal(t, 5*time.Second, stored.ttl)
+		})
+	}
+}
+
+func TestHTTPRevalidationDirectivesAreNotServedStale(t *testing.T) {
+	for _, directive := range []string{"must-revalidate", "proxy-revalidate"} {
+		t.Run(directive, func(t *testing.T) {
+			var version atomic.Int32
+			p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", "public, "+directive)
+				_, _ = w.Write([]byte("response-" + strconv.Itoa(int(version.Add(1)))))
+			})
+			base := time.Unix(2_000_000, 0)
+			p.now = func() time.Time { return base }
+			rule := cacheRule(t, &RuleCache{Enable: true, TTL: 5 * time.Second, StaleWhileRevalidate: time.Minute})
+
+			first := doGet(p, rule)
+			require.Equal(t, "response-1", first.Body.String())
+			require.Eventually(t, func() bool {
+				rec := doGet(p, rule)
+				return rec.Header().Get(cacheStateHeader) == cacheHit
+			}, time.Second, 5*time.Millisecond)
+
+			p.now = func() time.Time { return base.Add(6 * time.Second) }
+			second := doGet(p, rule)
+			require.Equal(t, cacheMiss, second.Header().Get(cacheStateHeader))
+			require.Equal(t, "response-2", second.Body.String())
+			require.Equal(t, int32(2), hits.Load())
+		})
 	}
 }
 
@@ -467,6 +562,54 @@ func TestHTTPPendingResponseExpiresBeforePersistenceCompletes(t *testing.T) {
 		t.Fatal("expired pending response did not refetch")
 	}
 	require.Equal(t, int32(2), hits.Load())
+}
+
+func TestHTTPPendingRevalidationRequiredResponseIsNotServedStale(t *testing.T) {
+	for _, directive := range []string{"must-revalidate", "proxy-revalidate"} {
+		t.Run(directive, func(t *testing.T) {
+			var responses atomic.Int32
+			p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", "public, "+directive)
+				_, _ = w.Write([]byte("response-" + strconv.Itoa(int(responses.Add(1)))))
+			})
+			blocking := newBlockingResponseCache()
+			t.Cleanup(func() { _ = blocking.Close() })
+			p.cache = blocking
+			base := time.Unix(2_000_000, 0)
+			var clock atomic.Int64
+			clock.Store(base.UnixNano())
+			p.now = func() time.Time { return time.Unix(0, clock.Load()) }
+			rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Second, StaleWhileRevalidate: time.Minute})
+
+			first := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec, _ := cacheRequest(p, rule, nil)
+				first <- rec
+			}()
+			select {
+			case <-blocking.setStarted:
+			case <-time.After(time.Second):
+				t.Fatal("cache persistence did not start")
+			}
+			require.Equal(t, "response-1", (<-first).Body.String())
+
+			clock.Store(base.Add(2 * time.Second).UnixNano())
+			second := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec, _ := cacheRequest(p, rule, nil)
+				second <- rec
+			}()
+			select {
+			case rec := <-second:
+				require.Equal(t, cacheMiss, rec.Header().Get(cacheStateHeader))
+				require.Equal(t, "response-2", rec.Body.String())
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("revalidation-required pending response did not refetch")
+			}
+			require.Equal(t, int32(2), hits.Load())
+			_ = blocking.Close()
+		})
+	}
 }
 
 func TestHTTPPendingPersistenceCannotOpenDuplicateMiss(t *testing.T) {

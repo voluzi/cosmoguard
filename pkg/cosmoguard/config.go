@@ -550,6 +550,9 @@ type RuleCache struct {
 	// an unset per-rule ttl inherits cache.ttl. >0 serves an expired entry
 	// for up to this long while one background request refreshes it.
 	StaleWhileRevalidate time.Duration `yaml:"staleWhileRevalidate,omitempty"`
+	// DisableStaleWhileRevalidate opts this rule out of an inherited global
+	// stale window. It cannot be combined with a positive per-rule window.
+	DisableStaleWhileRevalidate bool `yaml:"disableStaleWhileRevalidate,omitempty"`
 	// PreserveHeaders is the list of upstream response header names that
 	// should be replayed verbatim on a cache hit, in addition to the
 	// always-preserved set (Content-Type, Content-Encoding, Cache-Control,

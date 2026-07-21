@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"net/http"
 	"strings"
+	"time"
 )
 
 // alwaysPreservedHeaders is the set of upstream response headers always
@@ -30,6 +31,30 @@ var alwaysPreservedHeaders = []string{
 	// would re-emit the stale upstream value on every replay, leaving
 	// downstream caches with no signal that the response actually aged
 	// while sitting in cosmoguard's cache.
+}
+
+func cacheControlRequiresRevalidation(value string) bool {
+	for _, raw := range strings.Split(value, ",") {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "must-revalidate", "proxy-revalidate":
+			return true
+		}
+	}
+	return false
+}
+
+func upstreamHTTPStaleWindow(headers http.Header, configured time.Duration) time.Duration {
+	if cacheControlRequiresRevalidation(strings.Join(headers.Values("Cache-Control"), ",")) {
+		return 0
+	}
+	return configured
+}
+
+func cachedHTTPStaleWindow(response CachedResponse, configured time.Duration) time.Duration {
+	if cacheControlRequiresRevalidation(response.Headers[http.CanonicalHeaderKey("Cache-Control")]) {
+		return 0
+	}
+	return configured
 }
 
 // hopByHopHeaders are RFC 7230 section 6.1 hop-by-hop headers that must

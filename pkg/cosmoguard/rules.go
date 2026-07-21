@@ -45,6 +45,9 @@ func validateRuleCacheFeatures(c *RuleCache, ruleKind string, priority int) erro
 	if c.StaleWhileRevalidate < 0 {
 		return fmt.Errorf("%s rule (priority %d) cache.staleWhileRevalidate must be >= 0 (0 inherits the global default); got %s", ruleKind, priority, c.StaleWhileRevalidate)
 	}
+	if c.DisableStaleWhileRevalidate && c.StaleWhileRevalidate > 0 {
+		return fmt.Errorf("%s rule (priority %d) cannot set both cache.staleWhileRevalidate and cache.disableStaleWhileRevalidate", ruleKind, priority)
+	}
 	return nil
 }
 
@@ -60,6 +63,7 @@ func writeFingerprintCacheFeatures(h hash.Hash64, c *RuleCache) {
 		writeFingerprintBool(h, *c.Coalesce)
 	}
 	writeFingerprintInt(h, int(c.StaleWhileRevalidate))
+	writeFingerprintBool(h, c.DisableStaleWhileRevalidate)
 }
 
 func writeFingerprintStr(h hash.Hash64, s string) {

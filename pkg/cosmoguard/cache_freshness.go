@@ -67,9 +67,12 @@ func resolveCoalesce(rule *RuleCache, global *bool) bool {
 	return global == nil || *global
 }
 
-// resolveStaleWindow resolves the effective stale window: the rule's value if
-// non-zero, else the global default (which may itself be 0 = off).
+// resolveStaleWindow resolves the effective stale window: an explicit rule
+// disable wins, then a positive rule value, then the global default.
 func resolveStaleWindow(rule *RuleCache, global time.Duration) time.Duration {
+	if rule != nil && rule.DisableStaleWhileRevalidate {
+		return 0
+	}
 	if rule != nil && rule.StaleWhileRevalidate != 0 {
 		return rule.StaleWhileRevalidate
 	}
