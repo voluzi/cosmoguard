@@ -43,6 +43,76 @@ func TestApplyEnvOverrides_Listener(t *testing.T) {
 	assert.Equal(t, cfg.Metrics.Port, 9091)
 }
 
+// a valid 32-byte key, base64-encoded, for cluster gossip encryption.
+const testClusterKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+func TestApplyEnvOverrides_Cluster(t *testing.T) {
+	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "true")
+	t.Setenv("COSMOGUARD_CLUSTER_BIND_ADDR", "10.0.0.5")
+	t.Setenv("COSMOGUARD_CLUSTER_ENCRYPTION_KEY", testClusterKey)
+	t.Setenv("COSMOGUARD_CLUSTER_DISCOVERY_MODE", "dns")
+	t.Setenv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST", "guard-peer.ns.svc.cluster.local")
+
+	cfg := freshConfig(t)
+	c := cfg.Cache.Cluster
+	assert.Assert(t, c != nil)
+	assert.Equal(t, c.BindAddr, "10.0.0.5")
+	assert.Equal(t, c.EncryptionKey, testClusterKey)
+	// defaults seeded when the block is created via env
+	assert.Equal(t, c.BindPort, 3320)
+	assert.Equal(t, c.GossipPort, 3322)
+	assert.Equal(t, c.ReplicaCount, 2)
+	assert.Equal(t, c.Quorum, 1)
+	assert.Assert(t, c.Discovery != nil)
+	assert.Equal(t, c.Discovery.Mode, "dns")
+	assert.Assert(t, c.Discovery.DNS != nil)
+	assert.Equal(t, c.Discovery.DNS.Host, "guard-peer.ns.svc.cluster.local")
+}
+
+func TestApplyEnvOverrides_ClusterOverridesCountsAndPorts(t *testing.T) {
+	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "true")
+	t.Setenv("COSMOGUARD_CLUSTER_BIND_ADDR", "10.0.0.6")
+	t.Setenv("COSMOGUARD_CLUSTER_ENCRYPTION_KEY", testClusterKey)
+	t.Setenv("COSMOGUARD_CLUSTER_DISCOVERY_MODE", "dns")
+	t.Setenv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST", "peer")
+	t.Setenv("COSMOGUARD_CLUSTER_BIND_PORT", "4320")
+	t.Setenv("COSMOGUARD_CLUSTER_GOSSIP_PORT", "4322")
+	t.Setenv("COSMOGUARD_CLUSTER_REPLICA_COUNT", "3")
+	t.Setenv("COSMOGUARD_CLUSTER_QUORUM", "2")
+
+	c := freshConfig(t).Cache.Cluster
+	assert.Assert(t, c != nil)
+	assert.Equal(t, c.BindPort, 4320)
+	assert.Equal(t, c.GossipPort, 4322)
+	assert.Equal(t, c.ReplicaCount, 3)
+	assert.Equal(t, c.Quorum, 2)
+}
+
+func TestApplyEnvOverrides_ClusterDisabledByDefault(t *testing.T) {
+	cfg := freshConfig(t)
+	assert.Assert(t, cfg.Cache.Cluster == nil)
+}
+
+func TestApplyEnvOverrides_ClusterExplicitOptOut(t *testing.T) {
+	// ENABLE=false suppresses the block even when other cluster vars are set.
+	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "false")
+	t.Setenv("COSMOGUARD_CLUSTER_BIND_ADDR", "10.0.0.7")
+	t.Setenv("COSMOGUARD_CLUSTER_ENCRYPTION_KEY", testClusterKey)
+
+	cfg := freshConfig(t)
+	assert.Assert(t, cfg.Cache.Cluster == nil)
+}
+
+func TestApplyEnvOverrides_ClusterInvalidReplicaCount(t *testing.T) {
+	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "true")
+	t.Setenv("COSMOGUARD_CLUSTER_REPLICA_COUNT", "not-a-number")
+
+	cfg := &Config{}
+	err := PrepareConfig(cfg)
+	assert.Assert(t, err != nil)
+	assert.Assert(t, strings.Contains(err.Error(), "COSMOGUARD_CLUSTER_REPLICA_COUNT"))
+}
+
 func TestApplyEnvOverrides_Node(t *testing.T) {
 	t.Setenv("COSMOGUARD_NODE_NAME", "primary")
 	t.Setenv("COSMOGUARD_NODE_HOST", "node.example.com")
