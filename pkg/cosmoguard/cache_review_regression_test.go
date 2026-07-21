@@ -30,37 +30,27 @@ func TestFreshnessDurationAdditionSaturates(t *testing.T) {
 	require.Equal(t, staleEntry, classifyFreshness(storedAt, storedAt.Add(ttl), ttl, stale))
 }
 
-func TestCoalescerRefreshRegistersBeforeReturning(t *testing.T) {
+func TestCoalescerForegroundMissDoesNotJoinBackgroundRefresh(t *testing.T) {
 	var c coalescer[int]
-	var calls atomic.Int32
-	started := make(chan struct{})
-	release := make(chan struct{})
-	fetch := func() (int, error) {
-		if calls.Add(1) == 1 {
-			close(started)
-		}
-		<-release
-		return 1, nil
-	}
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	t.Cleanup(release)
 
-	c.refresh("key", fetch)
-	observed := make(chan struct{})
-	ctx := &observedDoneContext{Context: context.Background(), observed: observed}
-	type outcome struct {
-		value int
-		err   error
-	}
-	result := make(chan outcome, 1)
-	go func() {
-		got, err := c.do(ctx, "key", fetch)
-		result <- outcome{value: got, err: err}
-	}()
-	<-observed
-	close(release)
-	got := <-result
-	require.NoError(t, got.err)
-	require.Equal(t, 1, got.value)
-	require.Equal(t, int32(1), calls.Load())
+	c.refresh("key", func() (int, error) {
+		close(refreshStarted)
+		<-releaseRefresh
+		return 1, nil
+	})
+	<-refreshStarted
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got, err := c.do(ctx, "key", func() (int, error) { return 2, nil })
+	require.NoError(t, err)
+	require.Equal(t, 2, got)
+	release()
 }
 
 type observedDoneContext struct {
@@ -1082,6 +1072,34 @@ func TestHTTPBackgroundRefreshUsesIndependentRequestStats(t *testing.T) {
 	require.NotSame(t, originalStats, refreshStats)
 	require.Equal(t, "up", refreshStats.Upstream)
 	require.Empty(t, originalStats.Upstream)
+}
+
+func TestHTTPBackgroundRefreshDropsClientPreconditions(t *testing.T) {
+	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+			if r.Header.Get(name) != "" {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+		_, _ = w.Write([]byte("fresh"))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.Header.Set("If-Match", `"old"`)
+	req.Header.Set("If-None-Match", `"old"`)
+	req.Header.Set("If-Modified-Since", time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat))
+	req.Header.Set("If-Unmodified-Since", time.Now().UTC().Format(http.TimeFormat))
+	req.Header.Set("If-Range", `"old"`)
+
+	out, err := p.backgroundRefreshFn(req, "key", &RuleCache{Enable: true, TTL: time.Minute}, "rule")()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, out.StatusCode)
+	require.Equal(t, []byte("fresh"), out.Body)
+	require.Equal(t, int32(1), hits.Load())
+
+	cached, err := p.cache.Get(context.Background(), "key")
+	require.NoError(t, err)
+	require.Equal(t, []byte("fresh"), cached.Data)
 }
 
 func TestJSONRPCBackgroundRefreshUsesIndependentRequestStats(t *testing.T) {

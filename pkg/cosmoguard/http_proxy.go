@@ -1177,9 +1177,16 @@ func (p *HttpProxy) backgroundRefreshFn(r *http.Request, requestHash string, cac
 		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
+		stripHTTPPreconditions(req.Header)
 		req.Body = io.NopCloser(bytes.NewReader(body))
 		req.ContentLength = int64(len(body))
 		return p.fetchAndStore(req, requestHash, cache, ruleTag, nil, false)
+	}
+}
+
+func stripHTTPPreconditions(headers http.Header) {
+	for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+		headers.Del(name)
 	}
 }
 

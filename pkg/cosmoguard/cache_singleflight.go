@@ -20,6 +20,7 @@ import (
 // The zero value is ready to use.
 type coalescer[V any] struct {
 	g        singleflight.Group
+	refreshG singleflight.Group
 	inflight sync.Map // key(string) -> struct{}; guards background refreshes
 }
 
@@ -44,13 +45,13 @@ func (c *coalescer[V]) do(ctx context.Context, key string, fn func() (V, error))
 // refresh runs fn in the background for key, at most once per key at a time —
 // a refresh requested while one is already running for that key is dropped.
 // Used by stale-while-revalidate so the stale-serving request never blocks.
-// It shares the same single-flight group as do, so a background refresh and a
-// concurrent foreground miss for the same key collapse into one fetch.
+// Refreshes use a separate group so an expired foreground miss never inherits
+// a background refresh's shorter timeout.
 func (c *coalescer[V]) refresh(key string, fn func() (V, error)) {
 	if _, busy := c.inflight.LoadOrStore(key, struct{}{}); busy {
 		return
 	}
-	ch := c.g.DoChan(key, func() (any, error) { return fn() })
+	ch := c.refreshG.DoChan(key, func() (any, error) { return fn() })
 	go func() {
 		defer c.inflight.Delete(key)
 		<-ch
