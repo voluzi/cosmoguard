@@ -1102,6 +1102,43 @@ func TestHTTPBackgroundRefreshDropsClientPreconditions(t *testing.T) {
 	require.Equal(t, []byte("fresh"), cached.Data)
 }
 
+func TestJSONRPCBackgroundRefreshDropsClientPreconditions(t *testing.T) {
+	rule := &JsonRpcRule{
+		Action:  RuleActionAllow,
+		Methods: []string{"status"},
+		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
+	}
+	h := newJSONCacheHandler(t, rule)
+	next := func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+			if r.Header.Get(name) != "" {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"fresh"}`))
+	}
+	request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+	hash := request.HashWithRule(rule.Fingerprint)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"status"}`))
+	ctx, _ := WithRequestStats(req.Context())
+	req = req.WithContext(ctx)
+	req.Header.Set("If-Match", `"old"`)
+	req.Header.Set("If-None-Match", `"old"`)
+	req.Header.Set("If-Modified-Since", time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat))
+	req.Header.Set("If-Unmodified-Since", time.Now().UTC().Format(http.TimeFormat))
+	req.Header.Set("If-Range", `"old"`)
+
+	out, err := h.singleBackgroundRefreshFn(req, next, hash, rule.Cache, "rule", request.Method)()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, out.StatusCode)
+	require.NotNil(t, out.Message)
+
+	cached, err := h.cache.Get(context.Background(), hash)
+	require.NoError(t, err)
+	require.JSONEq(t, `"fresh"`, string(cached.Result))
+}
+
 func TestJSONRPCBackgroundRefreshUsesIndependentRequestStats(t *testing.T) {
 	rule := &JsonRpcRule{
 		Action:  RuleActionAllow,

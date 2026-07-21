@@ -894,6 +894,7 @@ func (h *JsonRpcHandler) singleBackgroundRefreshFn(r *http.Request, next func(ht
 		ctx, cancel := context.WithTimeout(ctx, httpRefreshTimeout)
 		defer cancel()
 		req := r.Clone(ctx)
+		stripHTTPPreconditions(req.Header)
 		req.Body = io.NopCloser(bytes.NewReader(body))
 		req.ContentLength = int64(len(body))
 		return h.fetchSingle(req, next, hash, cache, ruleTag, method, nil, false)
