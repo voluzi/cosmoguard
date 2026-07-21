@@ -44,6 +44,11 @@ const grpcCacheWriteTimeout = 5 * time.Second
 // upstream can't pin a refresh goroutine forever.
 const grpcRefreshTimeout = 30 * time.Second
 
+// grpcForegroundFetchTimeout bounds detached foreground flights without
+// coupling them to any one caller's deadline. It is deliberately longer than
+// the background refresh budget so slow but legitimate unary calls can finish.
+const grpcForegroundFetchTimeout = 5 * time.Minute
+
 // grpcCacheMetaKey is the response-header metadata cosmoguard adds to indicate
 // cache state (hit / miss / stale) — the gRPC analogue of the HTTP
 // X-Cosmoguard-Cache header. gRPC had no cache signal before; this gives
@@ -55,9 +60,13 @@ const grpcCacheMetaKey = "x-cosmoguard-cache"
 // read time (the bare []byte value had no timestamp). Old []byte-schema entries
 // fail to decode into this struct and surface as a miss — a safe self-heal.
 type grpcCachedResponse struct {
-	Payload  []byte    `msgpack:"payload"`
-	StoredAt time.Time `msgpack:"stored_at,omitempty"`
+	Payload   []byte    `msgpack:"payload"`
+	StoredAt  time.Time `msgpack:"stored_at,omitempty"`
+	shareable bool
+	owner     *grpcResponseOwner
 }
+
+type grpcResponseOwner [1]byte
 
 // CacheCost implements the L1 cost accounting (cache.CacheCoster). 64 bytes of
 // slack covers the struct header + StoredAt + map/entry bookkeeping.
@@ -218,7 +227,14 @@ func cachingStreamHandler(
 			fetchErr error
 		)
 		if resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
-			out, fetchErr = p.sf.do(stream.Context(), key, p.grpcForegroundFetchFn(outCtx, method, req.Payload, key, rule))
+			owner := &grpcResponseOwner{}
+			out, fetchErr = p.sf.do(stream.Context(), key, p.grpcForegroundFetchFn(outCtx, method, req.Payload, key, rule, owner))
+			if fetchErr != nil && stream.Context().Err() != nil {
+				return fetchErr
+			}
+			if out.owner != owner && (!out.shareable || fetchErr != nil) {
+				out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule)
+			}
 		} else {
 			out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule)
 		}
@@ -230,17 +246,15 @@ func cachingStreamHandler(
 	}
 }
 
-// grpcForegroundFetchFn detaches client cancellation while preserving the
-// caller's absolute deadline and credential-stripped outgoing context.
-func (p *GrpcProxy) grpcForegroundFetchFn(outCtx context.Context, method string, reqPayload []byte, key string, rule *GrpcRule) func() (grpcCachedResponse, error) {
+// grpcForegroundFetchFn detaches the shared upstream call from any one
+// waiter's cancellation or deadline while preserving outgoing metadata.
+func (p *GrpcProxy) grpcForegroundFetchFn(outCtx context.Context, method string, reqPayload []byte, key string, rule *GrpcRule, owner *grpcResponseOwner) func() (grpcCachedResponse, error) {
 	return func() (grpcCachedResponse, error) {
-		ctx := context.WithoutCancel(outCtx)
-		if deadline, ok := outCtx.Deadline(); ok {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, deadline)
-			defer cancel()
-		}
-		return p.grpcFetchAndStore(ctx, method, reqPayload, key, rule)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(outCtx), grpcForegroundFetchTimeout)
+		defer cancel()
+		out, err := p.grpcFetchAndStore(ctx, method, reqPayload, key, rule)
+		out.owner = owner
+		return out, err
 	}
 }
 
@@ -275,7 +289,11 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 	if invokeErr != nil {
 		return grpcCachedResponse{}, invokeErr
 	}
-	out := grpcCachedResponse{Payload: resp.Payload, StoredAt: nowOrDefault(p.now).UTC()}
+	out := grpcCachedResponse{
+		Payload:   resp.Payload,
+		StoredAt:  nowOrDefault(p.now).UTC(),
+		shareable: len(resp.Payload) > 0,
+	}
 	if len(resp.Payload) > 0 {
 		effTTL := effectiveTTL(rule.Cache, p.cacheConfig)
 		stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig))

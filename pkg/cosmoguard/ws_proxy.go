@@ -17,6 +17,7 @@ import (
 
 const (
 	defaultWebsocketPath = "/websocket"
+	wsCacheWriteTimeout  = 5 * time.Second
 
 	// defaultWSReadLimit bounds a single inbound client WS frame when no
 	// ServerConfig is threaded through the constructor. 1 MiB is generous
@@ -30,7 +31,10 @@ const (
 type JsonRpcWebSocketProxy struct {
 	broker *Broker
 	cache  cache.Cache[uint64, *JsonRpcMsg]
-	sf     coalescer[*JsonRpcMsg]
+	sf     coalescer[wsCoalescedResponse]
+	// pendingMisses keeps a fetched response available while its detached
+	// foreground cache write is still in progress.
+	pendingMisses sync.Map // cache hash -> *wsPendingResponse
 	// cacheConfig resolves the cluster-wide stale-while-revalidate / ttl
 	// defaults a rule inherits; now is swappable for deterministic tests.
 	// Both set by the parent JsonRpcHandler. nil/unset falls back safely.
@@ -73,6 +77,19 @@ type JsonRpcWebSocketProxy struct {
 	// upgrade, deregister on close) — never on the per-frame hot path.
 	connsMu sync.Mutex
 	conns   map[*JsonRpcWsClient]*wsConnInfo
+}
+
+type wsCoalescedResponse struct {
+	message   *JsonRpcMsg
+	shareable bool
+	owner     *wsResponseOwner
+}
+
+type wsResponseOwner [1]byte
+
+type wsPendingResponse struct {
+	message *JsonRpcMsg
+	writeMu *sync.Mutex
 }
 
 // wsConnInfo is the per-connection metadata the WebSockets panel renders.
@@ -526,21 +543,18 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 
 				var res *JsonRpcMsg
 				var err error
+				storeResponse := cacheable
 				if hasSubscriptionMethod(request) {
 					res, err = p.broker.HandleSubscription(client, request)
 					if err != nil {
 						return err
 					}
 				} else if cacheable && resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
-					res, err = p.sf.do(context.Background(), strconv.FormatUint(hash, 16), func() (*JsonRpcMsg, error) {
-						return p.broker.HandleRequest(request)
-					})
+					res, err = p.coalescedWSRequest(context.Background(), hash, request, rule.Cache, ruleID)
 					if err != nil {
 						return err
 					}
-					// The shared response carries the flight leader's ID; every
-					// caller must receive a distinct response matching its request.
-					res = res.CloneWithID(request.ID)
+					storeResponse = false
 				} else {
 					res, err = p.broker.HandleRequest(request)
 					if err != nil {
@@ -571,6 +585,9 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 					return nil
 				}
 				if res.IsEmptyResult() && !rule.Cache.CacheEmptyResult {
+					return nil
+				}
+				if !storeResponse {
 					return nil
 				}
 				res.StoredAt = nowOrDefault(p.now).UTC()
@@ -666,4 +683,95 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 	p.recordOutcome(request, source, cacheMiss, string(defaultActionSnap), "default", startTime,
 		fmt.Sprintf("request %s", defaultActionSnap))
 	return nil
+}
+
+func wsResponseShareable(res *JsonRpcMsg, cache *RuleCache) bool {
+	if res == nil {
+		return false
+	}
+	if res.Error != nil && !cache.CacheError {
+		return false
+	}
+	return !res.IsEmptyResult() || cache.CacheEmptyResult
+}
+
+func (p *JsonRpcWebSocketProxy) coalescedWSRequest(ctx context.Context, hash uint64, request *JsonRpcMsg, cacheRule *RuleCache, ruleID string) (*JsonRpcMsg, error) {
+	owner := &wsResponseOwner{}
+	out, err := p.sf.do(ctx, strconv.FormatUint(hash, 16), func() (wsCoalescedResponse, error) {
+		if recent, ok := p.recentWSResponse(ctx, hash, cacheRule); ok {
+			return wsCoalescedResponse{
+				message:   recent,
+				shareable: true,
+				owner:     owner,
+			}, nil
+		}
+		message, requestErr := p.broker.HandleRequest(request)
+		response := wsCoalescedResponse{
+			message:   message,
+			shareable: wsResponseShareable(message, cacheRule),
+			owner:     owner,
+		}
+		if requestErr == nil && response.shareable {
+			p.storeWSResponseAsync(hash, message, cacheRule, ruleID, request.Method)
+		}
+		return response, requestErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !out.shareable && out.owner != owner {
+		return p.broker.HandleRequest(request)
+	}
+	return out.message.CloneWithID(request.ID), nil
+}
+
+func (p *JsonRpcWebSocketProxy) recentWSResponse(ctx context.Context, hash uint64, cacheRule *RuleCache) (*JsonRpcMsg, bool) {
+	if pending, ok := p.pendingMisses.Load(hash); ok {
+		response := pending.(*wsPendingResponse).message
+		if p.wsResponseFresh(response, cacheRule) {
+			return response, true
+		}
+	}
+	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), wsCacheWriteTimeout)
+	defer cancel()
+	response, err := p.cache.Get(lookupCtx, hash)
+	if err != nil {
+		return nil, false
+	}
+	return response, p.wsResponseFresh(response, cacheRule)
+}
+
+func (p *JsonRpcWebSocketProxy) wsResponseFresh(response *JsonRpcMsg, cacheRule *RuleCache) bool {
+	state := classifyFreshness(response.StoredAt, nowOrDefault(p.now), effectiveTTL(cacheRule, p.cacheConfig), resolveStaleWindow(cacheRule, cfgStaleWindow(p.cacheConfig)))
+	return state == freshEntry
+}
+
+func (p *JsonRpcWebSocketProxy) storeWSResponseAsync(hash uint64, response *JsonRpcMsg, cacheRule *RuleCache, ruleID, method string) {
+	cached := response.CloneWithID(response.ID)
+	cached.StoredAt = nowOrDefault(p.now).UTC()
+	ttl := physicalTTL(effectiveTTL(cacheRule, p.cacheConfig), resolveStaleWindow(cacheRule, cfgStaleWindow(p.cacheConfig)))
+	// Generations for one key share a lock so a delayed older write cannot
+	// overwrite a newer response that superseded it while persistence waited.
+	writeMu := &sync.Mutex{}
+	if current, ok := p.pendingMisses.Load(hash); ok {
+		writeMu = current.(*wsPendingResponse).writeMu
+	}
+	pending := &wsPendingResponse{message: cached, writeMu: writeMu}
+	p.pendingMisses.Store(hash, pending)
+	go func() {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if current, ok := p.pendingMisses.Load(hash); !ok || current != pending {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), wsCacheWriteTimeout)
+		err := p.cache.Set(ctx, hash, cached, ttl)
+		cancel()
+		p.pendingMisses.CompareAndDelete(hash, pending)
+		if err != nil {
+			p.log.Errorf("error storing in cache: %v", err)
+			return
+		}
+		p.cgDashboard.RecordCardinality(p.section, ruleID, method)
+	}()
 }

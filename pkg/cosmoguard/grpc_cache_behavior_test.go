@@ -12,8 +12,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	cosmoguardcache "github.com/voluzi/cosmoguard/pkg/cache"
@@ -225,19 +227,19 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 	}
 }
 
-func TestGRPCCacheForegroundCoalescedMissPreservesCallerDeadline(t *testing.T) {
-	remainingDeadline := make(chan time.Duration, 1)
+func TestGRPCCacheForegroundCoalescedMissUsesProxyDeadline(t *testing.T) {
+	type deadlineObservation struct {
+		remaining time.Duration
+		ok        bool
+	}
+	observedDeadline := make(chan deadlineObservation, 1)
 	conn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
 		var frame rawFrame
 		if err := stream.RecvMsg(&frame); err != nil {
 			return err
 		}
 		deadline, ok := stream.Context().Deadline()
-		if !ok {
-			remainingDeadline <- 0
-		} else {
-			remainingDeadline <- time.Until(deadline)
-		}
+		observedDeadline <- deadlineObservation{remaining: time.Until(deadline), ok: ok}
 		return stream.SendMsg(&rawFrame{Payload: []byte("response")})
 	})
 	p, _ := newGRPCCacheTestProxy(t, conn, &RuleCache{Enable: true, TTL: time.Minute})
@@ -249,7 +251,164 @@ func TestGRPCCacheForegroundCoalescedMissPreservesCallerDeadline(t *testing.T) {
 	stream.ctx = ctx
 
 	require.NoError(t, handler(nil, stream))
-	require.Greater(t, <-remainingDeadline, 45*time.Minute)
+	observed := <-observedDeadline
+	require.True(t, observed.ok)
+	require.Greater(t, observed.remaining, 4*time.Minute)
+	require.LessOrEqual(t, observed.remaining, grpcForegroundFetchTimeout)
+}
+
+func TestGRPCCacheShortLeaderDeadlineDoesNotCapWaiter(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var invokes atomic.Int32
+
+	conn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		invokes.Add(1)
+		startedOnce.Do(func() { close(started) })
+		<-release
+		return stream.SendMsg(&rawFrame{Payload: []byte("response")})
+	})
+	p, _ := newGRPCCacheTestProxy(t, conn, &RuleCache{Enable: true, TTL: time.Minute})
+	handler := grpcCacheTestHandler(p)
+
+	leader := newGRPCCacheTestStream([]byte("request"))
+	leaderCtx, cancelLeader := context.WithTimeout(leader.ctx, 100*time.Millisecond)
+	defer cancelLeader()
+	leader.ctx = leaderCtx
+	leaderErr := make(chan error, 1)
+	go func() { leaderErr <- handler(nil, leader) }()
+	<-started
+
+	waiter := newGRPCCacheTestStream([]byte("request"))
+	waiterObserved := make(chan struct{})
+	waiter.ctx = &observedDoneContext{Context: waiter.ctx, observed: waiterObserved}
+	waiterErr := make(chan error, 1)
+	go func() { waiterErr <- handler(nil, waiter) }()
+	<-waiterObserved
+
+	select {
+	case err := <-leaderErr:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(2 * time.Second):
+		t.Fatal("short-deadline leader did not stop waiting")
+	}
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, <-waiterErr)
+	_, response := waiter.result()
+	require.Equal(t, []byte("response"), response)
+	require.Equal(t, int32(1), invokes.Load())
+}
+
+func TestGRPCCacheWaiterRefetchesSharedFailure(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var firstInvokes, retryInvokes atomic.Int32
+
+	firstConn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		firstInvokes.Add(1)
+		startedOnce.Do(func() { close(started) })
+		<-release
+		return status.Error(codes.Unavailable, "transient failure")
+	})
+	retryConn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		retryInvokes.Add(1)
+		return stream.SendMsg(&rawFrame{Payload: []byte("retry-response")})
+	})
+	p, _ := newGRPCCacheTestProxy(t, firstConn, &RuleCache{Enable: true, TTL: time.Minute})
+	firstUpstream := newTestGrpcUpstream("first", 1)
+	firstUpstream.conn = firstConn
+	retryUpstream := newTestGrpcUpstream("retry", 1)
+	retryUpstream.conn = retryConn
+	p.pool = newTestGrpcPool("round-robin", firstUpstream, retryUpstream)
+	handler := grpcCacheTestHandler(p)
+
+	leader := newGRPCCacheTestStream([]byte("request"))
+	leaderErr := make(chan error, 1)
+	go func() { leaderErr <- handler(nil, leader) }()
+	<-started
+	waiter := newGRPCCacheTestStream([]byte("request"))
+	waiterObserved := make(chan struct{})
+	waiter.ctx = &observedDoneContext{Context: waiter.ctx, observed: waiterObserved}
+	waiterErr := make(chan error, 1)
+	go func() { waiterErr <- handler(nil, waiter) }()
+	<-waiterObserved
+	releaseOnce.Do(func() { close(release) })
+
+	require.Equal(t, codes.Unavailable, status.Code(<-leaderErr))
+	require.NoError(t, <-waiterErr)
+	_, response := waiter.result()
+	require.Equal(t, []byte("retry-response"), response)
+	require.Equal(t, int32(1), firstInvokes.Load())
+	require.Equal(t, int32(1), retryInvokes.Load())
+}
+
+func TestGRPCCacheWaiterRefetchesEmptyResponse(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var retryInvokes atomic.Int32
+
+	firstConn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		startedOnce.Do(func() { close(started) })
+		<-release
+		return stream.SendMsg(&rawFrame{})
+	})
+	retryConn := newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+		var frame rawFrame
+		if err := stream.RecvMsg(&frame); err != nil {
+			return err
+		}
+		retryInvokes.Add(1)
+		return stream.SendMsg(&rawFrame{Payload: []byte("retry-response")})
+	})
+	p, _ := newGRPCCacheTestProxy(t, firstConn, &RuleCache{Enable: true, TTL: time.Minute})
+	firstUpstream := newTestGrpcUpstream("first", 1)
+	firstUpstream.conn = firstConn
+	retryUpstream := newTestGrpcUpstream("retry", 1)
+	retryUpstream.conn = retryConn
+	p.pool = newTestGrpcPool("round-robin", firstUpstream, retryUpstream)
+	handler := grpcCacheTestHandler(p)
+
+	leader := newGRPCCacheTestStream([]byte("request"))
+	leaderErr := make(chan error, 1)
+	go func() { leaderErr <- handler(nil, leader) }()
+	<-started
+	waiter := newGRPCCacheTestStream([]byte("request"))
+	waiterObserved := make(chan struct{})
+	waiter.ctx = &observedDoneContext{Context: waiter.ctx, observed: waiterObserved}
+	waiterErr := make(chan error, 1)
+	go func() { waiterErr <- handler(nil, waiter) }()
+	<-waiterObserved
+	releaseOnce.Do(func() { close(release) })
+
+	require.NoError(t, <-leaderErr)
+	_, leaderResponse := leader.result()
+	require.Empty(t, leaderResponse)
+	require.NoError(t, <-waiterErr)
+	_, waiterResponse := waiter.result()
+	require.Equal(t, []byte("retry-response"), waiterResponse)
+	require.Equal(t, int32(1), retryInvokes.Load())
 }
 
 func TestGRPCCacheStaleResponseRefreshesOnceInBackground(t *testing.T) {
