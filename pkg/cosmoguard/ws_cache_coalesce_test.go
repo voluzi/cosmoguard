@@ -514,6 +514,10 @@ func TestWSCacheCoalescedWaiterRefetchesTransportError(t *testing.T) {
 	require.ErrorIs(t, firstResult.err, transportErr)
 	require.NoError(t, secondResult.err)
 	require.JSONEq(t, `{"height":"2"}`, string(secondResult.message.Result))
+
+	thirdMessage, err := proxy.coalescedWSRequest(context.Background(), hash, wsCacheRequest(3), rule.Cache, "test")
+	require.NoError(t, err)
+	require.JSONEq(t, `{"height":"2"}`, string(thirdMessage.Result))
 	require.Equal(t, int32(2), upstream.calls.Load())
 }
 
