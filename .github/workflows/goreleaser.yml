@@ -11,7 +11,12 @@ permissions:
   contents: write
 
 jobs:
+  # Gate the release on the full test suite before publishing binaries.
+  test:
+    uses: ./.github/workflows/test.yml
+
   goreleaser:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

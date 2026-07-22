@@ -1,6 +1,16 @@
 name: Test
 
-on: [push]
+on:
+  # Run on branch pushes. Tags are excluded here because the release
+  # workflows (docker.yml, goreleaser.yml) call this workflow as a gate
+  # via workflow_call, so a tag doesn't need a separate standalone run.
+  push:
+    tags-ignore:
+      - "**"
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -109,3 +119,22 @@ jobs:
             cat /tmp/cg.log
             exit 1
           fi
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Scans the module (and the source-reachable call graph) against the Go
+      # vulnerability database. Fails the build on a known-exploitable CVE in a
+      # dependency or the toolchain — a real gate for an auth/cache proxy.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

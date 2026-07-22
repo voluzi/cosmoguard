@@ -10,6 +10,11 @@ permissions:
   packages: write
 
 jobs:
+  # Gate the release on the full test suite (race, fuzz, helm render, govulncheck).
+  # Reuses test.yml so the release can never ship code the tests reject.
+  test:
+    uses: ./.github/workflows/test.yml
+
   version:
     name: Extract Version
     runs-on: ubuntu-latest
@@ -25,6 +30,7 @@ jobs:
   build:
     name: Build and Push Cosmoguard Images
     needs:
+      - test
       - version
     strategy:
       fail-fast: true
@@ -120,7 +126,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=${{ needs.version.outputs.version }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(needs.version.outputs.version, '-') }}
 
       - name: Create manifest list and push
         run: |
