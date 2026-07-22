@@ -1,11 +1,13 @@
 name: Test
 
 on:
-  # Run on branch pushes. Tags are excluded here because the release
-  # workflows (docker.yml, goreleaser.yml) call this workflow as a gate
-  # via workflow_call, so a tag doesn't need a separate standalone run.
+  # Run on every branch push. A `branches` filter (rather than `tags-ignore`)
+  # is required to exclude tags: specifying only a tag filter would scope the
+  # push event to tags. Tags are handled by the release workflows
+  # (docker.yml, goreleaser.yml), which call this workflow as a gate via
+  # workflow_call, so a tag doesn't need a separate standalone run here.
   push:
-    tags-ignore:
+    branches:
       - "**"
   workflow_call:
 
