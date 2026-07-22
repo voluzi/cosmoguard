@@ -489,3 +489,63 @@ func TestJSONRPCSingleCoalesce_OneUpstreamCall(t *testing.T) {
 	wg.Wait()
 	require.Equal(t, int32(1), upstreamCalls.Load(), "concurrent JSON-RPC single misses must collapse to one upstream call")
 }
+
+// TestHTTPServeStale_SurvivesUpstreamErrorDuringWindow proves the stale-on-error
+// resilience property: while a cached entry is inside its stale window, a failing
+// upstream (503) must NOT reach the client and must NOT poison the cached value.
+// The client keeps getting the last good body (200, X-Cosmoguard-Cache: stale),
+// background refreshes are attempted (and rejected by shouldStore), and once the
+// upstream recovers the next refresh updates the cache to fresh.
+func TestHTTPServeStale_SurvivesUpstreamErrorDuringWindow(t *testing.T) {
+	var version atomic.Int32
+	var failing atomic.Bool
+	p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			// Upstream is down/degraded: a non-cacheable 5xx.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"v":%d}`, version.Add(1))
+	})
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: 5 * time.Second, StaleWhileRevalidate: 60 * time.Second})
+
+	base := time.Unix(3_000_000, 0)
+	p.now = func() time.Time { return base }
+
+	// Prime the cache: miss stores {"v":1} at base under physical TTL 65s.
+	rec := doGet(p, rule)
+	require.Equal(t, cacheMiss, rec.Header().Get(cacheStateHeader))
+	require.Equal(t, `{"v":1}`, rec.Body.String())
+	require.Equal(t, int32(1), hits.Load())
+
+	// Upstream goes down, and we move into the stale window (age 6s).
+	failing.Store(true)
+	p.now = func() time.Time { return base.Add(6 * time.Second) }
+
+	// Two sequential stale serves: each returns the last good body (never the
+	// 503) and each fires a background refresh that fails and is discarded.
+	for i := 0; i < 2; i++ {
+		before := hits.Load()
+		rec = doGet(p, rule)
+		require.Equal(t, http.StatusOK, rec.Code, "stale serve must be 200, never the upstream 503")
+		require.Equal(t, cacheStale, rec.Header().Get(cacheStateHeader), "served stale during outage")
+		require.Equal(t, `{"v":1}`, rec.Body.String(), "failed refresh must not poison the cached value")
+		require.Eventually(t, func() bool { return hits.Load() == before+1 }, 2*time.Second, 5*time.Millisecond,
+			"each stale serve attempts exactly one background refresh")
+		time.Sleep(20 * time.Millisecond)
+		require.Equal(t, before+1, hits.Load(), "a failed refresh must not retry-storm")
+	}
+
+	// Upstream recovers. The next stale serve still returns the cached body
+	// instantly, but its background refresh now succeeds and stores {"v":2}.
+	failing.Store(false)
+	rec = doGet(p, rule)
+	require.Equal(t, cacheStale, rec.Header().Get(cacheStateHeader))
+	require.Equal(t, `{"v":1}`, rec.Body.String(), "recovery serve is still instant-stale, refresh is async")
+
+	require.Eventually(t, func() bool {
+		r := doGet(p, rule)
+		return r.Header().Get(cacheStateHeader) == cacheHit && r.Body.String() == `{"v":2}`
+	}, 2*time.Second, 10*time.Millisecond, "after recovery the cache revalidates to a fresh value")
+}

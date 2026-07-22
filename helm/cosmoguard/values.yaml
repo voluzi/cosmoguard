@@ -544,3 +544,26 @@ readinessProbe:
   periodSeconds: 5
   timeoutSeconds: 2
   failureThreshold: 3
+
+# Total time Kubernetes allows for termination: it runs preStop, THEN sends
+# SIGTERM, and both the hook and CosmoGuard's drain must finish inside this
+# window or the pod is SIGKILLed. Budget = preStop sleep (5s) + CosmoGuard's
+# drain deadline (shutdownGrace, 30s) + buffer. Raise this if you raise the
+# preStop sleep below.
+terminationGracePeriodSeconds: 40
+
+# Container lifecycle. The preStop sleep closes the pod-termination drain race:
+# on SIGTERM CosmoGuard stops accepting connections immediately, but the pod's
+# removal from Service endpoints propagates through kube-proxy/ingress a beat
+# later. Without this delay the ingress keeps routing to the closing pod for
+# ~1-2s and those in-flight requests get a 502. The native `sleep` action (no
+# shell needed — the image is distroless) keeps the pod serving until endpoint
+# removal has propagated, THEN SIGTERM fires and CosmoGuard drains in-flight
+# requests. `sleep` requires Kubernetes >= 1.30, so the chart only renders this
+# block on >= 1.30 clusters (via .Capabilities.KubeVersion); older clusters
+# install without it. Keep sleep + 30s drain under terminationGracePeriodSeconds
+# above. Set lifecycle: {} to disable.
+lifecycle:
+  preStop:
+    sleep:
+      seconds: 5
