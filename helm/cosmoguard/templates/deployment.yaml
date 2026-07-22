@@ -102,8 +102,8 @@ spec:
           livenessProbe: {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe: {{- toYaml .Values.readinessProbe | nindent 12 }}
           {{- end }}
-          {{- with .Values.lifecycle }}
-          lifecycle: {{- toYaml . | nindent 12 }}
+          {{- if and .Values.lifecycle (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
+          lifecycle: {{- toYaml .Values.lifecycle | nindent 12 }}
           {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
