@@ -1,6 +1,6 @@
 module github.com/voluzi/cosmoguard
 
-go 1.25.0
+go 1.26.5
 
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
