@@ -333,12 +333,9 @@ func (p *GrpcUpstreamPool) storeUpstreams(s []*GrpcUpstream) {
 }
 
 // NewGrpcUpstreamPool dials one grpc.ClientConn per node and returns the
-// pool ready to pick. Caller must Close() when done. name is the pool
-// label exposed on the cosmoguard_upstream_healthy gauge.
+// pool ready to pick. An empty list is valid for discovery-backed pools.
+// Caller must Close() when done.
 func NewGrpcUpstreamPool(name string, nodes []NodeConfig, logger *Entry, opts ...GrpcUpstreamPoolOption) (*GrpcUpstreamPool, error) {
-	if len(nodes) == 0 {
-		return nil, fmt.Errorf("grpc upstream pool: no nodes configured")
-	}
 	pool := &GrpcUpstreamPool{name: name, log: logger, strategy: "weighted-round-robin"}
 	for _, opt := range opts {
 		opt(pool)

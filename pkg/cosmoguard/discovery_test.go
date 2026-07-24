@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -145,6 +146,72 @@ func TestExpandDiscoveryNodes_LookupError(t *testing.T) {
 	}
 	if len(tmpls) != 1 {
 		t.Fatalf("failing template should still be tracked, got %d templates", len(tmpls))
+	}
+}
+
+func TestNew_PendingDiscoveryBootsWithWebSocketsAndAddsUpstream(t *testing.T) {
+	lookup := &fakeLookup{}
+	lcdPort, rpcPort, grpcPort, evmRpcPort, evmRpcWsPort := reloadTestPorts(t)
+	disabled := false
+	cfg := &Config{
+		Host:         "127.0.0.1",
+		LcdPort:      lcdPort,
+		RpcPort:      rpcPort,
+		GrpcPort:     grpcPort,
+		EvmRpcPort:   evmRpcPort,
+		EvmRpcWsPort: evmRpcWsPort,
+		Nodes: []NodeConfig{{
+			Name: "pending",
+			Discovery: &DiscoveryConfig{
+				Type:            "dns",
+				Host:            "pending.svc",
+				RefreshInterval: 10 * time.Millisecond,
+			},
+		}},
+		Metrics:   MetricsConfig{Enable: &disabled},
+		Dashboard: DashboardConfig{Enable: &disabled},
+	}
+
+	cg, err := newWithLookup(cfg, lookup.lookup)
+	if err != nil {
+		t.Fatalf("pending discovery should boot with empty pools: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := cg.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	})
+
+	if got := len(cg.lcdProxy.pool.Upstreams()); got != 0 {
+		t.Fatalf("LCD pool has %d boot-time upstreams, want 0", got)
+	}
+	if got := len(cg.rpcProxy.pool.Upstreams()); got != 0 {
+		t.Fatalf("RPC pool has %d boot-time upstreams, want 0", got)
+	}
+	if got := len(cg.grpcProxy.pool.Upstreams()); got != 0 {
+		t.Fatalf("gRPC pool has %d boot-time upstreams, want 0", got)
+	}
+	if got, want := cg.jsonRpcHandler.wsProxy.wsBackends, []string{"ws://pending.svc:26657"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("WebSocket backends = %v, want %v", got, want)
+	}
+	if cg.allPoolsReady() {
+		t.Fatal("pending discovery must remain unready without an upstream")
+	}
+
+	lookup.set([]string{"127.0.0.1"}, nil)
+	cg.discovery.Start()
+	if !waitFor(t, time.Second, func() bool {
+		return len(cg.lcdProxy.pool.Upstreams()) == 1 &&
+			len(cg.rpcProxy.pool.Upstreams()) == 1 &&
+			len(cg.grpcProxy.pool.Upstreams()) == 1 &&
+			cg.allPoolsReady()
+	}) {
+		t.Fatalf("discovery did not populate empty pools: lcd=%d rpc=%d grpc=%d",
+			len(cg.lcdProxy.pool.Upstreams()),
+			len(cg.rpcProxy.pool.Upstreams()),
+			len(cg.grpcProxy.pool.Upstreams()))
 	}
 }
 
