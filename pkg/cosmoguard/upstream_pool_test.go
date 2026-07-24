@@ -196,6 +196,18 @@ func TestRetryNotForPOST(t *testing.T) {
 	}
 }
 
+func TestRetryEmptyPoolReturnsServiceUnavailable(t *testing.T) {
+	pool := newTestHTTPPool("round-robin", 2)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example/foo", nil)
+
+	pool.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty retry pool returned %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
 // TestInFlightCounted verifies inFlight is incremented during dispatch
 // and decremented after — least-conn relies on this.
 func TestInFlightCounted(t *testing.T) {

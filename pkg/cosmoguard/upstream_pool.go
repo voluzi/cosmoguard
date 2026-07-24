@@ -985,6 +985,10 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}).Debug("retrying transport failure on next upstream")
 		}
 	}
+	if len(tried) == 0 {
+		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
+		return
+	}
 	// Exhausted retries — surface 502.
 	w.WriteHeader(http.StatusBadGateway)
 }
