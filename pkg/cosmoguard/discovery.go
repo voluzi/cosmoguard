@@ -72,9 +72,8 @@ type DiscoveryTemplate struct {
 // deployment. The error is logged via slog so operators can see
 // what happened.
 //
-// Caller must check whether cfg.Nodes is empty after expansion and
-// decide whether to fail boot (no static fallback) or proceed with
-// an empty pool that the reconciler will fill in.
+// Caller must distinguish an empty config from pending discovery. The
+// latter starts with empty pools that the reconciler fills in.
 func expandDiscoveryNodes(cfg *Config, lookup LookupFunc) ([]DiscoveryTemplate, error) {
 	if lookup == nil {
 		lookup = defaultLookup

@@ -129,12 +129,15 @@ type CosmoGuard struct {
 	obsReplicator *observabilityReplicator
 }
 
-// nodeRpcAddrs returns the WS backend URLs ("ws://host:port" or
-// "wss://host:port") for every node — fed into the JSON-RPC handler's
-// WS broker pool. Honors per-node TLS flag and RpcURL overrides.
+// nodeRpcAddrs returns the WS backend URLs for every configured node.
+// Discovery templates use their stable DNS hostname so the WS reconnect
+// loop can wait for endpoints without depending on boot-time expansion.
 func nodeRpcAddrs(nodes []NodeConfig) ([]string, error) {
 	out := make([]string, 0, len(nodes))
 	for _, n := range nodes {
+		if n.Discovery != nil {
+			n.Host = n.Discovery.Host
+		}
 		b, err := nodeWSBackend(n, serviceRPC)
 		if err != nil {
 			return nil, fmt.Errorf("node %s rpc backend: %w", n.Name, err)
@@ -149,6 +152,9 @@ func nodeRpcAddrs(nodes []NodeConfig) ([]string, error) {
 func nodeEvmWsAddrs(nodes []NodeConfig) ([]string, error) {
 	out := make([]string, 0, len(nodes))
 	for _, n := range nodes {
+		if n.Discovery != nil {
+			n.Host = n.Discovery.Host
+		}
 		b, err := nodeWSBackend(n, serviceEVMRPCWS)
 		if err != nil {
 			return nil, fmt.Errorf("node %s evm-rpc-ws backend: %w", n.Name, err)
@@ -198,6 +204,10 @@ func NewFromFile(path string) (*CosmoGuard, error) {
 // PrepareConfig is safe to invoke on an already-prepared config, so the
 // NewFromFile path (which prepared during load) incurs no extra work.
 func New(cfg *Config) (*CosmoGuard, error) {
+	return newWithLookup(cfg, nil)
+}
+
+func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	if err := PrepareConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -213,26 +223,12 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	// A template lookup error (DNS unreachable) also survives boot:
 	// we don't want a transient cluster-DNS hiccup to fail startup
 	// for an autoscaled deployment.
-	templates, err := expandDiscoveryNodes(cfg, nil)
+	templates, err := expandDiscoveryNodes(cfg, lookup)
 	if err != nil {
 		return nil, fmt.Errorf("error expanding discovery templates: %w", err)
 	}
-	if len(cfg.Nodes) == 0 {
-		// Distinguish "config has nothing" (programmer error,
-		// must fix the YAML) from "every template resolved to
-		// zero IPs at boot" (transient — the pool just isn't
-		// ready yet). Both fail boot today because the proxy
-		// constructors require at least one node, but the
-		// operator-facing message should make the difference
-		// obvious.
-		if len(templates) == 0 {
-			return nil, fmt.Errorf("no upstream nodes configured: cfg.Nodes is empty and no discovery templates are set")
-		}
-		hosts := make([]string, 0, len(templates))
-		for _, t := range templates {
-			hosts = append(hosts, t.Template.Discovery.Host)
-		}
-		return nil, fmt.Errorf("no upstream nodes after discovery expansion: %d template(s) resolved to zero IPs at boot (hosts: %v) and no static nodes were configured as fallback; either add a static node or wait for the headless service's pods to become ready", len(templates), hosts)
+	if len(cfg.Nodes) == 0 && len(templates) == 0 {
+		return nil, fmt.Errorf("no upstream nodes configured: cfg.Nodes is empty and no discovery templates are set")
 	}
 	cosmoGuard := &CosmoGuard{
 		cfg:            cfg,
@@ -244,7 +240,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		metricsHistory: newMetricsHistory(defaultMetricsHistoryCap),
 	}
 	if len(templates) > 0 {
-		cosmoGuard.discovery = NewDiscoverer(log, templates, nil)
+		cosmoGuard.discovery = NewDiscoverer(log, templates, lookup)
 		cosmoGuard.discovery.SetDashboard(cosmoGuard.dashboard)
 	}
 
@@ -399,7 +395,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 	}
 
 	// Setup JSONRPC handler for RPC proxy
-	rpcWSBackends, err := nodeRpcAddrs(cosmoGuard.cfg.Nodes)
+	rpcWSBackends, err := nodeRpcAddrs(origNodes)
 	if err != nil {
 		return nil, fmt.Errorf("error resolving rpc ws backends: %w", err)
 	}
@@ -488,7 +484,7 @@ func New(cfg *Config) (*CosmoGuard, error) {
 		}
 
 		// Setup JSONRPC handler for EVM RPC WS proxy
-		evmWSBackends, err := nodeEvmWsAddrs(cosmoGuard.cfg.Nodes)
+		evmWSBackends, err := nodeEvmWsAddrs(origNodes)
 		if err != nil {
 			return nil, fmt.Errorf("error resolving evm-rpc-ws backends: %w", err)
 		}

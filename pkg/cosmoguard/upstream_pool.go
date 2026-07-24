@@ -281,9 +281,8 @@ func (p *HttpUpstreamPool) storeUpstreams(s []*HttpUpstream) {
 }
 
 // NewHttpUpstreamPool builds the pool from a list of NodeConfigs for a
-// given service. service is "lcd" or "rpc" — picks the right port.
-// rewriteDirector lets the caller add per-rule behavior (header strip,
-// CORS strip) on top of the per-upstream Director.
+// given service. An empty list is valid for discovery-backed pools and
+// returns 503 until AddUpstream supplies a resolved node.
 func NewHttpUpstreamPool(
 	nodes []NodeConfig,
 	service string,
@@ -291,9 +290,6 @@ func NewHttpUpstreamPool(
 	logger *Entry,
 	opts ...HttpUpstreamPoolOption,
 ) (*HttpUpstreamPool, error) {
-	if len(nodes) == 0 {
-		return nil, fmt.Errorf("upstream pool: no nodes configured")
-	}
 	pool := &HttpUpstreamPool{
 		name:            service,
 		service:         service,
