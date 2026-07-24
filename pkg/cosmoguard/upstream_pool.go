@@ -17,9 +17,9 @@ import (
 // (LCD or RPC). Holds the per-upstream ReverseProxy + healthcheck +
 // circuit-breaker state.
 type HttpUpstream struct {
-	Name      string
-	Target    *url.URL
-	Weight    int // for weighted round-robin (default 1)
+	Name    string
+	Target  *url.URL
+	Weight  int // for weighted round-robin (default 1)
 	proxy   *httputil.ReverseProxy
 	healthy atomic.Bool
 	// everHealthy records whether this upstream has been confirmed healthy at
@@ -503,31 +503,13 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteDirector func(*http.
 	// cert issued for the bare hostname. For non-default ports the
 	// suffix must stay so the upstream node still routes correctly.
 	hostHeader := hostHeaderForTarget(target)
+	rewriteHost := n.TLS || nodeServiceOverride(n, service) != ""
 	rp := httputil.NewSingleHostReverseProxy(target)
 	origDirector := rp.Director
 	rp.Director = func(r *http.Request) {
 		origDirector(r)
-		// httputil.NewSingleHostReverseProxy preserves the inbound Host
-		// header by default — wrong when the upstream is a TLS edge
-		// gateway / nginx that vhost-routes on Host (e.g. user's
-		// lcd.<chain>.voluzi.com pattern: the gateway 404s anything
-		// addressed to "127.0.0.1:xxxx"). Resetting r.Host to the
-		// upstream's host puts the right vhost on the wire. For local
-		// bare-node deployments the Host header is harmless metadata,
-		// so this is safe across all topologies.
-		//
-		// X-Forwarded-Host preserves what the inbound client put on
-		// the Host header so upstream / downstream services that
-		// trust forwarded headers still see the original.
-		//
-		// ALWAYS overwrite — cosmoguard is the authoritative source
-		// of these values for traffic it terminates. The previous
-		// "only set when absent" logic let a malicious client preset
-		// X-Forwarded-Host / X-Forwarded-Proto to spoof upstream
-		// apps that auto-route, redirect, or scope cookies on these
-		// headers (an internal "admin" host could be impersonated by
-		// any internet client supplying the header). Standard
-		// reverse-proxy hardening.
+		// CosmoGuard is authoritative for forwarded host and protocol
+		// values; clients must not be able to spoof them.
 		if r.Host != "" {
 			r.Header.Set("X-Forwarded-Host", r.Host)
 		}
@@ -536,7 +518,9 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteDirector func(*http.
 			proto = "https"
 		}
 		r.Header.Set("X-Forwarded-Proto", proto)
-		r.Host = hostHeader
+		if rewriteHost {
+			r.Host = hostHeader
+		}
 		if rewriteDirector != nil {
 			rewriteDirector(r)
 		}

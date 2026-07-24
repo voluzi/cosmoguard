@@ -311,6 +311,64 @@ func TestBuildHttpUpstream_HealthcheckService(t *testing.T) {
 	}
 }
 
+func TestBuildHttpUpstream_PlaintextNodePreservesInboundHost(t *testing.T) {
+	node := NodeConfig{Name: "n1", Host: "10.0.0.1", RpcPort: 26657}
+	u, err := buildHttpUpstream(node, serviceRPC, nil)
+	if err != nil {
+		t.Fatalf("buildHttpUpstream: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://rpc.public.example/status", nil)
+	req.Header.Set("X-Forwarded-Host", "spoofed.example")
+	u.proxy.Director(req)
+
+	if got, want := req.Host, "rpc.public.example"; got != want {
+		t.Fatalf("Host=%q, want %q", got, want)
+	}
+	if got, want := req.Header.Get("X-Forwarded-Host"), "rpc.public.example"; got != want {
+		t.Fatalf("X-Forwarded-Host=%q, want %q", got, want)
+	}
+}
+
+func TestBuildHttpUpstream_URLOverrideUsesUpstreamHost(t *testing.T) {
+	node := NodeConfig{
+		Name:    "n1",
+		Host:    "10.0.0.1",
+		RpcPort: 26657,
+		RpcURL:  "https://rpc.upstream.example:443",
+	}
+	u, err := buildHttpUpstream(node, serviceRPC, nil)
+	if err != nil {
+		t.Fatalf("buildHttpUpstream: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://rpc.public.example/status", nil)
+	req.Header.Set("X-Forwarded-Host", "spoofed.example")
+	u.proxy.Director(req)
+
+	if got, want := req.Host, "rpc.upstream.example"; got != want {
+		t.Fatalf("Host=%q, want %q", got, want)
+	}
+	if got, want := req.Header.Get("X-Forwarded-Host"), "rpc.public.example"; got != want {
+		t.Fatalf("X-Forwarded-Host=%q, want %q", got, want)
+	}
+}
+
+func TestBuildHttpUpstream_TLSNodeUsesUpstreamHost(t *testing.T) {
+	node := NodeConfig{Name: "n1", Host: "rpc.internal.example", RpcPort: 26657, TLS: true}
+	u, err := buildHttpUpstream(node, serviceRPC, nil)
+	if err != nil {
+		t.Fatalf("buildHttpUpstream: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://rpc.public.example/status", nil)
+	u.proxy.Director(req)
+
+	if got, want := req.Host, "rpc.internal.example:26657"; got != want {
+		t.Fatalf("Host=%q, want %q", got, want)
+	}
+}
+
 // A healthcheck-backed upstream must start UNHEALTHY so /readyz gates the pod
 // out of the load balancer until the first probe confirms the upstream is
 // reachable — otherwise a fresh/scaled-up pod is marked Ready and 502s traffic
