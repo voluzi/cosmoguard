@@ -51,9 +51,13 @@ server:
   wsAllowedOrigins:         # cross-origin WS upgrade allowlist
     - https://app.example.com
     - https://*.preview.example.com
+  trustedProxies:           # proxy CIDRs allowed to contribute client IPs
+    - 10.0.0.0/8
 ```
 
 **Breaking from v3:** `wsAllowedOrigins` defaults to empty — cross-origin WS upgrades are denied unless explicitly allowed. To restore v3 behavior, set `wsAllowedOrigins: ["*"]`.
+
+`trustedProxies` must contain only load balancers and ingress proxies under your control. CosmoGuard walks `X-Forwarded-For` from right to left across those trusted hops and selects the first untrusted address as the client, so prefixes supplied by the client are ignored. `X-Real-IP` is used only when no `X-Forwarded-For` header is present; a proxy relying on it must overwrite any client-supplied value. Leave the list empty when CosmoGuard is exposed directly, and never use `0.0.0.0/0` or `::/0` in production.
 
 **Default changes since v4.0.0-rc.1** (all restore v3-compatible behaviour that the rc.1 defaults broke):
 - `writeTimeout` now defaults to **0 (no limit)**. A fixed deadline truncated large/slow streamed responses (`/block_results`, `/genesis`, big `eth_getLogs`) mid-body. Set an explicit ceiling if exposing cosmoguard to untrusted clients.

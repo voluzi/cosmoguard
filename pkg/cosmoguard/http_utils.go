@@ -10,21 +10,21 @@ import (
 	"sync/atomic"
 )
 
-// trustedProxies is the live CIDR allowlist of immediate connection
-// peers whose X-Real-Ip / X-Forwarded-For headers GetSourceIP will
-// honor. Empty (the default) means "trust no one", and the source
-// IP comes from r.RemoteAddr only — secure-by-default.
+// trustedProxies is the live CIDR allowlist of proxy hops used to
+// resolve X-Real-Ip / X-Forwarded-For. The immediate connection peer
+// must be trusted before either header is considered. Empty (the
+// default) means "trust no one", and the source IP comes from
+// r.RemoteAddr only — secure-by-default.
 //
 // atomic.Pointer so SetTrustedProxies can swap the list at runtime
 // (config reload) without locking the hot GetSourceIP path. The
 // pointed-to slice is immutable after publication.
 var trustedProxies atomic.Pointer[[]*net.IPNet]
 
-// SetTrustedProxies parses and publishes the CIDR allowlist for
-// trusted forwarded-header sources. Pass nil or empty to clear
-// (default-deny). Returns an error on any malformed CIDR so a typo
-// fails startup loudly rather than silently degrading to
-// "trust nothing".
+// SetTrustedProxies parses and publishes the CIDR allowlist for trusted
+// proxy hops. Pass nil or empty to clear (default-deny). Returns an error
+// on any malformed CIDR so a typo fails startup loudly rather than
+// silently degrading to "trust nothing".
 //
 // PROCESS-GLOBAL. Two CosmoGuard instances in the same process
 // share the same allowlist — the second New() call's
@@ -78,16 +78,13 @@ func restoreTrustedProxies(prev *[]*net.IPNet) { trustedProxies.Store(prev) }
 // configured trustedProxies allowlist. Empty allowlist → always
 // false (default-deny).
 func remotePeerTrusted(remoteAddr string) bool {
+	host := stripPort(remoteAddr)
+	return ipTrusted(net.ParseIP(host))
+}
+
+func ipTrusted(ip net.IP) bool {
 	nets := trustedProxies.Load()
-	if nets == nil || len(*nets) == 0 {
-		return false
-	}
-	host := remoteAddr
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
+	if ip == nil || nets == nil || len(*nets) == 0 {
 		return false
 	}
 	for _, n := range *nets {
@@ -246,12 +243,9 @@ func (w *StatusOnlyWriter) WriteHeader(statusCode int) {
 // GetStatusCode returns the most-recently-observed response status.
 func (w *StatusOnlyWriter) GetStatusCode() int { return w.statusCode }
 
-// GetSourceIP returns the best-effort client IP, in priority order:
-// X-Real-Ip → X-Forwarded-For (FIRST hop only) → RemoteAddr. The
-// forwarded-header path is ONLY taken when r.RemoteAddr (the
-// immediate connection peer) matches the configured trustedProxies
-// allowlist; otherwise the headers are ignored and RemoteAddr is
-// returned directly.
+// GetSourceIP returns the best-effort client IP from X-Forwarded-For,
+// X-Real-Ip, or RemoteAddr. Forwarded headers are considered only when
+// the immediate connection peer matches trustedProxies.
 //
 // Default-deny semantics: a deployment that didn't set
 // server.trustedProxies treats every client-supplied X-Real-Ip /
@@ -262,20 +256,32 @@ func (w *StatusOnlyWriter) GetStatusCode() int { return w.statusCode }
 // the operator sets server.trustedProxies to the CIDR of the LB
 // that actually rewrites them.
 //
-// X-Forwarded-For is a comma-separated chain: "client-ip, lb-ip, ...".
-// The leftmost entry is the original client; subsequent entries are
-// intermediate proxies. Returning the first hop matches the spec and is
-// what every rate-limit / per-IP feature actually wants.
+// X-Forwarded-For is resolved from right to left. Each trusted hop is
+// discarded until the first untrusted address is reached, preventing a
+// client-supplied prefix from overriding the address appended by a trusted
+// proxy. X-Real-Ip is used only when X-Forwarded-For is absent.
 func GetSourceIP(r *http.Request) string {
-	if remotePeerTrusted(r.RemoteAddr) {
-		if v := r.Header.Get("X-Real-Ip"); v != "" {
-			return stripPort(strings.TrimSpace(v))
-		}
-		if v := r.Header.Get("X-Forwarded-For"); v != "" {
-			// First hop only — strip everything after the first comma.
-			if i := strings.IndexByte(v, ','); i >= 0 {
-				return stripPort(strings.TrimSpace(v[:i]))
+	remote := stripPort(r.RemoteAddr)
+	remoteIP := net.ParseIP(remote)
+	if ipTrusted(remoteIP) {
+		if values := r.Header.Values("X-Forwarded-For"); len(values) > 0 {
+			sourceIP := remoteIP
+			for valueIndex := len(values) - 1; valueIndex >= 0; valueIndex-- {
+				hops := strings.Split(values[valueIndex], ",")
+				for hopIndex := len(hops) - 1; hopIndex >= 0; hopIndex-- {
+					if !ipTrusted(sourceIP) {
+						return sourceIP.String()
+					}
+					candidate := net.ParseIP(stripPort(strings.TrimSpace(hops[hopIndex])))
+					if candidate == nil {
+						return remote
+					}
+					sourceIP = candidate
+				}
 			}
+			return sourceIP.String()
+		}
+		if v := r.Header.Get("X-Real-Ip"); v != "" {
 			return stripPort(strings.TrimSpace(v))
 		}
 	}
@@ -286,7 +292,7 @@ func GetSourceIP(r *http.Request) string {
 	// policy decisions are stable; the port is not useful for any
 	// per-client policy. stripPort is idempotent, so callers that still
 	// wrap this in stripPort() are unaffected.
-	return stripPort(r.RemoteAddr)
+	return remote
 }
 
 func WriteData(w http.ResponseWriter, code int, data []byte, headers ...string) {

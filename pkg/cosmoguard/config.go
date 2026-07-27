@@ -101,8 +101,8 @@ type ServerConfig struct {
 	// behavior of accepting any Origin.
 	WSAllowedOrigins []string `yaml:"wsAllowedOrigins,omitempty"`
 
-	// TrustedProxies is the CIDR allowlist of immediate upstream peers
-	// whose X-Real-Ip / X-Forwarded-For headers cosmoguard will honor
+	// TrustedProxies is the CIDR allowlist of upstream proxy hops whose
+	// X-Real-Ip / X-Forwarded-For headers cosmoguard will honor
 	// for per-IP rate limiting, audit logging, and the dashboard's
 	// SourceIP rule predicates. When empty (the default), every
 	// proxy-supplied header is ignored and the source IP comes from
@@ -111,10 +111,10 @@ type ServerConfig struct {
 	// client by anyone who simply sends `X-Real-Ip: ...`.
 	//
 	// Set this to the CIDR(s) of your front-end LB / ingress (e.g.
-	// ["10.0.0.0/8", "127.0.0.1/32"]) once you've verified that LB
-	// rewrites the forwarded headers. After that, X-Real-Ip /
-	// X-Forwarded-For are honored ONLY when the immediate connection
-	// peer matches one of the allowed CIDRs.
+	// ["10.0.0.0/8", "127.0.0.1/32"]). X-Forwarded-For is walked from
+	// right to left across trusted hops, so proxies must append their
+	// caller's address. A proxy that supplies only X-Real-Ip must overwrite
+	// any value received from its client.
 	TrustedProxies []string `yaml:"trustedProxies,omitempty"`
 }
 
