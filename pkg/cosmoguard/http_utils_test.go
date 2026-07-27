@@ -155,10 +155,10 @@ func TestGetSourceIP(t *testing.T) {
 			expected:   "1.2.3.4",
 		},
 		{
-			name:       "X-Real-Ip takes precedence",
+			name:       "X-Forwarded-For takes precedence",
 			headers:    map[string]string{"X-Real-Ip": "1.1.1.1", "X-Forwarded-For": "2.2.2.2"},
 			remoteAddr: "5.6.7.8:1234",
-			expected:   "1.1.1.1",
+			expected:   "2.2.2.2",
 		},
 		{
 			name:       "fallback to RemoteAddr",
@@ -251,6 +251,86 @@ func TestGetSourceIP_TrustedPeerHonored(t *testing.T) {
 	r2.Header.Set("X-Real-Ip", "1.2.3.4")
 	if got := GetSourceIP(r2); got != "8.8.8.8" {
 		t.Fatalf("untrusted peer must ignore X-Real-Ip, got %q", got)
+	}
+}
+
+func TestGetSourceIP_TrustedProxyChain(t *testing.T) {
+	prev := trustedProxies.Load()
+	if err := SetTrustedProxies([]string{"10.0.0.0/8", "fd00::/8"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
+	t.Cleanup(func() { trustedProxies.Store(prev) })
+
+	tests := []struct {
+		name       string
+		xRealIP    string
+		xff        string
+		xffValues  []string
+		remoteAddr string
+		expected   string
+	}{
+		{
+			name:       "forwarded chain takes precedence over real ip",
+			xRealIP:    "203.0.113.77",
+			xff:        "198.51.100.23",
+			remoteAddr: "10.1.2.3:55555",
+			expected:   "198.51.100.23",
+		},
+		{
+			name:       "client supplied prefix is ignored",
+			xff:        "203.0.113.77, 198.51.100.23",
+			remoteAddr: "10.1.2.3:55555",
+			expected:   "198.51.100.23",
+		},
+		{
+			name:       "multiple forwarded headers are one chain",
+			xffValues:  []string{"203.0.113.77", "198.51.100.23"},
+			remoteAddr: "10.1.2.3:55555",
+			expected:   "198.51.100.23",
+		},
+		{
+			name:       "malformed final forwarded header falls back to remote peer",
+			xffValues:  []string{"198.51.100.23", "not-an-ip"},
+			remoteAddr: "10.1.2.3:55555",
+			expected:   "10.1.2.3",
+		},
+		{
+			name:       "trusted intermediate proxy is skipped",
+			xff:        "198.51.100.23, 10.2.3.4",
+			remoteAddr: "10.1.2.3:55555",
+			expected:   "198.51.100.23",
+		},
+		{
+			name:       "trusted ipv6 intermediate proxy is skipped",
+			xff:        "2001:db8::23, fd00::2",
+			remoteAddr: "[fd00::1]:55555",
+			expected:   "2001:db8::23",
+		},
+		{
+			name:       "malformed nearest hop falls back to remote peer",
+			xRealIP:    "203.0.113.77",
+			xff:        "198.51.100.23, not-an-ip",
+			remoteAddr: "10.1.2.3:55555",
+			expected:   "10.1.2.3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.xRealIP != "" {
+				req.Header.Set("X-Real-Ip", tt.xRealIP)
+			}
+			if tt.xff != "" {
+				req.Header.Set("X-Forwarded-For", tt.xff)
+			}
+			for _, value := range tt.xffValues {
+				req.Header.Add("X-Forwarded-For", value)
+			}
+
+			assert.Equal(t, GetSourceIP(req), tt.expected)
+		})
 	}
 }
 
