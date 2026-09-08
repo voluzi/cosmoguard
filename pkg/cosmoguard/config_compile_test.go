@@ -12,15 +12,22 @@ import (
 	"gotest.tools/assert"
 )
 
-// reloadTestPorts returns five ephemeral ports for use in a test YAML so
-// concurrent or sequential tests don't collide on the default ports.
+// reloadTestPorts reserves five distinct ephemeral ports until all have been
+// allocated, preventing the kernel from reusing a port within one test YAML.
 func reloadTestPorts(t *testing.T) (lcd, rpc, grpc, evmRpc, evmRpcWs int) {
 	t.Helper()
+	listeners := make([]net.Listener, 0, 5)
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}()
+
 	for _, p := range []*int{&lcd, &rpc, &grpc, &evmRpc, &evmRpcWs} {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		assert.NilError(t, err)
+		listeners = append(listeners, l)
 		*p = l.Addr().(*net.TCPAddr).Port
-		_ = l.Close()
 	}
 	return
 }

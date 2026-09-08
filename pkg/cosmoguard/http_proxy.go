@@ -264,6 +264,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 	modifyResponse := func(u *HttpUpstream, resp *http.Response) error {
 		ok := resp.StatusCode < 500
 		u.RecordOutcome(ok)
+		recordUpstreamVary(resp)
 		if proxy.cors != nil && proxy.cors.Enable {
 			origin := ""
 			if resp.Request != nil {
@@ -1225,6 +1226,7 @@ func stripHTTPPreconditions(headers http.Header) {
 func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, requestHash string, cache *RuleCache, ruleTag string, startTime time.Time) {
 	ww := WrapResponseWriter(w)
 	ww.setHeaderOnCommit(cacheStateHeader, cacheMiss)
+	r, varyCapture := withUpstreamVaryCapture(r)
 	p.pool.ServeHTTP(ww, r)
 	status := ww.GetStatusCode()
 	p.recordOutcome(r, status, cacheMiss, RuleActionAllow, startTime, "request allowed")
@@ -1234,7 +1236,7 @@ func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	committed := ww.GetCommittedHeaders()
-	if status <= 0 || !p.shouldStore(status, committed, cache) {
+	if status <= 0 || !p.shouldStore(status, cacheAdmissionHeaders(committed, varyCapture), cache) {
 		return
 	}
 	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
@@ -1248,6 +1250,7 @@ func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, r
 // the cache write asynchronously; background refreshes persist before finishing.
 func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *RuleCache, ruleTag string, owner *responseOwner, asyncStore bool) (bufferedUpstreamResponse, error) {
 	sink := WrapResponseWriter(&discardResponseWriter{})
+	r, varyCapture := withUpstreamVaryCapture(r)
 	p.pool.ServeHTTP(sink, r)
 
 	status := sink.GetStatusCode()
@@ -1273,7 +1276,7 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 		"cache-error":   cache.CacheError,
 	}).Debug("got response from upstream")
 
-	if !p.shouldStore(status, committed, cache) {
+	if !p.shouldStore(status, cacheAdmissionHeaders(committed, varyCapture), cache) {
 		return out, nil
 	}
 	out.Shareable = true
@@ -1371,7 +1374,7 @@ func (p *HttpProxy) shouldStore(status int, committed http.Header, cache *RuleCa
 	if !cacheableByUpstream(committed) {
 		return false
 	}
-	return cacheableByVary(committed, p.cors != nil && p.cors.Enable)
+	return cacheableByVary(committed, httpCacheKeyVary)
 }
 
 // redactCredentialQuery replaces the value of any credential-carrying query

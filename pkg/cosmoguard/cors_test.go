@@ -21,10 +21,9 @@ func corsVaryHasOrigin(h http.Header) bool {
 
 // TestCORSApplyToResponseVary verifies that when cosmoguard owns CORS it emits
 // Vary: Origin on every response (matching rs/cors, the library CometBFT uses)
-// and re-derives Access-Control-Allow-Origin from the current request. This is
-// what makes a Vary: Origin response safe to cache: ACAO is never stored and is
-// regenerated per hit, and the always-present Vary protects any shared cache
-// between the client and cosmoguard.
+// and re-derives Access-Control-Allow-Origin from the current request. The
+// synthetic Vary protects shared caches between clients and cosmoguard; raw
+// upstream Vary is evaluated separately for cosmoguard's own cache admission.
 func TestCORSApplyToResponseVary(t *testing.T) {
 	mustCompile := func(c *CORSConfig) *CORSConfig {
 		t.Helper()
@@ -129,11 +128,9 @@ func TestCORSApplyToResponseVary(t *testing.T) {
 	})
 }
 
-// TestCacheHitReDerivesACAOPerOrigin is the load-bearing safety check for
-// caching Vary: Origin responses: a SINGLE cached body — stored WITHOUT
-// Access-Control-Allow-Origin — is replayed to two different allowed origins,
-// and each gets ITS OWN ACAO re-derived on the hit path. This proves cosmoguard
-// never serves one origin's CORS grant to another from a shared cache entry.
+// TestCacheHitReDerivesACAOPerOrigin is the load-bearing safety check for a
+// cached response carrying cosmoguard's synthetic Vary: Origin. The body is
+// stored without Access-Control-Allow-Origin and each hit derives its own ACAO.
 func TestCacheHitReDerivesACAOPerOrigin(t *testing.T) {
 	cors := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://a.example", "https://b.example"}}
 	if err := cors.Compile(); err != nil {

@@ -11,38 +11,35 @@ import (
 // client that sent different headers.
 func TestCacheableByVary(t *testing.T) {
 	cases := []struct {
-		vary      string
-		corsOwned bool
-		want      bool
+		name   string
+		vary   string
+		policy cacheKeyVaryPolicy
+		want   bool
 	}{
-		{"", false, true},
-		{"Accept-Encoding", false, true},
-		{"accept-encoding", false, true},
-		{"Accept-Encoding, Accept-Encoding", false, true},
-		{"Accept-Language", false, false},
-		{"Authorization", false, false},
-		{"Accept-Encoding, Accept-Language", false, false},
-		{"*", false, false},
-		// Origin is cacheable only when cosmoguard owns CORS — ACAO is
-		// re-derived per hit and never stored.
-		{"Origin", false, false},
-		{"Origin", true, true},
-		{"origin", true, true},
-		{"Accept-Encoding, Origin", true, true},
-		// Real per-client variance stays uncacheable even under CORS ownership.
-		{"Authorization", true, false},
-		{"Cookie", true, false},
-		{"Origin, Authorization", true, false},
-		{"*", true, false},
+		{"http absent", "", httpCacheKeyVary, true},
+		{"http accept encoding", "Accept-Encoding", httpCacheKeyVary, true},
+		{"http accept encoding case insensitive", "accept-encoding", httpCacheKeyVary, true},
+		{"http repeated accept encoding", "Accept-Encoding, Accept-Encoding", httpCacheKeyVary, true},
+		{"http accept language", "Accept-Language", httpCacheKeyVary, false},
+		{"http authorization", "Authorization", httpCacheKeyVary, false},
+		{"http mixed supported and unsupported", "Accept-Encoding, Accept-Language", httpCacheKeyVary, false},
+		{"http wildcard", "*", httpCacheKeyVary, false},
+		{"http origin", "Origin", httpCacheKeyVary, false},
+		{"json rpc absent", "", jsonRPCCacheKeyVary, true},
+		{"json rpc accept encoding", "Accept-Encoding", jsonRPCCacheKeyVary, false},
+		{"json rpc origin", "Origin", jsonRPCCacheKeyVary, false},
+		{"json rpc wildcard", "*", jsonRPCCacheKeyVary, false},
 	}
 	for _, tc := range cases {
-		h := http.Header{}
-		if tc.vary != "" {
-			h.Set("Vary", tc.vary)
-		}
-		if got := cacheableByVary(h, tc.corsOwned); got != tc.want {
-			t.Errorf("cacheableByVary(Vary: %q, corsOwned=%v) = %v, want %v", tc.vary, tc.corsOwned, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.Header{}
+			if tc.vary != "" {
+				h.Set("Vary", tc.vary)
+			}
+			if got := cacheableByVary(h, tc.policy); got != tc.want {
+				t.Errorf("cacheableByVary(Vary: %q, policy=%d) = %v, want %v", tc.vary, tc.policy, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -52,17 +49,36 @@ func TestCacheableByVaryMultiLine(t *testing.T) {
 	h := http.Header{}
 	h.Add("Vary", "Accept-Encoding")
 	h.Add("Vary", "Origin")
-	if !cacheableByVary(h, true) {
-		t.Error("Accept-Encoding + Origin across two lines must be cacheable when CORS owned")
-	}
-	if cacheableByVary(h, false) {
-		t.Error("Origin must NOT be cacheable when CORS is not owned")
+	if cacheableByVary(h, httpCacheKeyVary) {
+		t.Error("Origin must remain uncacheable when it appears on a second line")
 	}
 	bad := http.Header{}
 	bad.Add("Vary", "Accept-Encoding")
 	bad.Add("Vary", "Authorization")
-	if cacheableByVary(bad, true) {
-		t.Error("Authorization must never be cacheable, even under CORS ownership")
+	if cacheableByVary(bad, httpCacheKeyVary) {
+		t.Error("Authorization must never be cacheable")
+	}
+}
+
+func TestCacheAdmissionHeadersUsesRawUpstreamVary(t *testing.T) {
+	committed := http.Header{"Vary": {"Origin"}}
+
+	observedEmpty := &upstreamVaryCapture{observed: true}
+	if got := cacheAdmissionHeaders(committed, observedEmpty); len(got.Values("Vary")) != 0 {
+		t.Fatalf("synthetic Vary must be removed from admission headers, got %q", got.Values("Vary"))
+	}
+	if got := committed.Values("Vary"); len(got) != 1 || got[0] != "Origin" {
+		t.Fatalf("committed client-facing headers were mutated: %q", got)
+	}
+
+	raw := &upstreamVaryCapture{observed: true, values: []string{"Accept-Encoding", "Origin"}}
+	if got := cacheAdmissionHeaders(committed, raw).Values("Vary"); len(got) != 2 || got[0] != "Accept-Encoding" || got[1] != "Origin" {
+		t.Fatalf("raw upstream Vary lines were not restored: %q", got)
+	}
+
+	unobserved := &upstreamVaryCapture{}
+	if got := cacheAdmissionHeaders(committed, unobserved).Values("Vary"); len(got) != 1 || got[0] != "Origin" {
+		t.Fatalf("unobserved capture must conservatively keep committed Vary: %q", got)
 	}
 }
 

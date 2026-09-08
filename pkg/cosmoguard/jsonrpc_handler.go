@@ -771,6 +771,7 @@ func (h *JsonRpcHandler) forwardSingleUpstream(request *JsonRpcMsg, w http.Respo
 
 func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) {
 	ww := WrapResponseWriter(w)
+	r, varyCapture := withUpstreamVaryCapture(r)
 	next(ww, r)
 
 	b, err := ww.GetWrittenBytes()
@@ -819,14 +820,16 @@ func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *htt
 	// max-age) forbid storage: JSON-RPC entries drop response headers, so a
 	// cached no-cache reply would be served without the revalidation it
 	// requires. Mirror the HTTP path's cacheableByUpstream gate.
-	if !cacheableByUpstream(ww.GetCommittedHeaders()) {
+	committed := ww.GetCommittedHeaders()
+	admission := cacheAdmissionHeaders(committed, varyCapture)
+	if !cacheableByUpstream(admission) || !cacheableByVary(admission, jsonRPCCacheKeyVary) {
 		return
 	}
 
 	// Stamp StoredAt and store under a physical TTL extended by the stale
 	// window so this entry can be served stale-while-revalidate later.
 	res.StoredAt = nowOrDefault(h.now).UTC()
-	stale := upstreamHTTPStaleWindow(ww.GetCommittedHeaders(), resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
+	stale := upstreamHTTPStaleWindow(committed, resolveStaleWindow(cache, cfgStaleWindow(h.cacheConfig)))
 	physTTL := physicalTTL(effectiveTTL(cache, h.cacheConfig), stale)
 	go h.persistSingleResponse(hash, res, physTTL, ruleTag, method)
 }
@@ -968,12 +971,14 @@ func (h *JsonRpcHandler) recentSingleResponse(r *http.Request, hash uint64, cach
 // receives request-specific headers.
 func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string, owner *jsonRpcResponseOwner, asyncStore bool) (bufferedJsonRpcResponse, error) {
 	sink := WrapResponseWriter(&discardResponseWriter{})
+	r, varyCapture := withUpstreamVaryCapture(r)
 	next(sink, r)
 	b, err := sink.GetWrittenBytes()
+	committed := sink.GetCommittedHeaders()
 	out := bufferedJsonRpcResponse{
 		StatusCode:    sink.GetStatusCode(),
-		Headers:       sink.GetCommittedHeaders(),
-		SharedHeaders: pickSharedResponseHeaders(sink.GetCommittedHeaders()),
+		Headers:       committed,
+		SharedHeaders: pickSharedResponseHeaders(committed),
 		RawBody:       append([]byte(nil), b...),
 		Owner:         owner,
 	}
@@ -1000,7 +1005,8 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 	// no-cache reply would later be replayed — fresh or, with SWR, stale —
 	// without the revalidation its Cache-Control demands. Mirror the HTTP
 	// path's cacheableByUpstream gate.
-	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) || !cacheableByUpstream(out.Headers) {
+	admission := cacheAdmissionHeaders(committed, varyCapture)
+	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) || !cacheableByUpstream(admission) || !cacheableByVary(admission, jsonRPCCacheKeyVary) {
 		return out, nil
 	}
 	out.Shareable = true
@@ -1386,6 +1392,7 @@ func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, req
 	req := httpRequest.Clone(httpRequest.Context())
 	req.Body = io.NopCloser(bytes.NewReader(b))
 	req.ContentLength = int64(len(b))
+	req, varyCapture := withUpstreamVaryCapture(req)
 
 	// Cap how much of the upstream response we buffer — without this a
 	// pathological / malicious upstream returning gigabytes to a single
@@ -1402,8 +1409,10 @@ func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, req
 		return nil, nil, fmt.Errorf("upstream batch response exceeded %d bytes (cap)", maxUpstreamBatchResponse)
 	}
 	b = w.buf.Bytes()
+	committed := w.Header().Clone()
+	admission := cacheAdmissionHeaders(committed, varyCapture)
 	if len(bytes.TrimSpace(b)) == 0 {
-		return nil, w.Header().Clone(), nil
+		return nil, admission, nil
 	}
 	single, responses, parseErr := ParseJsonRpcMessage(b)
 	if parseErr != nil {
@@ -1412,7 +1421,7 @@ func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, req
 	if len(responses) == 0 && single != nil {
 		responses = JsonRpcMsgs{single}
 	}
-	return responses, w.Header().Clone(), nil
+	return responses, admission, nil
 }
 
 // cappedResponseWriter is an http.ResponseWriter that buffers the body up

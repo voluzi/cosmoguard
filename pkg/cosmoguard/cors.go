@@ -185,9 +185,9 @@ func (c *CORSConfig) ApplyToResponse(headers http.Header, requestOrigin string) 
 	// requests. This keeps cosmoguard byte-identical to a real node and stops
 	// any shared cache BETWEEN a client and cosmoguard from replaying one
 	// origin's response (or an ACAO-less one) to another. cosmoguard's OWN
-	// cache is exempt via cacheableByVary's corsOwned path, since ACAO is
-	// never stored and is re-derived here on every hit. addVary is idempotent,
-	// so an upstream that already sent Vary: Origin isn't duplicated.
+	// cache admission uses the raw upstream Vary captured before this method,
+	// while this synthetic field is retained for downstream caches. addVary is
+	// idempotent, so an upstream that already sent Vary: Origin isn't duplicated.
 	addVary(headers, "Origin")
 	// If the request had no Origin (non-browser client), don't add CORS
 	// headers — they'd be meaningless.

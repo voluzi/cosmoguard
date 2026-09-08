@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -72,20 +73,20 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
-// cacheableByVary reports whether a response is safe to cache given its
-// Vary header. cosmoguard keys the cache on Accept-Encoding (see
-// getRequestHash) but on no other request header, so a response that Vary's
-// on anything else — or on "*" — cannot be safely reused across clients and
-// must not be cached. Absent/empty Vary is cacheable.
-//
-// Origin is a special case: when corsOwned is true (cosmoguard's CORS layer
-// is enabled) the Origin dimension belongs to cosmoguard, not the cached
-// content. Access-Control-Allow-Origin is never stored (it's not in
-// alwaysPreservedHeaders) and is re-derived per request by
-// CORSConfig.ApplyToResponse on every cache hit, so a Vary: Origin response
-// — whose body is identical across origins — is safe to cache. With CORS
-// off we stay conservative and treat Origin like any other varying header.
-func cacheableByVary(upstream http.Header, corsOwned bool) bool {
+type cacheKeyVaryPolicy uint8
+
+const (
+	jsonRPCCacheKeyVary cacheKeyVaryPolicy = iota
+	httpCacheKeyVary
+)
+
+func (p cacheKeyVaryPolicy) includes(field string) bool {
+	return p == httpCacheKeyVary && strings.EqualFold(field, "Accept-Encoding")
+}
+
+// cacheableByVary reports whether every upstream Vary dimension is represented
+// in the selected cache key. An invalid policy permits no dimensions.
+func cacheableByVary(upstream http.Header, policy cacheKeyVaryPolicy) bool {
 	// An upstream can legally send Vary across MULTIPLE header lines; Get
 	// returns only the first, so a response with `Vary: Accept-Encoding`
 	// followed by `Vary: Authorization` would otherwise slip through. Walk
@@ -101,21 +102,54 @@ func cacheableByVary(upstream http.Header, corsOwned bool) bool {
 			if f == "*" {
 				return false
 			}
-			// Accept-Encoding is folded into the cache key, so it's safe.
-			if f == "accept-encoding" {
+			if policy.includes(f) {
 				continue
 			}
-			// Origin is safe only when cosmoguard owns the CORS surface.
-			if f == "origin" && corsOwned {
-				continue
-			}
-			// Any other varying header (Authorization, Cookie,
-			// Accept-Language, …) reflects real per-client content
-			// variance the cache can't key on — refuse.
 			return false
 		}
 	}
 	return true
+}
+
+type upstreamVaryCaptureContextKey struct{}
+
+type upstreamVaryCapture struct {
+	values   []string
+	observed bool
+}
+
+func withUpstreamVaryCapture(r *http.Request) (*http.Request, *upstreamVaryCapture) {
+	capture := &upstreamVaryCapture{}
+	ctx := context.WithValue(r.Context(), upstreamVaryCaptureContextKey{}, capture)
+	return r.WithContext(ctx), capture
+}
+
+// recordUpstreamVary must run before response middleware mutates Vary.
+func recordUpstreamVary(resp *http.Response) {
+	if resp == nil || resp.Request == nil {
+		return
+	}
+	capture, ok := resp.Request.Context().Value(upstreamVaryCaptureContextKey{}).(*upstreamVaryCapture)
+	if !ok {
+		return
+	}
+	capture.values = append(capture.values[:0], resp.Header.Values("Vary")...)
+	capture.observed = true
+}
+
+// cacheAdmissionHeaders substitutes the raw upstream Vary when the response
+// hook observed it. If the hook did not run, the committed headers remain the
+// conservative source of truth.
+func cacheAdmissionHeaders(committed http.Header, capture *upstreamVaryCapture) http.Header {
+	if capture == nil || !capture.observed {
+		return committed
+	}
+	headers := committed.Clone()
+	headers.Del("Vary")
+	for _, value := range capture.values {
+		headers.Add("Vary", value)
+	}
+	return headers
 }
 
 // pickCacheableHeaders returns a flat map of header-name → value containing

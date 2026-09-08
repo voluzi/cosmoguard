@@ -1276,26 +1276,22 @@ func TestJSONRPCCoalescedWaitersReapplyCORS(t *testing.T) {
 		Cache:   &RuleCache{Enable: true, TTL: time.Minute},
 	}
 	h := newJSONCacheHandler(t, rule)
-	cors := &CORSConfig{
-		Enable:         true,
-		AllowedOrigins: []string{"https://a.example", "https://b.example"},
-	}
-	require.NoError(t, cors.Compile())
+	cors := compiledTestCORS(t)
 	h.cors = cors
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	next := func(w http.ResponseWriter, r *http.Request) {
-		cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+	p, hits := newRealHookCacheProxy(t, cors, func(w http.ResponseWriter, r *http.Request) {
 		started <- struct{}{}
 		<-release
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
-	}
+		writeJSONRPCUpstreamResult(t, w, r)
+	})
+	next := p.pool.ServeHTTP
 
 	first := make(chan *httptest.ResponseRecorder, 1)
 	second := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		rec := httptest.NewRecorder()
-		r, _ := jsonRequestContext()
+		r := jsonTenantRequest("", 1)
 		r.Header.Set("Origin", "https://a.example")
 		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}, rec, r, next, time.Now())
 		first <- rec
@@ -1303,7 +1299,7 @@ func TestJSONRPCCoalescedWaitersReapplyCORS(t *testing.T) {
 	<-started
 	go func() {
 		rec := httptest.NewRecorder()
-		r, _ := jsonRequestContext()
+		r := jsonTenantRequest("", 2)
 		r.Header.Set("Origin", "https://b.example")
 		h.handleHttpSingle(&JsonRpcMsg{Version: "2.0", ID: 2, Method: "status"}, rec, r, next, time.Now())
 		second <- rec
@@ -1311,8 +1307,13 @@ func TestJSONRPCCoalescedWaitersReapplyCORS(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	close(release)
 
-	require.Equal(t, "https://a.example", (<-first).Header().Get("Access-Control-Allow-Origin"))
-	require.Equal(t, "https://b.example", (<-second).Header().Get("Access-Control-Allow-Origin"))
+	firstResponse := <-first
+	secondResponse := <-second
+	require.Equal(t, "https://a.example", firstResponse.Header().Get("Access-Control-Allow-Origin"))
+	require.Equal(t, "https://b.example", secondResponse.Header().Get("Access-Control-Allow-Origin"))
+	require.JSONEq(t, `{"jsonrpc":"2.0","id":1,"result":"ok"}`, firstResponse.Body.String())
+	require.JSONEq(t, `{"jsonrpc":"2.0","id":2,"result":"ok"}`, secondResponse.Body.String())
+	require.Equal(t, int32(1), hits.Load())
 }
 
 func TestJSONRPCForegroundMissUsesConfiguredProxyDeadline(t *testing.T) {

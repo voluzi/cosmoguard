@@ -1,9 +1,7 @@
 module github.com/voluzi/cosmoguard
 
-// Pinned to a patched 1.25.x: 1.25.12 clears the stdlib CVEs govulncheck flags
-// in earlier 1.25 patches, while staying on 1.25 (Go 1.26 deprecates httputil
-// ReverseProxy.Director → staticcheck SA1019, a migration to do separately).
-go 1.25.12
+// Stay on Go 1.25 until ReverseProxy.Director is migrated separately.
+go 1.25.14
 
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
