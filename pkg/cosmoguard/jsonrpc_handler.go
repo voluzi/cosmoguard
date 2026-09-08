@@ -1129,6 +1129,16 @@ func (h *JsonRpcHandler) handleHttpBatch(requests JsonRpcMsgs, w http.ResponseWr
 	if h.cors != nil {
 		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
 	}
+	if hasDuplicateJsonRpcIDs(requests) {
+		body, err := InvalidRequestResponse().Marshal()
+		if err != nil {
+			h.log.Errorf("error marshalling duplicate-id batch response: %v", err)
+			WriteError(w, http.StatusBadRequest, "bad request")
+			return
+		}
+		WriteData(w, http.StatusOK, body, "Content-Type", "application/json")
+		return
+	}
 	responses := JsonRpcResponses{}
 
 	var cacheHits, cacheMisses, allowed, denied int
@@ -1382,6 +1392,21 @@ RequestsLoop:
 		"duration":     duration,
 		"source":       GetSourceIP(r),
 	}).Info("processed batch of requests")
+}
+
+func hasDuplicateJsonRpcIDs(requests JsonRpcMsgs) bool {
+	seen := make(map[any]struct{}, len(requests))
+	for _, request := range requests {
+		if request == nil || request.ID == nil {
+			continue
+		}
+		id := normalizeJsonRpcID(request.ID)
+		if _, exists := seen[id]; exists {
+			return true
+		}
+		seen[id] = struct{}{}
+	}
+	return false
 }
 
 func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, requests JsonRpcMsgs, next func(http.ResponseWriter, *http.Request)) (JsonRpcMsgs, http.Header, error) {

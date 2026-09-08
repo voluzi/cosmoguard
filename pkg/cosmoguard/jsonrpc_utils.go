@@ -525,47 +525,42 @@ func (l *JsonRpcResponses) AddPendingWithCacheConfig(request *JsonRpcMsg, cacheK
 	*l = append(*l, res)
 }
 
-// Set correlates upstream batch responses to the pending request
-// slots by JSON-RPC `id`, NOT by position. Per JSON-RPC 2.0 §6 the
-// server MAY return batch responses in any order; the client must
-// match by id. Positional correlation (the previous shape) silently
-// attributed each response to the wrong request whenever a Cosmos /
-// EVM node legally re-ordered — wrong tx hashes, wrong balances,
-// data corruption that's invisible to monitoring.
-//
-// `requests` and `responses` are still both passed because:
-//   - falling back to positional when ids are unique-but-missing
-//     would be too lenient; we just leave the slot pending
-//     (UnauthorizedResponse will surface as the visible error);
-//   - duplicate ids in `responses` (malformed upstream) win to
-//     last-write — explicit instead of "whichever map iteration
-//     order picked"; a future change can warn.
+// Set correlates upstream batch responses to pending request slots by
+// JSON-RPC id. An id must be unique on both sides before it can be assigned;
+// ambiguous, missing, and unknown ids stay pending for FillUnansweredCalls.
 func (l *JsonRpcResponses) Set(requests, responses JsonRpcMsgs) {
-	byID := make(map[any]*JsonRpcMsg, len(responses))
-	for _, resp := range responses {
-		if resp == nil {
+	requestCounts := make(map[any]int, len(requests))
+	for _, req := range requests {
+		if req == nil || req.ID == nil {
 			continue
 		}
-		byID[normalizeJsonRpcID(resp.ID)] = resp
+		requestCounts[normalizeJsonRpcID(req.ID)]++
 	}
-	for i, req := range requests {
+
+	responseCounts := make(map[any]int, len(responses))
+	byID := make(map[any]*JsonRpcMsg, len(responses))
+	for _, resp := range responses {
+		if resp == nil || resp.ID == nil {
+			continue
+		}
+		id := normalizeJsonRpcID(resp.ID)
+		responseCounts[id]++
+		byID[id] = resp
+	}
+	for _, req := range requests {
 		res := l.Find(req)
-		if res == nil {
+		if res == nil || res.Response != nil {
 			continue
 		}
 		if req == nil || req.ID == nil {
 			continue
 		}
-		if matched, ok := byID[normalizeJsonRpcID(req.ID)]; ok {
-			res.Response = matched
+		id := normalizeJsonRpcID(req.ID)
+		if requestCounts[id] != 1 || responseCounts[id] != 1 {
 			continue
 		}
-		// Fallback: when ids didn't match (notification batch, or
-		// upstream omitted id) keep the positional pairing so an
-		// upstream that DOES respond in order still works. Only
-		// applied when both sides are the same length.
-		if len(requests) == len(responses) && i < len(responses) {
-			res.Response = responses[i]
+		if matched, ok := byID[id]; ok {
+			res.Response = matched
 		}
 	}
 }
@@ -579,6 +574,8 @@ func normalizeJsonRpcID(id any) any {
 	switch v := id.(type) {
 	case nil:
 		return nil
+	case int:
+		return int64(v)
 	case float64:
 		// Preserve integer-valued floats as int64 so a request id of
 		// 7 matches a response id of 7.0 (or vice versa).
