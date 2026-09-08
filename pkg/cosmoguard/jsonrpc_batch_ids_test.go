@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -278,10 +279,83 @@ func TestMalformedUpstreamBatchIDsDoNotPoisonRequestCaches(t *testing.T) {
 }
 
 func TestNormalizeJsonRpcIDTreatsIntegralRepresentationsEqually(t *testing.T) {
-	require.Equal(t, int64(7), normalizeJsonRpcID(int(7)))
-	require.Equal(t, int64(7), normalizeJsonRpcID(int64(7)))
-	require.Equal(t, int64(7), normalizeJsonRpcID(float64(7)))
+	tests := []struct {
+		name string
+		id   any
+		want int64
+	}{
+		{name: "int", id: int(7), want: 7},
+		{name: "int8", id: int8(7), want: 7},
+		{name: "int16", id: int16(7), want: 7},
+		{name: "int32", id: int32(7), want: 7},
+		{name: "int64", id: int64(7), want: 7},
+		{name: "uint", id: uint(7), want: 7},
+		{name: "uint8", id: uint8(7), want: 7},
+		{name: "uint16", id: uint16(7), want: 7},
+		{name: "uint32", id: uint32(7), want: 7},
+		{name: "uint64", id: uint64(7), want: 7},
+		{name: "uintptr", id: uintptr(7), want: 7},
+		{name: "negative int", id: int(-7), want: -7},
+		{name: "negative int8", id: int8(-7), want: -7},
+		{name: "negative int16", id: int16(-7), want: -7},
+		{name: "negative int32", id: int32(-7), want: -7},
+		{name: "negative int64", id: int64(-7), want: -7},
+		{name: "integral float64", id: float64(7), want: 7},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, normalizeJsonRpcID(tt.id))
+		})
+	}
 	require.NotEqual(t, normalizeJsonRpcID(7), normalizeJsonRpcID("7"))
+}
+
+func TestNormalizeJsonRpcIDPreservesLargeUnsignedValues(t *testing.T) {
+	high := uint64(1) << 63
+	require.Equal(t, high, normalizeJsonRpcID(high))
+	require.NotEqual(t, normalizeJsonRpcID(high), normalizeJsonRpcID(int64(-1<<63)))
+	if strconv.IntSize == 64 {
+		require.Equal(t, high, normalizeJsonRpcID(uint(high)))
+	}
+}
+
+func TestIntegralIDKindsShareDuplicateAndCorrelationKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		id   any
+	}{
+		{name: "int", id: int(7)},
+		{name: "int8", id: int8(7)},
+		{name: "int16", id: int16(7)},
+		{name: "int32", id: int32(7)},
+		{name: "uint", id: uint(7)},
+		{name: "uint8", id: uint8(7)},
+		{name: "uint16", id: uint16(7)},
+		{name: "uint32", id: uint32(7)},
+		{name: "uint64", id: uint64(7)},
+		{name: "uintptr", id: uintptr(7)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := JsonRpcMsgs{
+				{Version: "2.0", ID: int64(7), Method: "first"},
+				{Version: "2.0", ID: tt.id, Method: "second"},
+			}
+			require.True(t, hasDuplicateJsonRpcIDs(requests))
+
+			correlated := JsonRpcResponses{}
+			correlated.AddPending(requests[0])
+			correlated.AddPending(requests[1])
+			correlated.Set(requests, JsonRpcMsgs{
+				{Version: "2.0", ID: int64(7), Result: []byte(`"ambiguous"`)},
+			})
+
+			require.Nil(t, correlated.Find(requests[0]).Response)
+			require.Nil(t, correlated.Find(requests[1]).Response)
+		})
+	}
 }
 
 func TestRejectedDuplicateBatchDoesNotDisruptSingleMissCoalescing(t *testing.T) {

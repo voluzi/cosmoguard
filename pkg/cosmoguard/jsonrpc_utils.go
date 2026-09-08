@@ -576,6 +576,35 @@ func normalizeJsonRpcID(id any) any {
 		return nil
 	case int:
 		return int64(v)
+	case int8:
+		return int64(v)
+	case int16:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case int64:
+		return v
+	case uint:
+		if uint64(v) <= uint64(1<<63-1) {
+			return int64(v)
+		}
+		return uint64(v)
+	case uint8:
+		return int64(v)
+	case uint16:
+		return int64(v)
+	case uint32:
+		return int64(v)
+	case uint64:
+		if v <= uint64(1<<63-1) {
+			return int64(v)
+		}
+		return v
+	case uintptr:
+		if uint64(v) <= uint64(1<<63-1) {
+			return int64(v)
+		}
+		return uint64(v)
 	case float64:
 		// Preserve integer-valued floats as int64 so a request id of
 		// 7 matches a response id of 7.0 (or vice versa).
