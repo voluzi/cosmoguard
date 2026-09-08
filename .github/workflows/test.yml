@@ -30,9 +30,9 @@ jobs:
         run: go vet ./...
 
       - name: staticcheck
-        uses: dominikh/staticcheck-action@v1
+        uses: dominikh/staticcheck-action@9716614d4101e79b4340dd97b10e54d68234e431 # v1
         with:
-          version: "latest"
+          version: "v0.7.0"
           install-go: false
 
       - name: test (race + coverage)
@@ -138,5 +138,5 @@ jobs:
       # dependency or the toolchain — a real gate for an auth/cache proxy.
       - name: govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           govulncheck ./...

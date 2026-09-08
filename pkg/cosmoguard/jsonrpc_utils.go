@@ -621,7 +621,7 @@ func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], 
 	// max-age) forbid storage: entries here are written under a stale-extended
 	// TTL for single-path / WS serve-stale, so a stored no-cache reply would be
 	// served stale without the revalidation it requires. Mirror the HTTP path.
-	if !cacheableByUpstream(upstreamHeaders) {
+	if !cacheableByUpstream(upstreamHeaders) || !cacheableByVary(upstreamHeaders, jsonRPCCacheKeyVary) {
 		return nil
 	}
 	for _, r := range *l {

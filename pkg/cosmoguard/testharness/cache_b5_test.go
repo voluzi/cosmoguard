@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gotest.tools/assert"
+	"gotest.tools/poll"
 
 	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
 	"github.com/voluzi/cosmoguard/pkg/cosmoguard/testharness"
@@ -108,8 +109,16 @@ func TestB5_HeaderPreservation(t *testing.T) {
 	assert.Equal(t, r1.Header.Get("Content-Type"), "application/cbor")
 	assert.Equal(t, r1.Header.Get("X-Custom-Header"), "preserved-by-rule")
 
-	// Hit — preserved headers come from cache.
-	r2 := h.GET(t, h.LCDURL+"/with-headers")
+	// Hit — preserved headers come from cache once the asynchronous store
+	// completes. Pending responses are deliberately reported as misses.
+	var r2 *testharness.Response
+	poll.WaitOn(t, func(poll.LogT) poll.Result {
+		r2 = h.GET(t, h.LCDURL+"/with-headers")
+		if r2.Header.Get("X-Cosmoguard-Cache") == "hit" {
+			return poll.Success()
+		}
+		return poll.Continue("cache state is %q, not hit", r2.Header.Get("X-Cosmoguard-Cache"))
+	}, poll.WithTimeout(2*time.Second), poll.WithDelay(time.Millisecond))
 	assert.Equal(t, r2.StatusCode, http.StatusOK)
 	assert.Equal(t, r2.Header.Get("Content-Type"), "application/cbor")
 	assert.Equal(t, r2.Header.Get("Content-Encoding"), "identity")
