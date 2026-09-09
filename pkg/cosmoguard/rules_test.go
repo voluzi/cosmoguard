@@ -325,6 +325,23 @@ func TestRuleCacheDisableStaleWhileRevalidateValidationAndFingerprint(t *testing
 	assert.ErrorContains(t, conflicting.Compile(), "cannot set both")
 }
 
+func TestHttpRuleRejectsInvalidCacheKeyMetadataNames(t *testing.T) {
+	for _, name := range []string{"", " x-cosmos-block-height", "x cosmos", "x:cosmos"} {
+		t.Run(name, func(t *testing.T) {
+			rule := &HttpRule{
+				Priority: 100,
+				Action:   RuleActionAllow,
+				Cache: &RuleCache{
+					Enable:      true,
+					KeyMetadata: []string{name},
+				},
+			}
+
+			assert.ErrorContains(t, rule.Compile(), "invalid HTTP header name")
+		})
+	}
+}
+
 func TestJsonRpcRule_Match(t *testing.T) {
 	table := []struct {
 		Rule        JsonRpcRule
