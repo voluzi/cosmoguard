@@ -59,10 +59,11 @@ func BenchmarkGetRequestHash(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	keyMetadata := (&RuleCache{}).EffectiveHTTPKeyMetadata()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req.Body = io.NopCloser(strings.NewReader(body))
-		_, err := p.getRequestHash(req, 0xdeadbeef)
+		_, err := p.getRequestHash(req, 0xdeadbeef, keyMetadata)
 		if err != nil {
 			b.Fatal(err)
 		}

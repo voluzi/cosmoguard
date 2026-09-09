@@ -130,7 +130,7 @@ func TestHTTPStreamingCORSAddedVaryOriginRemainsCacheableThroughRealHook(t *test
 	first, _ := cacheRequest(p, rule, http.Header{"Origin": {"https://a.example"}})
 	keyRequest := httptest.NewRequest(http.MethodGet, "/status", nil)
 	keyRequest.Header.Set("Origin", "https://a.example")
-	key, err := p.getRequestHash(keyRequest, rule.Fingerprint)
+	key, err := p.getRequestHash(keyRequest, rule.Fingerprint, rule.Cache.EffectiveHTTPKeyMetadata())
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		stored, cacheErr := p.cache.Has(t.Context(), key)

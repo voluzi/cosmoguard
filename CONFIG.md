@@ -557,6 +557,9 @@ cache:
   preserveHeaders:                   # additional headers to replay on hit
     - Content-Encoding               # (Content-Type / Cache-Control / ETag / Vary
     - X-Custom-Header                #  are always preserved)
+  keyMetadata:                       # request headers folded into HTTP cache keys
+    - x-cosmos-block-height
+    - grpc-metadata-x-cosmos-block-height
 ```
 
 Cache keys are namespaced per rule fingerprint — two rules matching the same request never share entries.
@@ -567,6 +570,7 @@ Both `coalesce` and `staleWhileRevalidate` are per-rule overrides of the global 
 
 - **`coalesce` (single-flight)** — on by default. When a cacheable key is a hard miss, only ONE request fetches upstream; concurrent requests for the same key wait and share that result. This collapses the thundering herd that hits the upstream every time a hot key expires. Set `coalesce: false` to disable per rule (each concurrent miss then fetches independently — the previous behaviour).
 - **`staleWhileRevalidate` (serve-stale)** — off by default (`0`). When set, an entry that has passed its `ttl` but is still within the window is served **immediately** (with `X-Cosmoguard-Cache: stale`, or `x-cosmoguard-cache: stale` metadata for gRPC) while ONE background request refreshes it — so the client never waits on the upstream and the entry stays warm. Requires a positive freshness `ttl` (the rule's `ttl`, or the global default) to extend. Set `disableStaleWhileRevalidate: true` on a rule that must opt out of a positive global window; it cannot be combined with a positive per-rule window.
+- **`keyMetadata` (response-affecting request metadata)** — applies to HTTP-family and gRPC rules. HTTP-family rules default to `x-cosmos-block-height` and `grpc-metadata-x-cosmos-block-height`; gRPC defaults to `x-cosmos-block-height`. A non-empty list replaces the protocol default, so include the defaults explicitly when adding custom dimensions. `keyMetadata: []` opts out. HTTP names are case-insensitive, and all values participate in their received order with value boundaries preserved; `Host` uses the request authority rather than the ordinary header map. The two HTTP height aliases remain independent dimensions because gateways can interpret them differently. JSON-RPC message caches and WebSocket caches do not use this setting.
 
 Scope and caveats:
 - Coalescing applies to HTTP-family rules (LCD, RPC-HTTP, EVM-RPC-HTTP), gRPC rules, and JSON-RPC **single** requests over HTTP or WebSocket. gRPC responses also carry `x-cosmoguard-cache` response metadata (`hit`/`miss`/`stale`).
@@ -575,6 +579,7 @@ Scope and caveats:
 - **JSON-RPC batch** items are freshness-aware (a stale entry is revalidated as part of the aggregated batch call) but are not individually coalesced or served stale — a batch already collapses its misses into a single upstream call, so there is nothing to coalesce.
 - Coalescing is **per-pod** (in-process). Across a cluster the shared olric L2 dedups the stored value and serves subsequent reads cluster-wide, so per-pod single-flight already cuts an expiry stampede from N-per-pod to ~1-per-pod.
 - A coalesced miss buffers the upstream response fully before replying (it can't stream to N waiters); for cacheable responses this only shifts first-byte latency. Set `coalesce: false` on a rule if you need streaming on the miss path.
+- HTTP cache admission remains conservative: an upstream `Vary` field other than `Accept-Encoding` prevents storage even when that field is listed in `keyMetadata`. Adding a request header to the key does not make a response with that `Vary` value cacheable.
 
 #### Rate limit
 
@@ -666,6 +671,7 @@ rules:
 | `cache.enable` | `false` | Cache unary responses keyed by (rule fingerprint, method, payload). |
 | `cache.ttl` | `5s` | Per-rule TTL. |
 | `cache.keyMode` | `raw` | `raw` hashes payload bytes verbatim; `method-only` excludes payload (parameter-less queries only); `canonical` decodes payload against operator-supplied protoset descriptors and re-encodes deterministically before hashing — cache hits across clients with different serialization (field order, default-vs-absent). |
+| `cache.keyMetadata` | `x-cosmos-block-height` | Metadata keys folded into the cache key; see [Cache features](#cache-features). |
 
 For `keyMode: canonical`, set `grpc.protosets:` at the top level. Each path is a binary `FileDescriptorSet` produced by `protoc --descriptor_set_out=foo.protoset -I path/to/protos path/to/protos/**/*.proto`. Methods absent from the loaded protosets silently degrade to `raw`.
 
@@ -692,7 +698,7 @@ grpc:
         keyMode: method-only        # no parameters; one entry per method
 ```
 
-**`keyMetadata` (gRPC).** Response-affecting request metadata is folded into the cache key so requests that differ only by such metadata cache separately. It defaults to `["x-cosmos-block-height"]` — the metadata that selects the state height a Cosmos query runs against — so a query at one height never serves another height's cached response. Set an explicit empty list (`keyMetadata: []`) to opt out on a genuinely height-independent method:
+gRPC retains its `x-cosmos-block-height` default. Override it only when a method has other response-affecting metadata, or use an explicit empty list on a genuinely height-independent method:
 
 ```yaml
       cache:

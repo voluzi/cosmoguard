@@ -212,6 +212,102 @@ grpc:
 	assert.Equal(t, cfg.GRPC.Rules[1].Priority, 20)
 }
 
+func TestRuleCacheEffectiveHTTPKeyMetadata(t *testing.T) {
+	configured := []string{
+		"X-Response-Version",
+		"GRPC-METADATA-X-COSMOS-BLOCK-HEIGHT",
+		"x-response-version",
+	}
+	tests := []struct {
+		name  string
+		cache *RuleCache
+		want  []string
+	}{
+		{
+			name:  "default",
+			cache: &RuleCache{},
+			want: []string{
+				"grpc-metadata-x-cosmos-block-height",
+				"x-cosmos-block-height",
+			},
+		},
+		{
+			name:  "explicit empty opts out",
+			cache: &RuleCache{KeyMetadata: []string{}},
+			want:  []string{},
+		},
+		{
+			name:  "custom is normalized",
+			cache: &RuleCache{KeyMetadata: configured},
+			want: []string{
+				"grpc-metadata-x-cosmos-block-height",
+				"x-response-version",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cache.EffectiveHTTPKeyMetadata()
+			assert.DeepEqual(t, got, tt.want)
+			if len(got) > 0 {
+				got[0] = "mutated"
+				assert.DeepEqual(t, tt.cache.EffectiveHTTPKeyMetadata(), tt.want)
+			}
+		})
+	}
+	assert.DeepEqual(t, configured, []string{
+		"X-Response-Version",
+		"GRPC-METADATA-X-COSMOS-BLOCK-HEIGHT",
+		"x-response-version",
+	})
+	assert.DeepEqual(t, (&RuleCache{}).EffectiveKeyMetadata(), []string{"x-cosmos-block-height"})
+	assert.DeepEqual(t, (&RuleCache{KeyMetadata: []string{}}).EffectiveKeyMetadata(), []string{})
+	assert.DeepEqual(t,
+		(&RuleCache{KeyMetadata: []string{"X-Custom"}}).EffectiveKeyMetadata(),
+		[]string{"X-Custom"},
+	)
+}
+
+func TestReadConfigFromFile_HTTPKeyMetadataSemantics(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "http-key-metadata.yml")
+	configContent := `
+lcd:
+  rules:
+    - priority: 1
+      action: allow
+      paths: [/default]
+      cache:
+        enable: true
+    - priority: 2
+      action: allow
+      paths: [/empty]
+      cache:
+        enable: true
+        keyMetadata: []
+    - priority: 3
+      action: allow
+      paths: [/custom]
+      cache:
+        enable: true
+        keyMetadata: [X-Response-Version, x-response-version]
+`
+	assert.NilError(t, os.WriteFile(tmpFile, []byte(configContent), 0644))
+
+	cfg, err := ReadConfigFromFile(tmpFile)
+	assert.NilError(t, err)
+	assert.Equal(t, len(cfg.LCD.Rules), 3)
+	assert.Assert(t, cfg.LCD.Rules[0].Cache.KeyMetadata == nil)
+	assert.DeepEqual(t, cfg.LCD.Rules[0].Cache.EffectiveHTTPKeyMetadata(), []string{
+		"grpc-metadata-x-cosmos-block-height",
+		"x-cosmos-block-height",
+	})
+	assert.Assert(t, cfg.LCD.Rules[1].Cache.KeyMetadata != nil)
+	assert.DeepEqual(t, cfg.LCD.Rules[1].Cache.EffectiveHTTPKeyMetadata(), []string{})
+	assert.DeepEqual(t, cfg.LCD.Rules[2].Cache.KeyMetadata, []string{"X-Response-Version", "x-response-version"})
+	assert.DeepEqual(t, cfg.LCD.Rules[2].Cache.EffectiveHTTPKeyMetadata(), []string{"x-response-version"})
+}
+
 func TestReadConfigFromFile_EVMConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	tmpFile := filepath.Join(tmpDir, "evm.yml")

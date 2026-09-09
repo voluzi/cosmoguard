@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/creasty/defaults"
@@ -575,25 +576,46 @@ type RuleCache struct {
 	// body); KeyMode is honored on gRPC only.
 	KeyMode string `yaml:"keyMode,omitempty"`
 
-	// KeyMetadata lists inbound gRPC metadata keys whose values are folded
-	// into the cache key, so requests that differ only by such metadata are
-	// cached separately. This matters because response-affecting metadata
-	// (notably `x-cosmos-block-height`, which selects the state height a
-	// Cosmos query runs against) IS forwarded upstream and changes the
-	// response — but was previously absent from the key, so a query at one
-	// height served another height's cached response for the whole TTL.
+	// KeyMetadata lists inbound request metadata whose values are folded into
+	// the cache key. HTTP-family rules treat the entries as case-insensitive
+	// header names; gRPC rules treat them as lowercase metadata keys.
 	//
-	// A nil (unset) list defaults to the response-affecting keys in
-	// defaultGrpcCacheKeyMetadata (currently x-cosmos-block-height). Set an
-	// explicit empty list ([]) to opt out entirely (e.g. a method-only rule
-	// on a genuinely height-independent query). Keys are matched
-	// lowercase, as gRPC canonicalizes metadata keys to lowercase.
+	// A nil list uses protocol-specific safe defaults. A non-nil list replaces
+	// those defaults, including an explicit empty list to opt out entirely.
 	KeyMetadata []string `yaml:"keyMetadata,omitempty"`
+}
+
+// defaultHTTPCacheKeyMetadata contains the HTTP headers that select the state
+// height served by common Cosmos gateways.
+var defaultHTTPCacheKeyMetadata = []string{
+	"grpc-metadata-x-cosmos-block-height",
+	"x-cosmos-block-height",
 }
 
 // defaultGrpcCacheKeyMetadata is the response-affecting gRPC metadata folded
 // into cache keys when a rule doesn't configure KeyMetadata explicitly.
 var defaultGrpcCacheKeyMetadata = []string{"x-cosmos-block-height"}
+
+// EffectiveHTTPKeyMetadata returns a normalized copy of the HTTP header names
+// folded into the cache key. An explicit empty list opts out of header keying.
+func (c *RuleCache) EffectiveHTTPKeyMetadata() []string {
+	keys := c.KeyMetadata
+	if keys == nil {
+		keys = defaultHTTPCacheKeyMetadata
+	}
+	normalized := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		key = strings.ToLower(key)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, key)
+	}
+	sort.Strings(normalized)
+	return normalized
+}
 
 // EffectiveKeyMetadata returns the metadata keys to fold into the gRPC cache
 // key: the configured list when non-nil (including an explicit empty list,

@@ -303,6 +303,7 @@ func httpRuleFingerprint(r *HttpRule) uint64 {
 		writeFingerprintBool(h, r.Cache.CacheError)
 		writeFingerprintBool(h, r.Cache.CacheEmptyResult)
 		writeFingerprintStrSlice(h, r.Cache.PreserveHeaders)
+		writeFingerprintStrSlice(h, r.Cache.EffectiveHTTPKeyMetadata())
 		writeFingerprintCacheFeatures(h, r.Cache)
 	}
 	if r.RateLimit != nil {
