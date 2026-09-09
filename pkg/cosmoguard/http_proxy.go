@@ -876,15 +876,26 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 }
 
 // httpCacheKeyMetaPart preserves ordinary header names, value order, value
-// boundaries, and absent-versus-empty values. Host comes from Request.Host
-// because net/http removes it from the ordinary header map.
+// boundaries, and absent-versus-empty values. Authority and protocol headers
+// use the values CosmoGuard's upstream Director synthesizes.
 func httpCacheKeyMetaPart(req *http.Request, keys []string) string {
 	var b strings.Builder
 	for _, key := range keys {
 		key = strings.ToLower(key)
 		values := req.Header.Values(key)
-		if key == "host" {
+		switch key {
+		case "host":
 			values = []string{req.Host}
+		case "x-forwarded-host":
+			if req.Host != "" {
+				values = []string{req.Host}
+			}
+		case "x-forwarded-proto":
+			proto := "http"
+			if req.TLS != nil {
+				proto = "https"
+			}
+			values = []string{proto}
 		}
 		fmt.Fprintf(&b, "%q=%q;", key, values)
 	}

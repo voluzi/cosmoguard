@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -174,4 +175,59 @@ func TestHttpProxy_getRequestHash_KeyMetadata(t *testing.T) {
 		hash(http.Header{"x-cosmos-block-height": {"100"}}, "body", defaults),
 		hash(http.Header{"X-COSMOS-BLOCK-HEIGHT": {"100"}}, "body", defaults),
 	)
+}
+
+func TestHttpProxy_getRequestHash_SynthesizedForwardingMetadata(t *testing.T) {
+	p := &HttpProxy{}
+	hash := func(req *http.Request, key string) string {
+		t.Helper()
+		got, err := p.getRequestHash(req, 42, (&RuleCache{KeyMetadata: []string{key}}).EffectiveHTTPKeyMetadata())
+		assert.NilError(t, err)
+		return got
+	}
+	request := func(rawURL, forwardedHost, forwardedProto string) *http.Request {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+		if forwardedHost != "" {
+			req.Header.Set("X-Forwarded-Host", forwardedHost)
+		}
+		if forwardedProto != "" {
+			req.Header.Set("X-Forwarded-Proto", forwardedProto)
+		}
+		return req
+	}
+
+	t.Run("forwarded host uses request authority", func(t *testing.T) {
+		assert.Assert(t,
+			hash(request("http://alpha.example/status", "spoofed.example", ""), "X-Forwarded-Host") !=
+				hash(request("http://beta.example/status", "spoofed.example", ""), "X-Forwarded-Host"),
+		)
+	})
+	t.Run("forwarded host ignores spoofed value", func(t *testing.T) {
+		assert.Equal(t,
+			hash(request("http://alpha.example/status", "spoofed-a.example", ""), "X-Forwarded-Host"),
+			hash(request("http://alpha.example/status", "spoofed-b.example", ""), "X-Forwarded-Host"),
+		)
+	})
+	t.Run("forwarded host retains inbound value without authority", func(t *testing.T) {
+		left := request("http://alpha.example/status", "forwarded-a.example", "")
+		left.Host = ""
+		right := request("http://alpha.example/status", "forwarded-b.example", "")
+		right.Host = ""
+		assert.Assert(t,
+			hash(left, "X-Forwarded-Host") != hash(right, "X-Forwarded-Host"),
+		)
+	})
+	t.Run("forwarded proto uses transport", func(t *testing.T) {
+		assert.Assert(t,
+			hash(request("http://alpha.example/status", "", "spoofed"), "X-Forwarded-Proto") !=
+				hash(request("https://alpha.example/status", "", "spoofed"), "X-Forwarded-Proto"),
+		)
+	})
+	t.Run("forwarded proto ignores spoofed value", func(t *testing.T) {
+		assert.Equal(t,
+			hash(request("http://alpha.example/status", "", "spoofed-a"), "X-Forwarded-Proto"),
+			hash(request("http://alpha.example/status", "", "spoofed-b"), "X-Forwarded-Proto"),
+		)
+	})
 }

@@ -585,6 +585,23 @@ type RuleCache struct {
 	KeyMetadata []string `yaml:"keyMetadata,omitempty"`
 }
 
+// MarshalYAML preserves an explicit empty KeyMetadata list while keeping an
+// unset list omitted, so typed config rewrites retain opt-out semantics.
+func (c RuleCache) MarshalYAML() (any, error) {
+	type plainRuleCache RuleCache
+	var node yaml.Node
+	if err := node.Encode(plainRuleCache(c)); err != nil {
+		return nil, err
+	}
+	if c.KeyMetadata != nil && len(c.KeyMetadata) == 0 {
+		node.Content = append(node.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "keyMetadata"},
+			&yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Style: yaml.FlowStyle},
+		)
+	}
+	return &node, nil
+}
+
 // defaultHTTPCacheKeyMetadata contains the HTTP headers that select the state
 // height served by common Cosmos gateways.
 var defaultHTTPCacheKeyMetadata = []string{
