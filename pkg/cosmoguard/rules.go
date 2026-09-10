@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gobwas/glob"
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
 )
@@ -41,6 +42,13 @@ func writeFingerprintBool(h hash.Hash64, v bool) {
 func validateRuleCacheFeatures(c *RuleCache, ruleKind string, priority int) error {
 	if c == nil {
 		return nil
+	}
+	if ruleKind == "http" {
+		for _, key := range c.KeyMetadata {
+			if !httpguts.ValidHeaderFieldName(key) {
+				return fmt.Errorf("http rule (priority %d) cache.keyMetadata contains invalid HTTP header name %q", priority, key)
+			}
+		}
 	}
 	if c.StaleWhileRevalidate < 0 {
 		return fmt.Errorf("%s rule (priority %d) cache.staleWhileRevalidate must be >= 0 (0 inherits the global default); got %s", ruleKind, priority, c.StaleWhileRevalidate)
@@ -303,6 +311,7 @@ func httpRuleFingerprint(r *HttpRule) uint64 {
 		writeFingerprintBool(h, r.Cache.CacheError)
 		writeFingerprintBool(h, r.Cache.CacheEmptyResult)
 		writeFingerprintStrSlice(h, r.Cache.PreserveHeaders)
+		writeFingerprintStrSlice(h, r.Cache.EffectiveHTTPKeyMetadata())
 		writeFingerprintCacheFeatures(h, r.Cache)
 	}
 	if r.RateLimit != nil {

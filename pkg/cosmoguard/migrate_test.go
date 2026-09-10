@@ -99,6 +99,49 @@ rpc:
 	assert.Equal(t, cfg.LCD.Rules[0].Match.Paths[0], "/cosmos/bank/v1beta1/balances")
 }
 
+func TestMigrateV3ConfigPreservesExplicitEmptyKeyMetadata(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "v3-empty-key-metadata.yaml")
+	v3YAML := `
+node:
+  host: 10.0.0.1
+  lcdPort: 1317
+lcd:
+  default: allow
+  rules:
+    - action: allow
+      priority: 1
+      paths: [/status]
+      methods: [GET]
+      cache:
+        enable: true
+        keyMetadata: []
+    - action: allow
+      priority: 2
+      paths: [/default]
+      methods: [GET]
+      cache:
+        enable: true
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(v3YAML), 0o644))
+
+	changes, err := MigrateV3Config(cfgPath)
+	assert.NilError(t, err)
+	assert.Assert(t, changes > 0)
+
+	cfg, err := ReadConfigFromFile(cfgPath)
+	assert.NilError(t, err)
+	assert.Equal(t, len(cfg.LCD.Rules), 2)
+	keyMetadata := cfg.LCD.Rules[0].Cache.KeyMetadata
+	assert.Assert(t, keyMetadata != nil)
+	assert.Equal(t, len(keyMetadata), 0)
+	assert.DeepEqual(t, cfg.LCD.Rules[0].Cache.EffectiveHTTPKeyMetadata(), []string{})
+	assert.Assert(t, cfg.LCD.Rules[1].Cache.KeyMetadata == nil)
+	assert.DeepEqual(t, cfg.LCD.Rules[1].Cache.EffectiveHTTPKeyMetadata(), []string{
+		"grpc-metadata-x-cosmos-block-height",
+		"x-cosmos-block-height",
+	})
+}
+
 // TestMigrateV3Config_AlreadyV4: a v4 file produces no changes and no
 // backup is written.
 func TestMigrateV3Config_AlreadyV4(t *testing.T) {

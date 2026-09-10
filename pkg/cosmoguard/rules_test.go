@@ -260,6 +260,47 @@ func TestHttpRule_Fingerprint(t *testing.T) {
 		"rules differing only in cacheError must have different fingerprints")
 }
 
+func TestHttpRuleFingerprintIncludesEffectiveKeyMetadata(t *testing.T) {
+	mkRule := func(keyMetadata []string) *HttpRule {
+		return &HttpRule{
+			Priority: 100,
+			Action:   RuleActionAllow,
+			Paths:    []string{"/x"},
+			Methods:  []string{"GET"},
+			Cache: &RuleCache{
+				Enable:      true,
+				KeyMetadata: keyMetadata,
+			},
+		}
+	}
+
+	implicit := mkRule(nil)
+	explicit := mkRule([]string{
+		"x-cosmos-block-height",
+		"grpc-metadata-x-cosmos-block-height",
+	})
+	equivalent := mkRule([]string{
+		"X-COSMOS-BLOCK-HEIGHT",
+		"grpc-metadata-x-cosmos-block-height",
+		"x-cosmos-block-height",
+	})
+	optOut := mkRule([]string{})
+	custom := mkRule([]string{"x-response-version"})
+	for _, rule := range []*HttpRule{implicit, explicit, equivalent, optOut, custom} {
+		assert.NilError(t, rule.Compile())
+	}
+
+	assert.Equal(t, implicit.Fingerprint, explicit.Fingerprint)
+	assert.Equal(t, implicit.Fingerprint, equivalent.Fingerprint)
+	assert.Assert(t, implicit.Fingerprint != optOut.Fingerprint)
+	assert.Assert(t, implicit.Fingerprint != custom.Fingerprint)
+	assert.DeepEqual(t, equivalent.Cache.KeyMetadata, []string{
+		"X-COSMOS-BLOCK-HEIGHT",
+		"grpc-metadata-x-cosmos-block-height",
+		"x-cosmos-block-height",
+	})
+}
+
 func TestRuleCacheDisableStaleWhileRevalidateValidationAndFingerprint(t *testing.T) {
 	mkRule := func(cache *RuleCache) *HttpRule {
 		return &HttpRule{
@@ -282,6 +323,23 @@ func TestRuleCacheDisableStaleWhileRevalidateValidationAndFingerprint(t *testing
 		DisableStaleWhileRevalidate: true,
 	})
 	assert.ErrorContains(t, conflicting.Compile(), "cannot set both")
+}
+
+func TestHttpRuleRejectsInvalidCacheKeyMetadataNames(t *testing.T) {
+	for _, name := range []string{"", " x-cosmos-block-height", "x cosmos", "x:cosmos"} {
+		t.Run(name, func(t *testing.T) {
+			rule := &HttpRule{
+				Priority: 100,
+				Action:   RuleActionAllow,
+				Cache: &RuleCache{
+					Enable:      true,
+					KeyMetadata: []string{name},
+				},
+			}
+
+			assert.ErrorContains(t, rule.Compile(), "invalid HTTP header name")
+		})
+	}
 }
 
 func TestJsonRpcRule_Match(t *testing.T) {

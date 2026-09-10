@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"math"
@@ -781,7 +782,7 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 			return
 		}
 		r.Body = rr
-		hash, err := p.getRequestHash(r, fingerprint)
+		hash, err := p.getRequestHash(r, fingerprint, ruleCache.EffectiveHTTPKeyMetadata())
 		if err != nil {
 			// We could not get the hash, but we can still serve the request
 			p.log.Errorf("error getting hash of request: %v", err)
@@ -842,7 +843,7 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 // (preventing the pre-B5 cross-rule poisoning bug with cacheError /
 // cacheEmptyResult mismatches). When called from the default-action path,
 // pass 0 — the per-rule namespace simply collapses to "default".
-func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (string, error) {
+func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, keyMetadata []string) (string, error) {
 	b, err := io.ReadAll(req.Body)
 	if err != nil {
 		return "", err
@@ -869,8 +870,36 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64) (s
 		strconv.FormatUint(ruleFingerprint, 16) + "\x00" +
 			req.Method + "\x00" + canonical + "\x00" +
 			acceptEncodingKey(strings.Join(req.Header.Values("Accept-Encoding"), ",")) + "\x00" +
+			httpCacheKeyMetaPart(req, keyMetadata) + "\x00" +
 			string(b),
 	), nil
+}
+
+// httpCacheKeyMetaPart preserves ordinary header names, value order, value
+// boundaries, and absent-versus-empty values. Authority and protocol headers
+// use the values CosmoGuard's upstream Director synthesizes.
+func httpCacheKeyMetaPart(req *http.Request, keys []string) string {
+	var b strings.Builder
+	for _, key := range keys {
+		key = strings.ToLower(key)
+		values := req.Header.Values(key)
+		switch key {
+		case "host":
+			values = []string{req.Host}
+		case "x-forwarded-host":
+			if req.Host != "" {
+				values = []string{req.Host}
+			}
+		case "x-forwarded-proto":
+			proto := "http"
+			if req.TLS != nil {
+				proto = "https"
+			}
+			values = []string{proto}
+		}
+		fmt.Fprintf(&b, "%q=%q;", key, values)
+	}
+	return b.String()
 }
 
 // acceptEncodingKey returns a canonical, order-independent representation of
