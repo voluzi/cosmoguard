@@ -23,47 +23,67 @@ func TestUniqueID_Release(t *testing.T) {
 	u := &UniqueID{}
 
 	id := u.ID()
-
-	// Release the ID
 	u.Release(id)
 
-	// Verify the ID is marked as released (not in use)
-	v, ok := u.generated.Load(id)
-	if !ok {
-		t.Errorf("ID %s not found in map after release", id)
+	if _, ok := u.generated.Load(id); ok {
+		t.Errorf("ID %s found in map after release", id)
 	}
-	if v.(bool) {
-		t.Errorf("ID %s should be marked as false (released), got true", id)
+}
+
+func TestUniqueID_ReleaseChurn(t *testing.T) {
+	u := &UniqueID{}
+
+	for i := 0; i < 1000; i++ {
+		id := u.ID()
+		u.Release(id)
+	}
+
+	entries := 0
+	u.generated.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != 0 {
+		t.Errorf("generated map contains %d entries after release churn", entries)
 	}
 }
 
 func TestUniqueID_Concurrent(t *testing.T) {
 	u := &UniqueID{}
 	var wg sync.WaitGroup
-	idChan := make(chan string, 1000)
+	ids := make(chan string, 1000)
+	release := make(chan struct{})
 
-	// Generate IDs concurrently
-	for i := 0; i < 10; i++ {
+	for i := 0; i < cap(ids); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				id := u.ID()
-				idChan <- id
-			}
+			id := u.ID()
+			ids <- id
+			<-release
+			u.Release(id)
 		}()
 	}
 
-	wg.Wait()
-	close(idChan)
-
-	// Check for duplicates
-	ids := make(map[string]bool)
-	for id := range idChan {
-		if ids[id] {
+	generated := make(map[string]bool)
+	for i := 0; i < cap(ids); i++ {
+		id := <-ids
+		if generated[id] {
 			t.Errorf("Duplicate ID generated concurrently: %s", id)
 		}
-		ids[id] = true
+		generated[id] = true
+	}
+
+	close(release)
+	wg.Wait()
+
+	entries := 0
+	u.generated.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != 0 {
+		t.Errorf("generated map contains %d entries after concurrent release", entries)
 	}
 }
 

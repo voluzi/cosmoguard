@@ -14,14 +14,12 @@ type UniqueID struct {
 func (u *UniqueID) ID() string {
 	for {
 		id := strconv.Itoa(rand.Intn(math.MaxInt32))
-		v, ok := u.generated.Load(id)
-		if !ok || !v.(bool) {
-			u.generated.Store(id, true)
+		if _, loaded := u.generated.LoadOrStore(id, true); !loaded {
 			return id
 		}
 	}
 }
 
 func (u *UniqueID) Release(id string) {
-	u.generated.Store(id, false)
+	u.generated.Delete(id)
 }
