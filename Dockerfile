@@ -1,4 +1,4 @@
-FROM golang:1.25.14-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 
 ARG VERSION
 ARG COMMIT
