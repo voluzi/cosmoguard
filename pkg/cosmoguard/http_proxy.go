@@ -1098,6 +1098,16 @@ func (p *HttpProxy) cacheMiss(w http.ResponseWriter, r *http.Request, requestHas
 	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return
 	}
+	if errors.Is(err, errResponseCaptureTooLarge) {
+		p.applyUpstreamStats(r, out.Upstream)
+		w.Header().Set(cacheStateHeader, cacheMiss)
+		if p.cors != nil {
+			p.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+		}
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		p.recordOutcome(r, http.StatusBadGateway, cacheMiss, RuleActionAllow, startTime, "request allowed (upstream response too large)")
+		return
+	}
 	if out.Cached != nil {
 		if out.CacheState == cacheStale {
 			p.serveStale(w, r, *out.Cached, requestHash, cache, ruleTag, startTime)
@@ -1266,6 +1276,9 @@ func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, r
 	p.recordOutcome(r, status, cacheMiss, RuleActionAllow, startTime, "request allowed")
 	b, err := ww.GetWrittenBytes()
 	if err != nil {
+		if errors.Is(err, errResponseCaptureTooLarge) {
+			return
+		}
 		p.log.Errorf("error loading upstream response: %v (response not cached)", err)
 		return
 	}
@@ -1294,6 +1307,9 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 		upstream = stats.Upstream
 	}
 	if err != nil {
+		if errors.Is(err, errResponseCaptureTooLarge) {
+			return bufferedUpstreamResponse{Upstream: upstream}, err
+		}
 		p.log.Errorf("error loading upstream response: %v (response not cached)", err)
 		return bufferedUpstreamResponse{StatusCode: status, Headers: sink.GetCommittedHeaders(), Owner: owner, Upstream: upstream}, err
 	}
