@@ -81,6 +81,9 @@ cache:
   #   reserveFraction: 0.20          # auto-mode runtime reserve fraction, [0, 0.9)
   # cluster:
   #   bindAddr: "${POD_IP}"
+  #   # Also derives the peer-API request HMAC key; NetworkPolicy still
+  #   # protects confidentiality because peer-API HTTP is not encrypted.
+  #   encryptionKey: "${CLUSTER_KEY}"
   #   discovery: { mode: dns, dns: { host: cosmoguard-peers.svc.cluster.local } }
 
 # ---------------------------------------------------------------------------

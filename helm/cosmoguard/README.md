@@ -55,6 +55,13 @@ What the chart wires up automatically when cluster mode is on:
 - auto-fills `cache.cluster.discovery.dns.host` to the headless
   service's in-cluster FQDN (override by setting an explicit host).
 
+The shared cluster encryption key also derives the HMAC key used on the
+HTTP peer API. Signatures authenticate bodyless dashboard fan-out GETs
+within a 30-second clock-skew/replay window; they do not encrypt payloads,
+so the chart's NetworkPolicy is still the confidentiality boundary. There
+is no unsigned fallback, and mixed-version rolling upgrades can show
+partial cluster-dashboard data until all replicas run the signing version.
+
 Recommended HA shape for production:
 
 ```yaml

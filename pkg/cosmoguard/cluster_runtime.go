@@ -134,9 +134,10 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 // enable=true) the daemon binds the configured BindAddr:BindPort + GossipPort
 // and joins peers advertised by the configured discovery plugin.
 type clusterRuntime struct {
-	db        *olric.Olric
-	client    *olric.EmbeddedClient
-	discovery *clusterServiceDiscovery // non-nil only in cluster mode
+	db         *olric.Olric
+	client     *olric.EmbeddedClient
+	discovery  *clusterServiceDiscovery // non-nil only in cluster mode
+	peerAPIKey []byte
 }
 
 // clusterRuntimeOptions configures the runtime.
@@ -201,6 +202,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	// LogOutput here.
 	mc.LogOutput = nil
 
+	var peerAPIKey []byte
 	if clustered {
 		bindAddr := opts.Cluster.BindAddr
 		if bindAddr == "" {
@@ -222,6 +224,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 			return nil, fmt.Errorf("cluster runtime: encryption key: %w", err)
 		}
 		mc.SecretKey = key
+		peerAPIKey = derivePeerAPIKey(key)
 		// SecretKey only protects the memberlist GOSSIP plane. The olric RESP
 		// DATA port (BindPort) is a separate listener over which peers (and
 		// the embedded client) read/write the shared DMaps — without auth,
@@ -379,9 +382,10 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	}
 
 	return &clusterRuntime{
-		db:        db,
-		client:    db.NewEmbeddedClient(),
-		discovery: discovery,
+		db:         db,
+		client:     db.NewEmbeddedClient(),
+		discovery:  discovery,
+		peerAPIKey: peerAPIKey,
 	}, nil
 }
 

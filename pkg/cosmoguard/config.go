@@ -441,8 +441,8 @@ type ClusterConfig struct {
 
 	// PeerApiPort is the HTTP port the dashboard fan-out aggregator
 	// listens on. 0 means "BindPort + 1" — chosen so a single explicit
-	// BindPort sets up all three ports predictably. Restricted to the
-	// memberlist member set at the network layer; never internet-facing.
+	// BindPort sets up all three ports predictably. Requests require a
+	// key-derived HMAC and a source IP in the memberlist roster.
 	PeerApiPort int `yaml:"peerApiPort,omitempty"`
 
 	// ReplicaCount is the olric replication factor. Default 2 (one
@@ -471,8 +471,8 @@ type ClusterConfig struct {
 	// replay set. Generate one with e.g. `head -c32 /dev/urandom | base64`
 	// and give every pod in the cluster the SAME value (wire it from a
 	// Kubernetes Secret / env var). Node discovery must still restrict the
-	// peer ports at the network layer (NetworkPolicy) — this is
-	// defence-in-depth, not a substitute.
+	// peer ports at the network layer (NetworkPolicy). The derived peer-
+	// API HMAC authenticates requests but does not encrypt HTTP traffic.
 	EncryptionKey string `yaml:"encryptionKey,omitempty"`
 }
 

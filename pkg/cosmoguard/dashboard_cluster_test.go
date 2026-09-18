@@ -371,7 +371,7 @@ func TestFanoutGet_RoundTrip(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	body, err := fanoutGet(t.Context(), srv.Client(), srv.URL)
+	body, err := fanoutGet(t.Context(), srv.Client(), srv.URL, []byte("peer-api-test-key"))
 	require.NoError(t, err)
 	require.Contains(t, string(body), "history")
 }
@@ -385,7 +385,7 @@ func TestFanoutGet_NonOKStatusIsError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := fanoutGet(t.Context(), srv.Client(), srv.URL)
+	_, err := fanoutGet(t.Context(), srv.Client(), srv.URL, []byte("peer-api-test-key"))
 	require.Error(t, err)
 	require.True(t, strings.Contains(err.Error(), "500"))
 }

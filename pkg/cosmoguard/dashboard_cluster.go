@@ -22,8 +22,8 @@ import (
 //   - Every pod runs a small internal peer-API HTTP listener on
 //     cluster.PeerApiPort (defaulting to cluster.BindPort + 1). It
 //     mounts the same local /api/v1/<resource> handlers as the public
-//     dashboard but skips auth — access is restricted at the network
-//     layer to the memberlist member set.
+//     dashboard. Requests require a short-lived HMAC signature and a
+//     source address in the current memberlist roster.
 //   - The PUBLIC dashboard adds /api/v1/cluster/<resource> handlers
 //     that fan-out concurrently to every peer's internal API, merge
 //     the responses with per-resource aggregators, and return one
@@ -90,8 +90,10 @@ const fanoutTimeout = 2 * time.Second
 // per-call allocation it replaced.
 var fanoutClient = &http.Client{
 	Timeout: fanoutTimeout,
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 	Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   1 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -189,6 +191,10 @@ func clusterFanout(ctx context.Context, cg *CosmoGuard, resource string, peerApi
 		return nil
 	}
 	out := make([]peerResponse, len(members))
+	var peerAPIKey []byte
+	if cg != nil && cg.cluster != nil {
+		peerAPIKey = cg.cluster.peerAPIKey
+	}
 	var wg sync.WaitGroup
 	for i, m := range members {
 		wg.Add(1)
@@ -205,7 +211,7 @@ func clusterFanout(ctx context.Context, cg *CosmoGuard, resource string, peerApi
 			}
 			addr := net.JoinHostPort(host, strconv.Itoa(peerApiPort))
 			out[i] = peerResponse{PodID: m.Name, Addr: addr}
-			body, err := fanoutGet(ctx, fanoutClient, "http://"+addr+"/api/v1/"+resource)
+			body, err := fanoutGet(ctx, fanoutClient, "http://"+addr+"/api/v1/"+resource, peerAPIKey)
 			if err != nil {
 				out[i].Err = err.Error()
 				return
@@ -230,9 +236,15 @@ func clusterFanout(ctx context.Context, cg *CosmoGuard, resource string, peerApi
 // as healthy with mysteriously missing rows. Reading cap+1 bytes
 // lets us distinguish "exactly at the cap" (valid) from "over the
 // cap" (truncated, surface as soft error).
-func fanoutGet(ctx context.Context, client *http.Client, url string) (stdjson.RawMessage, error) {
+func fanoutGet(ctx context.Context, client *http.Client, url string, peerAPIKey []byte) (stdjson.RawMessage, error) {
+	if err := requirePeerAPIKey(peerAPIKey); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		return nil, err
+	}
+	if err := signPeerRequest(req, peerAPIKey, time.Now()); err != nil {
 		return nil, err
 	}
 	resp, err := client.Do(req)
@@ -260,11 +272,9 @@ func fanoutGet(ctx context.Context, client *http.Client, url string) (stdjson.Ra
 // envelope.
 //
 // The listener is bound to BindAddr (typically the pod IP) on
-// PeerApiPort. Auth is by network — every request is checked against
-// an IP allowlist built from the current memberlist roster. The
-// allowlist refreshes on each request, so a newly-joined peer is
-// reachable without a restart, and a peer that's left the cluster
-// stops being trusted within one membership tick.
+// PeerApiPort. Every request must carry a valid peer HMAC and come
+// from an IP in the current memberlist roster. The allowlist refreshes
+// on each request, so membership churn is reflected without a restart.
 func installPeerAPIServer(cg *CosmoGuard) *http.Server {
 	if cg == nil || cg.cluster == nil {
 		return nil
@@ -288,12 +298,12 @@ func installPeerAPIServer(cg *CosmoGuard) *http.Server {
 	// Mount only the local /api/v1/<resource> handlers — no static
 	// UI, no /api/v1/cluster/* routes (which would let a peer
 	// fan-out call recursively into another peer's fan-out). The
-	// outer membership gate handles auth; the inner gate passed to
+	// outer peer gates handle auth; the inner gate passed to
 	// installLocalAPIRoutes is a passthrough.
 	installLocalAPIRoutes(mux, cg, basicAuthGate("", ""), "/api/v1")
 	return &http.Server{
 		Addr:              net.JoinHostPort(bindAddr, strconv.Itoa(port)),
-		Handler:           peerMembershipGate(cg)(mux),
+		Handler:           peerAuthGate(cg.cluster.peerAPIKey)(peerMembershipGate(cg)(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
