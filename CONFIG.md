@@ -242,7 +242,7 @@ Bare hosts (no `:port`) are accepted — `cluster.gossipPort` is appended at run
 #### Operational notes
 
 - **TCP + UDP on `gossipPort`** — memberlist gossips over both. Operators who block UDP by reflex break cluster joins; open both protocols on the same port (`bindPort` is olric's data-replication socket and only needs TCP).
-- **Three ports per pod, not two** — `bindPort` (3320, TCP), `gossipPort` (3322, TCP + UDP) and `peerApiPort` (defaults to `bindPort + 1` → 3321, TCP) all need to be reachable pod-to-pod. The peer-API listener is what the dashboard fan-out aggregator calls on its siblings; default-deny `NetworkPolicy` setups must allow it explicitly. It requires both a valid key-derived HMAC and a source IP in the current memberlist roster. Keep it pod-network-only because the HMAC authenticates but does not encrypt its HTTP traffic.
+- **Three ports per pod, not two** — `bindPort` (3320, TCP), `gossipPort` (3322, TCP + UDP) and `peerApiPort` (defaults to `bindPort + 1` → 3321, TCP) all need to be reachable pod-to-pod. The peer-API listener is what the dashboard fan-out aggregator calls on its siblings; default-deny `NetworkPolicy` setups must allow it explicitly. It requires a valid key-derived HMAC and either a source IP in the current memberlist roster or a loopback source. Keep it pod-network-only because the HMAC authenticates but does not encrypt its HTTP traffic.
 - **RF=2 default** — every partition has one primary + one replica. Survives a single-pod restart cleanly. Survives a single-pod permanent loss with re-balancing.
 - **2 vs 3 replicas** — both supported.
   - **3 replicas** *(recommended)*: RF=2, quorum=2, textbook no-split-brain configuration.
@@ -337,6 +337,7 @@ cache:
     bindPort: 3320
     gossipPort: 3322
     replicaCount: 2
+    encryptionKey: "${CLUSTER_KEY}"
     discovery:
       mode: dns
       dns:
