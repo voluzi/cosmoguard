@@ -233,10 +233,18 @@ func TestHandleHTTPClassifiesValidJSONDecodeFailuresAsInvalidRequests(t *testing
 	}{
 		{name: "numeric method", body: `{"jsonrpc":"2.0","id":1,"method":42}`},
 		{name: "object id", body: `{"jsonrpc":"2.0","id":{"nested":1},"method":"status"}`},
+		{name: "array id", body: `{"jsonrpc":"2.0","id":[1,2],"method":"status"}`},
+		{name: "batch object id", body: `[{"jsonrpc":"2.0","id":{"nested":1},"method":"status"}]`},
+		{name: "batch array id", body: `[{"jsonrpc":"2.0","id":[1,2],"method":"status"}]`},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			single, batch, err := ParseJsonRpcMessage([]byte(tt.body))
+			require.ErrorIs(t, err, ErrInvalidRequest)
+			require.Nil(t, single)
+			require.Nil(t, batch)
+
 			h := newEnvelopeTestHandler(t)
 			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
 			recorder := httptest.NewRecorder()
