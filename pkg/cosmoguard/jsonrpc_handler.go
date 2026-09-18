@@ -186,7 +186,7 @@ func (h *JsonRpcHandler) recordSingle(r *http.Request, request *JsonRpcMsg, cach
 	ruleID, upstream := statsLabels(r)
 	if h.responseTimeHist != nil {
 		h.responseTimeHist.WithLabelValues(
-			request.Method,
+			statsMetricMethod(r),
 			cacheState,
 			action,
 			ruleID,
@@ -251,6 +251,14 @@ func statsLabels(r *http.Request) (string, string) {
 		ruleID = "default"
 	}
 	return ruleID, stats.Upstream
+}
+
+func statsMetricMethod(r *http.Request) string {
+	stats := RequestStatsFromCtx(r.Context())
+	if stats == nil || stats.MetricMethod == "" {
+		return jsonRPCMetricMethodOther
+	}
+	return stats.MetricMethod
 }
 
 // batchSizeClass maps a JSON-RPC batch length into one of a small closed
@@ -642,6 +650,10 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 		hash := request.HashWithRule(rule.Fingerprint)
 		match := rule.Match(request)
 		if match {
+			if stats := RequestStatsFromCtx(r.Context()); stats != nil {
+				stats.RuleTag = ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
+				stats.MetricMethod = jsonRPCMetricMethod(request.Method, rule)
+			}
 			// Per-rule auth + rate-limit run BEFORE the action switch
 			// so an explicit allow rule can still be gated by scopes /
 			// rate. Identity was resolved by the HTTP-level gate and
@@ -649,9 +661,6 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 			// and Authorize falls through to its default-require check.
 			if !h.enforceJsonRpcRulePolicy(w, r, request, rule, limitersSnap, startTime) {
 				return
-			}
-			if stats := RequestStatsFromCtx(r.Context()); stats != nil {
-				stats.RuleTag = ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
 			}
 			switch rule.Action {
 			case RuleActionAllow:
@@ -723,8 +732,11 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 		}
 	}
 
-	if stats := RequestStatsFromCtx(r.Context()); stats != nil && stats.RuleTag == "" {
-		stats.RuleTag = "default"
+	if stats := RequestStatsFromCtx(r.Context()); stats != nil {
+		if stats.RuleTag == "" {
+			stats.RuleTag = "default"
+		}
+		stats.MetricMethod = jsonRPCMetricMethodOther
 	}
 	// No rule matched — record the (method, "") tuple so the
 	// dashboard's unmatched panel surfaces it for the operator.

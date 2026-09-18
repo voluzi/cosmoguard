@@ -1565,7 +1565,7 @@ func (p *HttpProxy) recordOutcome(r *http.Request, status int, cacheState, actio
 	}
 	if p.responseTimeHist != nil {
 		p.responseTimeHist.WithLabelValues(
-			r.Method,
+			httpMetricMethod(r.Method),
 			strconv.Itoa(status),
 			cacheState,
 			action,

@@ -417,15 +417,13 @@ func (p *JsonRpcWebSocketProxy) StatsSnapshot() WSSectionStats {
 // observation. Mirrors HttpProxy.recordOutcome / JsonRpcHandler.recordSingle
 // for WS subscribers — same label set, different histogram.
 //
-// ruleID and upstream complete the Phase H label set; upstream is "" on
-// the WS path because the broker's connection pool picks per-frame and
-// that picking lives inside ws_upstream_pool. Operators who need a
-// per-upstream label on WS metrics can wire it up via the broker's
-// onSubscriptionMessage path in a future slice.
-func (p *JsonRpcWebSocketProxy) recordOutcome(request *JsonRpcMsg, source, cacheState, action, ruleID string, startTime time.Time, msg string) {
+// Upstream is "" on the WS path because the broker's connection pool picks
+// per-frame inside ws_upstream_pool.
+func (p *JsonRpcWebSocketProxy) recordOutcome(request *JsonRpcMsg, source, cacheState, action string, rule *JsonRpcRule, startTime time.Time, msg string) {
 	duration := time.Since(startTime)
-	if ruleID == "" {
-		ruleID = "default"
+	ruleID := "default"
+	if rule != nil {
+		ruleID = ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
 	}
 	p.log.WithFields(Fields{
 		"id":       request.ID,
@@ -438,7 +436,7 @@ func (p *JsonRpcWebSocketProxy) recordOutcome(request *JsonRpcMsg, source, cache
 	}).Info(msg)
 	if p.responseTimeHist != nil {
 		p.responseTimeHist.WithLabelValues(
-			request.Method,
+			jsonRPCMetricMethod(request.Method, rule),
 			cacheState,
 			action,
 			ruleID,
@@ -498,7 +496,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 						return err
 					}
 				}
-				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, ruleID, startTime, "request denied (policy)")
+				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, rule, startTime, "request denied (policy)")
 				return nil
 			}
 			switch rule.Action {
@@ -533,7 +531,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 						if err = client.SendMsg(res.CloneWithID(request.ID)); err != nil {
 							return err
 						}
-						p.recordOutcome(request, source, cacheHit, RuleActionAllow, ruleID, startTime, "request allowed")
+						p.recordOutcome(request, source, cacheHit, RuleActionAllow, rule, startTime, "request allowed")
 						return nil
 					}
 					if err != nil && !errors.Is(err, cache.ErrNotFound) {
@@ -568,14 +566,14 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				// unaffected. Nothing is cached for a notification either —
 				// the cached entry would later be replayed to a real call.
 				if request.ID == nil {
-					p.recordOutcome(request, source, cacheMiss, RuleActionAllow, ruleID, startTime, "request allowed")
+					p.recordOutcome(request, source, cacheMiss, RuleActionAllow, rule, startTime, "request allowed")
 					return nil
 				}
 
 				if err = client.SendMsg(res); err != nil {
 					return err
 				}
-				p.recordOutcome(request, source, cacheMiss, RuleActionAllow, ruleID, startTime, "request allowed")
+				p.recordOutcome(request, source, cacheMiss, RuleActionAllow, rule, startTime, "request allowed")
 
 				if !cacheable {
 					return nil
@@ -612,7 +610,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 						return err
 					}
 				}
-				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, ruleID, startTime, "request denied")
+				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, rule, startTime, "request denied")
 				return nil
 
 			default:
@@ -639,7 +637,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 						return err
 					}
 				}
-				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, "default", startTime, "request denied (auth)")
+				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, nil, startTime, "request denied (auth)")
 				return nil
 			}
 		}
@@ -680,7 +678,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 		}
 	}
 
-	p.recordOutcome(request, source, cacheMiss, string(defaultActionSnap), "default", startTime,
+	p.recordOutcome(request, source, cacheMiss, string(defaultActionSnap), nil, startTime,
 		fmt.Sprintf("request %s", defaultActionSnap))
 	return nil
 }
