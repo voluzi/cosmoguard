@@ -1,9 +1,14 @@
 package cosmoguard
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,12 +25,242 @@ func waitForHTTPTestCacheEntry(t *testing.T, p *HttpProxy, rule *HttpRule, heade
 			req.Header.Add(name, value)
 		}
 	}
+	waitForHTTPTestCacheRequest(t, p, rule, req)
+}
+
+func waitForHTTPTestCacheRequest(t *testing.T, p *HttpProxy, rule *HttpRule, req *http.Request) {
+	t.Helper()
 	key, err := p.getRequestHash(req, rule.Fingerprint, rule.Cache.EffectiveHTTPKeyMetadata())
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		stored, cacheErr := p.cache.Has(t.Context(), key)
 		return cacheErr == nil && stored
 	}, time.Second, time.Millisecond)
+}
+
+func newHTTPForwardingCacheProxy(t *testing.T, override bool, handler http.HandlerFunc) (*HttpProxy, *atomic.Int32) {
+	t.Helper()
+
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		handler(w, r)
+	}))
+	t.Cleanup(upstream.Close)
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	host, rawPort, err := net.SplitHostPort(upstreamURL.Host)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(rawPort)
+	require.NoError(t, err)
+	node := NodeConfig{Name: "up", Host: host, LcdPort: port}
+	if override {
+		node.LcdURL = upstream.URL
+	}
+	p, err := NewHttpProxy("target-isolation-test", "", []NodeConfig{node}, serviceLCD)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		require.NoError(t, p.Shutdown(ctx))
+	})
+	return p, &hits
+}
+
+func cacheTargetRequest(p *HttpProxy, rule *HttpRule, host, target string) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://"+host+target, nil)
+	ctx, _ := WithRequestStats(req.Context())
+	p.allow(recorder, req.WithContext(ctx), rule, time.Now())
+	return recorder
+}
+
+func TestHTTPCacheTargetIdentityMatchesForwardedRequest(t *testing.T) {
+	for _, override := range []bool{false, true} {
+		mode := "direct host"
+		if override {
+			mode = "override forwarded host"
+		}
+		for _, coalesce := range []bool{true, false} {
+			name := fmt.Sprintf("%s coalesce=%t", mode, coalesce)
+			t.Run(name, func(t *testing.T) {
+				p, hits := newHTTPForwardingCacheProxy(t, override, func(w http.ResponseWriter, r *http.Request) {
+					authority := r.Host
+					if override {
+						authority = r.Header.Get("X-Forwarded-Host")
+					}
+					_, _ = fmt.Fprintf(w, "%s %s", authority, r.RequestURI)
+				})
+				rule := cacheRule(t, &RuleCache{
+					Enable:      true,
+					TTL:         time.Minute,
+					Coalesce:    &coalesce,
+					KeyMetadata: []string{},
+				})
+				type targetRequest struct {
+					host   string
+					target string
+					body   string
+				}
+				misses := []targetRequest{
+					{host: "alpha.example", target: "/a%2Fb?b=2&a=1", body: "alpha.example /a%2Fb?b=2&a=1"},
+					{host: "beta.example", target: "/a%2Fb?b=2&a=1", body: "beta.example /a%2Fb?b=2&a=1"},
+					{host: "alpha.example", target: "/a/b?b=2&a=1", body: "alpha.example /a/b?b=2&a=1"},
+				}
+				for _, miss := range misses {
+					response := cacheTargetRequest(p, rule, miss.host, miss.target)
+					require.Equal(t, miss.body, response.Body.String())
+					require.Equal(t, cacheMiss, response.Header().Get(cacheStateHeader))
+					waitForHTTPTestCacheRequest(t, p, rule,
+						httptest.NewRequest(http.MethodGet, "http://"+miss.host+miss.target, nil))
+				}
+
+				hitsToCheck := []targetRequest{
+					{host: "alpha.example", target: "/a%2Fb?a=1&b=2", body: misses[0].body},
+					{host: "beta.example", target: "/a%2Fb?a=1&b=2", body: misses[1].body},
+					{host: "alpha.example", target: "/a/b?a=1&b=2", body: misses[2].body},
+				}
+				for _, hit := range hitsToCheck {
+					response := cacheTargetRequest(p, rule, hit.host, hit.target)
+					require.Equal(t, hit.body, response.Body.String())
+					require.Equal(t, cacheHit, response.Header().Get(cacheStateHeader))
+				}
+				require.Equal(t, int32(3), hits.Load())
+			})
+		}
+	}
+}
+
+func TestHTTPCacheTargetIdentitySeparatesConcurrentColdMisses(t *testing.T) {
+	tests := []struct {
+		name         string
+		firstHost    string
+		firstTarget  string
+		secondHost   string
+		secondTarget string
+	}{
+		{
+			name:         "authority",
+			firstHost:    "alpha.example",
+			firstTarget:  "/a%2Fb",
+			secondHost:   "beta.example",
+			secondTarget: "/a%2Fb",
+		},
+		{
+			name:         "escaped path",
+			firstHost:    "alpha.example",
+			firstTarget:  "/a%2Fb",
+			secondHost:   "alpha.example",
+			secondTarget: "/a/b",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			started := make(chan string, 2)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+			p, hits := newHTTPForwardingCacheProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+				identity := r.Header.Get("X-Forwarded-Host") + " " + r.RequestURI
+				started <- identity
+				<-release
+				_, _ = fmt.Fprint(w, identity)
+			})
+			t.Cleanup(releaseUpstream)
+			rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute, KeyMetadata: []string{}})
+
+			type result struct {
+				want string
+				got  string
+			}
+			results := make(chan result, 2)
+			request := func(host, target string) {
+				response := cacheTargetRequest(p, rule, host, target)
+				results <- result{want: host + " " + target, got: response.Body.String()}
+			}
+			go request(tt.firstHost, tt.firstTarget)
+			go request(tt.secondHost, tt.secondTarget)
+
+			seen := make(map[string]bool, 2)
+			for len(seen) < 2 {
+				select {
+				case identity := <-started:
+					seen[identity] = true
+				case <-time.After(500 * time.Millisecond):
+					require.FailNow(t, "distinct target upstream calls did not start independently", "started targets: %v", seen)
+				}
+			}
+			releaseUpstream()
+
+			for range 2 {
+				select {
+				case got := <-results:
+					require.Equal(t, got.want, got.got)
+				case <-time.After(time.Second):
+					require.FailNow(t, "cache request did not complete after releasing upstream")
+				}
+			}
+			require.Equal(t, int32(2), hits.Load())
+		})
+	}
+}
+
+func TestHTTPCacheTargetIdentitySeparatesOpaqueFromHierarchical(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = fmt.Fprint(w, r.RequestURI)
+	}))
+	t.Cleanup(upstream.Close)
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	target.Path = "/base"
+	reverseProxy := httputil.NewSingleHostReverseProxy(target)
+	httpUpstream := &HttpUpstream{Name: "up", Target: target, proxy: reverseProxy}
+	httpUpstream.healthy.Store(true)
+
+	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "target-isolation-test", CacheBudget{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
+	p := &HttpProxy{
+		log:   log.WithField("test", "target-isolation"),
+		pool:  newTestHTTPPool("weighted-round-robin", 0, httpUpstream),
+		cache: responseCache,
+		now:   time.Now,
+	}
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute, KeyMetadata: []string{}})
+
+	request := func(opaque bool) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://alpha.example/a", nil)
+		if opaque {
+			req.URL.Opaque = "/a"
+		}
+		ctx, _ := WithRequestStats(req.Context())
+		p.allow(recorder, req.WithContext(ctx), rule, time.Now())
+		return recorder
+	}
+	wait := func(opaque bool) {
+		req := httptest.NewRequest(http.MethodGet, "http://alpha.example/a", nil)
+		if opaque {
+			req.URL.Opaque = "/a"
+		}
+		waitForHTTPTestCacheRequest(t, p, rule, req)
+	}
+
+	hierarchical := request(false)
+	require.Equal(t, "/base/a", hierarchical.Body.String())
+	require.Equal(t, cacheMiss, hierarchical.Header().Get(cacheStateHeader))
+	wait(false)
+	opaque := request(true)
+	require.Equal(t, "/a", opaque.Body.String())
+	require.Equal(t, cacheMiss, opaque.Header().Get(cacheStateHeader))
+	wait(true)
+	require.Equal(t, cacheHit, request(false).Header().Get(cacheStateHeader))
+	require.Equal(t, cacheHit, request(true).Header().Get(cacheStateHeader))
+	require.Equal(t, int32(2), hits.Load())
 }
 
 func TestHTTPDefaultKeyMetadataIsolatesSequentialHeights(t *testing.T) {
