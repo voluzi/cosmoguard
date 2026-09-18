@@ -1,10 +1,50 @@
 package cosmoguard
 
 import (
+	"net/http"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+const (
+	jsonRPCMetricMethodOther = "other"
+	httpMetricMethodOther    = "OTHER"
+)
+
+func jsonRPCMetricMethod(method string, rule *JsonRpcRule) string {
+	if rule == nil {
+		return jsonRPCMetricMethodOther
+	}
+	for _, configured := range rule.Methods {
+		if configured == method {
+			return configured
+		}
+	}
+	for i, methodGlob := range rule.MethodGlobs {
+		if methodGlob.Match(method) && i < len(rule.Methods) {
+			return rule.Methods[i]
+		}
+	}
+	return jsonRPCMetricMethodOther
+}
+
+func httpMetricMethod(method string) string {
+	switch method {
+	case http.MethodConnect,
+		http.MethodDelete,
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodOptions,
+		http.MethodPatch,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodTrace:
+		return method
+	default:
+		return httpMetricMethodOther
+	}
+}
 
 // responseTimeBuckets is the shared histogram bucket spec for every
 // per-request response-time histogram (HTTP / JSON-RPC single & batch

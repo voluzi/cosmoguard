@@ -85,7 +85,7 @@ func TestWSRecordOutcomeFeedsRequestLog(t *testing.T) {
 	p.SetRequestLog(rl)
 
 	p.recordOutcome(&JsonRpcMsg{Method: "eth_subscribe", ID: 1}, "9.9.9.9",
-		cacheMiss, string(RuleActionAllow), "tag-x", time.Now(), "request allowed")
+		cacheMiss, string(RuleActionAllow), &JsonRpcRule{Tag: "tag-x"}, time.Now(), "request allowed")
 
 	entries := rl.Snapshot(nil, 0)
 	assert.Equal(t, len(entries), 1)

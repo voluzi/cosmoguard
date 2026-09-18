@@ -834,10 +834,7 @@ type requestStatsKeyT struct{}
 
 var requestStatsKey = requestStatsKeyT{}
 
-// RequestStats is the per-request metadata that proxy + pool fill in
-// for the metrics layer to read back. Both fields are bounded (rule
-// tags come from config, upstream names from config) so they're safe
-// as Prometheus labels.
+// RequestStats is per-request metadata shared between proxies and pools.
 type RequestStats struct {
 	// Upstream is the name of the node the pool dispatched to. Empty
 	// when no upstream was selected (e.g. deny short-circuit).
@@ -846,6 +843,9 @@ type RequestStats struct {
 	// "default" when no rule matched and the default-action path
 	// served the request.
 	RuleTag string
+	// MetricMethod is the configuration-derived JSON-RPC method label.
+	// Empty means the fixed unmatched-method label.
+	MetricMethod string
 	// IdentityName is the resolved identity (api-key alias, JWT
 	// subject). Empty for anonymous / unauthenticated requests. Used
 	// by the request-log ring; not exported as a Prometheus label.
