@@ -3,9 +3,12 @@ package cosmoguard
 import (
 	"bytes"
 	"context"
+	stdjson "encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -15,7 +18,8 @@ import (
 )
 
 var (
-	json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json                 = jsoniter.ConfigCompatibleWithStandardLibrary
+	errInvalidJSONSyntax = errors.New("invalid JSON syntax")
 )
 
 type JsonRpcError struct {
@@ -299,14 +303,254 @@ func trailingWhitespace(b []byte) []byte {
 }
 
 func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
+	validJSON := stdjson.Valid(b)
+	envelopeErr := validateJsonRpcEnvelopeKeysValid(b, validJSON)
 	if bytes.HasPrefix(b, []byte{'['}) {
 		var msg JsonRpcMsgs
-		err := json.Unmarshal(b, &msg)
+		err := classifyJsonRpcDecodeError(validJSON, json.Unmarshal(b, &msg))
+		if err == nil {
+			err = envelopeErr
+		}
+		if errors.Is(err, ErrInvalidRequest) {
+			return nil, nil, err
+		}
 		return nil, msg, err
 	}
 	var msg JsonRpcMsg
-	err := json.Unmarshal(b, &msg)
+	err := classifyJsonRpcDecodeError(validJSON, json.Unmarshal(b, &msg))
+	if err == nil {
+		err = envelopeErr
+	}
+	if errors.Is(err, ErrInvalidRequest) {
+		return nil, nil, err
+	}
 	return &msg, nil, err
+}
+
+func classifyJsonRpcDecodeError(validJSON bool, err error) error {
+	if !validJSON {
+		if err == nil {
+			return errInvalidJSONSyntax
+		}
+		return err
+	}
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: decode JSON-RPC message: %v", ErrInvalidRequest, err)
+}
+
+func validateJsonRpcEnvelopeKeys(b []byte) error {
+	return validateJsonRpcEnvelopeKeysValid(b, stdjson.Valid(b))
+}
+
+func validateJsonRpcEnvelopeKeysValid(b []byte, validJSON bool) error {
+	if !validJSON {
+		return nil
+	}
+	scanner := jsonEnvelopeScanner{data: b}
+	ambiguousKey := ""
+	if err := scanner.scanEnvelopes(&ambiguousKey); err != nil {
+		return fmt.Errorf("scan JSON-RPC envelope: %w", err)
+	}
+	if ambiguousKey != "" {
+		return fmt.Errorf("%w: ambiguous JSON-RPC envelope key %q", ErrInvalidRequest, ambiguousKey)
+	}
+	return nil
+}
+
+type jsonEnvelopeScanner struct {
+	data   []byte
+	offset int
+}
+
+func (s *jsonEnvelopeScanner) scanEnvelopes(ambiguousKey *string) error {
+	s.skipWhitespace()
+	if s.offset >= len(s.data) {
+		return nil
+	}
+	switch s.data[s.offset] {
+	case '{':
+		return s.scanEnvelopeObject(ambiguousKey)
+	case '[':
+		return s.scanEnvelopeArray(ambiguousKey)
+	default:
+		return nil
+	}
+}
+
+func (s *jsonEnvelopeScanner) scanEnvelopeArray(ambiguousKey *string) error {
+	s.offset++
+	s.skipWhitespace()
+	if s.consume(']') {
+		return nil
+	}
+	for {
+		s.skipWhitespace()
+		if s.offset >= len(s.data) {
+			return fmt.Errorf("unexpected end of batch")
+		}
+		if s.data[s.offset] != '{' {
+			return fmt.Errorf("%w: JSON-RPC batch item at byte %d is not an object", ErrInvalidRequest, s.offset)
+		}
+		if err := s.scanEnvelopeObject(ambiguousKey); err != nil {
+			return err
+		}
+		s.skipWhitespace()
+		if s.consume(']') {
+			return nil
+		}
+		if !s.consume(',') {
+			return fmt.Errorf("expected comma at byte %d", s.offset)
+		}
+	}
+}
+
+func (s *jsonEnvelopeScanner) scanEnvelopeObject(ambiguousKey *string) error {
+	if !s.consume('{') {
+		return fmt.Errorf("expected object at byte %d", s.offset)
+	}
+	seen := make(map[string]bool, 4)
+	s.skipWhitespace()
+	if s.consume('}') {
+		return nil
+	}
+	for {
+		s.skipWhitespace()
+		keyStart := s.offset
+		if err := s.skipString(); err != nil {
+			return err
+		}
+		var key string
+		if err := stdjson.Unmarshal(s.data[keyStart:s.offset], &key); err != nil {
+			return fmt.Errorf("decode object key at byte %d: %w", keyStart, err)
+		}
+		if canonical, reserved := canonicalJsonRpcEnvelopeKey(key); reserved {
+			switch {
+			case key != canonical, seen[canonical]:
+				if *ambiguousKey == "" {
+					*ambiguousKey = key
+				}
+			default:
+				seen[canonical] = true
+			}
+		}
+
+		s.skipWhitespace()
+		if !s.consume(':') {
+			return fmt.Errorf("expected colon at byte %d", s.offset)
+		}
+		if err := s.skipValue(); err != nil {
+			return err
+		}
+		s.skipWhitespace()
+		if s.consume('}') {
+			return nil
+		}
+		if !s.consume(',') {
+			return fmt.Errorf("expected comma at byte %d", s.offset)
+		}
+	}
+}
+
+func (s *jsonEnvelopeScanner) skipValue() error {
+	s.skipWhitespace()
+	if s.offset >= len(s.data) {
+		return fmt.Errorf("unexpected end of value")
+	}
+	switch s.data[s.offset] {
+	case '"':
+		return s.skipString()
+	case '{', '[':
+		return s.skipComposite()
+	default:
+		start := s.offset
+		for s.offset < len(s.data) {
+			switch s.data[s.offset] {
+			case ',', '}', ']', ' ', '\t', '\n', '\r':
+				if s.offset == start {
+					return fmt.Errorf("empty value at byte %d", start)
+				}
+				return nil
+			default:
+				s.offset++
+			}
+		}
+		if s.offset == start {
+			return fmt.Errorf("empty value at byte %d", start)
+		}
+		return nil
+	}
+}
+
+func (s *jsonEnvelopeScanner) skipComposite() error {
+	depth := 0
+	for s.offset < len(s.data) {
+		switch s.data[s.offset] {
+		case '"':
+			if err := s.skipString(); err != nil {
+				return err
+			}
+		case '{', '[':
+			depth++
+			s.offset++
+		case '}', ']':
+			depth--
+			s.offset++
+			if depth == 0 {
+				return nil
+			}
+		default:
+			s.offset++
+		}
+	}
+	return fmt.Errorf("unexpected end of composite value")
+}
+
+func (s *jsonEnvelopeScanner) skipString() error {
+	if !s.consume('"') {
+		return fmt.Errorf("expected string at byte %d", s.offset)
+	}
+	for s.offset < len(s.data) {
+		switch s.data[s.offset] {
+		case '\\':
+			s.offset += 2
+		case '"':
+			s.offset++
+			return nil
+		default:
+			s.offset++
+		}
+	}
+	return fmt.Errorf("unexpected end of string")
+}
+
+func (s *jsonEnvelopeScanner) skipWhitespace() {
+	for s.offset < len(s.data) {
+		switch s.data[s.offset] {
+		case ' ', '\t', '\n', '\r':
+			s.offset++
+		default:
+			return
+		}
+	}
+}
+
+func (s *jsonEnvelopeScanner) consume(want byte) bool {
+	if s.offset >= len(s.data) || s.data[s.offset] != want {
+		return false
+	}
+	s.offset++
+	return true
+}
+
+func canonicalJsonRpcEnvelopeKey(key string) (string, bool) {
+	for _, canonical := range [...]string{"jsonrpc", "id", "method", "params"} {
+		if strings.EqualFold(key, canonical) {
+			return canonical, true
+		}
+	}
+	return "", false
 }
 
 func UnauthorizedResponse(req *JsonRpcMsg) *JsonRpcMsg {

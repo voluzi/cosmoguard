@@ -146,6 +146,9 @@ func (c *JsonRpcWsClient) ReceiveMsg() (*JsonRpcMsg, error) {
 
 	msg, batch, err := ParseJsonRpcMessage(message)
 	if err != nil {
+		if errors.Is(err, ErrInvalidRequest) {
+			return nil, fmt.Errorf("parse message: %w", err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrBadMessage, err)
 	}
 
