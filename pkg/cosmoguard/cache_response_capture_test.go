@@ -91,6 +91,20 @@ func (w *shortThenSuccessResponseWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+type switchableShortResponseWriter struct {
+	header http.Header
+	short  bool
+}
+
+func (w *switchableShortResponseWriter) Header() http.Header { return w.header }
+func (*switchableShortResponseWriter) WriteHeader(int)       {}
+func (w *switchableShortResponseWriter) Write(p []byte) (int, error) {
+	if w.short {
+		return len(p) / 2, nil
+	}
+	return len(p), nil
+}
+
 type coalescerWaiterContext struct {
 	context.Context
 	enrolled chan struct{}
@@ -154,7 +168,7 @@ func TestResponseWriterWrapperResponseCapture(t *testing.T) {
 
 		n, err := wrapper.Write([]byte("response"))
 		require.Equal(t, 4, n)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, io.ErrShortWrite)
 		captured, captureErr := wrapper.GetWrittenBytes()
 		require.ErrorIs(t, captureErr, io.ErrShortWrite)
 		require.Nil(t, captured)
@@ -169,6 +183,33 @@ func TestResponseWriterWrapperResponseCapture(t *testing.T) {
 		require.Nil(t, captured)
 		require.Zero(t, wrapper.buf.Len())
 		require.Zero(t, wrapper.buf.Cap())
+	})
+
+	t.Run("overflowing write still reports downstream short write", func(t *testing.T) {
+		downstream := &switchableShortResponseWriter{header: make(http.Header), short: true}
+		wrapper := newResponseWriterWrapper(downstream, 4)
+
+		n, err := wrapper.Write([]byte("response"))
+		require.Equal(t, 4, n)
+		require.ErrorIs(t, err, io.ErrShortWrite)
+		captured, captureErr := wrapper.GetWrittenBytes()
+		require.ErrorIs(t, captureErr, errResponseCaptureTooLarge)
+		require.Nil(t, captured)
+	})
+
+	t.Run("write after capture transfer reports downstream short write", func(t *testing.T) {
+		downstream := &switchableShortResponseWriter{header: make(http.Header)}
+		wrapper := WrapResponseWriter(downstream)
+		_, err := wrapper.Write([]byte("captured"))
+		require.NoError(t, err)
+		captured, captureErr := wrapper.GetWrittenBytes()
+		require.NoError(t, captureErr)
+		require.Equal(t, "captured", string(captured))
+
+		downstream.short = true
+		n, err := wrapper.Write([]byte("response"))
+		require.Equal(t, 4, n)
+		require.ErrorIs(t, err, io.ErrShortWrite)
 	})
 }
 

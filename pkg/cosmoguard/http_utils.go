@@ -226,6 +226,9 @@ func (w *ResponseWriterWrapper) Write(p []byte) (int, error) {
 		w.buf.release()
 	}
 	n, err := w.ResponseWriter.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	if w.captureDone || w.overflowed || w.captureErr != nil {
 		return n, err
 	}
@@ -238,9 +241,6 @@ func (w *ResponseWriterWrapper) Write(p []byte) (int, error) {
 	}
 	if err != nil {
 		w.captureErr = err
-		w.buf.release()
-	} else if n != len(p) {
-		w.captureErr = io.ErrShortWrite
 		w.buf.release()
 	}
 	return n, err
