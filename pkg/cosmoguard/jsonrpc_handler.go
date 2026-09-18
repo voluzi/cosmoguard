@@ -453,7 +453,7 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 		// Use the explicit-null-id builders so the response carries
 		// `"id":null` (§5.1) rather than dropping the id via omitempty.
 		errResp := ParseErrorResponse() // -32700, unparseable JSON
-		if errors.Is(parseErr, ErrInvalidRequest) || requests != nil {
+		if errors.Is(parseErr, ErrInvalidRequest) {
 			errResp = InvalidRequestResponse() // -32600, parsed but not JSON-RPC
 		}
 		body, mErr := errResp.Marshal()

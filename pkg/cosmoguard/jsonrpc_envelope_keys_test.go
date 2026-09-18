@@ -26,6 +26,7 @@ func TestParseJsonRpcMessageRejectsAmbiguousReservedEnvelopeKeys(t *testing.T) {
 		{name: "duplicate method", body: `{"jsonrpc":"2.0","id":1,"method":"status","method":"unsafe"}`},
 		{name: "duplicate params", body: `{"jsonrpc":"2.0","id":1,"method":"status","params":[],"params":["unsafe"]}`},
 		{name: "escaped duplicate method", body: `{"jsonrpc":"2.0","id":1,"method":"status","m\u0065thod":"unsafe"}`},
+		{name: "unicode fold variant", body: `{"j\u017fonrpc":"2.0","id":1,"method":"status"}`},
 	}
 
 	for _, tt := range tests {
@@ -81,12 +82,25 @@ func TestParseJsonRpcMessageAllowsUnambiguousEnvelopes(t *testing.T) {
 }
 
 func TestParseJsonRpcMessageKeepsMalformedJSONAsParseError(t *testing.T) {
-	single, batch, err := ParseJsonRpcMessage([]byte(`{"jsonrpc":`))
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "truncated object", body: `{"jsonrpc":`},
+		{name: "ambiguous with leading zero", body: `{"jsonrpc":"2.0","method":"status","Method":"other","extension":-01}`},
+		{name: "ambiguous with leading decimal point", body: `{"jsonrpc":"2.0","method":"status","Method":"other","extension":-.1}`},
+	}
 
-	require.Error(t, err)
-	require.NotErrorIs(t, err, ErrInvalidRequest)
-	require.Nil(t, batch)
-	require.NotNil(t, single)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			single, batch, err := ParseJsonRpcMessage([]byte(tt.body))
+
+			require.Error(t, err)
+			require.NotErrorIs(t, err, ErrInvalidRequest)
+			require.Nil(t, batch)
+			require.NotNil(t, single)
+		})
+	}
 }
 
 func TestHandleHTTPRejectsAmbiguousEnvelopeBeforeUpstream(t *testing.T) {
@@ -104,6 +118,75 @@ func TestHandleHTTPRejectsAmbiguousEnvelopeBeforeUpstream(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
 	require.Zero(t, upstreamCalls)
+}
+
+func TestHandleHTTPRejectsAmbiguousBatchEnvelopeBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "case variant",
+			body: `[{"jsonrpc":"2.0","id":1,"method":"allowed","Method":"unsafe"}]`,
+		},
+		{
+			name: "duplicate",
+			body: `[{"jsonrpc":"2.0","id":1,"method":"allowed","method":"unsafe"}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newEnvelopeTestHandler(t)
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
+			recorder := httptest.NewRecorder()
+			upstreamCalls := 0
+
+			h.handleHttp(recorder, request, func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls++
+				_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+			}, time.Now())
+
+			require.Equal(t, http.StatusOK, recorder.Code)
+			require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+			require.Zero(t, upstreamCalls)
+		})
+	}
+}
+
+func TestValidateJsonRpcEnvelopeKeysDoesNotCopyLargeValues(t *testing.T) {
+	largeValue := strings.Repeat("x", 256<<10)
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "unescaped string",
+			body: []byte(`{"jsonrpc":"2.0","id":1,"method":"status","params":"` + largeValue + `"}`),
+		},
+		{
+			name: "escaped string",
+			body: []byte(`{"jsonrpc":"2.0","id":1,"method":"status","params":"` + largeValue + `\n"}`),
+		},
+		{
+			name: "nested escaped string",
+			body: []byte(`{"jsonrpc":"2.0","id":1,"method":"status","params":{"nested":"` + largeValue + `\n"}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := testing.Benchmark(func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					if err := validateJsonRpcEnvelopeKeys(tt.body); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+
+			require.Less(t, result.AllocedBytesPerOp(), int64(len(tt.body)/16))
+		})
+	}
 }
 
 func TestHandleHTTPClassifiesValidJSONDecodeFailuresAsInvalidRequests(t *testing.T) {
@@ -156,6 +239,9 @@ func TestHandleHTTPKeepsMalformedJSONAsParseError(t *testing.T) {
 	}{
 		{name: "truncated object", body: `{"jsonrpc":`},
 		{name: "trailing JSON", body: `{"jsonrpc":"2.0","id":1,"method":"status"}{}`},
+		{name: "ambiguous with leading zero", body: `{"jsonrpc":"2.0","method":"status","Method":"other","extension":-01}`},
+		{name: "ambiguous with leading decimal point", body: `{"jsonrpc":"2.0","method":"status","Method":"other","extension":-.1}`},
+		{name: "batch with leading zero", body: `[{"jsonrpc":"2.0","id":1,"method":"status","extension":-01}]`},
 	}
 
 	for _, tt := range tests {
