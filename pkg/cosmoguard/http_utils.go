@@ -247,11 +247,11 @@ func (w *ResponseWriterWrapper) Write(p []byte) (int, error) {
 }
 
 func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
-	if statusCode >= 100 && statusCode < 200 && statusCode != http.StatusSwitchingProtocols {
-		w.ResponseWriter.WriteHeader(statusCode)
+	if w.statusCode != 0 {
 		return
 	}
-	if w.statusCode != 0 {
+	if statusCode >= 100 && statusCode < 200 && statusCode != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(statusCode)
 		return
 	}
 	w.statusCode = statusCode

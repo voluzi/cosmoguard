@@ -170,3 +170,49 @@ func TestJSONRPCFinalUncacheableHeaderAfterInformationalResponse(t *testing.T) {
 		}
 	}
 }
+
+func TestJSONRPCCacheableFinalResponseAfterInformationalResponse(t *testing.T) {
+	for _, coalesce := range []bool{true, false} {
+		t.Run(fmt.Sprintf("coalesce=%t", coalesce), func(t *testing.T) {
+			rule := &JsonRpcRule{
+				Action:  RuleActionAllow,
+				Methods: []string{"status"},
+				Cache:   &RuleCache{Enable: true, TTL: time.Minute, Coalesce: &coalesce},
+			}
+			h := newJSONCacheHandler(t, rule)
+			request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
+			hash := request.HashWithRule(rule.Fingerprint)
+			var hits atomic.Int32
+			next := func(w http.ResponseWriter, _ *http.Request) {
+				hit := hits.Add(1)
+				w.WriteHeader(http.StatusContinue)
+				w.Header().Set("Cache-Control", "public, max-age=60")
+				_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"result":"hit-%d"}`, hit)
+			}
+			req, _ := jsonRequestContext()
+
+			if coalesce {
+				response, err := h.fetchSingle(req, next, hash, rule.Cache, "rule", request.Method, &jsonRpcResponseOwner{}, false)
+				require.NoError(t, err)
+				require.True(t, response.Shareable)
+			} else {
+				h.getSingleUpstreamResponse(newInformationalResponseRecorder(), req, next, hash, rule.Cache, "rule", request.Method)
+			}
+			require.Eventually(t, func() bool {
+				_, err := h.cache.Get(t.Context(), hash)
+				return err == nil
+			}, time.Second, 5*time.Millisecond)
+
+			replay := httptest.NewRecorder()
+			replayRequest := &JsonRpcMsg{Version: "2.0", ID: 2, Method: "status"}
+			replayHTTP, _ := jsonRequestContext()
+			h.handleHttpSingle(replayRequest, replay, replayHTTP, func(http.ResponseWriter, *http.Request) {
+				t.Fatal("cache replay reached upstream")
+			}, time.Now())
+
+			require.Equal(t, cacheHit, replay.Header().Get(cacheStateHeader))
+			require.JSONEq(t, `{"jsonrpc":"2.0","id":2,"result":"hit-1"}`, replay.Body.String())
+			require.Equal(t, int32(1), hits.Load())
+		})
+	}
+}

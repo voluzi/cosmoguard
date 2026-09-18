@@ -158,6 +158,7 @@ func TestResponseWriterWrapperInformationalResponseDoesNotCommit(t *testing.T) {
 
 	assert.Equal(t, wrapper.GetStatusCode(), 0)
 	assert.Assert(t, wrapper.GetCommittedHeaders() == nil)
+	assert.Equal(t, len(recorder.headerWrites), 1)
 	assert.Equal(t, recorder.headerWrites[0].status, http.StatusEarlyHints)
 	assert.Equal(t, recorder.headerWrites[0].headers.Get(cacheStateHeader), "")
 
@@ -166,6 +167,7 @@ func TestResponseWriterWrapperInformationalResponseDoesNotCommit(t *testing.T) {
 	wrapper.WriteHeader(http.StatusCreated)
 
 	assert.Equal(t, wrapper.GetStatusCode(), http.StatusCreated)
+	assert.Equal(t, len(recorder.headerWrites), 2)
 	assert.DeepEqual(t, []int{recorder.headerWrites[0].status, recorder.headerWrites[1].status}, []int{http.StatusEarlyHints, http.StatusCreated})
 	assert.Equal(t, recorder.headerWrites[1].headers.Get(cacheStateHeader), cacheMiss)
 	assert.Equal(t, wrapper.GetCommittedHeaders().Get("X-Upstream-Phase"), "final")
@@ -184,6 +186,7 @@ func TestResponseWriterWrapperWriteAfterInformationalCommitsImplicitOK(t *testin
 	assert.Equal(t, n, 2)
 	assert.Equal(t, wrapper.GetStatusCode(), http.StatusOK)
 	assert.Equal(t, wrapper.GetCommittedHeaders().Get("X-Upstream-Phase"), "final")
+	assert.Equal(t, len(recorder.headerWrites), 2)
 	assert.DeepEqual(t, []int{recorder.headerWrites[0].status, recorder.headerWrites[1].status}, []int{http.StatusContinue, http.StatusOK})
 }
 
@@ -198,6 +201,17 @@ func TestResponseWriterWrapperKeepsFirstFinalResponse(t *testing.T) {
 
 	assert.Equal(t, wrapper.GetStatusCode(), http.StatusCreated)
 	assert.Equal(t, wrapper.GetCommittedHeaders().Get("X-Upstream-Phase"), "first")
+}
+
+func TestResponseWriterWrapperIgnoresInformationalAfterFinal(t *testing.T) {
+	recorder := newInformationalResponseRecorder()
+	wrapper := WrapResponseWriter(recorder)
+	wrapper.WriteHeader(http.StatusCreated)
+
+	wrapper.WriteHeader(http.StatusEarlyHints)
+
+	assert.Equal(t, wrapper.GetStatusCode(), http.StatusCreated)
+	assert.Equal(t, len(recorder.headerWrites), 1)
 }
 
 func TestResponseWriterWrapperSwitchingProtocolsIsFinal(t *testing.T) {
