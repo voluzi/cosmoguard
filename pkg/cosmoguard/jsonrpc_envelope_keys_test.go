@@ -154,6 +154,43 @@ func TestHandleHTTPRejectsAmbiguousBatchEnvelopeBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestHandleHTTPRejectsNonObjectBatchItemsBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "null",
+			body: `[null,{"jsonrpc":"2.0","id":1,"method":"allowed"}]`,
+		},
+		{
+			name: "scalar",
+			body: `[42,{"jsonrpc":"2.0","id":1,"method":"allowed"}]`,
+		},
+		{
+			name: "array",
+			body: `[[{"jsonrpc":"2.0","id":2,"method":"nested"}],{"jsonrpc":"2.0","id":1,"method":"allowed"}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newEnvelopeTestHandler(t)
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
+			recorder := httptest.NewRecorder()
+			upstreamCalls := 0
+
+			h.handleHttp(recorder, request, func(http.ResponseWriter, *http.Request) {
+				upstreamCalls++
+			}, time.Now())
+
+			require.Equal(t, http.StatusOK, recorder.Code)
+			require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+			require.Zero(t, upstreamCalls)
+		})
+	}
+}
+
 func TestValidateJsonRpcEnvelopeKeysDoesNotCopyLargeValues(t *testing.T) {
 	largeValue := strings.Repeat("x", 256<<10)
 	tests := []struct {

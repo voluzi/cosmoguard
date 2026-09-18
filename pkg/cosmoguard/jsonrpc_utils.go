@@ -390,13 +390,10 @@ func (s *jsonEnvelopeScanner) scanEnvelopeArray(ambiguousKey *string) error {
 		if s.offset >= len(s.data) {
 			return fmt.Errorf("unexpected end of batch")
 		}
-		var err error
-		if s.data[s.offset] == '{' {
-			err = s.scanEnvelopeObject(ambiguousKey)
-		} else {
-			err = s.skipValue()
+		if s.data[s.offset] != '{' {
+			return fmt.Errorf("%w: JSON-RPC batch item at byte %d is not an object", ErrInvalidRequest, s.offset)
 		}
-		if err != nil {
+		if err := s.scanEnvelopeObject(ambiguousKey); err != nil {
 			return err
 		}
 		s.skipWhitespace()
