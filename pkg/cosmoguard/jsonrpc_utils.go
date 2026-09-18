@@ -3,9 +3,13 @@ package cosmoguard
 import (
 	"bytes"
 	"context"
+	stdjson "encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -301,12 +305,94 @@ func trailingWhitespace(b []byte) []byte {
 func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	if bytes.HasPrefix(b, []byte{'['}) {
 		var msg JsonRpcMsgs
-		err := json.Unmarshal(b, &msg)
+		err := classifyJsonRpcDecodeError(b, json.Unmarshal(b, &msg))
 		return nil, msg, err
 	}
+	if trimmed := bytes.TrimSpace(b); len(trimmed) > 0 && trimmed[0] == '{' {
+		if err := validateJsonRpcEnvelopeKeys(b); err != nil {
+			if errors.Is(err, ErrInvalidRequest) {
+				return nil, nil, err
+			}
+			return &JsonRpcMsg{}, nil, err
+		}
+	}
 	var msg JsonRpcMsg
-	err := json.Unmarshal(b, &msg)
+	err := classifyJsonRpcDecodeError(b, json.Unmarshal(b, &msg))
 	return &msg, nil, err
+}
+
+func classifyJsonRpcDecodeError(b []byte, err error) error {
+	if err == nil || !stdjson.Valid(b) {
+		return err
+	}
+	return fmt.Errorf("%w: decode JSON-RPC message: %v", ErrInvalidRequest, err)
+}
+
+func validateJsonRpcEnvelopeKeys(b []byte) error {
+	decoder := stdjson.NewDecoder(bytes.NewReader(b))
+	start, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if start != stdjson.Delim('{') {
+		return nil
+	}
+
+	seen := make(map[string]bool, 4)
+	var ambiguous error
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("JSON object key is not a string")
+		}
+		if canonical, reserved := canonicalJsonRpcEnvelopeKey(key); reserved {
+			switch {
+			case key != canonical:
+				if ambiguous == nil {
+					ambiguous = fmt.Errorf("ambiguous JSON-RPC envelope key %q", key)
+				}
+			case seen[canonical]:
+				if ambiguous == nil {
+					ambiguous = fmt.Errorf("ambiguous JSON-RPC envelope key %q", key)
+				}
+			default:
+				seen[canonical] = true
+			}
+		}
+
+		var value stdjson.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("multiple JSON values after JSON-RPC envelope")
+	}
+	if ambiguous != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidRequest, ambiguous)
+	}
+	return nil
+}
+
+func canonicalJsonRpcEnvelopeKey(key string) (string, bool) {
+	for _, canonical := range [...]string{"jsonrpc", "id", "method", "params"} {
+		if strings.EqualFold(key, canonical) {
+			return canonical, true
+		}
+	}
+	return "", false
 }
 
 func UnauthorizedResponse(req *JsonRpcMsg) *JsonRpcMsg {
