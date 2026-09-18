@@ -649,7 +649,7 @@ rules:
 | `priority` | `1000` | |
 | `action` | — | `allow` or `deny`. |
 | `methods` | empty | JSON-RPC method names (globs supported). Empty = all. |
-| `params` | empty | Dict (or array index) of param name → glob. |
+| `params` | empty | Flat object subset or positional-array prefix of scalar predicates. |
 | `cache` | nil | Same shape as HTTP. |
 
 ```yaml
@@ -665,6 +665,17 @@ rules:
       enable: true
       ttl: 2s
 ```
+
+`params` accepts only flat scalar values: strings, booleans, null, finite
+numbers, and integers from `-9007199254740991` through
+`9007199254740991`. Strings use glob matching. Other scalars use exact
+matching after numeric normalization, so YAML `10` matches JSON `10`, `10.0`,
+or `1e1`. In object form every configured key must be present (including keys
+configured as null), while additional request keys are allowed. In array form
+the configured values match a prefix, so additional trailing request values
+are allowed. Nested objects/arrays, timestamps, non-finite numbers, unsupported
+top-level shapes, and integers outside the exact range reject the config at
+startup or reload.
 
 ### gRPC rule
 

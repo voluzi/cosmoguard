@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash"
 	"hash/fnv"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -400,10 +401,11 @@ type JsonRpcRule struct {
 	// bucket (same semantics as HttpRule.RateLimit).
 	RateLimit *RateLimitConfig `yaml:"rateLimit,omitempty"`
 
-	MethodGlobs []glob.Glob          `yaml:"-"`
-	ParamsGlobs map[string]glob.Glob `yaml:"-"`
-	ParamsMap   bool                 `yaml:"-"`
-	ParamsSlice bool                 `yaml:"-"`
+	MethodGlobs    []glob.Glob          `yaml:"-"`
+	ParamsGlobs    map[string]glob.Glob `yaml:"-"`
+	ParamsMap      bool                 `yaml:"-"`
+	ParamsSlice    bool                 `yaml:"-"`
+	compiledParams interface{}          `yaml:"-"`
 
 	// Fingerprint is a 64-bit stable hash of the rule's matching
 	// criteria + action — used as the fallback `rule_id` metric label
@@ -422,52 +424,146 @@ func (r *JsonRpcRule) Compile() error {
 	if err := r.RateLimit.validate(); err != nil {
 		return err
 	}
-	r.MethodGlobs = nil
-	r.ParamsGlobs = map[string]glob.Glob{}
-	r.ParamsMap = false
-	r.ParamsSlice = false
 
+	var methodGlobs []glob.Glob
 	if len(r.Methods) > 0 {
-		r.MethodGlobs = make([]glob.Glob, 0, len(r.Methods))
+		methodGlobs = make([]glob.Glob, 0, len(r.Methods))
 		for _, p := range r.Methods {
 			g, err := compileGlob(p)
 			if err != nil {
 				return fmt.Errorf("jsonrpc rule (priority %d) method %q: %w", r.Priority, p, err)
 			}
-			r.MethodGlobs = append(r.MethodGlobs, g)
+			methodGlobs = append(methodGlobs, g)
 		}
 	}
-	if r.Params != nil {
-		if paramsMap, ok := r.Params.(map[string]interface{}); ok {
-			r.ParamsMap = len(paramsMap) > 0
-			for key, v := range paramsMap {
-				if value, ok := v.(string); ok {
-					g, err := compileGlob(value, '/')
-					if err != nil {
-						return fmt.Errorf("jsonrpc rule (priority %d) params[%q]=%q: %w", r.Priority, key, value, err)
-					}
-					r.ParamsGlobs[key] = g
-				}
-			}
-		}
-		if paramsSlice, ok := r.Params.([]interface{}); ok {
-			r.ParamsSlice = len(paramsSlice) > 0
-			for i, v := range paramsSlice {
-				if value, ok := v.(string); ok {
-					g, err := compileGlob(value, '/')
-					if err != nil {
-						return fmt.Errorf("jsonrpc rule (priority %d) params[%d]=%q: %w", r.Priority, i, value, err)
-					}
-					r.ParamsGlobs[strconv.Itoa(i)] = g
-				}
-			}
-		}
+
+	normalizedParams, paramsGlobs, paramsMap, paramsSlice, err := r.compileParams()
+	if err != nil {
+		return err
 	}
 	if err := validateRuleCacheFeatures(r.Cache, "jsonrpc", r.Priority); err != nil {
 		return err
 	}
-	r.Fingerprint = jsonRpcRuleFingerprint(r)
+	fingerprintRule := *r
+	fingerprintRule.Params = normalizedParams
+	fingerprint := jsonRpcRuleFingerprint(&fingerprintRule)
+
+	r.MethodGlobs = methodGlobs
+	r.ParamsGlobs = paramsGlobs
+	r.ParamsMap = paramsMap
+	r.ParamsSlice = paramsSlice
+	r.Params = normalizedParams
+	r.compiledParams = normalizedParams
+	r.Fingerprint = fingerprint
 	return nil
+}
+
+const maxSafeJSONInteger = int64(9007199254740991)
+
+func (r *JsonRpcRule) compileParams() (interface{}, map[string]glob.Glob, bool, bool, error) {
+	paramsGlobs := make(map[string]glob.Glob)
+	switch params := r.Params.(type) {
+	case nil:
+		return nil, paramsGlobs, false, false, nil
+	case map[string]interface{}:
+		normalized := make(map[string]interface{}, len(params))
+		for key, value := range params {
+			normalizedValue, err := normalizeJSONRPCParamScalar(value)
+			if err != nil {
+				return nil, nil, false, false, fmt.Errorf("jsonrpc rule (priority %d) params[%q]: %w", r.Priority, key, err)
+			}
+			normalized[key] = normalizedValue
+			if stringValue, ok := normalizedValue.(string); ok {
+				g, err := compileGlob(stringValue, '/')
+				if err != nil {
+					return nil, nil, false, false, fmt.Errorf("jsonrpc rule (priority %d) params[%q]=%q: %w", r.Priority, key, stringValue, err)
+				}
+				paramsGlobs[key] = g
+			}
+		}
+		return normalized, paramsGlobs, len(normalized) > 0, false, nil
+	case []interface{}:
+		normalized := make([]interface{}, len(params))
+		for i, value := range params {
+			normalizedValue, err := normalizeJSONRPCParamScalar(value)
+			if err != nil {
+				return nil, nil, false, false, fmt.Errorf("jsonrpc rule (priority %d) params[%d]: %w", r.Priority, i, err)
+			}
+			normalized[i] = normalizedValue
+			if stringValue, ok := normalizedValue.(string); ok {
+				g, err := compileGlob(stringValue, '/')
+				if err != nil {
+					return nil, nil, false, false, fmt.Errorf("jsonrpc rule (priority %d) params[%d]=%q: %w", r.Priority, i, stringValue, err)
+				}
+				paramsGlobs[strconv.Itoa(i)] = g
+			}
+		}
+		return normalized, paramsGlobs, false, len(normalized) > 0, nil
+	default:
+		return nil, nil, false, false, fmt.Errorf("jsonrpc rule (priority %d) params: unsupported top-level type %T (want a map, slice, or null)", r.Priority, r.Params)
+	}
+}
+
+func normalizeJSONRPCParamScalar(value interface{}) (interface{}, error) {
+	switch value := value.(type) {
+	case nil, string, bool:
+		return value, nil
+	case int:
+		return normalizeJSONRPCSignedInteger(int64(value))
+	case int8:
+		return normalizeJSONRPCSignedInteger(int64(value))
+	case int16:
+		return normalizeJSONRPCSignedInteger(int64(value))
+	case int32:
+		return normalizeJSONRPCSignedInteger(int64(value))
+	case int64:
+		return normalizeJSONRPCSignedInteger(value)
+	case uint:
+		return normalizeJSONRPCUnsignedInteger(uint64(value))
+	case uint8:
+		return normalizeJSONRPCUnsignedInteger(uint64(value))
+	case uint16:
+		return normalizeJSONRPCUnsignedInteger(uint64(value))
+	case uint32:
+		return normalizeJSONRPCUnsignedInteger(uint64(value))
+	case uint64:
+		return normalizeJSONRPCUnsignedInteger(value)
+	case float32:
+		formatted := strconv.FormatFloat(float64(value), 'g', -1, 32)
+		normalized, err := strconv.ParseFloat(formatted, 64)
+		if err != nil {
+			return nil, fmt.Errorf("normalize number %v: %w", value, err)
+		}
+		return normalizeJSONRPCFloat(normalized)
+	case float64:
+		return normalizeJSONRPCFloat(value)
+	default:
+		return nil, fmt.Errorf("unsupported scalar type %T; params predicates must be flat", value)
+	}
+}
+
+func normalizeJSONRPCFloat(value float64) (float64, error) {
+	if math.IsInf(value, 0) || math.IsNaN(value) {
+		return 0, fmt.Errorf("non-finite number %v is not supported", value)
+	}
+	if math.Trunc(value) == value && (value < -float64(maxSafeJSONInteger) || value > float64(maxSafeJSONInteger)) {
+		return 0, fmt.Errorf("integer %g is outside the exact JSON range [%d,%d]", value, -maxSafeJSONInteger, maxSafeJSONInteger)
+	}
+	return value, nil
+}
+
+func normalizeJSONRPCSignedInteger(value int64) (float64, error) {
+	if value < -maxSafeJSONInteger || value > maxSafeJSONInteger {
+		return 0, fmt.Errorf("integer %d is outside the exact JSON range [%d,%d]", value, -maxSafeJSONInteger, maxSafeJSONInteger)
+	}
+	return float64(value), nil
+}
+
+func normalizeJSONRPCUnsignedInteger(value uint64) (float64, error) {
+	if value > uint64(maxSafeJSONInteger) {
+		return 0, fmt.Errorf("integer %d is outside the exact JSON range [0,%d]", value, maxSafeJSONInteger)
+	}
+	return float64(value), nil
 }
 
 // jsonRpcRuleFingerprint produces a stable 64-bit hash of the rule's
@@ -552,17 +648,17 @@ func (r *JsonRpcRule) Match(req *JsonRpcMsg) bool {
 			// other JSON shape.
 			return false
 		}
-		paramsMap, ok := r.Params.(map[string]interface{})
+		paramsMap, ok := r.compiledParams.(map[string]interface{})
 		if !ok {
 			log.Errorf("jsonrpc: request params not a map: %v", requestParams)
 			return false
 		}
 		for key, v := range paramsMap {
+			reqV, exists := requestParams[key]
+			if !exists {
+				return false
+			}
 			if g, ok := r.ParamsGlobs[key]; ok {
-				reqV, exists := requestParams[key]
-				if !exists {
-					return false
-				}
 				str, ok := reqV.(string)
 				if !ok {
 					return false
@@ -570,10 +666,8 @@ func (r *JsonRpcRule) Match(req *JsonRpcMsg) bool {
 				if !g.Match(str) {
 					return false
 				}
-			} else {
-				if v != requestParams[key] {
-					return false
-				}
+			} else if !jsonRPCParamScalarsEqual(v, reqV) {
+				return false
 			}
 		}
 		return true
@@ -584,7 +678,7 @@ func (r *JsonRpcRule) Match(req *JsonRpcMsg) bool {
 			// constraint can't match. Do not short-circuit to true.
 			return false
 		}
-		paramsSlice, ok := r.Params.([]interface{})
+		paramsSlice, ok := r.compiledParams.([]interface{})
 		if !ok {
 			log.Errorf("jsonrpc: request params not a slice: %v", requestParams)
 			return false
@@ -607,15 +701,35 @@ func (r *JsonRpcRule) Match(req *JsonRpcMsg) bool {
 				if !g.Match(str) {
 					return false
 				}
-			} else {
-				if v != requestParams[i] {
-					return false
-				}
+			} else if !jsonRPCParamScalarsEqual(v, requestParams[i]) {
+				return false
 			}
 		}
 		return true
 	default:
 		log.Warnf("unsupported params type: %T\n", requestParams)
+		return false
+	}
+}
+
+func jsonRPCParamScalarsEqual(ruleValue, requestValue interface{}) bool {
+	normalizedRequest, err := normalizeJSONRPCParamScalar(requestValue)
+	if err != nil {
+		return false
+	}
+	switch ruleValue := ruleValue.(type) {
+	case nil:
+		return normalizedRequest == nil
+	case string:
+		requestString, ok := normalizedRequest.(string)
+		return ok && ruleValue == requestString
+	case bool:
+		requestBool, ok := normalizedRequest.(bool)
+		return ok && ruleValue == requestBool
+	case float64:
+		requestNumber, ok := normalizedRequest.(float64)
+		return ok && ruleValue == requestNumber
+	default:
 		return false
 	}
 }
