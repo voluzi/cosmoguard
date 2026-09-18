@@ -72,6 +72,54 @@ func TestPrepareConfig_RejectsInvalidJsonRpcGlob(t *testing.T) {
 	assert.Assert(t, err != nil, "expected error for malformed method glob")
 }
 
+func TestReadConfigFromFile_NormalizesJsonRpcNumericParams(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "numeric-jsonrpc.yaml")
+
+	yaml := `
+rpc:
+  jsonrpc:
+    default: allow
+    rules:
+      - priority: 17
+        action: deny
+        methods: [block]
+        params:
+          height: 10
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
+
+	cfg, err := ReadConfigFromFile(cfgPath)
+	assert.NilError(t, err)
+	assert.Equal(t, len(cfg.RPC.JsonRpc.Rules), 1)
+	request := parseSingleJSONRPCRequest(t, `{"jsonrpc":"2.0","id":1,"method":"block","params":{"height":10}}`)
+	assert.Equal(t, cfg.RPC.JsonRpc.Rules[0].Match(request), true)
+}
+
+func TestReadConfigFromFile_RejectsNestedJsonRpcParams(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "nested-jsonrpc.yaml")
+
+	yaml := `
+rpc:
+  jsonrpc:
+    rules:
+      - priority: 17
+        action: deny
+        methods: [eth_getLogs]
+        params:
+          filter:
+            address: "0x1"
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
+
+	_, err := ReadConfigFromFile(cfgPath)
+	assert.Assert(t, err != nil)
+	assert.Assert(t, strings.Contains(err.Error(), "rpc.jsonrpc"), "error should identify the config section: %v", err)
+	assert.Assert(t, strings.Contains(err.Error(), "priority 17"), "error should identify the rule: %v", err)
+	assert.Assert(t, strings.Contains(err.Error(), `params["filter"]`), "error should identify the predicate: %v", err)
+}
+
 func TestPrepareConfig_RejectsInvalidGrpcGlob(t *testing.T) {
 	cfg := &Config{
 		GRPC: GrpcConfig{
@@ -232,6 +280,52 @@ lcd:
 	// Rules still in place.
 	assert.Equal(t, cg.cfg.LCD.Rules[0].Paths[0], originalPath,
 		"failed reload must not mutate the running ruleset")
+}
+
+func TestTryReload_NestedJsonRpcParamsPreservePreviousRules(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+	header := portYAMLHeader(t)
+
+	valid := header + `
+rpc:
+  jsonrpc:
+    default: allow
+    rules:
+      - priority: 17
+        action: deny
+        methods: [block]
+        params:
+          height: 10
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(valid), 0644))
+
+	cg, err := NewFromFile(cfgPath)
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
+	originalCfg := cg.cfg
+
+	invalid := header + `
+rpc:
+  jsonrpc:
+    default: allow
+    rules:
+      - priority: 17
+        action: deny
+        methods: [eth_getLogs]
+        params:
+          filter:
+            address: "0x1"
+`
+	assert.NilError(t, os.WriteFile(cfgPath, []byte(invalid), 0644))
+
+	cg.tryReload()
+
+	assert.Equal(t, cg.cfg, originalCfg, "invalid reload must preserve the last-known-good config")
+	assert.Assert(t, cg.dashboard.lastReload != nil)
+	assert.Equal(t, cg.dashboard.lastReload.Success, false)
+	request := parseSingleJSONRPCRequest(t, `{"jsonrpc":"2.0","id":1,"method":"block","params":{"height":10}}`)
+	assert.Equal(t, cg.cfg.RPC.JsonRpc.Rules[0].Match(request), true)
 }
 
 // TestTryReload_GoodConfigReplacesPrevious is the positive case: a valid
