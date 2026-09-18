@@ -848,12 +848,16 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 	if err != nil {
 		return "", err
 	}
-	// Normalize query string (sorted keys) so semantically-equivalent
-	// requests share a cache entry regardless of param order.
-	canonical := req.URL.Path
-	if q := req.URL.Query().Encode(); q != "" {
-		canonical += "?" + q
+	// Normalize query keys on a copy so cache identity does not rewrite the
+	// request forwarded upstream. RequestURI retains the escaped or opaque
+	// target, including ForceQuery, using the transport's URL semantics.
+	targetURL := *req.URL
+	targetURL.RawQuery = req.URL.Query().Encode()
+	targetKind := "path"
+	if targetURL.Opaque != "" {
+		targetKind = "opaque"
 	}
+	canonical := targetURL.RequestURI()
 	// Fold the client's acceptable content-coding set into the key. Upstreams
 	// commonly content-negotiate on it (Content-Encoding + Vary: Accept-
 	// Encoding); without this, a compressed response cached for one client
@@ -868,7 +872,8 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 	// would see only the first and could mis-key.
 	return util.XXHash64Hex(
 		strconv.FormatUint(ruleFingerprint, 16) + "\x00" +
-			req.Method + "\x00" + canonical + "\x00" +
+			req.Method + "\x00" + req.Host + "\x00" +
+			targetKind + "\x00" + canonical + "\x00" +
 			acceptEncodingKey(strings.Join(req.Header.Values("Accept-Encoding"), ",")) + "\x00" +
 			httpCacheKeyMetaPart(req, keyMetadata) + "\x00" +
 			string(b),
