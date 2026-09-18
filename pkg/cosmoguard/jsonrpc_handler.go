@@ -771,11 +771,15 @@ func (h *JsonRpcHandler) forwardSingleUpstream(request *JsonRpcMsg, w http.Respo
 
 func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request), hash uint64, cache *RuleCache, ruleTag, method string) {
 	ww := WrapResponseWriter(w)
+	ww.setHeaderOnCommit(cacheStateHeader, cacheMiss)
 	r, varyCapture := withUpstreamVaryCapture(r)
 	next(ww, r)
 
 	b, err := ww.GetWrittenBytes()
 	if err != nil {
+		if errors.Is(err, errResponseCaptureTooLarge) {
+			return
+		}
 		h.log.Errorf("error getting data from upstream response: %v", err)
 		return
 	}
@@ -858,6 +862,7 @@ func (h *JsonRpcHandler) serveSingleMiss(w http.ResponseWriter, r *http.Request,
 		// garbage). Reply with a JSON-RPC internal error so the client still
 		// gets a valid response.
 		if request.ID != nil {
+			w.Header().Set(cacheStateHeader, cacheMiss)
 			h.writeSingleResponse(w, r, ErrorResponse(request, -32603, "upstream error", nil))
 		}
 		h.recordSingle(r, request, cacheMiss, RuleActionAllow, startTime, "request allowed (upstream error)")
@@ -974,20 +979,18 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 	r, varyCapture := withUpstreamVaryCapture(r)
 	next(sink, r)
 	b, err := sink.GetWrittenBytes()
-	committed := sink.GetCommittedHeaders()
-	out := bufferedJsonRpcResponse{
-		StatusCode:    sink.GetStatusCode(),
-		Headers:       committed,
-		SharedHeaders: pickSharedResponseHeaders(committed),
-		RawBody:       append([]byte(nil), b...),
-		Owner:         owner,
-	}
+	out := bufferedJsonRpcResponse{Owner: owner}
 	if stats := RequestStatsFromCtx(r.Context()); stats != nil {
 		out.Upstream = stats.Upstream
 	}
 	if err != nil {
 		return out, err
 	}
+	committed := sink.GetCommittedHeaders()
+	out.StatusCode = sink.GetStatusCode()
+	out.Headers = committed
+	out.SharedHeaders = pickSharedResponseHeaders(committed)
+	out.RawBody = b
 	res, _, perr := ParseJsonRpcMessage(b)
 	if perr != nil || res == nil {
 		if perr != nil {
@@ -1427,7 +1430,7 @@ func (h *JsonRpcHandler) getResponsesFromUpstream(httpRequest *http.Request, req
 	// httptest.ResponseRecorder buffers everything first). 32 MiB is
 	// generous for any legitimate Cosmos / EVM batch response. Mirrors
 	// the inbound http.MaxBytesReader guard on the response side.
-	const maxUpstreamBatchResponse = 32 << 20
+	const maxUpstreamBatchResponse = maxUpstreamResponseCaptureBytes
 	w := newCappedResponseWriter(maxUpstreamBatchResponse)
 	next(w, req)
 	if w.overflowed {

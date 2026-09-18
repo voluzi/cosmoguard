@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -138,21 +139,68 @@ func (r reusableReader) reset() {
 
 type ResponseWriterWrapper struct {
 	http.ResponseWriter
-	buf              *bytes.Buffer
-	multi            io.Writer
+	buf              *responseCaptureBuffer
 	statusCode       int
 	committedHeaders http.Header // snapshot taken at WriteHeader / first Write
 	commitHeaders    http.Header
+	overflowed       bool
+	captureDone      bool
+	captureErr       error
 }
 
+const maxUpstreamResponseCaptureBytes = 32 << 20
+
+var errResponseCaptureTooLarge = errors.New("upstream response capture too large")
+
 func WrapResponseWriter(w http.ResponseWriter) *ResponseWriterWrapper {
-	buffer := &bytes.Buffer{}
-	multi := io.MultiWriter(buffer, w)
+	return newResponseWriterWrapper(w, maxUpstreamResponseCaptureBytes)
+}
+
+func newResponseWriterWrapper(w http.ResponseWriter, limit int) *ResponseWriterWrapper {
 	return &ResponseWriterWrapper{
 		ResponseWriter: w,
-		buf:            buffer,
-		multi:          multi,
+		buf:            &responseCaptureBuffer{limit: limit},
 	}
+}
+
+type responseCaptureBuffer struct {
+	data  []byte
+	limit int
+}
+
+func (b *responseCaptureBuffer) Bytes() []byte { return b.data }
+func (b *responseCaptureBuffer) Len() int      { return len(b.data) }
+func (b *responseCaptureBuffer) Cap() int      { return cap(b.data) }
+
+func (b *responseCaptureBuffer) canAppend(n int) bool {
+	return n <= b.limit-len(b.data)
+}
+
+func (b *responseCaptureBuffer) append(p []byte) {
+	newLen := len(b.data) + len(p)
+	if newLen > cap(b.data) {
+		newCap := cap(b.data) * 2
+		if newCap < newLen {
+			newCap = newLen
+		}
+		if newCap > b.limit {
+			newCap = b.limit
+		}
+		grown := make([]byte, len(b.data), newCap)
+		copy(grown, b.data)
+		b.data = grown
+	}
+	previousLen := len(b.data)
+	b.data = b.data[:newLen]
+	copy(b.data[previousLen:], p)
+}
+
+func (b *responseCaptureBuffer) release() { b.data = nil }
+
+func (b *responseCaptureBuffer) take() []byte {
+	data := b.data
+	b.data = nil
+	return data
 }
 
 func (w *ResponseWriterWrapper) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -173,7 +221,29 @@ func (w *ResponseWriterWrapper) Write(p []byte) (int, error) {
 		w.applyCommitHeaders()
 		w.snapshotHeaders()
 	}
-	return w.multi.Write(p)
+	if !w.captureDone && !w.overflowed && w.captureErr == nil && !w.buf.canAppend(len(p)) {
+		w.overflowed = true
+		w.buf.release()
+	}
+	n, err := w.ResponseWriter.Write(p)
+	if w.captureDone || w.overflowed || w.captureErr != nil {
+		return n, err
+	}
+	if n > 0 {
+		captured := n
+		if captured > len(p) {
+			captured = len(p)
+		}
+		w.buf.append(p[:captured])
+	}
+	if err != nil {
+		w.captureErr = err
+		w.buf.release()
+	} else if n != len(p) {
+		w.captureErr = io.ErrShortWrite
+		w.buf.release()
+	}
+	return n, err
 }
 
 func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
@@ -199,8 +269,18 @@ func (w *ResponseWriterWrapper) GetStatusCode() int {
 	return w.statusCode
 }
 
+// GetWrittenBytes transfers ownership of the captured response bytes to the
+// caller. Call it only after upstream execution has finished; subsequent
+// writes continue downstream but are not added to the returned slice.
 func (w *ResponseWriterWrapper) GetWrittenBytes() ([]byte, error) {
-	return io.ReadAll(w.buf)
+	if w.overflowed {
+		return nil, errResponseCaptureTooLarge
+	}
+	if w.captureErr != nil {
+		return nil, w.captureErr
+	}
+	w.captureDone = true
+	return w.buf.take(), nil
 }
 
 // GetCommittedHeaders returns the header set as it was the moment the
