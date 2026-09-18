@@ -23,6 +23,7 @@ func TestClusterRuntimeEmbeddedStartStop(t *testing.T) {
 	cr, err := newClusterRuntime(clusterRuntimeOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, cr.Client())
+	require.Nil(t, cr.peerAPIKey)
 
 	// Smoke: a DMap should be obtainable from the embedded client.
 	dm, err := cr.Client().NewDMap("smoke")
@@ -88,6 +89,9 @@ func TestClusterRuntimeTwoNodeStaticDiscovery(t *testing.T) {
 	}
 
 	a := newNode(bindA, gossipA)
+	decodedKey, err := DecodeClusterEncryptionKey(testClusterEncryptionKey)
+	require.NoError(t, err)
+	require.Equal(t, derivePeerAPIKey(decodedKey), a.peerAPIKey)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

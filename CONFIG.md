@@ -212,7 +212,9 @@ cache:
         refreshInterval: 10s
 ```
 
-**`encryptionKey` is required in cluster mode.** It enables memberlist gossip encryption + peer authentication (AES-128/192/256-GCM) AND password authentication on olric's RESP data port, so both the gossip plane and the data plane require the shared secret. Without it, any host that can reach the peer ports could join the cluster and read/write the shared DMaps (rate-limit buckets, cache, JWT replay set). Generate one with `head -c32 /dev/urandom | base64` and give **every pod the same value** (from a Kubernetes Secret). Still restrict the peer ports at the network layer (NetworkPolicy) — the key is defence-in-depth, not a substitute.
+**`encryptionKey` is required in cluster mode.** It enables memberlist gossip encryption + peer authentication (AES-128/192/256-GCM), password authentication on olric's RESP data port, and a derived HMAC key for dashboard peer-API requests. Peer-API signatures use `X-Cosmoguard-Peer-Timestamp` and `X-Cosmoguard-Peer-Signature` and cover the timestamp, method, authority, path, and raw query. They are accepted for 30 seconds before or after the receiver's clock to tolerate ordinary pod clock skew, so a signed request can be replayed within that window. The HMAC authenticates requests but does **not** encrypt the peer API, so NetworkPolicy remains its confidentiality boundary. Generate the shared key with `head -c32 /dev/urandom | base64` and give **every pod the same value** from a Kubernetes Secret.
+
+Peer fan-out has no unsigned compatibility mode. During a rolling upgrade between versions that do and do not sign peer requests, cluster dashboard panels can show partial data until every pod runs the same version; the public dashboard and proxy traffic continue to operate normally.
 
 #### Discovery modes
 
@@ -240,7 +242,7 @@ Bare hosts (no `:port`) are accepted — `cluster.gossipPort` is appended at run
 #### Operational notes
 
 - **TCP + UDP on `gossipPort`** — memberlist gossips over both. Operators who block UDP by reflex break cluster joins; open both protocols on the same port (`bindPort` is olric's data-replication socket and only needs TCP).
-- **Three ports per pod, not two** — `bindPort` (3320, TCP), `gossipPort` (3322, TCP + UDP) and `peerApiPort` (defaults to `bindPort + 1` → 3321, TCP) all need to be reachable pod-to-pod. The peer-API listener is what the dashboard fan-out aggregator calls on its siblings; default-deny `NetworkPolicy` setups must allow it explicitly. Restricted by an IP allowlist built from the current memberlist roster, so it is never internet-facing even when exposed to the pod network.
+- **Three ports per pod, not two** — `bindPort` (3320, TCP), `gossipPort` (3322, TCP + UDP) and `peerApiPort` (defaults to `bindPort + 1` → 3321, TCP) all need to be reachable pod-to-pod. The peer-API listener is what the dashboard fan-out aggregator calls on its siblings; default-deny `NetworkPolicy` setups must allow it explicitly. It requires a valid key-derived HMAC and either a source IP in the current memberlist roster or a loopback source. Keep it pod-network-only because the HMAC authenticates but does not encrypt its HTTP traffic.
 - **RF=2 default** — every partition has one primary + one replica. Survives a single-pod restart cleanly. Survives a single-pod permanent loss with re-balancing.
 - **2 vs 3 replicas** — both supported.
   - **3 replicas** *(recommended)*: RF=2, quorum=2, textbook no-split-brain configuration.
@@ -335,6 +337,7 @@ cache:
     bindPort: 3320
     gossipPort: 3322
     replicaCount: 2
+    encryptionKey: "${CLUSTER_KEY}"
     discovery:
       mode: dns
       dns:

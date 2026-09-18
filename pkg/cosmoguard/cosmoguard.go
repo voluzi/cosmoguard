@@ -62,9 +62,9 @@ type CosmoGuard struct {
 	// peerApiServer is the internal HTTP listener every cluster pod
 	// runs so its peers can read THIS pod's local /api/v1/<resource>
 	// state for fan-out aggregation. nil in embedded-only (single-
-	// instance) mode. Restricted by network — see peerMembershipGate
-	// in dashboard_cluster.go — and never auth-gated, never internet-
-	// facing.
+	// instance) mode. Protected by peer HMAC authentication and the
+	// memberlist source-IP gate in dashboard_cluster.go; NetworkPolicy
+	// remains the transport-confidentiality boundary.
 	peerApiServer *http.Server
 
 	// tracingShutdown is the OpenTelemetry tracer-provider shutdown

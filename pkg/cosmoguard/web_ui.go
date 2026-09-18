@@ -94,8 +94,8 @@ func installDashboardRoutes(mux *http.ServeMux, cg *CosmoGuard, basicAuthUser, b
 // that return THIS pod's local state. Shared between the public
 // dashboard (where each route is auth-gated and composed with static
 // UI + cluster fan-outs) and the internal peer-API listener (where
-// auth is by network — see peerMembershipGate in dashboard_cluster.go
-// — and no static / cluster routes are mounted).
+// peer HMAC and membership gates are applied outside this function
+// and no static / cluster routes are mounted).
 func installLocalAPIRoutes(mux *http.ServeMux, cg *CosmoGuard, gate func(http.Handler) http.Handler, apiBase string) {
 	mux.Handle(apiBase+"/upstreams", gate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, listUpstreams(cg))
