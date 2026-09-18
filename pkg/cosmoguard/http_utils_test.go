@@ -116,6 +116,101 @@ func TestResponseWriterWrapper(t *testing.T) {
 	})
 }
 
+type recordedHeaderWrite struct {
+	status  int
+	headers http.Header
+}
+
+type informationalResponseRecorder struct {
+	header       http.Header
+	headerWrites []recordedHeaderWrite
+	body         bytes.Buffer
+	committed    bool
+}
+
+func newInformationalResponseRecorder() *informationalResponseRecorder {
+	return &informationalResponseRecorder{header: make(http.Header)}
+}
+
+func (w *informationalResponseRecorder) Header() http.Header { return w.header }
+
+func (w *informationalResponseRecorder) WriteHeader(status int) {
+	w.headerWrites = append(w.headerWrites, recordedHeaderWrite{status: status, headers: w.header.Clone()})
+	if status == http.StatusSwitchingProtocols || status >= http.StatusOK {
+		w.committed = true
+	}
+}
+
+func (w *informationalResponseRecorder) Write(p []byte) (int, error) {
+	if !w.committed {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.body.Write(p)
+}
+
+func TestResponseWriterWrapperInformationalResponseDoesNotCommit(t *testing.T) {
+	recorder := newInformationalResponseRecorder()
+	wrapper := WrapResponseWriter(recorder)
+	wrapper.setHeaderOnCommit(cacheStateHeader, cacheMiss)
+	wrapper.Header().Set("X-Upstream-Phase", "informational")
+
+	wrapper.WriteHeader(http.StatusEarlyHints)
+
+	assert.Equal(t, wrapper.GetStatusCode(), 0)
+	assert.Assert(t, wrapper.GetCommittedHeaders() == nil)
+	assert.Equal(t, recorder.headerWrites[0].status, http.StatusEarlyHints)
+	assert.Equal(t, recorder.headerWrites[0].headers.Get(cacheStateHeader), "")
+
+	wrapper.Header().Set("X-Upstream-Phase", "final")
+	wrapper.Header().Set("Cache-Control", "no-store")
+	wrapper.WriteHeader(http.StatusCreated)
+
+	assert.Equal(t, wrapper.GetStatusCode(), http.StatusCreated)
+	assert.DeepEqual(t, []int{recorder.headerWrites[0].status, recorder.headerWrites[1].status}, []int{http.StatusEarlyHints, http.StatusCreated})
+	assert.Equal(t, recorder.headerWrites[1].headers.Get(cacheStateHeader), cacheMiss)
+	assert.Equal(t, wrapper.GetCommittedHeaders().Get("X-Upstream-Phase"), "final")
+	assert.Equal(t, wrapper.GetCommittedHeaders().Get("Cache-Control"), "no-store")
+}
+
+func TestResponseWriterWrapperWriteAfterInformationalCommitsImplicitOK(t *testing.T) {
+	recorder := newInformationalResponseRecorder()
+	wrapper := WrapResponseWriter(recorder)
+	wrapper.WriteHeader(http.StatusContinue)
+	wrapper.Header().Set("X-Upstream-Phase", "final")
+
+	n, err := wrapper.Write([]byte("ok"))
+
+	assert.NilError(t, err)
+	assert.Equal(t, n, 2)
+	assert.Equal(t, wrapper.GetStatusCode(), http.StatusOK)
+	assert.Equal(t, wrapper.GetCommittedHeaders().Get("X-Upstream-Phase"), "final")
+	assert.DeepEqual(t, []int{recorder.headerWrites[0].status, recorder.headerWrites[1].status}, []int{http.StatusContinue, http.StatusOK})
+}
+
+func TestResponseWriterWrapperKeepsFirstFinalResponse(t *testing.T) {
+	recorder := newInformationalResponseRecorder()
+	wrapper := WrapResponseWriter(recorder)
+	wrapper.Header().Set("X-Upstream-Phase", "first")
+	wrapper.WriteHeader(http.StatusCreated)
+	wrapper.Header().Set("X-Upstream-Phase", "second")
+
+	wrapper.WriteHeader(http.StatusAccepted)
+
+	assert.Equal(t, wrapper.GetStatusCode(), http.StatusCreated)
+	assert.Equal(t, wrapper.GetCommittedHeaders().Get("X-Upstream-Phase"), "first")
+}
+
+func TestResponseWriterWrapperSwitchingProtocolsIsFinal(t *testing.T) {
+	recorder := newInformationalResponseRecorder()
+	wrapper := WrapResponseWriter(recorder)
+	wrapper.Header().Set("Upgrade", "websocket")
+	wrapper.WriteHeader(http.StatusSwitchingProtocols)
+	wrapper.WriteHeader(http.StatusOK)
+
+	assert.Equal(t, wrapper.GetStatusCode(), http.StatusSwitchingProtocols)
+	assert.Equal(t, wrapper.GetCommittedHeaders().Get("Upgrade"), "websocket")
+}
+
 // withTrustAll temporarily configures the package-level
 // trustedProxies allowlist to "trust everyone" for the duration of
 // the calling test, then restores the previous allowlist. Tests that
