@@ -137,9 +137,8 @@ config:
     # ttl: 5s
     cluster:
       # Default ON: cosmoguard runs as a networked olric cluster. The chart
-      # auto-wires everything a standard Kubernetes install needs — ${POD_IP}
-      # bind addr, DNS discovery via the headless peer Service, and a
-      # generated+persisted gossip key (cluster.generateEncryptionKey, below).
+      # wires ${POD_IP} as the bind addr and DNS discovery through the headless
+      # peer Service. Supply a stable shared key under `cluster:` below.
       # A single replica works and performs identically to embedded loopback,
       # so this is safe even for one-pod installs; scale up (or enable HPA) and
       # every replica shares one olric store. Memory note: a one-pod cluster
@@ -179,13 +178,19 @@ config:
   grpc:
     default: deny
 
-# Use an existing ConfigMap instead of templating one from `config:` above.
-# Useful when you manage cosmoguard.yaml outside Helm (e.g. ArgoCD).
+# Use an existing ConfigMap instead of templating cosmoguard.yaml from `config:`.
+# In cluster mode the external file must reference
+# cache.cluster.encryptionKey: "${CLUSTER_ENCRYPTION_KEY}" and use one of the
+# supported environment sources documented below. The chart still reads
+# config.cache.cluster to render cluster resources; keep both configurations
+# consistent.
 existingConfigMap: ""
 
 # Use an existing Secret as the source of env vars for the container —
 # the standard pattern for ${VAR} interpolated secrets in `config:`.
 # The Secret must define the env var names cosmoguard.yaml references.
+# With existingConfigMap in cluster mode it must include
+# CLUSTER_ENCRYPTION_KEY unless a dedicated cluster Secret is configured.
 existingSecret: ""
 
 # Inline env vars added to the container. Combine with existingSecret
@@ -195,12 +200,11 @@ env: {}
 
 # Cluster gossip/data encryption key wiring. Cluster mode
 # (config.cache.cluster.enable: true — the default) needs a shared key across
-# every replica. By DEFAULT the chart generates one and persists it
-# (cluster.generateEncryptionKey below, minted once and reused via lookup,
-# resource-policy: keep). CAVEAT: client-side / GitOps rendering (helm template,
-# Argo CD without cluster access) can't look up the existing Secret and would
-# mint a different key each sync, partitioning the cluster — there, supply one
-# of the two below instead (every replica must share the same value):
+# every replica. Provision a Secret once and set
+# `cluster.existingEncryptionKeySecret` for deterministic client-side and GitOps
+# rendering. Inline values remain available for chart-rendered configuration,
+# but put the key in the rendered ConfigMap. Every replica must share the same
+# value.
 cluster:
   # RECOMMENDED: reference a pre-created Secret with a base64-encoded
   # `encryptionKey` data field (16/24/32 bytes). Create it once with e.g.:
@@ -210,19 +214,16 @@ cluster:
   # Alternatively provide the key inline (base64-encoded 16/24/32 bytes). NOT
   # recommended — it lands in the rendered ConfigMap in cleartext.
   encryptionKey: ""
-  # When neither encryptionKey nor existingEncryptionKeySecret is set and
-  # cluster mode is on, the chart generates a random 32-byte key into a
-  # Secret named `<fullname>-cluster-key` and wires every pod to it. The key
-  # is generated ONCE and reused across upgrades via a cluster `lookup`, and
-  # the Secret is annotated `helm.sh/resource-policy: keep` so it survives a
-  # `helm uninstall` — a fresh key would partition a running cluster.
+  # Opt-in server-side Helm convenience: when no supplied key takes precedence,
+  # generate a random 32-byte key in `<fullname>-cluster-key` and wire every pod
+  # to it. A cluster `lookup` reuses the key across upgrades, and the Secret's
+  # `helm.sh/resource-policy: keep` annotation preserves it on uninstall.
   #
-  # CAVEAT (GitOps): `helm template` / client-side rendering cannot `lookup`
-  # the existing Secret, so it re-generates on every render and would churn
-  # the key across syncs. If you render client-side (Argo CD/Flux `helm
-  # template` mode), set generateEncryptionKey: false and supply
-  # existingEncryptionKeySecret instead.
-  generateEncryptionKey: true
+  # `helm template`, client-side dry runs, and Argo CD cannot use `lookup`, so
+  # this option produces a new key on every render. Use
+  # existingEncryptionKeySecret for those workflows. Flux helm-controller
+  # performs server-side Helm installs, where lookup is available.
+  generateEncryptionKey: false
 
 serviceAccount:
   create: true
