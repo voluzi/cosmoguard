@@ -349,6 +349,7 @@ case_generation_with_existing_secret() {
     --set-string existingSecret=app-environment &&
     assert_deterministic "${prefix}" &&
     assert_resource_absent "${tmp_dir}/${prefix}-a.yaml" Secret "${GENERATED_SECRET}" &&
+    assert_rendered_config_key "${tmp_dir}/${prefix}-a.yaml" '${CLUSTER_ENCRYPTION_KEY}' &&
     assert_env_from_secret "${tmp_dir}/${prefix}-a.yaml" "${kind}" app-environment &&
     assert_no_key_env "${tmp_dir}/${prefix}-a.yaml" "${kind}"
 }
@@ -361,6 +362,19 @@ case_generation_with_plain_env() {
     --set-string "env.CLUSTER_ENCRYPTION_KEY=${FIXTURE_KEY}" &&
     assert_deterministic "${prefix}" &&
     assert_resource_absent "${tmp_dir}/${prefix}-a.yaml" Secret "${GENERATED_SECRET}" &&
+    assert_rendered_config_key "${tmp_dir}/${prefix}-a.yaml" '${CLUSTER_ENCRYPTION_KEY}' &&
+    assert_plain_key_env "${tmp_dir}/${prefix}-a.yaml" "${kind}" "${FIXTURE_KEY}"
+}
+
+case_plain_env_with_dedicated_secret() {
+  local kind=$1
+  local prefix="${kind}-plain-env-dedicated-secret"
+  render_pair "${prefix}" "${kind}" \
+    --set-string cluster.existingEncryptionKeySecret=shared-cluster-key \
+    --set-string "env.CLUSTER_ENCRYPTION_KEY=${FIXTURE_KEY}" &&
+    assert_deterministic "${prefix}" &&
+    assert_resource_absent "${tmp_dir}/${prefix}-a.yaml" Secret "${GENERATED_SECRET}" &&
+    assert_rendered_config_key "${tmp_dir}/${prefix}-a.yaml" '${CLUSTER_ENCRYPTION_KEY}' &&
     assert_plain_key_env "${tmp_dir}/${prefix}-a.yaml" "${kind}" "${FIXTURE_KEY}"
 }
 
@@ -402,6 +416,7 @@ for kind in StatefulSet Deployment; do
   run_case "${kind}: inline key wins over generation" case_generation_with_inline "${kind}"
   run_case "${kind}: existingSecret wins over generation" case_generation_with_existing_secret "${kind}"
   run_case "${kind}: explicit environment key wins over generation" case_generation_with_plain_env "${kind}"
+  run_case "${kind}: explicit environment key wins over dedicated Secret" case_plain_env_with_dedicated_secret "${kind}"
   run_case "${kind}: disabled cluster needs no key" case_cluster_disabled "${kind}"
   run_case "${kind}: disabled cluster accepts external ConfigMap" case_cluster_disabled "${kind}" external
 done

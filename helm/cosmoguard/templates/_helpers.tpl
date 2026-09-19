@@ -251,12 +251,16 @@ self-generated cluster encryption key.
 clusterKeySecretName — name of the Secret to wire CLUSTER_ENCRYPTION_KEY
 from, or empty. Empty when a chart-managed key is inlined or when cluster
 mode is off. Precedence for chart-rendered config: inline key (no env) >
-existingEncryptionKeySecret > chart-generated Secret. External ConfigMaps
-ignore inline chart values, so a dedicated Secret reference remains effective.
+env.CLUSTER_ENCRYPTION_KEY > existingEncryptionKeySecret > chart-generated
+Secret. External ConfigMaps ignore inline chart values, so their precedence
+starts with the explicit environment key.
 */}}
 {{- define "cosmoguard.clusterKeySecretName" -}}
 {{- $cluster := .Values.cluster | default (dict) -}}
+{{- $env := .Values.env | default (dict) -}}
+{{- $explicitEnvKey := dig "CLUSTER_ENCRYPTION_KEY" "" $env -}}
 {{- if include "cosmoguard.clusterInlineKey" . -}}
+{{- else if $explicitEnvKey -}}
 {{- else if $cluster.existingEncryptionKeySecret -}}
 {{- $cluster.existingEncryptionKeySecret -}}
 {{- else if eq (include "cosmoguard.shouldGenerateKey" .) "true" -}}

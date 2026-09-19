@@ -110,7 +110,10 @@ For either a chart-rendered or external ConfigMap, `existingSecret` can supply
 the interpolation environment and must contain a `CLUSTER_ENCRYPTION_KEY`
 field. `env.CLUSTER_ENCRYPTION_KEY` is also accepted, but exposes the key in
 Helm values and the rendered workload manifest. Both environment-backed
-sources take precedence over `cluster.generateEncryptionKey=true`.
+sources take precedence over `cluster.generateEncryptionKey=true`; an explicit
+`env.CLUSTER_ENCRYPTION_KEY` also takes precedence over
+`cluster.existingEncryptionKeySecret` so the workload never receives duplicate
+environment entries.
 
 ### External ConfigMap key wiring
 

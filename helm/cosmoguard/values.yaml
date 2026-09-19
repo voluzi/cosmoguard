@@ -196,7 +196,8 @@ existingSecret: ""
 # Inline env vars added to the container. Combine with existingSecret
 # above when you have a mix of plaintext and secret env vars. Setting
 # env.CLUSTER_ENCRYPTION_KEY works with either ConfigMap path but exposes the
-# key in Helm values and the rendered workload manifest.
+# key in Helm values and the rendered workload manifest. It takes precedence
+# over cluster.existingEncryptionKeySecret when both are set.
 env: {}
   # JWT_SECRET: "..."   # don't put real secrets here; use existingSecret
 
