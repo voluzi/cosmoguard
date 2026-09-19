@@ -86,9 +86,17 @@ docker run -it --name cosmoguard \
 The repo ships a Helm chart at `helm/cosmoguard/`:
 
 ```bash
+kubectl create secret generic cosmoguard-cluster-key \
+  --from-literal=encryptionKey="$(head -c32 /dev/urandom | base64)"
+
 helm upgrade --install cosmoguard ./helm/cosmoguard \
-  --set config.nodes[0].host=cosmos-node.default.svc
+  --set config.nodes[0].host=cosmos-node.default.svc \
+  --set cluster.existingEncryptionKeySecret=cosmoguard-cluster-key
 ```
+
+Create the shared key Secret once; do not regenerate it on each deploy. The
+Secret and Helm release must use the same namespace (both commands above use
+`default`).
 
 See `helm/cosmoguard/README.md` for cluster-mode + HPA setup.
 
