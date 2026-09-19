@@ -266,6 +266,26 @@ case_external_plain_env() {
     assert_resource_absent "${output}" Secret "${GENERATED_SECRET}"
 }
 
+case_managed_existing_secret() {
+  local kind=$1
+  local output="${tmp_dir}/${kind}-managed-existing-secret.yaml"
+  render "${output}" "${kind}" --set-string existingSecret=app-environment &&
+    assert_rendered_config_key "${output}" '${CLUSTER_ENCRYPTION_KEY}' &&
+    assert_env_from_secret "${output}" "${kind}" app-environment &&
+    assert_no_key_env "${output}" "${kind}" &&
+    assert_resource_absent "${output}" Secret "${GENERATED_SECRET}"
+}
+
+case_managed_plain_env() {
+  local kind=$1
+  local output="${tmp_dir}/${kind}-managed-plain-env.yaml"
+  render "${output}" "${kind}" \
+    --set-string "env.CLUSTER_ENCRYPTION_KEY=${FIXTURE_KEY}" &&
+    assert_rendered_config_key "${output}" '${CLUSTER_ENCRYPTION_KEY}' &&
+    assert_plain_key_env "${output}" "${kind}" "${FIXTURE_KEY}" &&
+    assert_resource_absent "${output}" Secret "${GENERATED_SECRET}"
+}
+
 case_inline_key() {
   local kind=$1
   local source=$2
@@ -349,6 +369,8 @@ for kind in StatefulSet Deployment; do
     case_external_dedicated_secret "${kind}" --set-string "cluster.encryptionKey=${FIXTURE_KEY}"
   run_case "${kind}: external ConfigMap plus existingSecret" case_external_existing_secret "${kind}"
   run_case "${kind}: external ConfigMap plus explicit environment key" case_external_plain_env "${kind}"
+  run_case "${kind}: managed ConfigMap plus existingSecret" case_managed_existing_secret "${kind}"
+  run_case "${kind}: managed ConfigMap plus explicit environment key" case_managed_plain_env "${kind}"
   run_case "${kind}: top-level inline key remains supported" case_inline_key "${kind}" cluster.encryptionKey
   run_case "${kind}: config inline key remains supported" case_inline_key "${kind}" config.cache.cluster.encryptionKey
   run_case "${kind}: config inline key keeps precedence" case_inline_precedence "${kind}"

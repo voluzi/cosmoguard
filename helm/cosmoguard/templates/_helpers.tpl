@@ -145,14 +145,14 @@ mismatch, peerService disabled without cluster.enable=false).
 {{- fail "cosmoguard: config.cache.cluster.enable=true requires config.cache.cluster.discovery.mode (use \"dns\" with the chart's headless peer service in Kubernetes)" -}}
 {{- end -}}
 {{- $cluster := .Values.cluster | default (dict) -}}
-{{- if .Values.existingConfigMap -}}
 {{- $env := .Values.env | default (dict) -}}
 {{- $explicitEnvKey := dig "CLUSTER_ENCRYPTION_KEY" "" $env -}}
+{{- if .Values.existingConfigMap -}}
 {{- if and (not $cluster.existingEncryptionKeySecret) (not .Values.existingSecret) (not $explicitEnvKey) -}}
 {{- fail "cosmoguard: existingConfigMap requires CLUSTER_ENCRYPTION_KEY wiring when cluster mode is enabled — set cluster.existingEncryptionKeySecret (Secret field `encryptionKey`), set existingSecret (must contain `CLUSTER_ENCRYPTION_KEY`), or set env.CLUSTER_ENCRYPTION_KEY; the external cosmoguard.yaml must use cache.cluster.encryptionKey: \"${CLUSTER_ENCRYPTION_KEY}\". cluster.encryptionKey, config.cache.cluster.encryptionKey, and cluster.generateEncryptionKey only affect chart-managed configuration and cannot supply an external ConfigMap" -}}
 {{- end -}}
-{{- else if and (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) (ne (include "cosmoguard.shouldGenerateKey" .) "true") -}}
-{{- fail "cosmoguard: cluster mode requires an encryption key — set cluster.existingEncryptionKeySecret (recommended: a pre-created Secret with an `encryptionKey` field), set cluster.encryptionKey, or enable cluster.generateEncryptionKey (the chart mints a Secret once and reuses it via lookup). generateEncryptionKey is unsafe under client-side / GitOps rendering, which cannot lookup the existing Secret and would silently partition the cluster across syncs — supply existingEncryptionKeySecret there. Generate one manually with: kubectl create secret generic cosmoguard-cluster --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)" -}}
+{{- else if and (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) (not .Values.existingSecret) (not $explicitEnvKey) (ne (include "cosmoguard.shouldGenerateKey" .) "true") -}}
+{{- fail "cosmoguard: cluster mode requires an encryption key — set cluster.existingEncryptionKeySecret (recommended: a pre-created Secret with an `encryptionKey` field), set existingSecret or env.CLUSTER_ENCRYPTION_KEY, set cluster.encryptionKey, or enable cluster.generateEncryptionKey (the chart mints a Secret once and reuses it via lookup). generateEncryptionKey is unsafe under client-side / GitOps rendering, which cannot lookup the existing Secret and would silently partition the cluster across syncs — supply existingEncryptionKeySecret there. Generate one manually with: kubectl create secret generic cosmoguard-cluster --from-literal=encryptionKey=$(head -c32 /dev/urandom | base64)" -}}
 {{- end -}}
 {{- if eq $mode "static" -}}
 {{- $peers := dig "discovery" "static" "peers" (list) $c -}}
