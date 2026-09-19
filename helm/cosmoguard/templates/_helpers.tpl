@@ -227,12 +227,14 @@ into the config and no env reference or generated Secret is used.
 {{/*
 shouldGenerateKey — "true" when the chart must mint a cluster encryption key
 Secret itself: cluster mode is on, the config is chart-rendered (not an
-externally-managed ConfigMap), the operator supplied neither an inline key
-nor an existing Secret, and cluster.generateEncryptionKey is enabled.
+externally-managed ConfigMap), the operator supplied no inline or environment
+key source, and cluster.generateEncryptionKey is enabled.
 */}}
 {{- define "cosmoguard.shouldGenerateKey" -}}
 {{- $cluster := .Values.cluster | default (dict) -}}
-{{- if and (eq (include "cosmoguard.clusterEnabled" .) "true") (not .Values.existingConfigMap) (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) (dig "generateEncryptionKey" false $cluster) -}}
+{{- $env := .Values.env | default (dict) -}}
+{{- $explicitEnvKey := dig "CLUSTER_ENCRYPTION_KEY" "" $env -}}
+{{- if and (eq (include "cosmoguard.clusterEnabled" .) "true") (not .Values.existingConfigMap) (not (include "cosmoguard.clusterInlineKey" .)) (not $cluster.existingEncryptionKeySecret) (not .Values.existingSecret) (not $explicitEnvKey) (dig "generateEncryptionKey" false $cluster) -}}
 true
 {{- end -}}
 {{- end -}}

@@ -106,6 +106,12 @@ Inline `cluster.encryptionKey` and
 `config.cache.cluster.encryptionKey` remain supported when the chart renders
 the ConfigMap, but the value is then visible in that ConfigMap.
 
+For either a chart-rendered or external ConfigMap, `existingSecret` can supply
+the interpolation environment and must contain a `CLUSTER_ENCRYPTION_KEY`
+field. `env.CLUSTER_ENCRYPTION_KEY` is also accepted, but exposes the key in
+Helm values and the rendered workload manifest. Both environment-backed
+sources take precedence over `cluster.generateEncryptionKey=true`.
+
 ### External ConfigMap key wiring
 
 When `existingConfigMap` is set, its `cosmoguard.yaml` must consume the standard

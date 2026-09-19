@@ -189,12 +189,14 @@ existingConfigMap: ""
 # Use an existing Secret as the source of env vars for the container —
 # the standard pattern for ${VAR} interpolated secrets in `config:`.
 # The Secret must define the env var names cosmoguard.yaml references.
-# With existingConfigMap in cluster mode it must include
-# CLUSTER_ENCRYPTION_KEY unless a dedicated cluster Secret is configured.
+# When selected as the cluster key source, with either a chart-rendered or
+# external ConfigMap, it must include CLUSTER_ENCRYPTION_KEY.
 existingSecret: ""
 
 # Inline env vars added to the container. Combine with existingSecret
-# above when you have a mix of plaintext and secret env vars.
+# above when you have a mix of plaintext and secret env vars. Setting
+# env.CLUSTER_ENCRYPTION_KEY works with either ConfigMap path but exposes the
+# key in Helm values and the rendered workload manifest.
 env: {}
   # JWT_SECRET: "..."   # don't put real secrets here; use existingSecret
 
