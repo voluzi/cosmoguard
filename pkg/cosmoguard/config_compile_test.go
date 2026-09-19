@@ -441,8 +441,7 @@ lcd:
 	t.Cleanup(func() { _ = cg.Shutdown(t.Context()) })
 
 	go func() { _ = cg.WatchConfigFile() }()
-	// Let the watcher install before we generate events.
-	time.Sleep(100 * time.Millisecond)
+	waitForConfigWatcher(t, cg, tmpDir)
 
 	// currentCfg reads cg.cfg under the same mutex tryReload writes
 	// under. Plain reads would race against the watcher goroutine.
@@ -461,7 +460,10 @@ lcd:
 		assert.NilError(t, os.WriteFile(sibling, []byte("x"), 0644))
 		assert.NilError(t, os.Remove(sibling))
 	}
-	time.Sleep(150 * time.Millisecond)
+	dataSibling := filepath.Join(tmpDir, "..data")
+	assert.NilError(t, os.WriteFile(dataSibling, []byte("not a projected volume"), 0644))
+	assert.NilError(t, os.Remove(dataSibling))
+	time.Sleep(350 * time.Millisecond)
 
 	assert.Equal(t, currentCfg(), originalCfgPtr,
 		"sibling-file churn must not trigger a config reload")

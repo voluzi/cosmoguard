@@ -867,6 +867,7 @@ func (f *CosmoGuard) WatchConfigFile() error {
 	// the config in a busy directory like /tmp turns into a reload storm
 	// (one per neighbouring temp file). Match on the cleaned target path.
 	target := filepath.Clean(f.cfgFile)
+	dataLink := filepath.Join(filepath.Dir(target), "..data")
 	// Debounce window: a single save typically emits multiple events
 	// (Write+Chmod on plain saves, Create+Rename+Remove on atomic-save
 	// editors like vim/VS Code). Without coalescing them, the first
@@ -888,7 +889,8 @@ func (f *CosmoGuard) WatchConfigFile() error {
 			if !ok {
 				return fmt.Errorf("config watcher events channel closed")
 			}
-			if filepath.Clean(ev.Name) != target {
+			eventPath := filepath.Clean(ev.Name)
+			if eventPath != target && (eventPath != dataLink || !usesAtomicWriterDataLink(target)) {
 				continue
 			}
 			// (Re)arm the debounce timer instead of reloading
@@ -913,6 +915,18 @@ func (f *CosmoGuard) WatchConfigFile() error {
 			slog.Warn("config watcher transient error; continuing", "error", err)
 		}
 	}
+}
+
+func usesAtomicWriterDataLink(target string) bool {
+	link, err := os.Readlink(target)
+	if err != nil {
+		return false
+	}
+	if filepath.Clean(link) != filepath.Join("..data", filepath.Base(target)) {
+		return false
+	}
+	_, err = os.Stat(target)
+	return err == nil
 }
 
 // tryReload re-reads and re-applies the config file. On failure the previous
