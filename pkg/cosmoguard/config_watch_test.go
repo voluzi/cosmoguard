@@ -77,6 +77,31 @@ func currentReloadStatus(cg *CosmoGuard) ReloadStatus {
 	return listReloadStatus(cg)["reload"].(ReloadStatus)
 }
 
+func assertNoReloadFor(t *testing.T, cg *CosmoGuard, previous ReloadStatus, duration time.Duration) {
+	t.Helper()
+
+	assertUnchanged := func() {
+		status := currentReloadStatus(cg)
+		if status.TimestampMs != previous.TimestampMs {
+			t.Fatalf("unexpected config reload: before=%+v after=%+v", previous, status)
+		}
+	}
+	assertUnchanged()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			assertUnchanged()
+		case <-timer.C:
+			assertUnchanged()
+			return
+		}
+	}
+}
+
 func assertLCDStatus(t *testing.T, cg *CosmoGuard, want int) {
 	t.Helper()
 
@@ -142,12 +167,16 @@ func TestWatchConfigFile_ReloadsAtomicWriterPublications(t *testing.T) {
 		assert.NilError(t, os.WriteFile(noise, []byte("noise"), 0o644))
 		assert.NilError(t, os.Remove(noise))
 	}
-	time.Sleep(350 * time.Millisecond)
+	assertNoReloadFor(t, cg, ReloadStatus{}, configWatchTimeout)
 	assert.Equal(t, currentConfig(cg), originalCfg, "unrelated directory churn must not reload config")
-	assert.Equal(t, currentReloadStatus(cg).TimestampMs, int64(0), "unrelated directory churn must not attempt a reload")
 	assertLCDStatus(t, cg, http.StatusNoContent)
 
 	previousReload := currentReloadStatus(cg)
+	assert.NilError(t, os.Remove(filepath.Join(volume.dir, "..data")))
+	assertNoReloadFor(t, cg, previousReload, configWatchTimeout)
+	assert.Equal(t, currentConfig(cg), originalCfg, "removing ..data must not reload config")
+	assertLCDStatus(t, cg, http.StatusNoContent)
+
 	volume.publish(t, watchConfigYAML(header, upstream.URL, RuleActionDeny, "/policy"))
 	deniedReload := waitForReloadAfter(t, cg, previousReload.TimestampMs)
 	assert.Equal(t, deniedReload.Success, true)

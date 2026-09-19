@@ -922,7 +922,11 @@ func usesAtomicWriterDataLink(target string) bool {
 	if err != nil {
 		return false
 	}
-	return filepath.Clean(link) == filepath.Join("..data", filepath.Base(target))
+	if filepath.Clean(link) != filepath.Join("..data", filepath.Base(target)) {
+		return false
+	}
+	_, err = os.Stat(target)
+	return err == nil
 }
 
 // tryReload re-reads and re-applies the config file. On failure the previous
