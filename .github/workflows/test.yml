@@ -85,6 +85,9 @@ jobs:
       - name: cluster key render regression matrix
         run: scripts/test-helm-cluster-key.sh
 
+      - name: config reload render regression matrix
+        run: scripts/test-helm-config-reload.sh
+
       - name: cluster mode renders (generated key path)
         run: |
           helm template ci helm/cosmoguard \
