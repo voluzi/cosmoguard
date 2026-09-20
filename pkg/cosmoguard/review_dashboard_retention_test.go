@@ -2,6 +2,8 @@ package cosmoguard
 
 import (
 	"bufio"
+	"bytes"
+	stdjson "encoding/json"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -353,6 +355,54 @@ func TestBoundRetained(t *testing.T) {
 	t.Run("is idempotent", func(t *testing.T) {
 		once := boundRetained(strings.Repeat("a", 1<<20), maxRetainedMethodBytes)
 		require.Equal(t, once, boundRetained(once, maxRetainedMethodBytes))
+	})
+}
+
+// TestBoundRetainedNeverCreatesInvalidUTF8 pins the contract for input
+// that is not valid UTF-8 to begin with: the cut inherits whatever the
+// client sent and never manufactures a split rune of its own. It also
+// pins the choice not to back off over undecodable bytes — doing that
+// would make the retained length depend on how much garbage sits at
+// the tail rather than on the cap.
+func TestBoundRetainedNeverCreatesInvalidUTF8(t *testing.T) {
+	t.Run("valid input always yields valid output", func(t *testing.T) {
+		for _, fill := range []string{"a", "é", "€", "𝄞"} {
+			for max := maxRetainedMethodBytes; max < maxRetainedMethodBytes+4; max++ {
+				got := boundRetained(strings.Repeat(fill, 1<<10), max)
+				require.True(t, utf8.ValidString(got), "fill %q at limit %d", fill, max)
+				require.LessOrEqual(t, len(got), max)
+			}
+		}
+	})
+
+	t.Run("inherits invalidity, never introduces it", func(t *testing.T) {
+		// A truncated multi-byte sequence sitting before the cut: the
+		// client sent it that way.
+		s := strings.Repeat("a", 507) + "\xE2\x82" + strings.Repeat("d", 100)
+		got := boundRetained(s, maxRetainedPathBytes)
+
+		require.LessOrEqual(t, len(got), maxRetainedPathBytes)
+		require.True(t, strings.HasSuffix(got, retainedTruncationMarker))
+		// The marker's lead byte terminates any dangling sequence in
+		// front of it, so it always decodes intact.
+		r, size := utf8.DecodeLastRuneInString(got)
+		require.Equal(t, '…', r)
+		require.Equal(t, len(retainedTruncationMarker), size)
+
+		// What the operator sees is a prefix of what the full value
+		// would render: the dashboard's encoder maps each undecodable
+		// byte to U+FFFD identically in both.
+		full, err := stdjson.Marshal(s)
+		require.NoError(t, err)
+		kept, err := stdjson.Marshal(strings.TrimSuffix(got, retainedTruncationMarker))
+		require.NoError(t, err)
+		require.True(t, bytes.HasPrefix(full, kept[:len(kept)-1]), "retained value is not a prefix of the full one")
+	})
+
+	t.Run("undecodable bytes still fill the cap", func(t *testing.T) {
+		got := boundRetained(strings.Repeat("\xFF", 2*maxRetainedPathBytes), maxRetainedPathBytes)
+		require.Len(t, got, maxRetainedPathBytes,
+			"backing off over undecodable bytes would let the tail decide how much is kept")
 	})
 }
 

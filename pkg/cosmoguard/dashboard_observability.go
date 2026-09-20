@@ -26,10 +26,10 @@ import (
 // Both bound their entry count at construction, and every sink bounds
 // the length of the client-controlled strings it retains, so an
 // attacker driving arbitrary keys can't blow up the process by their
-// number or by their size. Nothing is persisted
-// across restarts — same in-memory model as the existing rate
-// limiter. The dashboard listener is auth-gated so the data here
-// (source IPs, paths, methods) is not exposed publicly.
+// number or by their size. Nothing is persisted across restarts — same
+// in-memory model as the existing rate limiter. The dashboard listener
+// is auth-gated so the data here (source IPs, paths, methods) is not
+// exposed publicly.
 
 // ReloadStatus is the JSON shape returned by /api/v1/reload-status —
 // the outcome of the most recent hot-reload attempt. Sections maps
@@ -450,8 +450,13 @@ func splitUnmatchedKey(key string) (method, path string) {
 }
 
 // boundRetained caps a client-controlled string at max bytes, marker
-// included, and never cuts a rune in half — a split rune would reach
-// the dashboard as U+FFFD once the payload is JSON-encoded.
+// included. It only ever cuts, never rewrites: for valid UTF-8 the cut
+// lands on a rune boundary, so the dashboard never shows a U+FFFD this
+// truncation created. A string that arrived as invalid UTF-8 keeps its
+// own dangling bytes — the cut neither creates nor repairs them, so an
+// operator reads a prefix of what the full value would render. The
+// marker's own lead byte terminates any dangling sequence in front of
+// it, so truncation stays visible even on pure garbage.
 //
 // Short values are copied rather than kept as-is: net/http hands out
 // Method, Path and RawQuery as slices of the one buffer holding the
