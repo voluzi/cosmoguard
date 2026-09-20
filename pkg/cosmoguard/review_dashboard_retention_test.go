@@ -305,10 +305,16 @@ func TestBoundRetained(t *testing.T) {
 	})
 
 	t.Run("never splits a rune", func(t *testing.T) {
-		// "é" is two bytes, so an odd limit lands mid-rune.
-		got := boundRetained(strings.Repeat("é", 1<<10), maxRetainedMethodBytes-1)
-		require.True(t, utf8.ValidString(got))
-		require.LessOrEqual(t, len(got), maxRetainedMethodBytes-1)
+		// The cut has to land mid-rune for the back-off to do anything:
+		// with a 3-byte rune, only a limit whose cut is not a multiple
+		// of 3 exercises it — the other two residues would pass even
+		// with the back-off deleted.
+		for _, max := range []int{maxRetainedMethodBytes, maxRetainedMethodBytes + 1, maxRetainedMethodBytes + 2} {
+			got := boundRetained(strings.Repeat("€", 1<<10), max)
+			require.True(t, utf8.ValidString(got), "limit %d cut a rune in half", max)
+			require.LessOrEqual(t, len(got), max)
+			require.True(t, strings.HasSuffix(got, retainedTruncationMarker))
+		}
 	})
 
 	t.Run("never exceeds a limit too small for the marker", func(t *testing.T) {
