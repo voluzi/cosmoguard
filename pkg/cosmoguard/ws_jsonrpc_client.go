@@ -226,6 +226,7 @@ func (c *JsonRpcWsClient) scheduleDisconnectCallback() {
 func wsNotificationSharedCost(msg *JsonRpcMsg) uint64 {
 	cost := addWSNotificationCost(jsonRpcMsgOverheadBytes, uint64(len(msg.Result)))
 	cost = addWSNotificationCost(cost, uint64(len(msg.WireSuffix)))
+	cost = addWSNotificationCost(cost, uint64(len(msg.Version)))
 	cost = addWSNotificationCost(cost, uint64(len(msg.Method)))
 	cost = addWSNotificationCost(cost, wsRetainedJSONCost(msg.Params))
 	if msg.Error != nil {

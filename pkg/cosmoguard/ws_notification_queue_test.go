@@ -287,6 +287,16 @@ func TestWSNotificationCostUsesRetainedJSONSizeAndClientID(t *testing.T) {
 	assert.Equal(t, uint64(len(largeID)-1), largeIDCost-smallIDCost)
 }
 
+func TestWSNotificationCostIncludesVersion(t *testing.T) {
+	short := &JsonRpcMsg{Version: "2.0"}
+	long := &JsonRpcMsg{Version: strings.Repeat("v", 4096)}
+
+	assert.Equal(t,
+		uint64(len(long.Version)-len(short.Version)),
+		wsNotificationSharedCost(long)-wsNotificationSharedCost(short),
+	)
+}
+
 func TestWSNotificationCostSaturatesAboveQueueBudget(t *testing.T) {
 	msg := &JsonRpcMsg{
 		Version: "2.0",
