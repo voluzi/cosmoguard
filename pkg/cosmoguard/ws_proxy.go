@@ -295,6 +295,13 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 			// is dead, so fall through to close.
 			if errors.Is(err, ErrBadMessage) || errors.Is(err, ErrInvalidRequest) {
 				p.log.Warnf("bad message from client: %v", err)
+				// §4.1: a notification gets no reply however it is
+				// rejected. Only a policy rejection hands back the
+				// parsed frame, so req stays nil for anything whose
+				// id cannot be trusted.
+				if req != nil && req.ID == nil {
+					continue
+				}
 				resp := ParseErrorResponse()
 				if errors.Is(err, ErrInvalidRequest) {
 					resp = InvalidRequestResponse()

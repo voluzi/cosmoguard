@@ -85,8 +85,8 @@ func TestReviewDashboardRetainsUnboundedMethodStrings(t *testing.T) {
 	huge := oversizedValue("a")
 	msg, batch, err := ParseJsonRpcRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"` + huge + `"}`))
 	require.ErrorIs(t, err, ErrInvalidRequest)
-	require.Nil(t, msg)
 	require.Nil(t, batch)
+	require.NotNil(t, msg)
 
 	d := newDashboardObservability()
 	for i := 0; i < 64; i++ {

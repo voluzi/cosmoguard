@@ -118,7 +118,9 @@ func (c *JsonRpcWsClient) ReceiveRequest() (*JsonRpcMsg, error) {
 		return nil, err
 	}
 	if err := validateJsonRpcMethodLength(msg); err != nil {
-		return nil, fmt.Errorf("parse message: %w", err)
+		// The message comes back with the error so the caller can see
+		// it is a notification and stay silent, per §4.1.
+		return msg, fmt.Errorf("parse message: %w", err)
 	}
 	return msg, nil
 }

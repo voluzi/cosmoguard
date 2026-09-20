@@ -123,13 +123,13 @@ func New(t *testing.T, opts ...Option) *Harness {
 		h.cfg = defaultHarnessConfig()
 	}
 
-	// Ports are chosen via freePort (bind :0, read the port, close).
-	// That's inherently racy: between the close and cosmoguard.New
-	// re-binding, a parallel test or the OS can grab the same port,
-	// surfacing as "bind: address already in use". Retry the whole
-	// port-assign + New with fresh ports a few times so the suite is
-	// robust under -parallel load instead of flaking. Declared here so
-	// the post-New URL builders can read the final values.
+	// freePorts hands back distinct ports, but they are only reserved
+	// until it closes its listeners: between that and cosmoguard.New
+	// re-binding, a parallel test or the OS can grab one, surfacing as
+	// "bind: address already in use". Retry the whole port-assign +
+	// New with a fresh batch a few times so the suite is robust under
+	// -parallel load instead of flaking. Declared here so the post-New
+	// URL builders can read the final values.
 	var lcdPort, rpcPort, grpcPort, evmRpcPort, evmRpcWsPort int
 	var cg *cosmoguard.CosmoGuard
 	for attempt := 0; ; attempt++ {
@@ -176,8 +176,8 @@ func New(t *testing.T, opts ...Option) *Harness {
 		if nerr == nil {
 			break
 		}
-		// Retry only the racy "port got taken between freePort and bind"
-		// case; anything else is a real config/setup error.
+		// Retry only the racy "port got taken between the allocation
+		// and the bind" case; anything else is a real config error.
 		if attempt < 4 && strings.Contains(nerr.Error(), "address already in use") {
 			continue
 		}
@@ -377,10 +377,6 @@ func (h *Harness) JSONRPCBatch(t *testing.T, calls []JSONRPCCall) *Response {
 
 // ---------- internals ----------
 
-// freePort returns an ephemeral TCP port by binding-then-closing. There is a
-// vanishingly small TOCTOU window between Close() and cosmoguard's bind; in
-// practice this hasn't been observed but tests that depend on absolute port
-// uniqueness should be aware.
 // freePorts returns n distinct free ports. Every listener stays open
 // until all n are chosen — binding and closing one at a time can hand
 // back the same port twice, and cosmoguard.New rejects such a config

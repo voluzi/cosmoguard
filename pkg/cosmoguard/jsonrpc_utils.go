@@ -344,13 +344,24 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 // memory in the observability buffers, not to police what a configured
 // upstream may send — dropping an upstream notification would cost a
 // subscriber its event.
+//
+// A single message rejected for its method length is returned
+// alongside the error, because the caller still has to honour §4.1:
+// a notification carries no id and gets no reply, however it is
+// rejected. Every other error keeps the parser's usual contract of
+// returning nothing, since an envelope that failed to parse cannot be
+// trusted to say whether it had an id.
 func ParseJsonRpcRequest(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	msg, batch, err := ParseJsonRpcMessage(b)
 	if err != nil {
-		return msg, batch, err
+		// Drop the partially-decoded message a syntax error leaves
+		// behind: its id is whatever the decoder managed to read
+		// before giving up, which is not something §4.1 can be
+		// decided on.
+		return nil, nil, err
 	}
 	if err := validateJsonRpcMethodLength(msg); err != nil {
-		return nil, nil, err
+		return msg, nil, err
 	}
 	if err := validateJsonRpcMethodLengths(batch); err != nil {
 		return nil, nil, err

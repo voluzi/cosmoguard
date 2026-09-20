@@ -26,7 +26,17 @@ func TestParseJsonRpcRequestRejectsOversizedMethod(t *testing.T) {
 		msg, batch, err := ParseJsonRpcRequest([]byte(
 			`{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}`))
 		require.ErrorIs(t, err, ErrInvalidRequest)
-		require.Nil(t, msg)
+		require.Nil(t, batch)
+		// The message comes back so the caller can tell a request from
+		// a notification and answer only the former (§4.1).
+		require.NotNil(t, msg)
+		require.Equal(t, 1, msg.ID)
+	})
+
+	t.Run("keeps nothing back when the payload never parsed", func(t *testing.T) {
+		msg, batch, err := ParseJsonRpcRequest([]byte(`{"jsonrpc":`))
+		require.Error(t, err)
+		require.Nil(t, msg, "a half-decoded id must not reach the caller")
 		require.Nil(t, batch)
 	})
 
@@ -107,6 +117,49 @@ func TestHandleHTTPRejectsOversizedMethodBeforeRuleMatching(t *testing.T) {
 	}
 }
 
+// TestOversizedNotificationGetsNoResponse pins §4.1 for the length
+// policy: a notification carries no id and gets no reply however it is
+// rejected, the same way the deny and auth paths already treat one.
+func TestOversizedNotificationGetsNoResponse(t *testing.T) {
+	notification := `{"jsonrpc":"2.0","method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}`
+
+	t.Run("http stays silent", func(t *testing.T) {
+		h := newEnvelopeTestHandler(t)
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(notification))
+		recorder := httptest.NewRecorder()
+
+		h.handleHttp(recorder, request, func(http.ResponseWriter, *http.Request) {
+			t.Fatal("oversized notification reached upstream")
+		}, time.Now())
+
+		require.Empty(t, recorder.Body.String(), "a notification must not be answered")
+	})
+
+	t.Run("http still answers a request", func(t *testing.T) {
+		h := newEnvelopeTestHandler(t)
+		body := `{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}`
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		recorder := httptest.NewRecorder()
+
+		h.handleHttp(recorder, request, func(http.ResponseWriter, *http.Request) {
+			t.Fatal("oversized request reached upstream")
+		}, time.Now())
+
+		require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+	})
+
+	t.Run("websocket hands the frame back so the caller can stay silent", func(t *testing.T) {
+		client, peer := newWSCacheClient(t)
+		require.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(notification)))
+
+		msg, err := client.ReceiveRequest()
+
+		require.ErrorIs(t, err, ErrInvalidRequest)
+		require.NotNil(t, msg, "the rejected frame must come back so §4.1 can be honoured")
+		require.Nil(t, msg.ID)
+	})
+}
+
 func TestReceiveRequestRejectsOversizedMethodAsInvalidRequest(t *testing.T) {
 	client, peer := newWSCacheClient(t)
 	frame := []byte(`{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}`)
@@ -114,9 +167,9 @@ func TestReceiveRequestRejectsOversizedMethodAsInvalidRequest(t *testing.T) {
 
 	msg, err := client.ReceiveRequest()
 
-	require.Nil(t, msg)
 	require.ErrorIs(t, err, ErrInvalidRequest)
 	require.NotErrorIs(t, err, ErrBadMessage)
+	require.NotNil(t, msg, "the rejected frame comes back so §4.1 can be honoured")
 
 	// The same frame read as upstream traffic is delivered, not dropped.
 	require.NoError(t, peer.WriteMessage(websocket.TextMessage, frame))

@@ -460,6 +460,14 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 		// and silently went on to handleHttpSingle.
 		// Use the explicit-null-id builders so the response carries
 		// `"id":null` (§5.1) rather than dropping the id via omitempty.
+		// §4.1: a notification gets no reply however it is rejected,
+		// matching the deny and auth paths below. Only a policy
+		// rejection hands back the parsed message, so this stays nil
+		// for an envelope that never parsed and whose id cannot be
+		// trusted.
+		if req != nil && req.ID == nil {
+			return
+		}
 		errResp := ParseErrorResponse() // -32700, unparseable JSON
 		if errors.Is(parseErr, ErrInvalidRequest) {
 			errResp = InvalidRequestResponse() // -32600, parsed but not JSON-RPC
