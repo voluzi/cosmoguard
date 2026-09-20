@@ -291,17 +291,18 @@ func (c *JsonRpcWsClient) enqueueNotification(msg *JsonRpcMsg, cost uint64) erro
 		return ErrClosed
 	}
 
-	if cost > wsNotificationQueueBytes {
-		c.closeForNotificationFailure()
-		return errNotificationQueueFull
-	}
-
 	c.notificationMux.Lock()
 	if c.notificationStopped || c.IsClosed() {
 		c.notificationMux.Unlock()
 		return ErrClosed
 	}
-	if c.notificationCount >= wsNotificationQueueMessages || c.notificationBytes+cost > wsNotificationQueueBytes {
+	// An idle client may carry one accepted upstream notification even when
+	// its decoded form exceeds the retained-byte budget.
+	exceedsByteBudget := c.notificationCount > 0 &&
+		(c.notificationBytes > wsNotificationQueueBytes ||
+			cost > wsNotificationQueueBytes ||
+			cost > wsNotificationQueueBytes-c.notificationBytes)
+	if c.notificationCount >= wsNotificationQueueMessages || exceedsByteBudget {
 		c.notificationMux.Unlock()
 		c.closeForNotificationFailure()
 		return errNotificationQueueFull

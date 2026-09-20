@@ -265,6 +265,63 @@ func TestBrokerNotificationDeliversHTMLHeavyAcceptedFrame(t *testing.T) {
 	assert.False(t, client.IsClosed())
 }
 
+func TestBrokerNotificationDeliversDenseAcceptedFrameAboveRetainedBudget(t *testing.T) {
+	client, peer := newWSCacheClient(t)
+	broker := &Broker{log: log.WithField("test", t.Name()), sm: NewSubscriptionManager()}
+	broker.sm.AddSubscription("newHeads", "subscription")
+	broker.sm.SubscribeClient("subscription", client, nil)
+
+	elements := int(wsNotificationQueueBytes/32) + 1
+	denseArray := bytes.Repeat([]byte("0,"), elements)
+	denseArray = denseArray[:len(denseArray)-1]
+	raw := make([]byte, 0, len(denseArray)+128)
+	raw = append(raw, `{"jsonrpc":"2.0","id":"subscription","method":"eth_subscription","params":{"subscription":"subscription","result":[`...)
+	raw = append(raw, denseArray...)
+	raw = append(raw, `]}}`...)
+	require.Less(t, int64(len(raw)), upstreamWSReadLimit)
+	msg, batch, err := ParseJsonRpcMessage(raw)
+	require.NoError(t, err)
+	require.Nil(t, batch)
+	require.Greater(t, wsNotificationSharedCost(msg), wsNotificationQueueBytes)
+
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(10*time.Second)))
+	frame := readNotificationFrames(peer, 1)
+	broker.onSubscriptionMessage(msg)
+
+	received := <-frame
+	require.NoError(t, received.err)
+	var oversized struct {
+		Params struct {
+			Subscription string    `json:"subscription"`
+			Result       []float64 `json:"result"`
+		} `json:"params"`
+	}
+	require.NoError(t, stdjson.Unmarshal(received.raw, &oversized))
+	assert.Equal(t, "subscription", oversized.Params.Subscription)
+	assert.Len(t, oversized.Params.Result, elements)
+	require.Eventually(t, func() bool {
+		count, retainedBytes := notificationQueueStats(client)
+		return count == 0 && retainedBytes == 0
+	}, time.Second, time.Millisecond)
+
+	normal := ethSequenceNotification("subscription", 1)
+	normal.Params.(map[string]interface{})["payload"] = "after-oversized"
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(3*time.Second)))
+	broker.onSubscriptionMessage(normal)
+	_, normalRaw, err := peer.ReadMessage()
+	require.NoError(t, err)
+	var delivered struct {
+		Params struct {
+			Sequence int    `json:"sequence"`
+			Payload  string `json:"payload"`
+		} `json:"params"`
+	}
+	require.NoError(t, stdjson.Unmarshal(normalRaw, &delivered))
+	assert.Equal(t, 1, delivered.Params.Sequence)
+	assert.Equal(t, "after-oversized", delivered.Params.Payload)
+	assert.False(t, client.IsClosed())
+}
+
 func TestWSNotificationCostUsesRetainedJSONSizeAndClientID(t *testing.T) {
 	payload := strings.Repeat("<", 1<<20)
 	msg := &JsonRpcMsg{
@@ -433,19 +490,44 @@ func TestQueuedNotificationsStayOrderedAcrossCanonicalMigration(t *testing.T) {
 	}
 }
 
-func TestNotificationQueueRejectsOversizedMessage(t *testing.T) {
+func TestNotificationQueueAllowsOneOversizedMessageButRejectsFollowingMessage(t *testing.T) {
 	client, _ := newWSCacheClient(t)
 
-	err := enqueueTestNotification(client, &JsonRpcMsg{
-		Version: "2.0",
-		Result:  make([]byte, wsNotificationQueueBytes),
-	})
-	require.ErrorIs(t, err, errNotificationQueueFull)
+	client.writeMux.Lock()
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			client.writeMux.Unlock()
+		}
+	}()
+
+	oversizedCost := wsNotificationQueueBytes + 1
+	require.NoError(t, client.enqueueNotification(sequenceNotification(0), oversizedCost))
+	client.notificationMux.Lock()
+	workerDone := client.notificationDone
+	client.notificationMux.Unlock()
+	require.NotNil(t, workerDone)
+	require.Eventually(t, func() bool {
+		client.notificationMux.Lock()
+		defer client.notificationMux.Unlock()
+		return client.notificationRunning && len(client.notificationQueue) == 0 &&
+			client.notificationCount == 1 && client.notificationBytes == oversizedCost
+	}, time.Second, time.Millisecond)
+
+	require.ErrorIs(t, enqueueTestNotification(client, sequenceNotification(1)), errNotificationQueueFull)
 	require.Eventually(t, client.IsClosed, time.Second, time.Millisecond)
 
-	count, bytes := notificationQueueStats(client)
-	assert.Zero(t, count)
-	assert.Zero(t, bytes)
+	client.writeMux.Unlock()
+	unlocked = true
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("notification worker did not exit after oversized overflow")
+	}
+	require.Eventually(t, func() bool {
+		count, retainedBytes := notificationQueueStats(client)
+		return count == 0 && retainedBytes == 0
+	}, time.Second, time.Millisecond)
 }
 
 func TestNotificationQueueRejectsCumulativeByteOverflow(t *testing.T) {
