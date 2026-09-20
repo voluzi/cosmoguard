@@ -172,6 +172,9 @@ func (b *Broker) HandleRequest(msg *JsonRpcMsg) (*JsonRpcMsg, error) {
 func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (*JsonRpcMsg, error) {
 	b.log.WithField("client", client).Debug("handling subscription")
 	client.SetOnDisconnectCallback(b.onClientDisconnect)
+	if client.IsClosed() {
+		return nil, ErrClosed
+	}
 
 	switch msg.Method {
 	case methodSubscribeCosmos:
@@ -220,6 +223,9 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (stri
 
 	b.upstreamSubMux.Lock()
 	defer b.upstreamSubMux.Unlock()
+	if client.IsClosed() {
+		return "", ErrClosed
+	}
 
 	id, exists := b.sm.GetSubscriptionID(param)
 	if !exists {
@@ -244,6 +250,10 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (stri
 	} else {
 		b.sm.SubscribeClient(id, client, msg.ID)
 	}
+	if client.IsClosed() {
+		b.sm.UnsubscribeClient(id, client)
+		return "", errors.Join(ErrClosed, b.removeEmptySubscriptionLocked(id))
+	}
 
 	b.log.WithFields(map[string]interface{}{
 		"id":     id,
@@ -251,6 +261,20 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (stri
 	}).Debug("subscribed client")
 
 	return id, nil
+}
+
+// removeEmptySubscriptionLocked tears down an upstream subscription that lost
+// its last downstream client. The caller must hold upstreamSubMux.
+func (b *Broker) removeEmptySubscriptionLocked(id string) error {
+	if !b.sm.SubscriptionEmpty(id) {
+		return nil
+	}
+	upstreamID, _ := b.sm.UpstreamID(id)
+	if err := b.pool.Unsubscribe(upstreamID); err != nil {
+		return err
+	}
+	b.sm.RemoveSubscription(id)
+	return nil
 }
 
 func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) error {
@@ -383,23 +407,12 @@ func (b *Broker) onSubscriptionMessage(msg *JsonRpcMsg) {
 		"clients": len(clients),
 	}).Info("broadcasting message to subscribers")
 
+	sharedCost := wsNotificationSharedCost(msg)
 	for client, id := range clients {
-		go func(client *JsonRpcWsClient, id interface{}) {
-			if err := client.SendMsg(msg.CloneWithID(id)); err != nil {
-				b.log.Errorf("error sending message to client: %v", err)
-				// Treat any send failure as "this client is unhealthy"
-				// and close the conn so the next broadcast skips it
-				// fast via IsClosed, and the proxy's HandleConnection
-				// loop observes a closed read → calls onDisconnect →
-				// drains subscriptions. Without this, a slow consumer
-				// re-enters this code path on every upstream message
-				// and burns wsClientWriteDeadline (10 s) of goroutine
-				// time per push before failing — for as long as the
-				// process lives. Close is idempotent so this is safe
-				// when the client already closed itself via reads.
-				_ = client.Close()
-			}
-		}(client, id)
+		cost := wsNotificationCostWithID(sharedCost, id)
+		if err := client.enqueueNotification(msg.CloneWithID(id), cost); err != nil && !errors.Is(err, ErrClosed) {
+			b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
+		}
 	}
 }
 
