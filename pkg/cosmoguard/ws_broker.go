@@ -407,8 +407,10 @@ func (b *Broker) onSubscriptionMessage(msg *JsonRpcMsg) {
 		"clients": len(clients),
 	}).Info("broadcasting message to subscribers")
 
+	sharedCost := wsNotificationSharedCost(msg)
 	for client, id := range clients {
-		if err := client.enqueueNotification(msg.CloneWithID(id)); err != nil && !errors.Is(err, ErrClosed) {
+		cost := wsNotificationCostWithID(sharedCost, id)
+		if err := client.enqueueNotification(msg.CloneWithID(id), cost); err != nil && !errors.Is(err, ErrClosed) {
 			b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
 		}
 	}

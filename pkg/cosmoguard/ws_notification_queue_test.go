@@ -233,7 +233,7 @@ func TestNotificationQueueDeliversLargeAcceptedNotification(t *testing.T) {
 
 	require.NoError(t, peer.SetReadDeadline(time.Now().Add(5*time.Second)))
 	frame := readNotificationFrames(peer, 1)
-	require.NoError(t, client.enqueueNotification(&JsonRpcMsg{Version: "2.0", Result: result}))
+	require.NoError(t, enqueueTestNotification(client, &JsonRpcMsg{Version: "2.0", Result: result}))
 
 	received := <-frame
 	require.NoError(t, received.err)
@@ -241,11 +241,67 @@ func TestNotificationQueueDeliversLargeAcceptedNotification(t *testing.T) {
 	assert.False(t, client.IsClosed())
 }
 
+func TestBrokerNotificationDeliversHTMLHeavyAcceptedFrame(t *testing.T) {
+	client, peer := newWSCacheClient(t)
+	broker := &Broker{log: log.WithField("test", t.Name()), sm: NewSubscriptionManager()}
+	broker.sm.AddSubscription("newHeads", "subscription")
+	broker.sm.SubscribeClient("subscription", client, nil)
+
+	payload := strings.Repeat("<", int(wsNotificationQueueBytes/6)+1)
+	raw := []byte(`{"jsonrpc":"2.0","id":"subscription","method":"eth_subscription","params":{"subscription":"subscription","payload":"` + payload + `"}}`)
+	require.Less(t, int64(len(raw)), upstreamWSReadLimit)
+	msg, batch, err := ParseJsonRpcMessage(raw)
+	require.NoError(t, err)
+	require.Nil(t, batch)
+
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(10*time.Second)))
+	frame := readNotificationFrames(peer, 1)
+	broker.onSubscriptionMessage(msg)
+
+	received := <-frame
+	require.NoError(t, received.err)
+	require.GreaterOrEqual(t, len(received.raw), 256)
+	assert.Contains(t, string(received.raw[:256]), `"method":"eth_subscription"`)
+	assert.False(t, client.IsClosed())
+}
+
+func TestWSNotificationCostUsesRetainedJSONSizeAndClientID(t *testing.T) {
+	payload := strings.Repeat("<", 1<<20)
+	msg := &JsonRpcMsg{
+		Version: "2.0",
+		ID:      "upstream-subscription",
+		Method:  "eth_subscription",
+		Params: map[string]interface{}{
+			"payload": payload,
+		},
+	}
+
+	sharedCost := wsNotificationSharedCost(msg)
+	require.Greater(t, sharedCost, uint64(len(payload)))
+	require.Less(t, sharedCost, uint64(2*len(payload)))
+	assert.Equal(t, sharedCost, wsNotificationSharedCost(msg.CloneWithID(strings.Repeat("z", 1<<20))))
+
+	smallIDCost := wsNotificationCostWithID(sharedCost, "x")
+	largeID := strings.Repeat("y", 1025)
+	largeIDCost := wsNotificationCostWithID(sharedCost, largeID)
+	assert.Equal(t, uint64(len(largeID)-1), largeIDCost-smallIDCost)
+}
+
+func TestWSNotificationCostSaturatesAboveQueueBudget(t *testing.T) {
+	msg := &JsonRpcMsg{
+		Version: "2.0",
+		Params: map[string]interface{}{
+			"payload": strings.Repeat("x", int(wsNotificationQueueBytes)),
+		},
+	}
+	assert.Equal(t, wsNotificationQueueBytes+1, wsNotificationSharedCost(msg))
+}
+
 func TestNotificationWorkerExitsWhenIdleAndRestarts(t *testing.T) {
 	client, peer := newWSCacheClient(t)
 	require.NoError(t, peer.SetReadDeadline(time.Now().Add(3*time.Second)))
 
-	require.NoError(t, client.enqueueNotification(sequenceNotification(0)))
+	require.NoError(t, enqueueTestNotification(client, sequenceNotification(0)))
 	client.notificationMux.Lock()
 	firstDone := client.notificationDone
 	client.notificationMux.Unlock()
@@ -258,8 +314,8 @@ func TestNotificationWorkerExitsWhenIdleAndRestarts(t *testing.T) {
 	assert.False(t, client.IsClosed())
 
 	frames := readNotificationFrames(peer, 2)
-	require.NoError(t, client.enqueueNotification(sequenceNotification(1)))
-	require.NoError(t, client.enqueueNotification(sequenceNotification(2)))
+	require.NoError(t, enqueueTestNotification(client, sequenceNotification(1)))
+	require.NoError(t, enqueueTestNotification(client, sequenceNotification(2)))
 	client.notificationMux.Lock()
 	secondDone := client.notificationDone
 	client.notificationMux.Unlock()
@@ -370,7 +426,7 @@ func TestQueuedNotificationsStayOrderedAcrossCanonicalMigration(t *testing.T) {
 func TestNotificationQueueRejectsOversizedMessage(t *testing.T) {
 	client, _ := newWSCacheClient(t)
 
-	err := client.enqueueNotification(&JsonRpcMsg{
+	err := enqueueTestNotification(client, &JsonRpcMsg{
 		Version: "2.0",
 		Result:  make([]byte, wsNotificationQueueBytes),
 	})
@@ -394,9 +450,9 @@ func TestNotificationQueueRejectsCumulativeByteOverflow(t *testing.T) {
 	}()
 
 	payload := make([]byte, wsNotificationQueueBytes/2)
-	require.NoError(t, client.enqueueNotification(&JsonRpcMsg{Version: "2.0", Result: payload}))
+	require.NoError(t, enqueueTestNotification(client, &JsonRpcMsg{Version: "2.0", Result: payload}))
 	require.ErrorIs(t,
-		client.enqueueNotification(&JsonRpcMsg{Version: "2.0", Result: payload}),
+		enqueueTestNotification(client, &JsonRpcMsg{Version: "2.0", Result: payload}),
 		errNotificationQueueFull,
 	)
 	require.Eventually(t, client.IsClosed, time.Second, time.Millisecond)
@@ -426,7 +482,7 @@ func TestNotificationQueueCloseIsPromptAndReleasesAccounting(t *testing.T) {
 	}()
 
 	for i := 0; i < 3; i++ {
-		require.NoError(t, client.enqueueNotification(&JsonRpcMsg{
+		require.NoError(t, enqueueTestNotification(client, &JsonRpcMsg{
 			Version: "2.0",
 			Result:  []byte(`{"sequence":` + strconv.Itoa(i) + `}`),
 		}))
@@ -592,4 +648,9 @@ func notificationQueueStats(client *JsonRpcWsClient) (int, uint64) {
 	client.notificationMux.Lock()
 	defer client.notificationMux.Unlock()
 	return client.notificationCount, client.notificationBytes
+}
+
+func enqueueTestNotification(client *JsonRpcWsClient, msg *JsonRpcMsg) error {
+	sharedCost := wsNotificationSharedCost(msg)
+	return client.enqueueNotification(msg, wsNotificationCostWithID(sharedCost, msg.ID))
 }

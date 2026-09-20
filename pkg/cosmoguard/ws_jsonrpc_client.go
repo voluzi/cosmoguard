@@ -29,11 +29,14 @@ const (
 	// A subscriber can absorb short bursts without letting sustained lag
 	// retain unbounded messages or payload bytes.
 	wsNotificationQueueMessages = 64
-	// One accepted upstream frame can expand while decoded and wrapped in a
-	// client-specific envelope, so retain one frame-size of headroom.
+	// The byte budget tracks decoded values retained by a client's queue, not
+	// their escaped wire encoding. Two upstream frame limits leave headroom
+	// for decoded map/slice storage and the client-specific envelope.
 	wsNotificationQueueBytes uint64 = uint64(upstreamWSReadLimit) * 2
 	wsClientWriteDeadline           = 10 * time.Second
 )
+
+const wsNotificationCostLimit = wsNotificationQueueBytes + 1
 
 type queuedNotification struct {
 	msg  *JsonRpcMsg
@@ -220,12 +223,73 @@ func (c *JsonRpcWsClient) scheduleDisconnectCallback() {
 	})
 }
 
-func (c *JsonRpcWsClient) enqueueNotification(msg *JsonRpcMsg) error {
+func wsNotificationSharedCost(msg *JsonRpcMsg) uint64 {
+	cost := addWSNotificationCost(jsonRpcMsgOverheadBytes, uint64(len(msg.Result)))
+	cost = addWSNotificationCost(cost, uint64(len(msg.WireSuffix)))
+	cost = addWSNotificationCost(cost, uint64(len(msg.Method)))
+	cost = addWSNotificationCost(cost, wsRetainedJSONCost(msg.Params))
+	if msg.Error != nil {
+		cost = addWSNotificationCost(cost, uint64(len(msg.Error.Message)))
+		cost = addWSNotificationCost(cost, wsRetainedJSONCost(msg.Error.Data))
+	}
+	return cost
+}
+
+func wsNotificationCostWithID(sharedCost uint64, id interface{}) uint64 {
+	return addWSNotificationCost(sharedCost, wsRetainedJSONCost(id))
+}
+
+// wsRetainedJSONCost estimates allocations reachable from decoded JSON values.
+// Unknown shapes saturate instead of falling back to per-client serialization.
+func wsRetainedJSONCost(v interface{}) uint64 {
+	switch value := v.(type) {
+	case nil, explicitNullIDType:
+		return 0
+	case string:
+		return addWSNotificationCost(16, uint64(len(value)))
+	case []byte:
+		return addWSNotificationCost(24, uint64(len(value)))
+	case bool, float64, float32,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64:
+		return 16
+	case []interface{}:
+		cost := addWSNotificationCost(24, uint64(len(value))*16)
+		for _, item := range value {
+			cost = addWSNotificationCost(cost, wsRetainedJSONCost(item))
+			if cost == wsNotificationCostLimit {
+				return cost
+			}
+		}
+		return cost
+	case map[string]interface{}:
+		cost := uint64(48)
+		for key, item := range value {
+			cost = addWSNotificationCost(cost, 32)
+			cost = addWSNotificationCost(cost, uint64(len(key)))
+			cost = addWSNotificationCost(cost, wsRetainedJSONCost(item))
+			if cost == wsNotificationCostLimit {
+				return cost
+			}
+		}
+		return cost
+	default:
+		return wsNotificationCostLimit
+	}
+}
+
+func addWSNotificationCost(cost, part uint64) uint64 {
+	if cost >= wsNotificationCostLimit || part >= wsNotificationCostLimit || part > wsNotificationCostLimit-cost {
+		return wsNotificationCostLimit
+	}
+	return cost + part
+}
+
+func (c *JsonRpcWsClient) enqueueNotification(msg *JsonRpcMsg, cost uint64) error {
 	if c.IsClosed() {
 		return ErrClosed
 	}
 
-	cost := msg.CacheCost() + approxInterfaceCost(msg.Params)
 	if cost > wsNotificationQueueBytes {
 		c.closeForNotificationFailure()
 		return errNotificationQueueFull
