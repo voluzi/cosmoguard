@@ -342,6 +342,13 @@ func (d *dashboardObservability) RecordUnmatched(section, method, path string) {
 	d.unmatchedMu.Unlock()
 	// Bound the components, then compose — bounding the composed key
 	// would leave the path half free to eat the method's budget.
+	//
+	// Plain truncation, no digest: this panel ranks hot tuples rather
+	// than counting distinct ones, and callers pass the path without
+	// its query string, so nothing legitimate reaches the marker. A
+	// digest would split one honestly-marked row into many rows showing
+	// the same prefix, pushing them below the top-20 the dashboard
+	// renders. Revisit if a caller ever passes a full request URI.
 	c.Observe(unmatchedKey(boundRetained(method, maxRetainedMethodBytes), boundRetained(path, maxRetainedPathBytes)))
 }
 
@@ -472,11 +479,19 @@ func boundRetained(s string, max int) string {
 	return s[:cut] + retainedTruncationMarker
 }
 
-// boundCardinalityRequestKey bounds a cache key while keeping distinct
-// keys distinct. The counter measures how many different keys a rule
-// writes, so plain truncation would fold a thousand long keys into one
-// entry and hide the very explosion the panel exists to surface — the
-// hash of the full key preserves the distinction the count depends on.
+// boundCardinalityRequestKey bounds a cache key while keeping long
+// keys distinct from one another. The counter measures how many
+// different keys a rule writes, so plain truncation would fold a
+// thousand long keys into one entry and hide the very explosion the
+// panel exists to surface.
+//
+// The digest is not a collision-resistant tag and the encoding is not
+// injective: a client-chosen short key that spells out some long key's
+// bounded form merges with it, and fnv1a-64 collisions between two long
+// keys are constructible offline. Both cost the client accuracy in its
+// own count while its explosion stays visible, which is the right trade
+// for an LRU-approximate counter the cluster view already reports as an
+// upper bound.
 func boundCardinalityRequestKey(s string) string {
 	if len(s) <= maxRetainedPathBytes {
 		return strings.Clone(s)
