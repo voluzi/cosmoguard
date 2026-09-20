@@ -99,6 +99,14 @@ func (l *requestLog) Record(e RequestLogEntry) {
 	if e.TimestampMs == 0 {
 		e.TimestampMs = time.Now().UnixMilli()
 	}
+	// Client-controlled fields are bounded before retention — up to
+	// maxEntriesTotal of these are held at once, so their size has to
+	// be independent of request size. Identity is a validated JWT
+	// claim or a configured API-key alias and is left intact.
+	e.Method = boundRetained(e.Method, maxRetainedMethodBytes)
+	e.SourceIP = boundRetained(e.SourceIP, maxRetainedMethodBytes)
+	e.Path = boundRetained(e.Path, maxRetainedPathBytes)
+	e.Query = boundRetained(e.Query, maxRetainedPathBytes)
 
 	cutoffMs := e.TimestampMs - s.maxAge.Milliseconds()
 

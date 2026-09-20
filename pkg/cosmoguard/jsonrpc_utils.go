@@ -22,6 +22,14 @@ var (
 	errInvalidJSONSyntax = errors.New("invalid JSON syntax")
 )
 
+// maxJsonRpcMethodBytes rejects absurd method names at parse time. The
+// method is otherwise bounded only by the body cap (5 MiB by default),
+// and it is retained downstream — dashboard counters, deny records,
+// request log. The longest names in the wild are well under 40 bytes
+// (eth_getTransactionByBlockNumberAndIndex, num_unconfirmed_txs), so
+// this leaves ample headroom for a method nobody has invented yet.
+const maxJsonRpcMethodBytes = 256
+
 type JsonRpcError struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
@@ -311,6 +319,9 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 		if err == nil {
 			err = envelopeErr
 		}
+		if err == nil {
+			err = validateJsonRpcMethodLengths(msg)
+		}
 		if errors.Is(err, ErrInvalidRequest) {
 			return nil, nil, err
 		}
@@ -321,10 +332,35 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	if err == nil {
 		err = envelopeErr
 	}
+	if err == nil {
+		err = validateJsonRpcMethodLength(&msg)
+	}
 	if errors.Is(err, ErrInvalidRequest) {
 		return nil, nil, err
 	}
 	return &msg, nil, err
+}
+
+// validateJsonRpcMethodLength rejects a single message whose method
+// exceeds maxJsonRpcMethodBytes. Length is counted in bytes, matching
+// the body cap it backstops.
+func validateJsonRpcMethodLength(msg *JsonRpcMsg) error {
+	if msg == nil || len(msg.Method) <= maxJsonRpcMethodBytes {
+		return nil
+	}
+	return fmt.Errorf("%w: JSON-RPC method exceeds %d bytes", ErrInvalidRequest, maxJsonRpcMethodBytes)
+}
+
+// validateJsonRpcMethodLengths rejects the whole batch on the first
+// oversized member, the same way an ambiguous envelope key or a
+// duplicate id fails a batch.
+func validateJsonRpcMethodLengths(msgs JsonRpcMsgs) error {
+	for _, msg := range msgs {
+		if err := validateJsonRpcMethodLength(msg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func classifyJsonRpcDecodeError(validJSON bool, err error) error {

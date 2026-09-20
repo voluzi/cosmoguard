@@ -3,10 +3,13 @@ package cosmoguard
 import (
 	"container/list"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/segmentio/fasthash/fnv1a"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -20,8 +23,10 @@ import (
 //   - RingBuffer[T] is a fixed-size FIFO used for the denied tail
 //     (and, in commit B, the discovery refresh log).
 //
-// Both bound their memory at construction so an attacker driving
-// arbitrary keys can't blow up the process. Nothing is persisted
+// Both bound their entry count at construction, and every sink bounds
+// the length of the client-controlled strings it retains, so an
+// attacker driving arbitrary keys can't blow up the process by their
+// number or by their size. Nothing is persisted
 // across restarts — same in-memory model as the existing rate
 // limiter. The dashboard listener is auth-gated so the data here
 // (source IPs, paths, methods) is not exposed publicly.
@@ -293,6 +298,23 @@ const (
 	defaultDiscoveryCap   = 256
 )
 
+// Per-string bounds. The caps above limit how many keys are kept;
+// these limit how large each one can be, so retained memory no longer
+// scales with request size — a JSON-RPC method or a path with a query
+// string is otherwise bounded only by the 5 MiB body cap, and 256
+// unauthenticated requests could pin over a gigabyte per section.
+// Methods share the parser's own limit, so a method that survives
+// ParseJsonRpcMessage is never displayed truncated; only HTTP verbs
+// and gRPC method names from a hostile client pick up the marker.
+const (
+	maxRetainedMethodBytes = maxJsonRpcMethodBytes
+	maxRetainedPathBytes   = 512
+)
+
+// retainedTruncationMarker is appended to every bounded value so an
+// operator never reads a shortened path or method as a complete one.
+const retainedTruncationMarker = "…"
+
 func newDashboardObservability() *dashboardObservability {
 	return &dashboardObservability{
 		unmatched:    make(map[string]*TopNCounter),
@@ -318,7 +340,9 @@ func (d *dashboardObservability) RecordUnmatched(section, method, path string) {
 		d.unmatched[section] = c
 	}
 	d.unmatchedMu.Unlock()
-	c.Observe(unmatchedKey(method, path))
+	// Bound the components, then compose — bounding the composed key
+	// would leave the path half free to eat the method's budget.
+	c.Observe(unmatchedKey(boundRetained(method, maxRetainedMethodBytes), boundRetained(path, maxRetainedPathBytes)))
 }
 
 // RecordDeny pushes a deny record into the ring buffer. TimestampMs
@@ -330,7 +354,7 @@ func (d *dashboardObservability) RecordDeny(rec DenyRecord) {
 	if rec.TimestampMs == 0 {
 		rec.TimestampMs = time.Now().UnixMilli()
 	}
-	d.denied.Push(rec)
+	d.denied.Push(boundDenyRecord(rec))
 }
 
 // RecordCardinality bumps the distinct-keys counter for the
@@ -350,7 +374,7 @@ func (d *dashboardObservability) RecordCardinality(section, ruleTag, requestKey 
 		d.cardinality[section] = c
 	}
 	d.cardinalityMu.Unlock()
-	c.Observe(cardinalityKey(ruleTag, requestKey))
+	c.Observe(cardinalityKey(ruleTag, boundCardinalityRequestKey(requestKey)))
 }
 
 // RecordReload stamps the latest hot-reload outcome on the
@@ -416,6 +440,59 @@ func splitUnmatchedKey(key string) (method, path string) {
 		return key[:i], key[i+1:]
 	}
 	return key, ""
+}
+
+// boundRetained caps a client-controlled string at max bytes, marker
+// included, and never cuts a rune in half — a split rune would reach
+// the dashboard as U+FFFD once the payload is JSON-encoded.
+//
+// Short values are copied rather than kept as-is: net/http hands out
+// Method, Path and RawQuery as slices of the one buffer holding the
+// whole request line, so retaining a three-byte "GET" from a request
+// with a 512 KiB query string pins all 512 KiB for as long as the
+// record lives. A bound on length alone does not bound memory. The
+// copy costs one small allocation per recorded request, on paths that
+// already take a lock and update an LRU.
+//
+// Bounding an already-bounded value yields an equal string, which is
+// what lets Restore re-apply the bound without rewriting every key.
+func boundRetained(s string, max int) string {
+	if len(s) <= max {
+		return strings.Clone(s)
+	}
+	cut := max - len(retainedTruncationMarker)
+	if cut < 0 {
+		// No room for the marker. Unreachable with the constants
+		// above; the invariant that matters is never exceeding max.
+		return ""
+	}
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + retainedTruncationMarker
+}
+
+// boundCardinalityRequestKey bounds a cache key while keeping distinct
+// keys distinct. The counter measures how many different keys a rule
+// writes, so plain truncation would fold a thousand long keys into one
+// entry and hide the very explosion the panel exists to surface — the
+// hash of the full key preserves the distinction the count depends on.
+func boundCardinalityRequestKey(s string) string {
+	if len(s) <= maxRetainedPathBytes {
+		return strings.Clone(s)
+	}
+	digest := "#" + strconv.FormatUint(fnv1a.HashString64(s), 16)
+	return boundRetained(s, maxRetainedPathBytes-len(digest)) + digest
+}
+
+// boundDenyRecord bounds the client-controlled fields of a deny
+// record. Section, Reason and RuleTag come from the operator's own
+// configuration and are left intact.
+func boundDenyRecord(rec DenyRecord) DenyRecord {
+	rec.SourceIP = boundRetained(rec.SourceIP, maxRetainedMethodBytes)
+	rec.Method = boundRetained(rec.Method, maxRetainedMethodBytes)
+	rec.Path = boundRetained(rec.Path, maxRetainedPathBytes)
+	return rec
 }
 
 // listUnmatched is the JSON payload for GET /api/v1/unmatched —
@@ -666,7 +743,7 @@ func (d *dashboardObservability) Restore(blob []byte) error {
 			c = NewTopNCounter(defaultUnmatchedCap)
 			d.unmatched[section] = c
 		}
-		restoreTopN(c, entries)
+		restoreTopN(c, boundUnmatchedSnap(entries))
 	}
 	d.unmatchedMu.Unlock()
 
@@ -677,12 +754,12 @@ func (d *dashboardObservability) Restore(blob []byte) error {
 			c = NewTopNCounter(defaultCardinalityCap)
 			d.cardinality[section] = c
 		}
-		restoreTopN(c, entries)
+		restoreTopN(c, boundCardinalitySnap(entries))
 	}
 	d.cardinalityMu.Unlock()
 
 	for _, rec := range snap.Denied {
-		d.denied.Push(rec)
+		d.denied.Push(boundDenyRecord(rec))
 	}
 	for _, ev := range snap.DiscoveryLog {
 		d.discoveryLog.Push(ev)
@@ -695,6 +772,51 @@ func (d *dashboardObservability) Restore(blob []byte) error {
 		d.reloadMu.Unlock()
 	}
 	return nil
+}
+
+// boundUnmatchedSnap and boundCardinalitySnap re-apply the retention
+// bounds to snapshot entries. Restore writes straight into the
+// counter, bypassing the sinks, and the blob can come from a peer
+// still running a release that retained unbounded keys — so the
+// bound belongs on this path too. Entries already within the bounds
+// pass through untouched, which keeps a snapshot written by this
+// release byte-identical across a round trip. Two keys that collapse
+// onto the same bounded key keep the first, and snapshots are emitted
+// count-descending, so the hotter of the two wins.
+func boundUnmatchedSnap(entries []topNEntrySnap) []topNEntrySnap {
+	return boundTopNSnap(entries, func(key string) (string, bool) {
+		method, path := splitUnmatchedKey(key)
+		if len(method) <= maxRetainedMethodBytes && len(path) <= maxRetainedPathBytes {
+			return key, false
+		}
+		return unmatchedKey(boundRetained(method, maxRetainedMethodBytes), boundRetained(path, maxRetainedPathBytes)), true
+	})
+}
+
+func boundCardinalitySnap(entries []topNEntrySnap) []topNEntrySnap {
+	return boundTopNSnap(entries, func(key string) (string, bool) {
+		ruleTag, requestKey := splitCardinalityKey(key)
+		if len(requestKey) <= maxRetainedPathBytes {
+			return key, false
+		}
+		return cardinalityKey(ruleTag, boundCardinalityRequestKey(requestKey)), true
+	})
+}
+
+func boundTopNSnap(entries []topNEntrySnap, bound func(string) (string, bool)) []topNEntrySnap {
+	out, copied := entries, false
+	for i, e := range entries {
+		key, bounded := bound(e.Key)
+		if !bounded {
+			continue
+		}
+		if !copied {
+			out = append([]topNEntrySnap(nil), entries...)
+			copied = true
+		}
+		out[i].Key = key
+	}
+	return out
 }
 
 // restoreTopN re-hydrates a TopNCounter from a slice of snapshot
