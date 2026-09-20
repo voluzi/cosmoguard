@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,9 +29,11 @@ func TestParseJsonRpcRequestRejectsOversizedMethod(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidRequest)
 		require.Nil(t, batch)
 		// The message comes back so the caller can tell a request from
-		// a notification and answer only the former (§4.1).
+		// a notification and answer only the former (§4.1). What
+		// matters is that an id is present, not which numeric type the
+		// decoder produced for it.
 		require.NotNil(t, msg)
-		require.Equal(t, 1, msg.ID)
+		require.NotNil(t, msg.ID)
 	})
 
 	t.Run("keeps nothing back when the payload never parsed", func(t *testing.T) {
@@ -40,13 +43,17 @@ func TestParseJsonRpcRequestRejectsOversizedMethod(t *testing.T) {
 		require.Nil(t, batch)
 	})
 
-	t.Run("rejects the whole batch when one member is oversized", func(t *testing.T) {
+	t.Run("hands a batch back intact for per-member checking", func(t *testing.T) {
+		// §6 answers a batch member by member, so the parser must not
+		// discard a whole array over one member; handleHttpBatch
+		// rejects the offending call on its own.
 		msg, batch, err := ParseJsonRpcRequest([]byte(
 			`[{"jsonrpc":"2.0","id":1,"method":"status"},` +
 				`{"jsonrpc":"2.0","id":2,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}]`))
-		require.ErrorIs(t, err, ErrInvalidRequest)
+		require.NoError(t, err)
 		require.Nil(t, msg)
-		require.Nil(t, batch)
+		require.Len(t, batch, 2)
+		require.Len(t, batch[1].Method, maxJsonRpcMethodBytes+1)
 	})
 
 	t.Run("keeps a valid batch intact", func(t *testing.T) {
@@ -86,14 +93,18 @@ func TestHandleHTTPRejectsOversizedMethodBeforeRuleMatching(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
+		want string
 	}{
 		{
 			name: "single",
 			body: `{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}`,
+			// The id was read, so §5.1's null is not the right answer.
+			want: `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":1}`,
 		},
 		{
 			name: "batch",
 			body: `[{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}]`,
+			want: `[{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":1}]`,
 		},
 	}
 
@@ -108,7 +119,7 @@ func TestHandleHTTPRejectsOversizedMethodBeforeRuleMatching(t *testing.T) {
 			}, time.Now())
 
 			require.Equal(t, http.StatusOK, recorder.Code)
-			require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+			require.JSONEq(t, tt.want, recorder.Body.String())
 
 			h.cgDashboard.unmatchedMu.Lock()
 			defer h.cgDashboard.unmatchedMu.Unlock()
@@ -145,7 +156,7 @@ func TestOversizedNotificationGetsNoResponse(t *testing.T) {
 			t.Fatal("oversized request reached upstream")
 		}, time.Now())
 
-		require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+		require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":1}`, recorder.Body.String())
 	})
 
 	t.Run("websocket hands the frame back so the caller can stay silent", func(t *testing.T) {
@@ -157,6 +168,102 @@ func TestOversizedNotificationGetsNoResponse(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidRequest)
 		require.NotNil(t, msg, "the rejected frame must come back so §4.1 can be honoured")
 		require.Nil(t, msg.ID)
+	})
+}
+
+// TestOversizedBatchMemberIsRejectedAlone pins §6: a well-formed batch
+// is answered member by member, so one oversized method costs only its
+// own call — siblings are forwarded and answered, and a notification
+// keeps the silence it would have had on its own.
+func TestOversizedBatchMemberIsRejectedAlone(t *testing.T) {
+	oversized := methodOfLength(maxJsonRpcMethodBytes + 1)
+
+	t.Run("sibling is forwarded and answered", func(t *testing.T) {
+		h := newEnvelopeTestHandler(t)
+		body := `[{"jsonrpc":"2.0","id":1,"method":"status"},` +
+			`{"jsonrpc":"2.0","id":2,"method":"` + oversized + `"}]`
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		recorder := httptest.NewRecorder()
+
+		var forwarded []byte
+		h.handleHttp(recorder, request, func(w http.ResponseWriter, r *http.Request) {
+			var err error
+			forwarded, err = io.ReadAll(r.Body)
+			require.NoError(t, err)
+			_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+		}, time.Now())
+
+		require.JSONEq(t, `[{"jsonrpc":"2.0","id":1,"result":"ok"},`+
+			`{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":2}]`,
+			recorder.Body.String())
+		require.NotContains(t, string(forwarded), oversized, "the rejected member must not reach upstream")
+		require.Contains(t, string(forwarded), "status")
+
+		// The valid sibling legitimately lands in the unmatched
+		// counter; the rejected member must not, because it is turned
+		// away before rule matching.
+		for _, r := range unmatchedComponents(h.cgDashboard, h.section) {
+			require.NotContains(t, r.value, oversized[:64], "a rejected member reached the unmatched counter")
+		}
+	})
+
+	t.Run("oversized notification beside a request costs it nothing", func(t *testing.T) {
+		h := newEnvelopeTestHandler(t)
+		body := `[{"jsonrpc":"2.0","id":1,"method":"status"},` +
+			`{"jsonrpc":"2.0","method":"` + oversized + `"}]`
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		recorder := httptest.NewRecorder()
+
+		h.handleHttp(recorder, request, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":1,"result":"ok"}]`))
+		}, time.Now())
+
+		require.JSONEq(t, `[{"jsonrpc":"2.0","id":1,"result":"ok"}]`, recorder.Body.String())
+	})
+
+	t.Run("a batch that answers nothing returns nothing", func(t *testing.T) {
+		h := newEnvelopeTestHandler(t)
+		body := `[{"jsonrpc":"2.0","method":"status"},{"jsonrpc":"2.0","method":"` + oversized + `"}]`
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		recorder := httptest.NewRecorder()
+
+		forwardedCalls := 0
+		h.handleHttp(recorder, request, func(http.ResponseWriter, *http.Request) {
+			forwardedCalls++
+		}, time.Now())
+
+		require.Equal(t, http.StatusOK, recorder.Code)
+		require.Empty(t, recorder.Body.String(), "§6: no responses means no array")
+		require.Equal(t, 1, forwardedCalls, "the valid notification is still forwarded")
+	})
+
+	t.Run("lone oversized notification never reaches upstream", func(t *testing.T) {
+		h := newEnvelopeTestHandler(t)
+		body := `[{"jsonrpc":"2.0","method":"` + oversized + `"}]`
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		recorder := httptest.NewRecorder()
+
+		h.handleHttp(recorder, request, func(http.ResponseWriter, *http.Request) {
+			t.Fatal("oversized notification reached upstream")
+		}, time.Now())
+
+		require.Equal(t, http.StatusOK, recorder.Code)
+		require.Empty(t, recorder.Body.String())
+	})
+
+	t.Run("duplicate ids still fail the whole batch first", func(t *testing.T) {
+		h := newEnvelopeTestHandler(t)
+		body := `[{"jsonrpc":"2.0","id":1,"method":"` + oversized + `"},` +
+			`{"jsonrpc":"2.0","id":1,"method":"status"}]`
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		recorder := httptest.NewRecorder()
+
+		h.handleHttp(recorder, request, func(http.ResponseWriter, *http.Request) {
+			t.Fatal("duplicate-id batch reached upstream")
+		}, time.Now())
+
+		require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`,
+			recorder.Body.String())
 	})
 }
 

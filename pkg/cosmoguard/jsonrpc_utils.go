@@ -351,6 +351,12 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 // rejected. Every other error keeps the parser's usual contract of
 // returning nothing, since an envelope that failed to parse cannot be
 // trusted to say whether it had an id.
+//
+// A batch comes back intact and is checked per member by
+// handleHttpBatch. §6 answers a well-formed array member by member, so
+// one oversized method must not cost its siblings their responses —
+// and a notification inside a batch has the same right to silence as
+// one sent on its own.
 func ParseJsonRpcRequest(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	msg, batch, err := ParseJsonRpcMessage(b)
 	if err != nil {
@@ -363,9 +369,6 @@ func ParseJsonRpcRequest(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	if err := validateJsonRpcMethodLength(msg); err != nil {
 		return msg, nil, err
 	}
-	if err := validateJsonRpcMethodLengths(batch); err != nil {
-		return nil, nil, err
-	}
 	return msg, batch, nil
 }
 
@@ -377,18 +380,6 @@ func validateJsonRpcMethodLength(msg *JsonRpcMsg) error {
 		return nil
 	}
 	return fmt.Errorf("%w: JSON-RPC method exceeds %d bytes", ErrInvalidRequest, maxJsonRpcMethodBytes)
-}
-
-// validateJsonRpcMethodLengths rejects the whole batch on the first
-// oversized member, the same way an ambiguous envelope key or a
-// duplicate id fails a batch.
-func validateJsonRpcMethodLengths(msgs JsonRpcMsgs) error {
-	for _, msg := range msgs {
-		if err := validateJsonRpcMethodLength(msg); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func classifyJsonRpcDecodeError(validJSON bool, err error) error {
@@ -660,12 +651,20 @@ func InvalidRequestResponse() *JsonRpcMsg {
 	return &JsonRpcMsg{
 		Version: "2.0",
 		Error: &JsonRpcError{
-			Code:    -32600,
-			Message: "Invalid Request",
+			Code:    invalidRequestCode,
+			Message: invalidRequestMessage,
 		},
 		ID: explicitNullID,
 	}
 }
+
+// The -32600 pair, named so a rejection that knows the request's id can
+// build the same error carrying that id instead of the null §5.1
+// reserves for an id that could not be read.
+const (
+	invalidRequestCode    = -32600
+	invalidRequestMessage = "Invalid Request"
+)
 
 func EmptyResult(req *JsonRpcMsg) *JsonRpcMsg {
 	return &JsonRpcMsg{
