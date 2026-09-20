@@ -319,9 +319,6 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 		if err == nil {
 			err = envelopeErr
 		}
-		if err == nil {
-			err = validateJsonRpcMethodLengths(msg)
-		}
 		if errors.Is(err, ErrInvalidRequest) {
 			return nil, nil, err
 		}
@@ -332,13 +329,33 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	if err == nil {
 		err = envelopeErr
 	}
-	if err == nil {
-		err = validateJsonRpcMethodLength(&msg)
-	}
 	if errors.Is(err, ErrInvalidRequest) {
 		return nil, nil, err
 	}
 	return &msg, nil, err
+}
+
+// ParseJsonRpcRequest parses a message that came from a client and
+// adds the one policy that applies to requests only: a method longer
+// than maxJsonRpcMethodBytes is an Invalid Request.
+//
+// Upstream responses and notifications go through ParseJsonRpcMessage,
+// which carries no such limit. The cap exists to stop a client pinning
+// memory in the observability buffers, not to police what a configured
+// upstream may send — dropping an upstream notification would cost a
+// subscriber its event.
+func ParseJsonRpcRequest(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
+	msg, batch, err := ParseJsonRpcMessage(b)
+	if err != nil {
+		return msg, batch, err
+	}
+	if err := validateJsonRpcMethodLength(msg); err != nil {
+		return nil, nil, err
+	}
+	if err := validateJsonRpcMethodLengths(batch); err != nil {
+		return nil, nil, err
+	}
+	return msg, batch, nil
 }
 
 // validateJsonRpcMethodLength rejects a single message whose method

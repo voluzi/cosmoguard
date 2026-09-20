@@ -284,7 +284,7 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 	}()
 
 	for {
-		req, err := client.ReceiveMsg()
+		req, err := client.ReceiveRequest()
 		if err != nil {
 			// A malformed / unsupported frame on an otherwise healthy
 			// connection must NOT tear down the client and drop all its

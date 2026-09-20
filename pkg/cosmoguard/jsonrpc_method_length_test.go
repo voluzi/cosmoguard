@@ -13,9 +13,9 @@ import (
 
 func methodOfLength(n int) string { return strings.Repeat("m", n) }
 
-func TestParseJsonRpcMessageRejectsOversizedMethod(t *testing.T) {
+func TestParseJsonRpcRequestRejectsOversizedMethod(t *testing.T) {
 	t.Run("accepts a method at the limit", func(t *testing.T) {
-		msg, batch, err := ParseJsonRpcMessage([]byte(
+		msg, batch, err := ParseJsonRpcRequest([]byte(
 			`{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes) + `"}`))
 		require.NoError(t, err)
 		require.Nil(t, batch)
@@ -23,7 +23,7 @@ func TestParseJsonRpcMessageRejectsOversizedMethod(t *testing.T) {
 	})
 
 	t.Run("rejects one byte over", func(t *testing.T) {
-		msg, batch, err := ParseJsonRpcMessage([]byte(
+		msg, batch, err := ParseJsonRpcRequest([]byte(
 			`{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}`))
 		require.ErrorIs(t, err, ErrInvalidRequest)
 		require.Nil(t, msg)
@@ -31,7 +31,7 @@ func TestParseJsonRpcMessageRejectsOversizedMethod(t *testing.T) {
 	})
 
 	t.Run("rejects the whole batch when one member is oversized", func(t *testing.T) {
-		msg, batch, err := ParseJsonRpcMessage([]byte(
+		msg, batch, err := ParseJsonRpcRequest([]byte(
 			`[{"jsonrpc":"2.0","id":1,"method":"status"},` +
 				`{"jsonrpc":"2.0","id":2,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}]`))
 		require.ErrorIs(t, err, ErrInvalidRequest)
@@ -39,9 +39,29 @@ func TestParseJsonRpcMessageRejectsOversizedMethod(t *testing.T) {
 		require.Nil(t, batch)
 	})
 
-	t.Run("leaves upstream responses alone", func(t *testing.T) {
-		// Responses carry no method, and the parser is shared with the
-		// upstream read path — a large result must still parse.
+	t.Run("keeps a valid batch intact", func(t *testing.T) {
+		msg, batch, err := ParseJsonRpcRequest([]byte(
+			`[{"jsonrpc":"2.0","id":1,"method":"status"},{"jsonrpc":"2.0","id":2,"method":"health"}]`))
+		require.NoError(t, err)
+		require.Nil(t, msg)
+		require.Len(t, batch, 2)
+		require.Equal(t, "health", batch[1].Method)
+	})
+}
+
+// TestParseJsonRpcMessageKeepsUpstreamMethodsUnbounded pins the split:
+// the length cap is a policy on client requests. An upstream is
+// configured by the operator, and dropping its notification would cost
+// a subscriber an event it is entitled to.
+func TestParseJsonRpcMessageKeepsUpstreamMethodsUnbounded(t *testing.T) {
+	t.Run("upstream notification with a long method", func(t *testing.T) {
+		long := methodOfLength(maxJsonRpcMethodBytes + 1)
+		msg, _, err := ParseJsonRpcMessage([]byte(`{"jsonrpc":"2.0","method":"` + long + `","params":{}}`))
+		require.NoError(t, err)
+		require.Equal(t, long, msg.Method)
+	})
+
+	t.Run("upstream response with a large result", func(t *testing.T) {
 		msg, _, err := ParseJsonRpcMessage([]byte(
 			`{"jsonrpc":"2.0","id":1,"result":"` + strings.Repeat("r", 1<<20) + `"}`))
 		require.NoError(t, err)
@@ -87,15 +107,20 @@ func TestHandleHTTPRejectsOversizedMethodBeforeRuleMatching(t *testing.T) {
 	}
 }
 
-func TestReceiveMsgRejectsOversizedMethodAsInvalidRequest(t *testing.T) {
+func TestReceiveRequestRejectsOversizedMethodAsInvalidRequest(t *testing.T) {
 	client, peer := newWSCacheClient(t)
-	require.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(
-		`{"jsonrpc":"2.0","id":1,"method":"`+methodOfLength(maxJsonRpcMethodBytes+1)+`"}`,
-	)))
+	frame := []byte(`{"jsonrpc":"2.0","id":1,"method":"` + methodOfLength(maxJsonRpcMethodBytes+1) + `"}`)
+	require.NoError(t, peer.WriteMessage(websocket.TextMessage, frame))
 
-	msg, err := client.ReceiveMsg()
+	msg, err := client.ReceiveRequest()
 
 	require.Nil(t, msg)
 	require.ErrorIs(t, err, ErrInvalidRequest)
 	require.NotErrorIs(t, err, ErrBadMessage)
+
+	// The same frame read as upstream traffic is delivered, not dropped.
+	require.NoError(t, peer.WriteMessage(websocket.TextMessage, frame))
+	upstream, err := client.ReceiveMsg()
+	require.NoError(t, err)
+	require.Len(t, upstream.Method, maxJsonRpcMethodBytes+1)
 }

@@ -108,6 +108,21 @@ func (c *JsonRpcWsClient) IsClosed() bool {
 	return c.closed
 }
 
+// ReceiveRequest is ReceiveMsg for the downstream side, where the frame
+// is a client request: it also enforces the request-only method-length
+// policy. The upstream managers stay on ReceiveMsg, so a notification
+// from a configured upstream is never dropped over its method length.
+func (c *JsonRpcWsClient) ReceiveRequest() (*JsonRpcMsg, error) {
+	msg, err := c.ReceiveMsg()
+	if err != nil {
+		return nil, err
+	}
+	if err := validateJsonRpcMethodLength(msg); err != nil {
+		return nil, fmt.Errorf("parse message: %w", err)
+	}
+	return msg, nil
+}
+
 func (c *JsonRpcWsClient) ReceiveMsg() (*JsonRpcMsg, error) {
 	if c.IsClosed() {
 		return nil, ErrClosed

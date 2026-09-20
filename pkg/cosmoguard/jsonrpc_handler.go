@@ -450,7 +450,7 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	req, requests, parseErr := ParseJsonRpcMessage(b)
+	req, requests, parseErr := ParseJsonRpcRequest(b)
 	if parseErr != nil {
 		// Per JSON-RPC 2.0 §5.1, a parse failure responds with id=null,
 		// code -32700 Parse error (when the payload was unparseable as

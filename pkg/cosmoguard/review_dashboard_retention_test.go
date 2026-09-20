@@ -19,18 +19,30 @@ import (
 // default 5 MiB body cap.
 func oversizedValue(fill string) string { return strings.Repeat(fill, 1<<20) }
 
+// retainedValue is one client-controlled string a sink kept, paired
+// with the cap that applies to it. Carrying the cap per field is what
+// makes the class-level test able to catch a method field wired to the
+// looser path cap.
+type retainedValue struct {
+	field string
+	value string
+	cap   int
+}
+
+func (r retainedValue) String() string { return r.field }
+
 // unmatchedComponents returns the client-controlled halves of every
 // retained unmatched key, undoing the (method, path) encoding.
-func unmatchedComponents(d *dashboardObservability, section string) []string {
+func unmatchedComponents(d *dashboardObservability, section string) []retainedValue {
 	d.unmatchedMu.Lock()
 	c := d.unmatched[section]
 	d.unmatchedMu.Unlock()
-	var out []string
+	var out []retainedValue
 	for _, e := range c.Snapshot() {
 		method, path := splitUnmatchedKey(e.Key)
-		out = append(out, method)
+		out = append(out, retainedValue{"unmatched.method", method, maxRetainedMethodBytes})
 		if path != "" {
-			out = append(out, path)
+			out = append(out, retainedValue{"unmatched.path", path, maxRetainedPathBytes})
 		}
 	}
 	return out
@@ -39,22 +51,26 @@ func unmatchedComponents(d *dashboardObservability, section string) []string {
 // cardinalityComponents returns the client-controlled request keys of
 // every retained cardinality entry; the rule tag half is operator
 // configuration and is deliberately left out.
-func cardinalityComponents(d *dashboardObservability, section string) []string {
+func cardinalityComponents(d *dashboardObservability, section string) []retainedValue {
 	d.cardinalityMu.Lock()
 	c := d.cardinality[section]
 	d.cardinalityMu.Unlock()
-	var out []string
+	var out []retainedValue
 	for _, e := range c.Snapshot() {
 		_, requestKey := splitCardinalityKey(e.Key)
-		out = append(out, requestKey)
+		out = append(out, retainedValue{"cardinality.request_key", requestKey, maxRetainedPathBytes})
 	}
 	return out
 }
 
-func deniedComponents(d *dashboardObservability) []string {
-	var out []string
+func deniedComponents(d *dashboardObservability) []retainedValue {
+	var out []retainedValue
 	for _, rec := range d.denied.Snapshot() {
-		out = append(out, rec.SourceIP, rec.Method, rec.Path)
+		out = append(out,
+			retainedValue{"deny.source_ip", rec.SourceIP, maxRetainedMethodBytes},
+			retainedValue{"deny.method", rec.Method, maxRetainedMethodBytes},
+			retainedValue{"deny.path", rec.Path, maxRetainedPathBytes},
+		)
 	}
 	return out
 }
@@ -65,7 +81,7 @@ func deniedComponents(d *dashboardObservability) []string {
 // valid request at all.
 func TestReviewDashboardRetainsUnboundedMethodStrings(t *testing.T) {
 	huge := oversizedValue("a")
-	msg, batch, err := ParseJsonRpcMessage([]byte(`{"jsonrpc":"2.0","id":1,"method":"` + huge + `"}`))
+	msg, batch, err := ParseJsonRpcRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"` + huge + `"}`))
 	require.ErrorIs(t, err, ErrInvalidRequest)
 	require.Nil(t, msg)
 	require.Nil(t, batch)
@@ -94,11 +110,11 @@ func TestDashboardRetentionBoundsEverySink(t *testing.T) {
 
 	tests := []struct {
 		name string
-		feed func(t *testing.T) []string
+		feed func(t *testing.T) []retainedValue
 	}{
 		{
 			name: "unmatched",
-			feed: func(t *testing.T) []string {
+			feed: func(t *testing.T) []retainedValue {
 				d := newDashboardObservability()
 				d.RecordUnmatched("lcd", huge, huge)
 				return unmatchedComponents(d, "lcd")
@@ -106,7 +122,7 @@ func TestDashboardRetentionBoundsEverySink(t *testing.T) {
 		},
 		{
 			name: "denied",
-			feed: func(t *testing.T) []string {
+			feed: func(t *testing.T) []retainedValue {
 				d := newDashboardObservability()
 				d.RecordDeny(DenyRecord{Section: "lcd", Reason: "rule", SourceIP: huge, Method: huge, Path: huge})
 				return deniedComponents(d)
@@ -114,7 +130,7 @@ func TestDashboardRetentionBoundsEverySink(t *testing.T) {
 		},
 		{
 			name: "cardinality",
-			feed: func(t *testing.T) []string {
+			feed: func(t *testing.T) []retainedValue {
 				d := newDashboardObservability()
 				d.RecordCardinality("lcd", "rule-1", huge)
 				return cardinalityComponents(d, "lcd")
@@ -122,22 +138,27 @@ func TestDashboardRetentionBoundsEverySink(t *testing.T) {
 		},
 		{
 			name: "request log",
-			feed: func(t *testing.T) []string {
+			feed: func(t *testing.T) []retainedValue {
 				rl := enabledLog(t, 100)
 				rl.Record(RequestLogEntry{
 					Section: "lcd", Status: 200,
 					Method: huge, Path: huge, Query: huge, SourceIP: huge,
 				})
-				var out []string
+				var out []retainedValue
 				for _, e := range rl.Snapshot(nil, 10) {
-					out = append(out, e.Method, e.Path, e.Query, e.SourceIP)
+					out = append(out,
+						retainedValue{"request_log.method", e.Method, maxRetainedMethodBytes},
+						retainedValue{"request_log.source_ip", e.SourceIP, maxRetainedMethodBytes},
+						retainedValue{"request_log.path", e.Path, maxRetainedPathBytes},
+						retainedValue{"request_log.query", e.Query, maxRetainedPathBytes},
+					)
 				}
 				return out
 			},
 		},
 		{
 			name: "restore from peer snapshot",
-			feed: func(t *testing.T) []string {
+			feed: func(t *testing.T) []retainedValue {
 				blob, err := msgpack.Marshal(&observabilitySnapshot{
 					Unmatched:   map[string][]topNEntrySnap{"lcd": {{Key: unmatchedKey(huge, huge), Count: 3}}},
 					Cardinality: map[string][]topNEntrySnap{"lcd": {{Key: cardinalityKey("rule-1", huge), Count: 3}}},
@@ -159,11 +180,13 @@ func TestDashboardRetentionBoundsEverySink(t *testing.T) {
 			retained := tt.feed(t)
 			require.NotEmpty(t, retained, "sink retained nothing — the test no longer exercises it")
 			total := 0
-			for _, s := range retained {
-				require.LessOrEqual(t, len(s), maxRetainedPathBytes, "retained string is unbounded: %d bytes", len(s))
-				require.Contains(t, s, retainedTruncationMarker, "truncation must be visible to the operator")
-				require.True(t, utf8.ValidString(s), "truncation split a rune")
-				total += len(s)
+			for _, r := range retained {
+				require.LessOrEqual(t, len(r.value), r.cap,
+					"%s exceeds its own cap: %d bytes retained, cap %d", r.field, len(r.value), r.cap)
+				require.Contains(t, r.value, retainedTruncationMarker,
+					"%s: truncation must be visible to the operator", r.field)
+				require.True(t, utf8.ValidString(r.value), "%s: truncation split a rune", r.field)
+				total += len(r.value)
 			}
 			t.Logf("retained bytes: %d", total)
 			require.Less(t, total, 1<<20)
@@ -211,13 +234,18 @@ func TestRetainedStringsDoNotAliasTheRequestBuffer(t *testing.T) {
 	retained := append(deniedComponents(d), unmatchedComponents(d, "lcd")...)
 	retained = append(retained, cardinalityComponents(d, "lcd")...)
 	for _, e := range rl.Snapshot(nil, 10) {
-		retained = append(retained, e.Method, e.Path, e.Query, e.SourceIP)
+		retained = append(retained,
+			retainedValue{"request_log.method", e.Method, maxRetainedMethodBytes},
+			retainedValue{"request_log.source_ip", e.SourceIP, maxRetainedMethodBytes},
+			retainedValue{"request_log.path", e.Path, maxRetainedPathBytes},
+			retainedValue{"request_log.query", e.Query, maxRetainedPathBytes},
+		)
 	}
 
 	require.NotEmpty(t, retained)
-	for _, s := range retained {
-		require.False(t, pinsRequestLine(s),
-			"a %d-byte retained value still pins the %d-byte request line", len(s), len(raw))
+	for _, r := range retained {
+		require.False(t, pinsRequestLine(r.value),
+			"%s: a %d-byte retained value still pins the %d-byte request line", r.field, len(r.value), len(raw))
 	}
 }
 
@@ -287,8 +315,8 @@ func TestRecordCardinalityKeepsDistinctLongKeysDistinct(t *testing.T) {
 	d.cardinalityMu.Unlock()
 	require.Len(t, c.Snapshot(), 50)
 
-	for _, s := range cardinalityComponents(d, "lcd") {
-		require.Contains(t, s, retainedTruncationMarker)
+	for _, r := range cardinalityComponents(d, "lcd") {
+		require.Contains(t, r.value, retainedTruncationMarker)
 	}
 }
 
