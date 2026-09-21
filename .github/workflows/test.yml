@@ -127,7 +127,7 @@ jobs:
             .server.websocketLimits.maxSubscriptionsPerUpstreamConnection == 10 and
             .server.websocketLimits.maxConnectionsPerIP == 16
           ' /tmp/cosmoguard.yaml >/dev/null; then
-            echo "rendered WebSocket defaults do not match the expected capacity policy:"
+            echo "::error::rendered WebSocket defaults do not match the expected capacity policy:"
             yq '{
               "rpcWebSocketConnections": .rpc.webSocketConnections,
               "evmWebSocketConnections": .evm.ws.webSocketConnections,
