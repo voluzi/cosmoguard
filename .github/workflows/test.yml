@@ -119,14 +119,22 @@ jobs:
             --set-string cluster.existingEncryptionKeySecret=ci-cluster-key \
             --show-only templates/configmap.yaml \
             | yq '.data["cosmoguard.yaml"]' > /tmp/cosmoguard.yaml
-          yq -e '
+          if ! yq -e '
             .rpc.webSocketConnections == 40 and
             .evm.ws.webSocketConnections == 40 and
             .server.websocketLimits.maxSubscriptionsPerClient == 32 and
             .server.websocketLimits.maxSubscriptionsPerIdentity == 128 and
             .server.websocketLimits.maxSubscriptionsPerUpstreamConnection == 10 and
             .server.websocketLimits.maxConnectionsPerIP == 16
-          ' /tmp/cosmoguard.yaml >/dev/null
+          ' /tmp/cosmoguard.yaml >/dev/null; then
+            echo "rendered WebSocket defaults do not match the expected capacity policy:"
+            yq '{
+              "rpcWebSocketConnections": .rpc.webSocketConnections,
+              "evmWebSocketConnections": .evm.ws.webSocketConnections,
+              "websocketLimits": .server.websocketLimits
+            }' /tmp/cosmoguard.yaml
+            exit 1
+          fi
           POD_IP=127.0.0.1 \
           CLUSTER_ENCRYPTION_KEY="$(head -c32 /dev/urandom | base64)" \
           /tmp/cosmoguard --config /tmp/cosmoguard.yaml >/tmp/cg.log 2>&1 &
