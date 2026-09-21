@@ -62,7 +62,7 @@ server:
   websocketLimits:
     maxSubscriptionsPerClient: 32
     maxSubscriptionsPerIdentity: 128
-    maxSubscriptionsPerUpstreamConnection: 4
+    maxSubscriptionsPerUpstreamConnection: 10
     maxConnectionsPerIP: 16
   # wsAllowedOrigins is empty by default — cross-origin WS upgrades denied.
   # Set to ["*"] to restore v3 behavior, or list specific origins:
@@ -200,7 +200,7 @@ lcd:
 rpc:
   default: allow
   webSocketEnabled: true
-  webSocketConnections: 10
+  webSocketConnections: 40
 
   rules:
     - action: allow
@@ -253,6 +253,6 @@ grpc:
 #     default: allow
 #     rules: []
 #   ws:
-#     webSocketConnections: 10
+#     webSocketConnections: 40
 #     default: allow
 #     rules: []

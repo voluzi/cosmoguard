@@ -687,7 +687,7 @@ type RpcConfig struct {
 	// silently re-enabled — creasty/defaults can't distinguish false from
 	// unset). Read via WebSocketIsEnabled(). nil → default (enabled).
 	WebSocketEnabled     *bool `yaml:"webSocketEnabled,omitempty"`
-	WebSocketConnections int   `yaml:"webSocketConnections,omitempty" default:"10"`
+	WebSocketConnections int   `yaml:"webSocketConnections,omitempty" default:"40"`
 }
 
 // WebSocketIsEnabled reports whether the JSON-RPC WebSocket proxy is on.
@@ -910,7 +910,7 @@ type EvmRpcConfig struct {
 type EvmRpcWsConfig struct {
 	Default              RuleAction     `yaml:"default,omitempty" default:"deny"`
 	Rules                []*JsonRpcRule `yaml:"rules,omitempty"`
-	WebSocketConnections int            `yaml:"webSocketConnections,omitempty" default:"10"`
+	WebSocketConnections int            `yaml:"webSocketConnections,omitempty" default:"40"`
 }
 
 // ReadConfigFromFile parses YAML at path and returns a fully prepared Config

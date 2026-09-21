@@ -9,7 +9,7 @@ import (
 const (
 	defaultMaxSubscriptionsPerClient             = 32
 	defaultMaxSubscriptionsPerIdentity           = 128
-	defaultMaxSubscriptionsPerUpstreamConnection = 4
+	defaultMaxSubscriptionsPerUpstreamConnection = 10
 	defaultMaxConnectionsPerIP                   = 16
 
 	wsLimitScopeClient             = "client"

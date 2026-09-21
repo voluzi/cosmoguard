@@ -14,6 +14,9 @@ func TestReadConfigFromFile(t *testing.T) {
 	cfg, err := ReadConfigFromFile("../../example.config.yml")
 	assert.NilError(t, err)
 	assert.Assert(t, cfg != nil)
+	assert.Equal(t, cfg.RPC.WebSocketConnections, 40)
+	assert.Equal(t, cfg.EVM.WS.WebSocketConnections, 40)
+	assert.Equal(t, cfg.Server.EffectiveWebSocketLimits().MaxSubscriptionsPerUpstreamConnection, 10)
 }
 
 func TestReadConfigFromFile_NonExistent(t *testing.T) {
@@ -52,6 +55,9 @@ func TestReadConfigFromFile_DefaultValues(t *testing.T) {
 	assert.Equal(t, cfg.EnableEvm, false)
 	assert.Equal(t, cfg.EvmRpcPort, 18545)
 	assert.Equal(t, cfg.EvmRpcWsPort, 18546)
+	assert.Equal(t, cfg.RPC.WebSocketConnections, 40)
+	assert.Equal(t, cfg.EVM.WS.WebSocketConnections, 40)
+	assert.Equal(t, cfg.Server.EffectiveWebSocketLimits().MaxSubscriptionsPerUpstreamConnection, 10)
 
 	// Node defaults — PrepareConfig promotes the v3 singular
 	// `node:` into Nodes[0] and clears cfg.Node, so assertions
@@ -88,6 +94,17 @@ grpcPort: 9090
 enableEvm: true
 evmRpcPort: 8545
 
+server:
+  websocketLimits:
+    maxSubscriptionsPerUpstreamConnection: 7
+
+rpc:
+  webSocketConnections: 6
+
+evm:
+  ws:
+    webSocketConnections: 5
+
 node:
   host: 10.0.0.1
   rpcPort: 26658
@@ -119,6 +136,9 @@ lcd:
 	assert.Equal(t, cfg.GrpcPort, 9090)
 	assert.Equal(t, cfg.EnableEvm, true)
 	assert.Equal(t, cfg.EvmRpcPort, 8545)
+	assert.Equal(t, cfg.RPC.WebSocketConnections, 6)
+	assert.Equal(t, cfg.EVM.WS.WebSocketConnections, 5)
+	assert.Equal(t, cfg.Server.EffectiveWebSocketLimits().MaxSubscriptionsPerUpstreamConnection, 7)
 
 	assert.Equal(t, cfg.Nodes[0].Host, "10.0.0.1")
 	assert.Equal(t, cfg.Nodes[0].RpcPort, 26658)

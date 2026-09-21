@@ -278,7 +278,7 @@ func TestWebSocketLimitsEffectiveValues(t *testing.T) {
 	limits := (&ServerConfig{}).EffectiveWebSocketLimits()
 	assert.Equal(t, limits.MaxSubscriptionsPerClient, 32)
 	assert.Equal(t, limits.MaxSubscriptionsPerIdentity, 128)
-	assert.Equal(t, limits.MaxSubscriptionsPerUpstreamConnection, 4)
+	assert.Equal(t, limits.MaxSubscriptionsPerUpstreamConnection, 10)
 	assert.Equal(t, limits.MaxConnectionsPerIP, 16)
 
 	zero := &ServerConfig{WebSocketLimits: WebSocketLimitsConfig{
@@ -299,10 +299,98 @@ func TestWebSocketLimitsEffectiveValues(t *testing.T) {
 	explicitDefaults := &ServerConfig{WebSocketLimits: WebSocketLimitsConfig{
 		MaxSubscriptionsPerClient:             intPtr(32),
 		MaxSubscriptionsPerIdentity:           intPtr(128),
-		MaxSubscriptionsPerUpstreamConnection: intPtr(4),
+		MaxSubscriptionsPerUpstreamConnection: intPtr(10),
 		MaxConnectionsPerIP:                   intPtr(16),
 	}}
 	assert.Assert(t, !serverRuntimeImmutableChanged(&ServerConfig{}, explicitDefaults))
+}
+
+func TestDefaultWebSocketCapacitySupports100DistinctSubscriptions(t *testing.T) {
+	protocols := []struct {
+		name        string
+		method      string
+		connections func(*Config) int
+	}{
+		{name: "cosmos", method: methodSubscribeCosmos, connections: func(cfg *Config) int { return cfg.RPC.WebSocketConnections }},
+		{name: "evm", method: methodSubscribeEth, connections: func(cfg *Config) int { return cfg.EVM.WS.WebSocketConnections }},
+	}
+	for _, protocol := range protocols {
+		t.Run(protocol.name, func(t *testing.T) {
+			cfg := &Config{}
+			assert.NilError(t, PrepareConfig(cfg))
+			limits := cfg.Server.EffectiveWebSocketLimits()
+			broker := NewBroker([]string{"ws://upstream.test"}, "/", protocol.connections(cfg), fakeConstructor)
+			broker.log = log.WithField("test", t.Name())
+			broker.setAdmissionController(newWSAdmissionController(limits))
+			t.Cleanup(broker.Stop)
+
+			clients := make([]*JsonRpcWsClient, 4)
+			for i := range clients {
+				clients[i] = NewJsonRpcWsClient(nil)
+				assert.NilError(t, broker.admission.reserveConnection("192.0.2.10"))
+			}
+			t.Cleanup(func() {
+				for range clients {
+					broker.admission.releaseConnection("192.0.2.10")
+				}
+			})
+
+			for i := range 100 {
+				response, err := broker.HandleSubscription(clients[i%len(clients)], &JsonRpcMsg{
+					Version: jsonRpcVersion,
+					ID:      i + 1,
+					Method:  protocol.method,
+					Params:  []any{fmt.Sprintf("distinct-%03d", i)},
+				}, "shared-identity")
+				assert.NilError(t, err)
+				assert.Assert(t, response.Error == nil, "subscription %d rejected: %+v", i+1, response.Error)
+			}
+
+			assert.Equal(t, len(broker.sm.Snapshot()), 100)
+			var allocated int64
+			for _, count := range broker.pool.subCount {
+				allocated += count.Load()
+			}
+			assert.Equal(t, allocated, int64(100))
+		})
+	}
+}
+
+func TestDefaultWebSocketCapacityBoundary(t *testing.T) {
+	cfg := &Config{}
+	assert.NilError(t, PrepareConfig(cfg))
+	limits := cfg.Server.EffectiveWebSocketLimits()
+	protocolPools := []struct {
+		name        string
+		connections int
+	}{
+		{name: "cosmos", connections: cfg.RPC.WebSocketConnections},
+		{name: "evm", connections: cfg.EVM.WS.WebSocketConnections},
+	}
+	for _, protocol := range protocolPools {
+		t.Run(protocol.name, func(t *testing.T) {
+			pool := NewUpstreamPool([]string{"ws://upstream.test"}, "/", protocol.connections, func(*JsonRpcMsg) {}, fakeConstructor)
+			pool.SetMaxSubscriptionsPerConnection(limits.MaxSubscriptionsPerUpstreamConnection)
+			t.Cleanup(pool.Stop)
+			for i := range 400 {
+				_, err := pool.Subscribe(fmt.Sprintf("distinct-%03d", i))
+				assert.NilError(t, err)
+			}
+			_, err := pool.Subscribe("over-capacity")
+			var exhausted *WSResourceExhaustedError
+			assert.Assert(t, errors.As(err, &exhausted))
+			assert.Equal(t, exhausted.Scope, wsLimitScopeUpstreamConnection)
+			assert.Equal(t, exhausted.Limit, 10)
+
+			var allocated int64
+			for _, count := range pool.subCount {
+				value := count.Load()
+				assert.Assert(t, value <= 10, "connection holds %d subscriptions", value)
+				allocated += value
+			}
+			assert.Equal(t, allocated, int64(400))
+		})
+	}
 }
 
 func TestWSAdmissionControllerSharesClientIdentityAndIPLimits(t *testing.T) {
