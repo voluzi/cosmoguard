@@ -16,11 +16,13 @@ import (
 )
 
 type UpstreamConnManagerCosmos struct {
-	url       url.URL
-	dialer    *websocket.Dialer
-	log       *Entry
-	IdGen     *util.UniqueID
-	lifecycle *wsSubscriptionLifecycle
+	url            url.URL
+	dialer         *websocket.Dialer
+	log            *Entry
+	IdGen          *util.UniqueID
+	lifecycle      *wsSubscriptionLifecycle
+	requestIDs     wsInternalRequestIDs
+	requestTimeout time.Duration
 
 	respMap map[wsResponseKey]chan *JsonRpcMsg
 	respMux sync.Mutex
@@ -295,7 +297,7 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClie
 	// for the full responseTimeout window. On a hot subscription
 	// workload time.After accumulates thousands of zombie timers,
 	// costing both memory and timer-heap rebalance CPU.
-	timeout := time.NewTimer(responseTimeout)
+	timeout := time.NewTimer(effectiveWSResponseTimeout(u.requestTimeout))
 	defer timeout.Stop()
 	select {
 	case response := <-respChan:
@@ -322,11 +324,7 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClie
 }
 
 func (u *UpstreamConnManagerCosmos) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, error) {
-	// Generate unique ID for request
-	ID := u.IdGen.ID()
-	response, err := u.makeRequestWithID(ID, req)
-	releaseWSRequestID(u.IdGen, ID, err)
-	return response, err
+	return u.makeRequestWithID(u.requestIDs.next(), req)
 }
 
 func (u *UpstreamConnManagerCosmos) HasSubscription(param string) bool {
@@ -377,13 +375,12 @@ func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) <-chan error 
 }
 
 func (u *UpstreamConnManagerCosmos) unsubscribeOn(binding wsSubscriptionBinding, param string) error {
-	requestID := u.IdGen.ID()
+	requestID := u.requestIDs.next()
 	response, err := u.makeRequestWithIDOnClient(binding.client, requestID, &JsonRpcMsg{
 		Version: jsonRpcVersion,
 		Method:  methodUnsubscribeCosmos,
 		Params:  []interface{}{param},
 	})
-	releaseWSRequestID(u.IdGen, requestID, err)
 	if u.beforeUnsubscribeCommit != nil {
 		u.beforeUnsubscribeCommit()
 	}

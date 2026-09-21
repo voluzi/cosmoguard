@@ -853,7 +853,7 @@ func seedManagerSubscription(manager UpstreamConnManager, param, id string) {
 	lifecycle := managerLifecycle(manager)
 	client := lifecycle.currentClient()
 	record := &wsSubscriptionRecord{
-		param: param, handle: id, state: wsSubscriptionActive, desired: true,
+		param: param, handle: id, reservation: id, state: wsSubscriptionActive, desired: true,
 		binding: &wsSubscriptionBinding{client: client, wireID: id}, settled: make(chan struct{}),
 	}
 	lifecycle.mu.Lock()

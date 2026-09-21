@@ -324,3 +324,70 @@ func TestRunReconnectPreservesLogicalSubscriptionID(t *testing.T) {
 		})
 	}
 }
+
+func TestEVMRunReconnectKeepsLogicalHandlesIndependentFromWireIDs(t *testing.T) {
+	backend := newLifecycleRunBackend(t)
+	notifications := make(chan *JsonRpcMsg, 2)
+	replayed := make(chan struct{}, 2)
+	manager := EthUpstreamConnManager(backend.wsURL(t), &util.UniqueID{}, func(msg *JsonRpcMsg) {
+		notifications <- msg
+	}).(*UpstreamConnManagerEth)
+	manager.afterResubmit = func() { replayed <- struct{}{} }
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(log.WithField("test", t.Name())) }()
+	t.Cleanup(func() {
+		manager.Stop()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("manager Run did not stop")
+		}
+	})
+
+	connA := backend.nextConn(t)
+	<-replayed
+	firstCall := startSubscribe(manager, "first")
+	firstRequest := connA.nextRequest(t)
+	connA.respond(t, WithResult(firstRequest, "0x2"))
+	first := <-firstCall
+	assert.NilError(t, first.err)
+
+	assert.NilError(t, connA.close())
+	connB := backend.nextConn(t)
+	replay := connB.nextRequest(t)
+	connB.respond(t, WithResult(replay, "replayed-first"))
+	<-replayed
+
+	secondCall := startSubscribe(manager, "second")
+	secondRequest := connB.nextRequest(t)
+	connB.respond(t, WithResult(secondRequest, first.id))
+	second := <-secondCall
+	assert.NilError(t, second.err)
+	assert.Assert(t, first.id != second.id, "logical handles collided at %q", first.id)
+
+	connB.respond(t, &JsonRpcMsg{Version: jsonRpcVersion, Params: map[string]any{
+		"subscription": "replayed-first", "result": "first-event",
+	}})
+	connB.respond(t, &JsonRpcMsg{Version: jsonRpcVersion, Params: map[string]any{
+		"subscription": first.id, "result": "second-event",
+	}})
+	routed := map[any]bool{}
+	for range 2 {
+		msg := <-notifications
+		routed[msg.ID] = true
+	}
+	assert.Assert(t, routed[first.id])
+	assert.Assert(t, routed[second.id])
+
+	firstRemoval := startUnsubscribe(manager, first.id)
+	firstUnsubscribe := connB.nextRequest(t)
+	assert.DeepEqual(t, firstUnsubscribe.Params, []any{"replayed-first"})
+	connB.respond(t, WithResult(firstUnsubscribe, true))
+	assert.NilError(t, <-firstRemoval)
+
+	secondRemoval := startUnsubscribe(manager, second.id)
+	secondUnsubscribe := connB.nextRequest(t)
+	assert.DeepEqual(t, secondUnsubscribe.Params, []any{first.id})
+	connB.respond(t, WithResult(secondUnsubscribe, true))
+	assert.NilError(t, <-secondRemoval)
+}

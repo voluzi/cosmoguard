@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -34,6 +35,23 @@ var (
 type wsResponseKey struct {
 	client *JsonRpcWsClient
 	id     string
+}
+
+type wsInternalRequestIDs struct {
+	sequence atomic.Uint64
+}
+
+// next never reuses completed or timed-out IDs, so a late response cannot be
+// mistaken for a newer request and no per-timeout reservation needs a waiter.
+func (ids *wsInternalRequestIDs) next() string {
+	return fmt.Sprintf("cosmoguard-request-%d", ids.sequence.Add(1))
+}
+
+func effectiveWSResponseTimeout(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return responseTimeout
 }
 
 // uncertainWSUpstreamOutcomeError means a request may have reached the
@@ -69,26 +87,6 @@ func uncertainWSUpstreamOutcomeSettlement(err error) <-chan struct{} {
 		return nil
 	}
 	return uncertain.settled
-}
-
-func releaseWSRequestID(idGen *util.UniqueID, id string, err error) {
-	if !isUncertainWSUpstreamOutcome(err) {
-		idGen.Release(id)
-		return
-	}
-	settled := uncertainWSUpstreamOutcomeSettlement(err)
-	if settled == nil {
-		return
-	}
-	select {
-	case <-settled:
-		idGen.Release(id)
-	default:
-		go func() {
-			<-settled
-			idGen.Release(id)
-		}()
-	}
 }
 
 func validateWSJSONRPCResponse(method string, response *JsonRpcMsg) error {

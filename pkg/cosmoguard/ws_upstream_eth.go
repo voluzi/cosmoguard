@@ -16,11 +16,13 @@ import (
 )
 
 type UpstreamConnManagerEth struct {
-	url       url.URL
-	dialer    *websocket.Dialer
-	log       *Entry
-	IdGen     *util.UniqueID
-	lifecycle *wsSubscriptionLifecycle
+	url            url.URL
+	dialer         *websocket.Dialer
+	log            *Entry
+	IdGen          *util.UniqueID
+	lifecycle      *wsSubscriptionLifecycle
+	requestIDs     wsInternalRequestIDs
+	requestTimeout time.Duration
 
 	respMap map[wsResponseKey]chan *JsonRpcMsg
 	respMux sync.Mutex
@@ -264,7 +266,7 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 	// Stoppable timer (not time.After) so the happy path frees the
 	// runtime timer slot immediately — see the matching comment in
 	// the cosmos variant.
-	timeout := time.NewTimer(responseTimeout)
+	timeout := time.NewTimer(effectiveWSResponseTimeout(u.requestTimeout))
 	defer timeout.Stop()
 	select {
 	case response := <-respChan:
@@ -291,11 +293,7 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 }
 
 func (u *UpstreamConnManagerEth) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, error) {
-	// Generate unique ID for request
-	ID := u.IdGen.ID()
-	response, err := u.makeRequestWithID(ID, req)
-	releaseWSRequestID(u.IdGen, ID, err)
-	return response, err
+	return u.makeRequestWithID(u.requestIDs.next(), req)
 }
 
 func (u *UpstreamConnManagerEth) HasSubscription(subID string) bool {
@@ -318,11 +316,8 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 	return u.lifecycle.subscribe(param, id, cli, u)
 }
 
-func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param string, replay bool) (string, error) {
-	requestID := id
-	if replay {
-		requestID = u.IdGen.ID()
-	}
+func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param string, _ bool) (string, error) {
+	requestID := u.requestIDs.next()
 	msg := &JsonRpcMsg{
 		Version: jsonRpcVersion,
 		ID:      requestID,
@@ -332,11 +327,9 @@ func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param str
 
 	resp, err := u.makeRequestWithIDOnClient(cli, requestID, msg)
 	if err != nil {
-		releaseWSRequestID(u.IdGen, requestID, err)
 		return "", err
 	}
 	if err := validateWSJSONRPCResponse(methodSubscribeEth, resp); err != nil {
-		u.IdGen.Release(requestID)
 		return "", err
 	}
 
@@ -346,10 +339,8 @@ func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param str
 	var subID string
 	if err := json.Unmarshal(resp.Result, &subID); err != nil {
 		outcome := uncertainWSUpstreamOutcomeUntil(fmt.Errorf("decode subscription ID %q: %w", string(resp.Result), err), cli.Closed())
-		releaseWSRequestID(u.IdGen, requestID, outcome)
 		return "", outcome
 	}
-	u.IdGen.Release(requestID)
 	return subID, nil
 }
 
@@ -362,13 +353,12 @@ func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) <-chan error {
 }
 
 func (u *UpstreamConnManagerEth) unsubscribeOn(binding wsSubscriptionBinding, _ string) error {
-	requestID := u.IdGen.ID()
+	requestID := u.requestIDs.next()
 	response, err := u.makeRequestWithIDOnClient(binding.client, requestID, &JsonRpcMsg{
 		Version: jsonRpcVersion,
 		Method:  methodUnsubscribeEth,
 		Params:  []string{binding.wireID},
 	})
-	releaseWSRequestID(u.IdGen, requestID, err)
 	if u.beforeUnsubscribeCommit != nil {
 		u.beforeUnsubscribeCommit()
 	}
@@ -378,11 +368,14 @@ func (u *UpstreamConnManagerEth) unsubscribeOn(binding wsSubscriptionBinding, _ 
 	return validateEthUnsubscribeResponse(response)
 }
 
-func (u *UpstreamConnManagerEth) stableHandle(_, wireID string) string {
-	return wireID
+const evmLogicalHandlePrefix = "cosmoguard-evm-"
+
+func (u *UpstreamConnManagerEth) stableHandle(provisional, _ string) string {
+	return evmLogicalHandlePrefix + provisional
 }
 
-func (u *UpstreamConnManagerEth) releaseHandle(string) {
+func (u *UpstreamConnManagerEth) releaseHandle(reservation string) {
+	u.IdGen.Release(reservation)
 }
 
 func validateEthUnsubscribeResponse(response *JsonRpcMsg) error {

@@ -22,12 +22,13 @@ type wsSubscriptionBinding struct {
 }
 
 type wsSubscriptionRecord struct {
-	param   string
-	handle  string
-	state   wsSubscriptionState
-	desired bool
-	binding *wsSubscriptionBinding
-	settled chan struct{}
+	param       string
+	handle      string
+	reservation string
+	state       wsSubscriptionState
+	desired     bool
+	binding     *wsSubscriptionBinding
+	settled     chan struct{}
 }
 
 type wsSubscriptionExchange interface {
@@ -118,7 +119,7 @@ func (l *wsSubscriptionLifecycle) subscribe(param, provisional string, client *J
 		return "", ErrSubscriptionExists
 	}
 	record := &wsSubscriptionRecord{
-		param: param, handle: provisional, state: wsSubscriptionCreating,
+		param: param, handle: provisional, reservation: provisional, state: wsSubscriptionCreating,
 		desired: true, settled: make(chan struct{}),
 	}
 	l.byParam[param] = record
@@ -372,10 +373,10 @@ func (l *wsSubscriptionLifecycle) settle(record *wsSubscriptionRecord, releaseHa
 	record.state = wsSubscriptionRetired
 	record.binding = nil
 	close(record.settled)
-	handle := record.handle
+	reservation := record.reservation
 	l.mu.Unlock()
 	if releaseHandle {
-		exchange.releaseHandle(handle)
+		exchange.releaseHandle(reservation)
 	}
 }
 
