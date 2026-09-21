@@ -284,7 +284,7 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 	}()
 
 	for {
-		req, err := client.ReceiveMsg()
+		req, err := client.ReceiveRequest()
 		if err != nil {
 			// A malformed / unsupported frame on an otherwise healthy
 			// connection must NOT tear down the client and drop all its
@@ -295,8 +295,18 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 			// is dead, so fall through to close.
 			if errors.Is(err, ErrBadMessage) || errors.Is(err, ErrInvalidRequest) {
 				p.log.Warnf("bad message from client: %v", err)
+				// Only a policy rejection hands back the parsed frame,
+				// so req is nil for anything whose id cannot be
+				// trusted. When it is non-nil the id is known: a
+				// notification gets no reply at all (§4.1), and a
+				// request gets the error under its own id.
 				resp := ParseErrorResponse()
-				if errors.Is(err, ErrInvalidRequest) {
+				switch {
+				case req != nil && req.ID == nil:
+					continue
+				case req != nil:
+					resp = ErrorResponse(req, invalidRequestCode, invalidRequestMessage, nil)
+				case errors.Is(err, ErrInvalidRequest):
 					resp = InvalidRequestResponse()
 				}
 				if sendErr := client.SendMsg(resp); sendErr == nil {

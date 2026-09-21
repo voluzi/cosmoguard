@@ -22,6 +22,14 @@ var (
 	errInvalidJSONSyntax = errors.New("invalid JSON syntax")
 )
 
+// maxJsonRpcMethodBytes rejects absurd method names at parse time. The
+// method is otherwise bounded only by the body cap (5 MiB by default),
+// and it is retained downstream — dashboard counters, deny records,
+// request log. The longest names in the wild are well under 40 bytes
+// (eth_getTransactionByBlockNumberAndIndex, num_unconfirmed_txs), so
+// this leaves ample headroom for a method nobody has invented yet.
+const maxJsonRpcMethodBytes = 256
+
 type JsonRpcError struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
@@ -327,6 +335,53 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	return &msg, nil, err
 }
 
+// ParseJsonRpcRequest parses a message that came from a client and
+// adds the one policy that applies to requests only: a method longer
+// than maxJsonRpcMethodBytes is an Invalid Request.
+//
+// Upstream responses and notifications go through ParseJsonRpcMessage,
+// which carries no such limit. The cap exists to stop a client pinning
+// memory in the observability buffers, not to police what a configured
+// upstream may send — dropping an upstream notification would cost a
+// subscriber its event.
+//
+// A single message rejected for its method length is returned
+// alongside the error, because the caller still has to honour §4.1:
+// a notification carries no id and gets no reply, however it is
+// rejected. Every other error keeps the parser's usual contract of
+// returning nothing, since an envelope that failed to parse cannot be
+// trusted to say whether it had an id.
+//
+// A batch comes back intact and is checked per member by
+// handleHttpBatch. §6 answers a well-formed array member by member, so
+// one oversized method must not cost its siblings their responses —
+// and a notification inside a batch has the same right to silence as
+// one sent on its own.
+func ParseJsonRpcRequest(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
+	msg, batch, err := ParseJsonRpcMessage(b)
+	if err != nil {
+		// Drop the partially-decoded message a syntax error leaves
+		// behind: its id is whatever the decoder managed to read
+		// before giving up, which is not something §4.1 can be
+		// decided on.
+		return nil, nil, err
+	}
+	if err := validateJsonRpcMethodLength(msg); err != nil {
+		return msg, nil, err
+	}
+	return msg, batch, nil
+}
+
+// validateJsonRpcMethodLength rejects a single message whose method
+// exceeds maxJsonRpcMethodBytes. Length is counted in bytes, matching
+// the body cap it backstops.
+func validateJsonRpcMethodLength(msg *JsonRpcMsg) error {
+	if msg == nil || len(msg.Method) <= maxJsonRpcMethodBytes {
+		return nil
+	}
+	return fmt.Errorf("%w: JSON-RPC method exceeds %d bytes", ErrInvalidRequest, maxJsonRpcMethodBytes)
+}
+
 func classifyJsonRpcDecodeError(validJSON bool, err error) error {
 	if !validJSON {
 		if err == nil {
@@ -596,12 +651,20 @@ func InvalidRequestResponse() *JsonRpcMsg {
 	return &JsonRpcMsg{
 		Version: "2.0",
 		Error: &JsonRpcError{
-			Code:    -32600,
-			Message: "Invalid Request",
+			Code:    invalidRequestCode,
+			Message: invalidRequestMessage,
 		},
 		ID: explicitNullID,
 	}
 }
+
+// The -32600 pair, named so a rejection that knows the request's id can
+// build the same error carrying that id instead of the null §5.1
+// reserves for an id that could not be read.
+const (
+	invalidRequestCode    = -32600
+	invalidRequestMessage = "Invalid Request"
+)
 
 func EmptyResult(req *JsonRpcMsg) *JsonRpcMsg {
 	return &JsonRpcMsg{

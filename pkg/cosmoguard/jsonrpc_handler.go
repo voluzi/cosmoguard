@@ -450,7 +450,7 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	req, requests, parseErr := ParseJsonRpcMessage(b)
+	req, requests, parseErr := ParseJsonRpcRequest(b)
 	if parseErr != nil {
 		// Per JSON-RPC 2.0 §5.1, a parse failure responds with id=null,
 		// code -32700 Parse error (when the payload was unparseable as
@@ -460,8 +460,20 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 		// and silently went on to handleHttpSingle.
 		// Use the explicit-null-id builders so the response carries
 		// `"id":null` (§5.1) rather than dropping the id via omitempty.
+		// Only a policy rejection hands back the parsed message, so req
+		// is nil for an envelope that never parsed and whose id cannot
+		// be trusted. When it is non-nil the id is known, which
+		// decides the reply: none at all for a notification (§4.1,
+		// matching the deny and auth paths below), otherwise an error
+		// carrying that id rather than the null §5.1 reserves for a
+		// request whose id could not be read.
 		errResp := ParseErrorResponse() // -32700, unparseable JSON
-		if errors.Is(parseErr, ErrInvalidRequest) {
+		switch {
+		case req != nil && req.ID == nil:
+			return
+		case req != nil:
+			errResp = ErrorResponse(req, invalidRequestCode, invalidRequestMessage, nil)
+		case errors.Is(parseErr, ErrInvalidRequest):
 			errResp = InvalidRequestResponse() // -32600, parsed but not JSON-RPC
 		}
 		body, mErr := errResp.Marshal()
@@ -1172,6 +1184,19 @@ func (h *JsonRpcHandler) handleHttpBatch(requests JsonRpcMsgs, w http.ResponseWr
 RequestsLoop:
 	for i, req := range requests {
 		requestIDs[i] = req.ID
+		// The request-only method-length policy, per member and ahead
+		// of rule matching, so an oversized method reaches no rule and
+		// no observability sink. §6 answers a batch member by member:
+		// the offending call gets its own error carrying its own id,
+		// its siblings are untouched, and a notification stays silent
+		// (§4.1) exactly as it would outside a batch.
+		if err := validateJsonRpcMethodLength(req); err != nil {
+			denied++
+			if req.ID != nil {
+				responses.AddResponse(req, InvalidRequestResponse())
+			}
+			continue RequestsLoop
+		}
 		if len(rulesSnap) == 0 {
 			cacheMisses++
 			// No rules at all — every batch item is unmatched.

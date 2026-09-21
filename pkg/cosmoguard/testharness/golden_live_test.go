@@ -399,12 +399,11 @@ type liveProxyURLs struct {
 // — the test asserts compatibility, not gating.
 func bootCosmoguardForLive(t *testing.T, c liveChainCase) (*cosmoguard.CosmoGuard, liveProxyURLs) {
 	t.Helper()
-	lcdPort := freePort(t)
-	rpcPort := freePort(t)
-	grpcPort := freePort(t)
+	allocated := freePorts(t, 5)
+	lcdPort, rpcPort, grpcPort := allocated[0], allocated[1], allocated[2]
 	evmRpcPort := 0
 	if c.EnableEVM {
-		evmRpcPort = freePort(t)
+		evmRpcPort = allocated[3]
 	}
 	cfg := &cosmoguard.Config{
 		Host:         "127.0.0.1",
@@ -413,7 +412,7 @@ func bootCosmoguardForLive(t *testing.T, c liveChainCase) (*cosmoguard.CosmoGuar
 		GrpcPort:     grpcPort,
 		EnableEvm:    c.EnableEVM,
 		EvmRpcPort:   evmRpcPort,
-		EvmRpcWsPort: freePort(t),
+		EvmRpcWsPort: allocated[4],
 		Nodes:        []cosmoguard.NodeConfig{c.Node},
 		Metrics:      cosmoguard.MetricsConfig{Enable: boolPtr(false)},
 		LCD:          cosmoguard.LcdConfig{Default: cosmoguard.RuleActionAllow},
