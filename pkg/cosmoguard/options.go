@@ -84,7 +84,7 @@ func DefaultJsonRpcHandlerOptions() *JsonRpcHandlerOptions {
 	cfg := &JsonRpcHandlerOptions{
 		WebsocketBackend:     "localhost:26657",
 		WebsocketEnabled:     true,
-		WebsocketConnections: 10,
+		WebsocketConnections: 40,
 		WebsocketPath:        defaultWebsocketPath,
 		UpstreamConstructor:  CosmosUpstreamConnManager,
 	}
