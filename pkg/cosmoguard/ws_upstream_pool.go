@@ -27,7 +27,11 @@ type UpstreamPool struct {
 	subscriptionConn        map[string]UpstreamConnManager
 	subscriptionID          map[string]string
 	subscriptionParam       map[string]string
+	subscriptionLease       map[string]*wsReservationLease
+	pendingCreates          map[string]*wsPoolCreate
 	pendingUnsubscribe      map[string]struct{}
+	migrating               map[string]struct{}
+	drainingParams          map[string]*wsReservationLease
 	subMux                  sync.Mutex
 	maxSubscriptionsPerConn int
 
@@ -49,7 +53,33 @@ type UpstreamPool struct {
 	// independently.
 	subCount map[UpstreamConnManager]*atomic.Int64
 
-	onSubscriptionMessage func(*JsonRpcMsg)
+	onSubscriptionMessage  func(*JsonRpcMsg)
+	afterJoinPendingCreate func()
+}
+
+type wsReservationLease struct {
+	pool *UpstreamPool
+	conn UpstreamConnManager
+	once sync.Once
+}
+
+func (l *wsReservationLease) release() {
+	if l == nil {
+		return
+	}
+	l.pool.subMux.Lock()
+	l.releaseLocked()
+	l.pool.subMux.Unlock()
+}
+
+func (l *wsReservationLease) releaseLocked() {
+	l.once.Do(func() { l.pool.addSubCount(l.conn, -1) })
+}
+
+type wsPoolCreate struct {
+	done chan struct{}
+	id   string
+	err  error
 }
 
 // SetMaxSubscriptionsPerConnection configures the per-connection admission
@@ -111,7 +141,11 @@ func NewUpstreamPool(backends []string, path string, n int, onMessage func(*Json
 		subscriptionConn:      make(map[string]UpstreamConnManager),
 		subscriptionID:        make(map[string]string),
 		subscriptionParam:     make(map[string]string),
+		subscriptionLease:     make(map[string]*wsReservationLease),
+		pendingCreates:        make(map[string]*wsPoolCreate),
 		pendingUnsubscribe:    make(map[string]struct{}),
+		migrating:             make(map[string]struct{}),
+		drainingParams:        make(map[string]*wsReservationLease),
 		subCount:              make(map[UpstreamConnManager]*atomic.Int64, n),
 		onSubscriptionMessage: onMessage,
 		IdGen:                 &util.UniqueID{},
@@ -250,6 +284,7 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	// stall every other Subscribe/Unsubscribe call AND deadlock
 	// against onUpstreamMessage in some edge cases.
 	p.subMux.Lock()
+	p.ensureSubscriptionMapsLocked()
 	if id, ok := p.subscriptionID[param]; ok {
 		_, pending := p.pendingUnsubscribe[id]
 		limit := p.maxSubscriptionsPerConn
@@ -259,43 +294,51 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 		}
 		return id, nil
 	}
-	conn, err := p.reserveSubscriptionConnectionLocked(nil)
+	if _, draining := p.drainingParams[param]; draining {
+		limit := p.maxSubscriptionsPerConn
+		p.subMux.Unlock()
+		return "", pendingUnsubscribeError(limit)
+	}
+	if pending := p.pendingCreates[param]; pending != nil {
+		p.subMux.Unlock()
+		if p.afterJoinPendingCreate != nil {
+			p.afterJoinPendingCreate()
+		}
+		<-pending.done
+		return pending.id, pending.err
+	}
+	conn, lease, err := p.reserveSubscriptionConnectionLocked(nil)
 	if err != nil {
 		p.subMux.Unlock()
 		return "", err
 	}
+	pending := &wsPoolCreate{done: make(chan struct{})}
+	p.pendingCreates[param] = pending
 	p.subMux.Unlock()
 
 	id, err := conn.Subscribe(param)
 	if err != nil {
 		if isUncertainWSUpstreamOutcome(err) {
-			p.releaseUncertainReservation(conn, err)
-		} else {
+			settled := uncertainWSUpstreamOutcomeSettlement(err)
 			p.subMux.Lock()
-			p.addSubCount(conn, -1)
+			p.drainingParams[param] = lease
 			p.subMux.Unlock()
+			err = uncertainWSUpstreamOutcomeWithSettlement(err, p.releaseDrainingLease(param, lease, settled))
+		} else {
+			lease.release()
 		}
+		p.completeCreate(param, pending, "", err)
 		return "", err
 	}
 
-	// Commit under lock. A concurrent Subscribe for the same param
-	// could have raced in here; if so, prefer the existing entry and
-	// unsubscribe ours so we don't double-subscribe upstream.
 	p.subMux.Lock()
 	if existing, ok := p.subscriptionID[param]; ok {
-		_, pending := p.pendingUnsubscribe[existing]
+		_, removalPending := p.pendingUnsubscribe[existing]
 		limit := p.maxSubscriptionsPerConn
 		p.subMux.Unlock()
-		// The extra subscription exists. Release its capacity only after
-		// upstream cleanup is confirmed.
-		if err := conn.Unsubscribe(id); err == nil {
-			p.subMux.Lock()
-			p.addSubCount(conn, -1)
-			p.subMux.Unlock()
-		} else if isUncertainWSUpstreamOutcome(err) {
-			p.releaseUncertainReservation(conn, err)
-		}
-		if pending {
+		p.retireUncommitted(param, conn, lease)
+		p.completeCreate(param, pending, existing, nil)
+		if removalPending {
 			return "", pendingUnsubscribeError(limit)
 		}
 		return existing, nil
@@ -303,8 +346,87 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	p.subscriptionParam[id] = param
 	p.subscriptionID[param] = id
 	p.subscriptionConn[id] = conn
+	p.subscriptionLease[id] = lease
 	p.subMux.Unlock()
+	p.completeCreate(param, pending, id, nil)
 	return id, nil
+}
+
+func (p *UpstreamPool) ensureSubscriptionMapsLocked() {
+	if p.subscriptionConn == nil {
+		p.subscriptionConn = make(map[string]UpstreamConnManager)
+	}
+	if p.subscriptionID == nil {
+		p.subscriptionID = make(map[string]string)
+	}
+	if p.subscriptionParam == nil {
+		p.subscriptionParam = make(map[string]string)
+	}
+	if p.subscriptionLease == nil {
+		p.subscriptionLease = make(map[string]*wsReservationLease)
+	}
+	if p.pendingCreates == nil {
+		p.pendingCreates = make(map[string]*wsPoolCreate)
+	}
+	if p.pendingUnsubscribe == nil {
+		p.pendingUnsubscribe = make(map[string]struct{})
+	}
+	if p.migrating == nil {
+		p.migrating = make(map[string]struct{})
+	}
+	if p.drainingParams == nil {
+		p.drainingParams = make(map[string]*wsReservationLease)
+	}
+}
+
+func (p *UpstreamPool) completeCreate(param string, pending *wsPoolCreate, id string, err error) {
+	p.subMux.Lock()
+	pending.id, pending.err = id, err
+	if p.pendingCreates[param] == pending {
+		delete(p.pendingCreates, param)
+	}
+	close(pending.done)
+	p.subMux.Unlock()
+}
+
+func (p *UpstreamPool) releaseDrainingLease(param string, lease *wsReservationLease, settled <-chan struct{}) <-chan struct{} {
+	if settled == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	release := func() {
+		p.subMux.Lock()
+		if p.drainingParams[param] == lease {
+			delete(p.drainingParams, param)
+		}
+		lease.releaseLocked()
+		p.subMux.Unlock()
+		close(done)
+	}
+	select {
+	case <-settled:
+		release()
+		return done
+	default:
+	}
+	go func() {
+		<-settled
+		release()
+	}()
+	return done
+}
+
+func (p *UpstreamPool) retireUncommitted(param string, conn UpstreamConnManager, lease *wsReservationLease) {
+	settled := conn.LocalUnsubscribe(param)
+	if settled == nil {
+		lease.release()
+		return
+	}
+	go func() {
+		if err, ok := <-settled; !ok || err == nil {
+			lease.release()
+		}
+	}()
 }
 
 func pendingUnsubscribeError(limit int) error {
@@ -314,31 +436,10 @@ func pendingUnsubscribeError(limit int) error {
 	return errors.New("subscription removal is pending")
 }
 
-func (p *UpstreamPool) releaseUncertainReservation(conn UpstreamConnManager, err error) {
-	settled := uncertainWSUpstreamOutcomeSettlement(err)
-	if settled == nil {
-		return
-	}
-	release := func() {
-		p.subMux.Lock()
-		p.addSubCount(conn, -1)
-		p.subMux.Unlock()
-	}
-	select {
-	case <-settled:
-		release()
-	default:
-		go func() {
-			<-settled
-			release()
-		}()
-	}
-}
-
 // reserveSubscriptionConnectionLocked chooses a healthy connection with
 // available subscription capacity and increments its count before the caller
 // performs network I/O. The caller must hold subMux.
-func (p *UpstreamPool) reserveSubscriptionConnectionLocked(skip UpstreamConnManager) (UpstreamConnManager, error) {
+func (p *UpstreamPool) reserveSubscriptionConnectionLocked(skip UpstreamConnManager) (UpstreamConnManager, *wsReservationLease, error) {
 	n := len(p.conn)
 	start := int((atomic.AddUint32(&p.connIdx, 1) - 1) % uint32(n))
 	var best UpstreamConnManager
@@ -364,21 +465,22 @@ func (p *UpstreamPool) reserveSubscriptionConnectionLocked(skip UpstreamConnMana
 	}
 	if best != nil {
 		p.addSubCount(best, 1)
-		return best, nil
+		return best, &wsReservationLease{pool: p, conn: best}, nil
 	}
 	if healthy {
-		return nil, &WSResourceExhaustedError{
+		return nil, nil, &WSResourceExhaustedError{
 			Scope: wsLimitScopeUpstreamConnection,
 			Limit: p.maxSubscriptionsPerConn,
 		}
 	}
-	return nil, ErrNoHealthyUpstream
+	return nil, nil, ErrNoHealthyUpstream
 }
 
 func (p *UpstreamPool) Unsubscribe(subID string) error {
 	// Snapshot under lock, do the network call outside it, then
 	// commit deletion atomically.
 	p.subMux.Lock()
+	p.ensureSubscriptionMapsLocked()
 	conn, ok := p.subscriptionConn[subID]
 	if !ok {
 		p.subMux.Unlock()
@@ -393,15 +495,23 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 		p.pendingUnsubscribe = make(map[string]struct{})
 	}
 	p.pendingUnsubscribe[subID] = struct{}{}
+	lease := p.leaseForRouteLocked(subID, conn)
+	param := p.subscriptionParam[subID]
 	p.subMux.Unlock()
 
 	// A definite failure preserves the existing subscription maps and
 	// clears the pending-removal marker so callers may retry. An uncertain
-	// outcome keeps the marker and capacity charged until the exact socket
-	// settles, when releaseUncertainUnsubscribe removes both atomically.
+	// outcome keeps capacity charged until the exact socket settles.
 	if err := conn.Unsubscribe(subID); err != nil {
 		if isUncertainWSUpstreamOutcome(err) {
-			p.releaseUncertainUnsubscribe(subID, conn, err)
+			settled := uncertainWSUpstreamOutcomeSettlement(err)
+			p.subMux.Lock()
+			if p.subscriptionConn[subID] == conn {
+				p.removeRouteLocked(subID, param)
+				p.drainingParams[param] = lease
+			}
+			p.subMux.Unlock()
+			err = uncertainWSUpstreamOutcomeWithSettlement(err, p.releaseDrainingLease(param, lease, settled))
 		} else {
 			p.subMux.Lock()
 			delete(p.pendingUnsubscribe, subID)
@@ -411,45 +521,29 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 	}
 
 	p.subMux.Lock()
-	delete(p.subscriptionConn, subID)
-	delete(p.subscriptionID, p.subscriptionParam[subID])
-	delete(p.subscriptionParam, subID)
-	delete(p.pendingUnsubscribe, subID)
-	// Decrement the per-conn counter in lockstep with the
-	// subscriptionConn delete; same ordering rationale as Subscribe.
-	p.addSubCount(conn, -1)
+	p.removeRouteLocked(subID, param)
+	lease.releaseLocked()
 	p.subMux.Unlock()
 	return nil
 }
 
-func (p *UpstreamPool) releaseUncertainUnsubscribe(subID string, conn UpstreamConnManager, err error) {
-	settled := uncertainWSUpstreamOutcomeSettlement(err)
-	if settled == nil {
-		return
+func (p *UpstreamPool) leaseForRouteLocked(id string, conn UpstreamConnManager) *wsReservationLease {
+	if lease := p.subscriptionLease[id]; lease != nil {
+		return lease
 	}
-	release := func() {
-		p.subMux.Lock()
-		defer p.subMux.Unlock()
-		if p.subscriptionConn[subID] != conn {
-			return
-		}
-		param := p.subscriptionParam[subID]
-		delete(p.subscriptionConn, subID)
-		delete(p.subscriptionParam, subID)
-		delete(p.pendingUnsubscribe, subID)
-		if p.subscriptionID[param] == subID {
-			delete(p.subscriptionID, param)
-		}
-		p.addSubCount(conn, -1)
-	}
-	select {
-	case <-settled:
-		release()
-	default:
-		go func() {
-			<-settled
-			release()
-		}()
+	lease := &wsReservationLease{pool: p, conn: conn}
+	p.subscriptionLease[id] = lease
+	return lease
+}
+
+func (p *UpstreamPool) removeRouteLocked(id, param string) {
+	delete(p.subscriptionConn, id)
+	delete(p.subscriptionParam, id)
+	delete(p.subscriptionLease, id)
+	delete(p.pendingUnsubscribe, id)
+	delete(p.migrating, id)
+	if p.subscriptionID[param] == id {
+		delete(p.subscriptionID, param)
 	}
 }
 
@@ -477,12 +571,15 @@ type SubscriptionMigration struct {
 // outside, commit successful migrations under lock.
 func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 	type pending struct {
-		oldID string
-		conn  UpstreamConnManager
-		alt   UpstreamConnManager
-		param string
+		oldID       string
+		conn        UpstreamConnManager
+		alt         UpstreamConnManager
+		param       string
+		sourceLease *wsReservationLease
+		destLease   *wsReservationLease
 	}
 	p.subMux.Lock()
+	p.ensureSubscriptionMapsLocked()
 	if len(p.subscriptionConn) == 0 {
 		p.subMux.Unlock()
 		return nil
@@ -492,6 +589,9 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		if _, removing := p.pendingUnsubscribe[oldID]; removing {
 			continue
 		}
+		if _, moving := p.migrating[oldID]; moving {
+			continue
+		}
 		if conn.IsHealthy() {
 			continue
 		}
@@ -499,11 +599,15 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		if !ok {
 			continue
 		}
-		alt, err := p.reserveSubscriptionConnectionLocked(conn)
+		alt, destLease, err := p.reserveSubscriptionConnectionLocked(conn)
 		if err != nil {
 			continue
 		}
-		candidates = append(candidates, pending{oldID: oldID, conn: conn, alt: alt, param: param})
+		p.migrating[oldID] = struct{}{}
+		candidates = append(candidates, pending{
+			oldID: oldID, conn: conn, alt: alt, param: param,
+			sourceLease: p.leaseForRouteLocked(oldID, conn), destLease: destLease,
+		})
 	}
 	p.subMux.Unlock()
 
@@ -512,12 +616,15 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		newID, err := c.alt.Subscribe(c.param)
 		if err != nil {
 			if isUncertainWSUpstreamOutcome(err) {
-				p.releaseUncertainReservation(c.alt, err)
+				p.releaseDrainingLease(c.param, c.destLease, uncertainWSUpstreamOutcomeSettlement(err))
 			} else {
-				p.subMux.Lock()
-				p.addSubCount(c.alt, -1)
-				p.subMux.Unlock()
+				c.destLease.release()
 			}
+			p.subMux.Lock()
+			if p.subscriptionConn[c.oldID] == c.conn {
+				delete(p.migrating, c.oldID)
+			}
+			p.subMux.Unlock()
 			if p.log != nil {
 				p.log.WithFields(Fields{
 					"oldID": c.oldID,
@@ -539,33 +646,34 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		// stillPinned catches it) or it didn't (and the param mapping
 		// still points at oldID).
 		p.subMux.Lock()
-		_, stillPinned := p.subscriptionConn[c.oldID]
+		current := p.subscriptionConn[c.oldID]
 		_, removing := p.pendingUnsubscribe[c.oldID]
-		if !stillPinned || removing {
+		_, moving := p.migrating[c.oldID]
+		if current != c.conn || removing || !moving || p.subscriptionLease[c.oldID] != c.sourceLease {
 			p.subMux.Unlock()
-			// The replacement subscription exists. Release its capacity only
-			// after upstream cleanup is confirmed.
-			if err := c.alt.Unsubscribe(newID); err == nil {
-				p.subMux.Lock()
-				p.addSubCount(c.alt, -1)
-				p.subMux.Unlock()
-			} else if isUncertainWSUpstreamOutcome(err) {
-				p.releaseUncertainReservation(c.alt, err)
-			}
+			p.retireUncommitted(c.param, c.alt, c.destLease)
 			continue
 		}
-		delete(p.subscriptionConn, c.oldID)
-		delete(p.subscriptionParam, c.oldID)
+		p.removeRouteLocked(c.oldID, c.param)
 		p.subscriptionConn[newID] = c.alt
 		p.subscriptionParam[newID] = c.param
 		p.subscriptionID[c.param] = newID
+		p.subscriptionLease[newID] = c.destLease
 		p.subMux.Unlock()
 
 		// A reconnect can recreate the source subscription while the alternate
 		// subscribe is in flight, so its slot stays reserved until cleanup proves
 		// that duplicate cannot remain.
 		cleanup := c.conn.LocalUnsubscribe(c.param)
-		p.releaseMigratedSourceCapacity(c.conn, cleanup)
+		if cleanup == nil {
+			c.sourceLease.release()
+		} else {
+			go func(lease *wsReservationLease, settled <-chan error) {
+				if err, ok := <-settled; !ok || err == nil {
+					lease.release()
+				}
+			}(c.sourceLease, cleanup)
+		}
 
 		if p.log != nil {
 			p.log.WithFields(Fields{
@@ -579,23 +687,6 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		})
 	}
 	return migrated
-}
-
-func (p *UpstreamPool) releaseMigratedSourceCapacity(conn UpstreamConnManager, cleanup <-chan error) {
-	release := func() {
-		p.subMux.Lock()
-		p.addSubCount(conn, -1)
-		p.subMux.Unlock()
-	}
-	if cleanup == nil {
-		release()
-		return
-	}
-	go func() {
-		if err, ok := <-cleanup; ok && err == nil {
-			release()
-		}
-	}()
 }
 
 // ConnStat is one upstream connection's dashboard view: its backend

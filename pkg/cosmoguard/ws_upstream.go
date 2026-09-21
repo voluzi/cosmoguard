@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"sync"
 	"time"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -32,29 +31,9 @@ var (
 	ErrSubscriptionExists = errors.New("subscription already exists")
 )
 
-type wsCleanupConfirmation struct {
-	once   sync.Once
-	result chan error
-}
-
-type wsResubmitEpoch struct {
-	done   chan struct{}
-	params map[string]struct{}
-}
-
-func newWSResubmitEpoch() *wsResubmitEpoch {
-	return &wsResubmitEpoch{done: make(chan struct{}), params: make(map[string]struct{})}
-}
-
-func newWSCleanupConfirmation() *wsCleanupConfirmation {
-	return &wsCleanupConfirmation{result: make(chan error, 1)}
-}
-
-func (c *wsCleanupConfirmation) complete(err error) {
-	c.once.Do(func() {
-		c.result <- err
-		close(c.result)
-	})
+type wsResponseKey struct {
+	client *JsonRpcWsClient
+	id     string
 }
 
 // uncertainWSUpstreamOutcomeError means a request may have reached the
@@ -133,9 +112,9 @@ type UpstreamConnManager interface {
 	HasSubscription(string) bool
 	Subscribe(string) (string, error)
 	Unsubscribe(string) error
-	// LocalUnsubscribe forgets and tombstones a migrated subscription. A nil
-	// result means no live socket cleanup remains; otherwise the channel yields
-	// the cleanup outcome exactly once without blocking migration routing.
+	// LocalUnsubscribe retires a migrated subscription. A nil result means no
+	// physical cleanup remains; otherwise the channel closes after the exact
+	// subscription record has settled.
 	LocalUnsubscribe(param string) <-chan error
 	// IsHealthy reports whether the underlying WS connection is in a
 	// usable state. Returns false when the connection is closed, nil,

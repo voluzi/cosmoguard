@@ -22,15 +22,15 @@ func TestOnUpstreamMessage_DuplicateResponseNoPanic(t *testing.T) {
 		mgr.log = log.WithField("test", "eth-dup")
 
 		respChan := make(chan *JsonRpcMsg, 1)
-		mgr.respMap["42"] = respChan
+		mgr.respMap[wsResponseKey{id: "42"}] = respChan
 
 		// First response: delivered + channel closed + entry removed.
-		mgr.onUpstreamMessage(&JsonRpcMsg{Version: "2.0", ID: "42"})
+		mgr.onUpstreamMessage(nil, &JsonRpcMsg{Version: "2.0", ID: "42"})
 		if _, ok := <-respChan; !ok {
 			t.Fatal("expected first response on the channel")
 		}
 		// Second, duplicate response with the same id must NOT panic.
-		mgr.onUpstreamMessage(&JsonRpcMsg{Version: "2.0", ID: "42"})
+		mgr.onUpstreamMessage(nil, &JsonRpcMsg{Version: "2.0", ID: "42"})
 	})
 
 	t.Run("cosmos", func(t *testing.T) {
@@ -38,12 +38,50 @@ func TestOnUpstreamMessage_DuplicateResponseNoPanic(t *testing.T) {
 		mgr.log = log.WithField("test", "cosmos-dup")
 
 		respChan := make(chan *JsonRpcMsg, 1)
-		mgr.respMap["42"] = respChan
+		mgr.respMap[wsResponseKey{id: "42"}] = respChan
 
-		mgr.onUpstreamMessage(&JsonRpcMsg{Version: "2.0", ID: "42"})
+		mgr.onUpstreamMessage(nil, &JsonRpcMsg{Version: "2.0", ID: "42"})
 		if _, ok := <-respChan; !ok {
 			t.Fatal("expected first response on the channel")
 		}
-		mgr.onUpstreamMessage(&JsonRpcMsg{Version: "2.0", ID: "42"})
+		mgr.onUpstreamMessage(nil, &JsonRpcMsg{Version: "2.0", ID: "42"})
+	})
+}
+
+func TestOnUpstreamMessage_ResponseIsScopedToOriginSocket(t *testing.T) {
+	u, _ := url.Parse("ws://127.0.0.1:0/")
+	clientA := &JsonRpcWsClient{}
+	clientB := &JsonRpcWsClient{}
+
+	t.Run("eth", func(t *testing.T) {
+		mgr := EthUpstreamConnManager(*u, &util.UniqueID{}, func(*JsonRpcMsg) {}).(*UpstreamConnManagerEth)
+		mgr.log = log.WithField("test", t.Name())
+		responseB := make(chan *JsonRpcMsg, 1)
+		mgr.respMap[wsResponseKey{client: clientB, id: "42"}] = responseB
+
+		mgr.onUpstreamMessage(clientA, &JsonRpcMsg{Version: jsonRpcVersion, ID: "42"})
+		select {
+		case <-responseB:
+			t.Fatal("late response from socket A satisfied socket B waiter")
+		default:
+		}
+		mgr.onUpstreamMessage(clientB, &JsonRpcMsg{Version: jsonRpcVersion, ID: "42"})
+		<-responseB
+	})
+
+	t.Run("cosmos", func(t *testing.T) {
+		mgr := CosmosUpstreamConnManager(*u, &util.UniqueID{}, func(*JsonRpcMsg) {}).(*UpstreamConnManagerCosmos)
+		mgr.log = log.WithField("test", t.Name())
+		responseB := make(chan *JsonRpcMsg, 1)
+		mgr.respMap[wsResponseKey{client: clientB, id: "42"}] = responseB
+
+		mgr.onUpstreamMessage(clientA, &JsonRpcMsg{Version: jsonRpcVersion, ID: "42"})
+		select {
+		case <-responseB:
+			t.Fatal("late response from socket A satisfied socket B waiter")
+		default:
+		}
+		mgr.onUpstreamMessage(clientB, &JsonRpcMsg{Version: jsonRpcVersion, ID: "42"})
+		<-responseB
 	})
 }
