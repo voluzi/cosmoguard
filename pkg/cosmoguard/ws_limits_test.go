@@ -27,6 +27,7 @@ type limitingUpstream struct {
 	failSubscribe      atomic.Bool
 	uncertainSubscribe atomic.Bool
 	failUnsubscribe    atomic.Bool
+	unsubscribeCalls   atomic.Int32
 	subscribeStarted   chan struct{}
 	subscribeRelease   chan struct{}
 	unsubscribeStarted chan struct{}
@@ -245,8 +246,12 @@ func (u *limitingUpstream) Subscribe(param string) (string, error) {
 	return fmt.Sprintf("%s-%d", param, n), nil
 }
 func (u *limitingUpstream) Unsubscribe(string) error {
+	u.unsubscribeCalls.Add(1)
 	if u.unsubscribeStarted != nil {
-		u.unsubscribeStarted <- struct{}{}
+		select {
+		case u.unsubscribeStarted <- struct{}{}:
+		default:
+		}
 		<-u.unsubscribeRelease
 	}
 	if u.failUnsubscribe.Load() {
@@ -472,6 +477,7 @@ func TestBrokerDisconnectDuringSubscribeReleasesAllAdmissionBeforeRollback(t *te
 	}
 	close(upstream.unsubscribeRelease)
 	assert.Assert(t, errors.Is(<-result, ErrClosed))
+	assert.Equal(t, upstream.unsubscribeCalls.Load(), int32(3))
 }
 
 func TestBrokerFailedSubscribeRollsBackDownstreamAdmission(t *testing.T) {
@@ -963,7 +969,7 @@ func TestAbandonedMigrationClearsMarkerAfterDestinationRetires(t *testing.T) {
 	destination.localUnsubStarted = make(chan struct{})
 	destination.localUnsubResult = make(chan error)
 	source.failUnsubscribe.Store(true)
-	source.unsubscribeStarted = make(chan struct{})
+	source.unsubscribeStarted = make(chan struct{}, 1)
 	source.unsubscribeRelease = make(chan struct{})
 
 	migrationResult := make(chan []SubscriptionMigration, 1)
@@ -1369,6 +1375,15 @@ func TestCosmosReconnectFailurePreservesCanonicalID(t *testing.T) {
 		}},
 		{name: "null result", uncertain: true, response: func(req *JsonRpcMsg) *JsonRpcMsg {
 			return &JsonRpcMsg{Version: jsonRpcVersion, ID: req.ID, Result: []byte("null")}
+		}},
+		{name: "false result", uncertain: true, response: func(req *JsonRpcMsg) *JsonRpcMsg {
+			return WithResult(req, false)
+		}},
+		{name: "string result", uncertain: true, response: func(req *JsonRpcMsg) *JsonRpcMsg {
+			return WithResult(req, "subscription")
+		}},
+		{name: "array result", uncertain: true, response: func(req *JsonRpcMsg) *JsonRpcMsg {
+			return WithResult(req, []any{})
 		}},
 		{name: "socket close", uncertain: true},
 	}

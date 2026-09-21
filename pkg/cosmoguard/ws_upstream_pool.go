@@ -656,6 +656,40 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 	return nil
 }
 
+func (p *UpstreamPool) retireSubscription(subID string) {
+	p.subMux.Lock()
+	p.ensureSubscriptionMapsLocked()
+	conn, ok := p.subscriptionConn[subID]
+	if !ok {
+		p.subMux.Unlock()
+		return
+	}
+	lease := p.leaseForRouteLocked(subID, conn)
+	canonicalReservation := p.canonicalReservations[subID]
+	param := p.subscriptionParam[subID]
+	p.removeRouteLocked(subID, param)
+	p.addDrainingLeaseLocked(param, lease)
+	p.subMux.Unlock()
+
+	settled := conn.LocalUnsubscribe(param)
+	release := func() {
+		p.subMux.Lock()
+		p.removeDrainingLeaseLocked(param, lease)
+		lease.releaseLocked()
+		p.subMux.Unlock()
+		canonicalReservation.releaseWhenSettled(p.IdGen)
+	}
+	if settled == nil {
+		release()
+		return
+	}
+	go func() {
+		if err, ok := <-settled; !ok || err == nil {
+			release()
+		}
+	}()
+}
+
 func (p *UpstreamPool) leaseForRouteLocked(id string, conn UpstreamConnManager) *wsReservationLease {
 	if lease := p.subscriptionLease[id]; lease != nil {
 		return lease

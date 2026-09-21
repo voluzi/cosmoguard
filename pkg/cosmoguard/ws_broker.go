@@ -325,8 +325,8 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		return fmt.Errorf("subscription does not exist")
 	}
 
+	clientSubID := b.sm.GetSubscriptionClients(subID)[client]
 	b.sm.UnsubscribeClient(subID, client)
-	b.admission.releaseSubscription(client)
 	b.log.WithFields(map[string]interface{}{
 		"id":     subID,
 		"client": client,
@@ -337,16 +337,24 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		// from the canonical subID after a migration.
 		upstreamID, _ := b.sm.UpstreamID(subID)
 		if err = b.pool.Unsubscribe(upstreamID); err != nil {
-			b.forgetSettlingSubscription(subID, err)
+			if !isUncertainWSUpstreamOutcome(err) && !client.IsClosed() {
+				b.sm.SubscribeClient(subID, client, clientSubID)
+				return err
+			}
+			b.admission.releaseSubscription(client)
+			b.abandonEmptySubscription(subID, upstreamID, err)
 			return err
 		}
 		param, _ := b.sm.GetSubscriptionParam(subID)
 		b.sm.RemoveSubscription(subID)
+		b.admission.releaseSubscription(client)
 
 		b.log.WithFields(map[string]interface{}{
 			"ID":    subID,
 			"param": param,
 		}).Warn("unsubscribed upstream")
+	} else {
+		b.admission.releaseSubscription(client)
 	}
 
 	return nil
@@ -383,7 +391,7 @@ func (b *Broker) removeEmptySubscriptionsLocked(emptySubscriptions []string) err
 		b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
 		upstreamID, _ := b.sm.UpstreamID(subscriptionID)
 		if err := b.pool.Unsubscribe(upstreamID); err != nil {
-			b.forgetSettlingSubscription(subscriptionID, err)
+			b.abandonEmptySubscription(subscriptionID, upstreamID, err)
 			errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
 			continue
 		}
@@ -395,6 +403,15 @@ func (b *Broker) removeEmptySubscriptionsLocked(emptySubscriptions []string) err
 		}).Warn("unsubscribed upstream")
 	}
 	return errors.Join(errs...)
+}
+
+func (b *Broker) abandonEmptySubscription(id, upstreamID string, err error) {
+	if isUncertainWSUpstreamOutcome(err) {
+		b.forgetSettlingSubscription(id, err)
+		return
+	}
+	b.pool.retireSubscription(upstreamID)
+	b.sm.RemoveSubscription(id)
 }
 
 func (b *Broker) forgetSettlingSubscription(id string, err error) {

@@ -393,10 +393,24 @@ func (u *UpstreamConnManagerCosmos) subscribeOn(cli *JsonRpcWsClient, id, param 
 	if err != nil {
 		return id, err
 	}
-	if err := validateWSSubscribeResponse(methodSubscribeCosmos, response, cli.Closed()); err != nil {
+	if err := validateCosmosSubscribeResponse(response, cli.Closed()); err != nil {
 		return id, err
 	}
 	return id, nil
+}
+
+func validateCosmosSubscribeResponse(response *JsonRpcMsg, settled <-chan struct{}) error {
+	if err := validateWSSubscribeResponse(methodSubscribeCosmos, response, settled); err != nil {
+		return err
+	}
+	var acknowledgement map[string]any
+	if err := json.Unmarshal(response.Result, &acknowledgement); err != nil || acknowledgement == nil {
+		if err == nil {
+			err = errors.New("expected object")
+		}
+		return uncertainWSUpstreamOutcomeUntil(fmt.Errorf("decode %s acknowledgement: %w", methodSubscribeCosmos, err), settled)
+	}
+	return nil
 }
 
 func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
