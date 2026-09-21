@@ -55,5 +55,5 @@ func getSubscriptionParam(req *JsonRpcMsg) (string, error) {
 }
 
 func isEthSubscriptionID(params string) bool {
-	return strings.HasPrefix(params, "0x") || strings.HasPrefix(params, evmLogicalHandlePrefix)
+	return strings.HasPrefix(params, "0x")
 }

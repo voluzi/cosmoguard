@@ -351,6 +351,7 @@ func TestEVMRunReconnectKeepsLogicalHandlesIndependentFromWireIDs(t *testing.T) 
 	connA.respond(t, WithResult(firstRequest, "0x2"))
 	first := <-firstCall
 	assert.NilError(t, first.err)
+	assertEVMU256Handle(t, first.id)
 
 	assert.NilError(t, connA.close())
 	connB := backend.nextConn(t)
@@ -363,6 +364,7 @@ func TestEVMRunReconnectKeepsLogicalHandlesIndependentFromWireIDs(t *testing.T) 
 	connB.respond(t, WithResult(secondRequest, first.id))
 	second := <-secondCall
 	assert.NilError(t, second.err)
+	assertEVMU256Handle(t, second.id)
 	assert.Assert(t, first.id != second.id, "logical handles collided at %q", first.id)
 
 	connB.respond(t, &JsonRpcMsg{Version: jsonRpcVersion, Params: map[string]any{

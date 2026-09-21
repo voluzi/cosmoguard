@@ -360,7 +360,7 @@ func (u *UpstreamConnManagerCosmos) subscribeOn(cli *JsonRpcWsClient, id, param 
 	if err != nil {
 		return id, err
 	}
-	if err := validateWSJSONRPCResponse(methodSubscribeCosmos, response); err != nil {
+	if err := validateWSSubscribeResponse(methodSubscribeCosmos, response, cli.Closed()); err != nil {
 		return id, err
 	}
 	return id, nil

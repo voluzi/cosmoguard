@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -329,7 +330,7 @@ func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param str
 	if err != nil {
 		return "", err
 	}
-	if err := validateWSJSONRPCResponse(methodSubscribeEth, resp); err != nil {
+	if err := validateWSSubscribeResponse(methodSubscribeEth, resp, cli.Closed()); err != nil {
 		return "", err
 	}
 
@@ -368,10 +369,10 @@ func (u *UpstreamConnManagerEth) unsubscribeOn(binding wsSubscriptionBinding, _ 
 	return validateEthUnsubscribeResponse(response)
 }
 
-const evmLogicalHandlePrefix = "cosmoguard-evm-"
+const evmLogicalHandleDomain = "cg:"
 
 func (u *UpstreamConnManagerEth) stableHandle(provisional, _ string) string {
-	return evmLogicalHandlePrefix + provisional
+	return "0x" + hex.EncodeToString([]byte(evmLogicalHandleDomain+provisional))
 }
 
 func (u *UpstreamConnManagerEth) releaseHandle(reservation string) {

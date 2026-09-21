@@ -3,10 +3,12 @@ package cosmoguard
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -479,7 +481,46 @@ func TestProviderRejectedSubscribeReleasesCapacity(t *testing.T) {
 	}
 }
 
-func TestMissingSubscribeResultReleasesCapacity(t *testing.T) {
+func TestEVMLogicalHandleIsU256Compatible(t *testing.T) {
+	protocol := wsProtocolCase{name: "evm", constructor: EthUpstreamConnManager, evm: true}
+	pool, _, backend := newRealManagerPool(t, protocol, 1)
+
+	subscribeCall := startSubscribe(pool, "newHeads")
+	request := <-backend.requests
+	backend.responses <- WithResult(request, "provider-wire-id")
+	subscription := <-subscribeCall
+	assert.NilError(t, subscription.err)
+	assertEVMU256Handle(t, subscription.id)
+}
+
+func assertEVMU256Handle(t *testing.T, handle string) {
+	t.Helper()
+	if !strings.HasPrefix(handle, "0x") {
+		t.Fatalf("EVM subscription handle %q is not 0x-prefixed", handle)
+	}
+	value, ok := new(big.Int).SetString(strings.TrimPrefix(handle, "0x"), 16)
+	if !ok {
+		t.Fatalf("EVM subscription handle %q is not hexadecimal", handle)
+	}
+	if value.BitLen() > 256 {
+		t.Fatalf("EVM subscription handle %q exceeds U256", handle)
+	}
+}
+
+func TestMissingResultUncertaintyIsSubscribeSpecific(t *testing.T) {
+	response := &JsonRpcMsg{Version: jsonRpcVersion, ID: "request"}
+	ordinaryErr := validateWSJSONRPCResponse("status", response)
+	assert.ErrorContains(t, ordinaryErr, "missing result")
+	assert.Assert(t, !isUncertainWSUpstreamOutcome(ordinaryErr))
+
+	settled := make(chan struct{})
+	subscribeErr := validateWSSubscribeResponse(methodSubscribeEth, response, settled)
+	assert.ErrorContains(t, subscribeErr, "missing result")
+	assert.Assert(t, isUncertainWSUpstreamOutcome(subscribeErr))
+	assert.Equal(t, uncertainWSUpstreamOutcomeSettlement(subscribeErr), (<-chan struct{})(settled))
+}
+
+func TestMissingSubscribeResultRetainsCapacityUntilOriginCloses(t *testing.T) {
 	responses := []struct {
 		name   string
 		result []byte
@@ -491,6 +532,7 @@ func TestMissingSubscribeResultReleasesCapacity(t *testing.T) {
 		for _, response := range responses {
 			t.Run(protocol.name+"/"+response.name, func(t *testing.T) {
 				pool, manager, backend := newRealManagerPool(t, protocol, 1)
+				origin := currentManagerClient(manager)
 
 				firstCall := startSubscribe(pool, "first")
 				firstReq := <-backend.requests
@@ -501,14 +543,36 @@ func TestMissingSubscribeResultReleasesCapacity(t *testing.T) {
 				}
 				first := <-firstCall
 				assert.ErrorContains(t, first.err, "missing result")
-				assert.Assert(t, !isUncertainWSUpstreamOutcome(first.err))
+				assert.Assert(t, isUncertainWSUpstreamOutcome(first.err))
 				assert.Assert(t, !manager.HasSubscription("first"))
 
 				secondCall := startSubscribe(pool, "second")
-				secondReq := <-backend.requests
-				backend.responses <- protocol.subscribeSuccess(secondReq, "second")
-				second := <-secondCall
-				assert.NilError(t, second.err, "definite malformed response must release capacity")
+				select {
+				case request := <-backend.requests:
+					t.Fatalf("ambiguous acknowledgement admitted another upstream request: %+v", request)
+				case second := <-secondCall:
+					var exhausted *WSResourceExhaustedError
+					assert.Assert(t, errors.As(second.err, &exhausted))
+				}
+
+				settled := uncertainWSUpstreamOutcomeSettlement(first.err)
+				assert.Assert(t, settled != nil)
+				assert.NilError(t, origin.Close())
+				<-settled
+
+				pool.subMux.Lock()
+				count := pool.subCount[manager].Load()
+				pool.subMux.Unlock()
+				assert.Equal(t, count, int64(0))
+
+				replacement, peer := newWSCacheClient(t)
+				setManagerClient(manager, replacement)
+				replacementBackend := newControlledWSBackend(manager, replacement, peer)
+				thirdCall := startSubscribe(pool, "third")
+				thirdRequest := <-replacementBackend.requests
+				replacementBackend.responses <- protocol.subscribeSuccess(thirdRequest, "third")
+				third := <-thirdCall
+				assert.NilError(t, third.err, "closing the exact origin must reclaim capacity")
 			})
 		}
 	}
@@ -801,10 +865,10 @@ func TestCosmosReconnectFailurePreservesCanonicalID(t *testing.T) {
 		uncertain bool
 	}{
 		{name: "provider rejection", response: providerRejectedResponse},
-		{name: "missing result", response: func(req *JsonRpcMsg) *JsonRpcMsg {
+		{name: "missing result", uncertain: true, response: func(req *JsonRpcMsg) *JsonRpcMsg {
 			return &JsonRpcMsg{Version: jsonRpcVersion, ID: req.ID}
 		}},
-		{name: "null result", response: func(req *JsonRpcMsg) *JsonRpcMsg {
+		{name: "null result", uncertain: true, response: func(req *JsonRpcMsg) *JsonRpcMsg {
 			return &JsonRpcMsg{Version: jsonRpcVersion, ID: req.ID, Result: []byte("null")}
 		}},
 		{name: "socket close", uncertain: true},

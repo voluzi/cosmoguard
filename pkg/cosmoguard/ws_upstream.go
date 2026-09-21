@@ -30,6 +30,7 @@ const (
 
 var (
 	ErrSubscriptionExists = errors.New("subscription already exists")
+	errWSMissingResult    = errors.New("missing result")
 )
 
 type wsResponseKey struct {
@@ -97,9 +98,17 @@ func validateWSJSONRPCResponse(method string, response *JsonRpcMsg) error {
 		return fmt.Errorf("upstream %s rejected request with code %d: %s", method, response.Error.Code, response.Error.Message)
 	}
 	if response.IsEmptyResult() {
-		return fmt.Errorf("upstream %s returned a missing result", method)
+		return fmt.Errorf("upstream %s returned a %w", method, errWSMissingResult)
 	}
 	return nil
+}
+
+func validateWSSubscribeResponse(method string, response *JsonRpcMsg, settled <-chan struct{}) error {
+	err := validateWSJSONRPCResponse(method, response)
+	if errors.Is(err, errWSMissingResult) {
+		return uncertainWSUpstreamOutcomeUntil(err, settled)
+	}
+	return err
 }
 
 type UpstreamConnManagerConstructor func(url.URL, *util.UniqueID, func(msg *JsonRpcMsg)) UpstreamConnManager
