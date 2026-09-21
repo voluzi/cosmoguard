@@ -164,6 +164,10 @@ func TestJoinNonEmpty_ActuallyFiltersEmpties(t *testing.T) {
 }
 
 func TestWebSocketLimitRenderingPreservesMissingZeroAndLargeValues(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
 	app, err := webFS.ReadFile("web/app.js")
 	assert.NilError(t, err)
 	source := string(app)
@@ -211,6 +215,6 @@ includes("mixed", rendered(wsSection({}, true, false)), "mixed");
 `
 	script := filepath.Join(t.TempDir(), "websocket-limits.js")
 	assert.NilError(t, os.WriteFile(script, []byte(harness+source[:bootstrap]+assertions), 0o600))
-	output, err := exec.Command("node", script).CombinedOutput()
+	output, err := exec.Command(node, script).CombinedOutput()
 	assert.NilError(t, err, string(output))
 }

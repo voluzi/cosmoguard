@@ -98,7 +98,7 @@ func newControlledWSBackend(manager UpstreamConnManager, client *JsonRpcWsClient
 			if err != nil {
 				return
 			}
-			dispatchManagerMessage(manager, msg)
+			dispatchManagerMessageFromClient(manager, client, msg)
 		}
 	}()
 	go func() {
@@ -125,11 +125,60 @@ func newControlledWSBackend(manager UpstreamConnManager, client *JsonRpcWsClient
 }
 
 func dispatchManagerMessage(manager UpstreamConnManager, msg *JsonRpcMsg) {
+	dispatchManagerMessageFromClient(manager, currentManagerClient(manager), msg)
+}
+
+func dispatchManagerMessageFromClient(manager UpstreamConnManager, client *JsonRpcWsClient, msg *JsonRpcMsg) {
 	switch manager := manager.(type) {
 	case *UpstreamConnManagerCosmos:
-		manager.onUpstreamMessage(manager.curClient(), msg)
+		manager.onUpstreamMessage(client, msg)
 	case *UpstreamConnManagerEth:
-		manager.onUpstreamMessage(manager.curClient(), msg)
+		manager.onUpstreamMessage(client, msg)
+	}
+}
+
+func TestControlledWSBackendDispatchesResponseToReaderSocket(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			oldClient, oldPeer := newWSCacheClient(t)
+			newClient, _ := newWSCacheClient(t)
+			manager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(manager, oldClient)
+			setManagerLog(manager, log.WithField("test", t.Name()))
+			_ = newControlledWSBackend(manager, oldClient, oldPeer)
+
+			oldResponse := make(chan *JsonRpcMsg, 1)
+			newResponse := make(chan *JsonRpcMsg, 1)
+			setManagerResponseWaiter(manager, wsResponseKey{client: oldClient, id: "shared"}, oldResponse)
+			setManagerResponseWaiter(manager, wsResponseKey{client: newClient, id: "shared"}, newResponse)
+			setManagerClient(manager, newClient)
+
+			response := &JsonRpcMsg{Version: jsonRpcVersion, ID: "shared", Result: []byte(`{}`)}
+			encoded, err := response.Marshal()
+			assert.NilError(t, err)
+			assert.NilError(t, oldPeer.WriteMessage(websocket.TextMessage, encoded))
+			assert.Assert(t, mustRecv(t, oldResponse, "old socket response") != nil)
+			select {
+			case <-newResponse:
+				t.Fatal("old socket response was delivered to the replacement waiter")
+			default:
+			}
+			assert.NilError(t, oldClient.Close())
+			assert.NilError(t, newClient.Close())
+		})
+	}
+}
+
+func setManagerResponseWaiter(manager UpstreamConnManager, key wsResponseKey, waiter chan *JsonRpcMsg) {
+	switch manager := manager.(type) {
+	case *UpstreamConnManagerCosmos:
+		manager.respMux.Lock()
+		manager.respMap[key] = waiter
+		manager.respMux.Unlock()
+	case *UpstreamConnManagerEth:
+		manager.respMux.Lock()
+		manager.respMap[key] = waiter
+		manager.respMux.Unlock()
 	}
 }
 
@@ -1573,9 +1622,9 @@ func setManagerClient(manager UpstreamConnManager, client *JsonRpcWsClient) {
 func managerLifecycle(manager UpstreamConnManager) *wsSubscriptionLifecycle {
 	switch manager := manager.(type) {
 	case *UpstreamConnManagerCosmos:
-		return manager.lifecycle
+		return manager.subscriptionLifecycle()
 	case *UpstreamConnManagerEth:
-		return manager.lifecycle
+		return manager.subscriptionLifecycle()
 	default:
 		return nil
 	}

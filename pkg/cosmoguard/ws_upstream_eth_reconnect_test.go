@@ -1,37 +1,85 @@
 package cosmoguard
 
 import (
-	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
+	"gotest.tools/assert"
 )
 
-func TestEthResetConnectionStatePreservesDesiredSubscriptions(t *testing.T) {
-	u, _ := url.Parse("ws://127.0.0.1:0/")
-	manager := EthUpstreamConnManager(*u, &util.UniqueID{}, func(*JsonRpcMsg) {}).(*UpstreamConnManagerEth)
-	seedManagerSubscription(manager, "newHeads", "0xold")
-	key := wsResponseKey{id: "req-1"}
-	manager.respMap[key] = make(chan *JsonRpcMsg, 1)
+func TestEthRunReconnectReplaysEverySubscriptionAndScopesResponses(t *testing.T) {
+	backend := newLifecycleRunBackend(t)
+	replayed := make(chan struct{}, 2)
+	notifications := make(chan *JsonRpcMsg, 2)
+	manager := EthUpstreamConnManager(backend.wsURL(t), &util.UniqueID{}, func(msg *JsonRpcMsg) {
+		notifications <- msg
+	}).(*UpstreamConnManagerEth)
+	manager.afterResubmit = func() { replayed <- struct{}{} }
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(log.WithField("test", t.Name())) }()
+	t.Cleanup(func() {
+		manager.Stop()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("manager Run did not stop")
+		}
+	})
 
-	if !manager.HasSubscription("newHeads") {
-		t.Fatal("desired membership must survive reconnect state reset")
+	connA := backend.nextConn(t)
+	mustWait(t, replayed, "initial replay pass")
+	logicalByParam := make(map[string]string)
+	for _, param := range []string{"newHeads", "logs"} {
+		created := startSubscribe(manager, param)
+		request := connA.nextRequest(t)
+		connA.respond(t, WithResult(request, "wire-a-"+param))
+		result := mustRecv(t, created, param+" subscribe result")
+		assert.NilError(t, result.err)
+		logicalByParam[param] = result.id
 	}
-	if len(manager.respMap) != 1 {
-		t.Fatalf("in-flight response state must remain scoped to its old socket, got %d entries", len(manager.respMap))
-	}
-}
+	oldClient := manager.curClient()
 
-func TestEthReconnectSnapshotRetainsEveryDesiredSubscription(t *testing.T) {
-	u, _ := url.Parse("ws://127.0.0.1:0/")
-	manager := EthUpstreamConnManager(*u, &util.UniqueID{}, func(*JsonRpcMsg) {}).(*UpstreamConnManagerEth)
-	seedManagerSubscription(manager, "newHeads", "0xold")
-	seedManagerSubscription(manager, "logs", "0xold2")
-
-	manager.lifecycle.mu.RLock()
-	desired := len(manager.lifecycle.byParam)
-	manager.lifecycle.mu.RUnlock()
-	if desired != 2 {
-		t.Fatalf("expected both subscriptions retained for replay, got %d", desired)
+	assert.NilError(t, connA.close())
+	connB := backend.nextConn(t)
+	wireByParam := make(map[string]string)
+	for range 2 {
+		request := connB.nextRequest(t)
+		params := request.Params.([]any)
+		param := params[0].(string)
+		wireByParam[param] = "wire-b-" + param
+		connB.respond(t, WithResult(request, wireByParam[param]))
 	}
+	mustWait(t, replayed, "reconnect replay pass")
+	assert.Assert(t, manager.HasSubscription("newHeads"))
+	assert.Assert(t, manager.HasSubscription("logs"))
+
+	rpcResult := make(chan *JsonRpcMsg, 1)
+	rpcErr := make(chan error, 1)
+	go func() {
+		response, err := manager.MakeRequest(&JsonRpcMsg{Version: jsonRpcVersion, Method: "status"})
+		rpcResult <- response
+		rpcErr <- err
+	}()
+	rpcRequest := connB.nextRequest(t)
+	manager.onUpstreamMessage(oldClient, WithResult(rpcRequest, map[string]any{"socket": "old"}))
+	assert.Equal(t, managerResponseCount(manager), 1, "old socket response must not consume the replacement waiter")
+	connB.respond(t, WithResult(rpcRequest, map[string]any{"socket": "current"}))
+	assert.NilError(t, mustRecv(t, rpcErr, "ordinary RPC error"))
+	response := mustRecv(t, rpcResult, "ordinary RPC response")
+	assert.Assert(t, response != nil)
+	assert.Assert(t, strings.Contains(string(response.Result), "current"))
+
+	for _, param := range []string{"newHeads", "logs"} {
+		connB.respond(t, &JsonRpcMsg{Version: jsonRpcVersion, Params: map[string]any{
+			"subscription": wireByParam[param], "result": param,
+		}})
+	}
+	routed := map[any]bool{}
+	for range 2 {
+		routed[mustRecv(t, notifications, "replayed subscription notification").ID] = true
+	}
+	assert.Assert(t, routed[logicalByParam["newHeads"]])
+	assert.Assert(t, routed[logicalByParam["logs"]])
 }

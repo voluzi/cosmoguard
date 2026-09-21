@@ -41,10 +41,39 @@ type UpstreamConnManagerEth struct {
 	// Lifecycle — see Cosmos impl for shape. stopCh closes on Stop()
 	// so the reconnect-backoff sleep wakes immediately; lazily
 	// allocated to keep direct-literal construction safe.
-	stopped  atomic.Bool
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	initOnce sync.Once
+	stopped   atomic.Bool
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	initOnce  sync.Once
+	stateOnce sync.Once
+}
+
+func (u *UpstreamConnManagerEth) initState() {
+	u.stateOnce.Do(func() {
+		if u.lifecycle == nil {
+			u.lifecycle = newWSSubscriptionLifecycle()
+		}
+		if u.IdGen == nil {
+			u.IdGen = &util.UniqueID{}
+		}
+		if u.respMap == nil {
+			u.respMap = make(map[wsResponseKey]chan *JsonRpcMsg)
+		}
+		if u.dialer == nil {
+			u.dialer = &websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: connectTimeout}
+		}
+		if u.log == nil {
+			u.log = log
+		}
+		if u.onSubscriptionMessage == nil {
+			u.onSubscriptionMessage = func(*JsonRpcMsg) {}
+		}
+	})
+}
+
+func (u *UpstreamConnManagerEth) subscriptionLifecycle() *wsSubscriptionLifecycle {
+	u.initState()
+	return u.lifecycle
 }
 
 func (u *UpstreamConnManagerEth) initStopCh() {
@@ -54,7 +83,7 @@ func (u *UpstreamConnManagerEth) initStopCh() {
 }
 
 func (u *UpstreamConnManagerEth) curClient() *JsonRpcWsClient {
-	return u.lifecycle.currentClient()
+	return u.subscriptionLifecycle().currentClient()
 }
 
 func EthUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMessage func(msg *JsonRpcMsg)) UpstreamConnManager {
@@ -72,6 +101,7 @@ func EthUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMes
 }
 
 func (u *UpstreamConnManagerEth) Run(log *Entry) error {
+	u.initState()
 	u.log = log
 	u.initStopCh()
 	for {
@@ -138,7 +168,7 @@ func (u *UpstreamConnManagerEth) connect() error {
 		if u.beforeInstall != nil {
 			u.beforeInstall(client)
 		}
-		if !u.lifecycle.install(client) {
+		if !u.subscriptionLifecycle().install(client) {
 			_ = client.Close()
 			return ErrClosed
 		}
@@ -150,6 +180,7 @@ func (u *UpstreamConnManagerEth) connect() error {
 }
 
 func (u *UpstreamConnManagerEth) onUpstreamMessage(client *JsonRpcWsClient, msg *JsonRpcMsg) {
+	u.initState()
 	// Defence-in-depth: a single malformed/duplicate upstream frame must
 	// never take down the process. The Run goroutine that calls this has
 	// no recover of its own.
@@ -181,7 +212,7 @@ func (u *UpstreamConnManagerEth) onUpstreamMessage(client *JsonRpcWsClient, msg 
 			u.log.Errorf("dropped message from upstream: subscription ID is not a string")
 			return
 		}
-		handle, ok := u.lifecycle.route(client, subscriptionID)
+		handle, ok := u.subscriptionLifecycle().route(client, subscriptionID)
 		if ok {
 			u.log.WithFields(map[string]interface{}{
 				"ID": handle,
@@ -234,6 +265,7 @@ func (u *UpstreamConnManagerEth) makeRequestWithID(id string, req *JsonRpcMsg) (
 // makeRequestWithIDOnClient drives a single round-trip over an explicit
 // client. See cosmos counterpart.
 func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient, id string, req *JsonRpcMsg) (*JsonRpcMsg, error) {
+	u.initState()
 	request := req.CloneWithID(id)
 
 	if cli == nil || cli.IsClosed() {
@@ -298,23 +330,24 @@ func (u *UpstreamConnManagerEth) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, erro
 }
 
 func (u *UpstreamConnManagerEth) HasSubscription(subID string) bool {
-	return u.lifecycle.hasParam(subID)
+	return u.subscriptionLifecycle().hasParam(subID)
 }
 
 func (u *UpstreamConnManagerEth) Subscribe(query string) (string, error) {
+	u.initState()
 	id := u.IdGen.ID()
-	return u.lifecycle.subscribe(query, id, u.curClient(), u)
+	return u.subscriptionLifecycle().subscribe(query, id, u.curClient(), u)
 }
 
 func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) (string, error) {
 	if resubmit {
-		record := u.lifecycle.lookupParam(param)
+		record := u.subscriptionLifecycle().lookupParam(param)
 		if record == nil {
 			return "", nil
 		}
-		return record.handle, u.lifecycle.resubmitRecord(cli, record, u)
+		return record.handle, u.subscriptionLifecycle().resubmitRecord(cli, record, u)
 	}
-	return u.lifecycle.subscribe(param, id, cli, u)
+	return u.subscriptionLifecycle().subscribe(param, id, cli, u)
 }
 
 func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param string, _ bool) (string, error) {
@@ -346,19 +379,21 @@ func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param str
 }
 
 func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
-	return u.lifecycle.unsubscribe(id, u)
+	return u.subscriptionLifecycle().unsubscribe(id, u)
 }
 
 func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) <-chan error {
-	return u.lifecycle.retire(u.lifecycle.lookupParam(param), u)
+	lifecycle := u.subscriptionLifecycle()
+	return lifecycle.retire(lifecycle.lookupParam(param), u)
 }
 
 func (u *UpstreamConnManagerEth) localUnsubscribePreservingHandle(param string) <-chan error {
-	return u.lifecycle.retirePreservingHandle(u.lifecycle.lookupParam(param), u)
+	lifecycle := u.subscriptionLifecycle()
+	return lifecycle.retirePreservingHandle(lifecycle.lookupParam(param), u)
 }
 
 func (u *UpstreamConnManagerEth) reservationForHandle(handle string) (string, bool) {
-	return u.lifecycle.reservationForHandle(handle)
+	return u.subscriptionLifecycle().reservationForHandle(handle)
 }
 
 func (u *UpstreamConnManagerEth) unsubscribeOn(binding wsSubscriptionBinding, _ string) error {
@@ -384,6 +419,7 @@ func (u *UpstreamConnManagerEth) stableHandle(provisional, _ string) string {
 }
 
 func (u *UpstreamConnManagerEth) releaseHandle(reservation string) {
+	u.initState()
 	u.IdGen.Release(reservation)
 }
 
@@ -402,7 +438,7 @@ func validateEthUnsubscribeResponse(response *JsonRpcMsg) error {
 }
 
 func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
-	return u.lifecycle.resubmit(cli, u)
+	return u.subscriptionLifecycle().resubmit(cli, u)
 }
 
 // IsHealthy mirrors the Cosmos manager's check: nil/closed client →
@@ -421,9 +457,10 @@ func (u *UpstreamConnManagerEth) IsHealthy() bool {
 // Idempotent — see Cosmos impl.
 func (u *UpstreamConnManagerEth) Stop() {
 	u.stopOnce.Do(func() {
+		u.initState()
 		u.initStopCh()
 		u.stopped.Store(true)
 		close(u.stopCh)
-		u.lifecycle.stop(u)
+		u.subscriptionLifecycle().stop(u)
 	})
 }

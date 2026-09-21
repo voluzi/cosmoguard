@@ -48,9 +48,38 @@ type UpstreamConnManagerCosmos struct {
 	// up immediately instead of parking the goroutine for up to
 	// connectRetryPeriod past shutdown. Lazily allocated to avoid
 	// breaking direct &UpstreamConnManagerCosmos{} literal uses.
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	initOnce sync.Once
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	initOnce  sync.Once
+	stateOnce sync.Once
+}
+
+func (u *UpstreamConnManagerCosmos) initState() {
+	u.stateOnce.Do(func() {
+		if u.lifecycle == nil {
+			u.lifecycle = newWSSubscriptionLifecycle()
+		}
+		if u.IdGen == nil {
+			u.IdGen = &util.UniqueID{}
+		}
+		if u.respMap == nil {
+			u.respMap = make(map[wsResponseKey]chan *JsonRpcMsg)
+		}
+		if u.dialer == nil {
+			u.dialer = &websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: connectTimeout}
+		}
+		if u.log == nil {
+			u.log = log
+		}
+		if u.onSubscriptionMessage == nil {
+			u.onSubscriptionMessage = func(*JsonRpcMsg) {}
+		}
+	})
+}
+
+func (u *UpstreamConnManagerCosmos) subscriptionLifecycle() *wsSubscriptionLifecycle {
+	u.initState()
+	return u.lifecycle
 }
 
 // initStopCh is called by Run before the loop starts and again by
@@ -66,7 +95,7 @@ func (u *UpstreamConnManagerCosmos) initStopCh() {
 // curClient returns the currently-attached WS client under
 // clientMu.RLock. nil when there's no live connection.
 func (u *UpstreamConnManagerCosmos) curClient() *JsonRpcWsClient {
-	return u.lifecycle.currentClient()
+	return u.subscriptionLifecycle().currentClient()
 }
 
 func CosmosUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMessage func(msg *JsonRpcMsg)) UpstreamConnManager {
@@ -84,6 +113,7 @@ func CosmosUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscription
 }
 
 func (u *UpstreamConnManagerCosmos) Run(log *Entry) error {
+	u.initState()
 	u.log = log
 	u.initStopCh()
 	for {
@@ -179,7 +209,7 @@ func (u *UpstreamConnManagerCosmos) connect() error {
 		if u.beforeInstall != nil {
 			u.beforeInstall(client)
 		}
-		if !u.lifecycle.install(client) {
+		if !u.subscriptionLifecycle().install(client) {
 			_ = client.Close()
 			return ErrClosed
 		}
@@ -191,6 +221,7 @@ func (u *UpstreamConnManagerCosmos) connect() error {
 }
 
 func (u *UpstreamConnManagerCosmos) onUpstreamMessage(client *JsonRpcWsClient, msg *JsonRpcMsg) {
+	u.initState()
 	// Defence-in-depth: a single malformed/duplicate upstream frame must
 	// never take down the process. The Run goroutine that calls this has
 	// no recover of its own.
@@ -239,7 +270,7 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(client *JsonRpcWsClient, m
 	}
 
 	// Otherwise let's check if it's a cosmos subscription notification.
-	handle, ok := u.lifecycle.route(client, msgID)
+	handle, ok := u.subscriptionLifecycle().route(client, msgID)
 	if ok {
 		u.log.WithFields(map[string]interface{}{
 			"ID": handle,
@@ -262,6 +293,7 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithID(id string, req *JsonRpcMsg
 // underneath it. The select wakes on the client's Closed() channel so a
 // disconnect cancels the wait instead of stalling for responseTimeout.
 func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClient, id string, req *JsonRpcMsg) (*JsonRpcMsg, error) {
+	u.initState()
 	request := req.CloneWithID(id)
 
 	if cli == nil || cli.IsClosed() {
@@ -328,23 +360,24 @@ func (u *UpstreamConnManagerCosmos) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, e
 }
 
 func (u *UpstreamConnManagerCosmos) HasSubscription(param string) bool {
-	return u.lifecycle.hasParam(param)
+	return u.subscriptionLifecycle().hasParam(param)
 }
 
 func (u *UpstreamConnManagerCosmos) Subscribe(param string) (string, error) {
+	u.initState()
 	id := u.IdGen.ID()
-	return u.lifecycle.subscribe(param, id, u.curClient(), u)
+	return u.subscriptionLifecycle().subscribe(param, id, u.curClient(), u)
 }
 
 func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) error {
 	if resubmit {
-		record := u.lifecycle.lookupParam(param)
+		record := u.subscriptionLifecycle().lookupParam(param)
 		if record == nil {
 			return nil
 		}
-		return u.lifecycle.resubmitRecord(cli, record, u)
+		return u.subscriptionLifecycle().resubmitRecord(cli, record, u)
 	}
-	_, err := u.lifecycle.subscribe(param, id, cli, u)
+	_, err := u.subscriptionLifecycle().subscribe(param, id, cli, u)
 	return err
 }
 
@@ -367,19 +400,21 @@ func (u *UpstreamConnManagerCosmos) subscribeOn(cli *JsonRpcWsClient, id, param 
 }
 
 func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
-	return u.lifecycle.unsubscribe(id, u)
+	return u.subscriptionLifecycle().unsubscribe(id, u)
 }
 
 func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) <-chan error {
-	return u.lifecycle.retire(u.lifecycle.lookupParam(param), u)
+	lifecycle := u.subscriptionLifecycle()
+	return lifecycle.retire(lifecycle.lookupParam(param), u)
 }
 
 func (u *UpstreamConnManagerCosmos) localUnsubscribePreservingHandle(param string) <-chan error {
-	return u.lifecycle.retirePreservingHandle(u.lifecycle.lookupParam(param), u)
+	lifecycle := u.subscriptionLifecycle()
+	return lifecycle.retirePreservingHandle(lifecycle.lookupParam(param), u)
 }
 
 func (u *UpstreamConnManagerCosmos) reservationForHandle(handle string) (string, bool) {
-	return u.lifecycle.reservationForHandle(handle)
+	return u.subscriptionLifecycle().reservationForHandle(handle)
 }
 
 func (u *UpstreamConnManagerCosmos) unsubscribeOn(binding wsSubscriptionBinding, param string) error {
@@ -403,6 +438,7 @@ func (u *UpstreamConnManagerCosmos) stableHandle(provisional, _ string) string {
 }
 
 func (u *UpstreamConnManagerCosmos) releaseHandle(handle string) {
+	u.initState()
 	u.IdGen.Release(handle)
 }
 
@@ -426,13 +462,14 @@ func validateCosmosUnsubscribeResponse(response *JsonRpcMsg) error {
 // it to surface ErrClosed.
 func (u *UpstreamConnManagerCosmos) Stop() {
 	u.stopOnce.Do(func() {
+		u.initState()
 		u.initStopCh()
 		u.stopped.Store(true)
 		close(u.stopCh)
-		u.lifecycle.stop(u)
+		u.subscriptionLifecycle().stop(u)
 	})
 }
 
 func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
-	return u.lifecycle.resubmit(cli, u)
+	return u.subscriptionLifecycle().resubmit(cli, u)
 }
