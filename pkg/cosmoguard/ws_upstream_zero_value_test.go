@@ -2,37 +2,42 @@ package cosmoguard
 
 import (
 	"errors"
-	"sync"
 	"testing"
 
 	"gotest.tools/assert"
 )
 
 func TestUpstreamManagerZeroValueInitializesLifecycleOnce(t *testing.T) {
+	type observation struct {
+		healthy         bool
+		hasSubscription bool
+		lifecycle       *wsSubscriptionLifecycle
+	}
 	managers := []UpstreamConnManager{
 		&UpstreamConnManagerCosmos{},
 		&UpstreamConnManagerEth{},
 	}
 	for _, manager := range managers {
-		var wg sync.WaitGroup
-		lifecycles := make(chan *wsSubscriptionLifecycle, 16)
+		observations := make(chan observation, 16)
 		for range 16 {
-			wg.Add(1)
 			go func() {
-				defer wg.Done()
-				assert.Assert(t, !manager.IsHealthy())
-				assert.Assert(t, !manager.HasSubscription("missing"))
-				lifecycles <- managerLifecycle(manager)
+				observations <- observation{
+					healthy:         manager.IsHealthy(),
+					hasSubscription: manager.HasSubscription("missing"),
+					lifecycle:       managerLifecycle(manager),
+				}
 			}()
 		}
-		wg.Wait()
-		close(lifecycles)
 		var initialized *wsSubscriptionLifecycle
-		for lifecycle := range lifecycles {
+		for range 16 {
+			result := mustRecv(t, observations, "zero-value manager observation")
+			assert.Assert(t, !result.healthy)
+			assert.Assert(t, !result.hasSubscription)
+			assert.Assert(t, result.lifecycle != nil)
 			if initialized == nil {
-				initialized = lifecycle
+				initialized = result.lifecycle
 			}
-			assert.Assert(t, lifecycle == initialized, "concurrent access created multiple lifecycles")
+			assert.Assert(t, result.lifecycle == initialized, "concurrent access created multiple lifecycles")
 		}
 
 		_, err := manager.Subscribe("victim")
