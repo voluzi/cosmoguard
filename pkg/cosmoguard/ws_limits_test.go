@@ -372,6 +372,52 @@ func TestBrokerDisconnectReleasesAllAdmissionBeforeUpstreamCleanup(t *testing.T)
 	assert.NilError(t, <-disconnected)
 }
 
+func TestBrokerDisconnectDuringSubscribeReleasesAllAdmissionBeforeRollback(t *testing.T) {
+	upstream := newLimitingUpstream()
+	broker := NewBroker([]string{"ws://upstream.test"}, "/", 1, limitingConstructor(upstream))
+	broker.log = log.WithField("test", t.Name())
+	broker.setAdmissionController(newWSAdmissionController(WebSocketLimits{
+		MaxSubscriptionsPerClient:   3,
+		MaxSubscriptionsPerIdentity: 3,
+	}))
+	client := NewJsonRpcWsClient(nil)
+	client.SetOnDisconnectCallback(broker.onClientDisconnect)
+	for i, param := range []string{"first", "second"} {
+		response, err := broker.HandleSubscription(client, &JsonRpcMsg{
+			Version: jsonRpcVersion, ID: i + 1, Method: methodSubscribeCosmos, Params: []any{param},
+		}, "alice")
+		assert.NilError(t, err)
+		assert.Assert(t, response.Error == nil)
+	}
+
+	upstream.subscribeStarted = make(chan struct{})
+	upstream.subscribeRelease = make(chan struct{})
+	upstream.unsubscribeStarted = make(chan struct{}, 3)
+	upstream.unsubscribeRelease = make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := broker.addSubscription(client, &JsonRpcMsg{
+			Version: jsonRpcVersion, ID: 3, Method: methodSubscribeCosmos, Params: []any{"third"},
+		}, "alice")
+		result <- err
+	}()
+	<-upstream.subscribeStarted
+	assert.NilError(t, client.Close())
+	close(upstream.subscribeRelease)
+	<-upstream.unsubscribeStarted
+
+	replacement := &JsonRpcWsClient{}
+	for i := 0; i < 3; i++ {
+		assert.NilError(t, broker.admission.reserveSubscription(replacement, "alice"),
+			"disconnect rollback must release every membership before upstream cleanup")
+	}
+	for i := 0; i < 3; i++ {
+		broker.admission.releaseSubscription(replacement)
+	}
+	close(upstream.unsubscribeRelease)
+	assert.Assert(t, errors.Is(<-result, ErrClosed))
+}
+
 func TestBrokerFailedSubscribeRollsBackDownstreamAdmission(t *testing.T) {
 	upstream := newLimitingUpstream()
 	upstream.failSubscribe.Store(true)
@@ -839,6 +885,86 @@ func TestUncertainMigrationBlocksRepeatUntilExactSocketSettles(t *testing.T) {
 
 			assert.Equal(t, len(pool.MigrateUnhealthy()), 0)
 			assert.Equal(t, alternate.calls.Load(), int32(2), "settlement must allow a later migration attempt")
+		})
+	}
+}
+
+func TestOverlappingMigrationAndSourceDrainsBlockUntilBothSettle(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			sourceClient, sourcePeer := newWSCacheClient(t)
+			source := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(source, sourceClient)
+			setManagerLog(source, log.WithField("test", t.Name()+"-source"))
+			sourceBackend := newControlledWSBackend(source, sourceClient, sourcePeer)
+			created := startSubscribe(source, "victim")
+			request := <-sourceBackend.requests
+			sourceBackend.responses <- protocol.subscribeSuccess(request, "source")
+			initial := <-created
+			assert.NilError(t, initial.err)
+			assert.NilError(t, sourceClient.Close())
+
+			destinationClient, destinationPeer := newWSCacheClient(t)
+			destinationManager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(destinationManager, destinationClient)
+			setManagerLog(destinationManager, log.WithField("test", t.Name()+"-destination"))
+			destinationBackend := newControlledWSBackend(destinationManager, destinationClient, destinationPeer)
+			destination := &migrationSubscribeProbe{UpstreamConnManager: destinationManager}
+			destination.healthy.Store(true)
+			pool := &UpstreamPool{
+				conn:                    []UpstreamConnManager{source, destination},
+				subscriptionConn:        map[string]UpstreamConnManager{initial.id: source},
+				subscriptionID:          map[string]string{"victim": initial.id},
+				subscriptionParam:       map[string]string{initial.id: "victim"},
+				subCount:                map[UpstreamConnManager]*atomic.Int64{source: {}, destination: {}},
+				maxSubscriptionsPerConn: 2,
+			}
+			pool.subCount[source].Store(1)
+
+			migration := make(chan []SubscriptionMigration, 1)
+			go func() { migration <- pool.MigrateUnhealthy() }()
+			request = <-destinationBackend.requests
+			destinationBackend.responses <- &JsonRpcMsg{Version: jsonRpcVersion, ID: request.ID}
+			assert.Equal(t, len(<-migration), 0)
+
+			reconnectedClient, reconnectedPeer := newWSCacheClient(t)
+			setManagerClient(source, reconnectedClient)
+			reconnectedBackend := newControlledWSBackend(source, reconnectedClient, reconnectedPeer)
+			replayed := startManagerResubscribe(source, reconnectedClient, "victim", initial.id)
+			request = <-reconnectedBackend.requests
+			reconnectedBackend.responses <- protocol.subscribeSuccess(request, "replayed")
+			assert.NilError(t, <-replayed)
+
+			removed := startUnsubscribe(pool, initial.id)
+			<-reconnectedBackend.requests
+			close(reconnectedBackend.responses)
+			assert.NilError(t, reconnectedClient.Close())
+			removeErr := <-removed
+			assert.Assert(t, isUncertainWSUpstreamOutcome(removeErr))
+			if settled := uncertainWSUpstreamOutcomeSettlement(removeErr); settled != nil {
+				<-settled
+			}
+
+			_, err := pool.Subscribe("victim")
+			var pending *WSResourceExhaustedError
+			assert.Assert(t, errors.As(err, &pending),
+				"settling the source drain must not clear the outstanding destination drain")
+			assert.Equal(t, destination.calls.Load(), int32(1))
+
+			assert.NilError(t, destinationClient.Close())
+			deadline := time.Now().Add(time.Second)
+			for {
+				pool.subMux.Lock()
+				_, draining := pool.drainingParams["victim"]
+				pool.subMux.Unlock()
+				if !draining {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("destination drain did not settle")
+				}
+				runtime.Gosched()
+			}
 		})
 	}
 }

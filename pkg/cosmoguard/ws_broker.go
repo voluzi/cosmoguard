@@ -286,8 +286,9 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 		b.sm.SubscribeClient(id, client, msg.ID)
 	}
 	if client.IsClosed() {
-		b.sm.UnsubscribeClient(id, client)
-		return "", errors.Join(ErrClosed, b.removeEmptySubscriptionLocked(id))
+		emptySubscriptions := b.detachClientSubscriptionsLocked(client)
+		admitted = false
+		return "", errors.Join(ErrClosed, b.removeEmptySubscriptionsLocked(emptySubscriptions))
 	}
 	admitted = false
 
@@ -297,21 +298,6 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 	}).Debug("subscribed client")
 
 	return id, nil
-}
-
-// removeEmptySubscriptionLocked tears down an upstream subscription that lost
-// its last downstream client. The caller must hold upstreamSubMux.
-func (b *Broker) removeEmptySubscriptionLocked(id string) error {
-	if !b.sm.SubscriptionEmpty(id) {
-		return nil
-	}
-	upstreamID, _ := b.sm.UpstreamID(id)
-	if err := b.pool.Unsubscribe(upstreamID); err != nil {
-		b.forgetSettlingSubscription(id, err)
-		return err
-	}
-	b.sm.RemoveSubscription(id)
-	return nil
 }
 
 func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) error {
@@ -372,6 +358,11 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 	b.upstreamSubMux.Lock()
 	defer b.upstreamSubMux.Unlock()
 
+	emptySubscriptions := b.detachClientSubscriptionsLocked(client)
+	return b.removeEmptySubscriptionsLocked(emptySubscriptions)
+}
+
+func (b *Broker) detachClientSubscriptionsLocked(client *JsonRpcWsClient) []string {
 	var emptySubscriptions []string
 	for _, subscriptionID := range b.sm.GetSubscriptions(client) {
 		b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
@@ -381,7 +372,10 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 			emptySubscriptions = append(emptySubscriptions, subscriptionID)
 		}
 	}
+	return emptySubscriptions
+}
 
+func (b *Broker) removeEmptySubscriptionsLocked(emptySubscriptions []string) error {
 	// Admission belongs to downstream membership, so all memberships must be
 	// released before any upstream cleanup can wait on network I/O.
 	var errs []error

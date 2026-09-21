@@ -32,7 +32,7 @@ type UpstreamPool struct {
 	pendingCreates          map[string]*wsPoolCreate
 	pendingUnsubscribe      map[string]struct{}
 	migrating               map[string]struct{}
-	drainingParams          map[string]*wsReservationLease
+	drainingParams          map[string]map[*wsReservationLease]struct{}
 	subMux                  sync.Mutex
 	maxSubscriptionsPerConn int
 
@@ -187,7 +187,7 @@ func NewUpstreamPool(backends []string, path string, n int, onMessage func(*Json
 		pendingCreates:        make(map[string]*wsPoolCreate),
 		pendingUnsubscribe:    make(map[string]struct{}),
 		migrating:             make(map[string]struct{}),
-		drainingParams:        make(map[string]*wsReservationLease),
+		drainingParams:        make(map[string]map[*wsReservationLease]struct{}),
 		subCount:              make(map[UpstreamConnManager]*atomic.Int64, n),
 		onSubscriptionMessage: onMessage,
 		IdGen:                 &util.UniqueID{},
@@ -327,7 +327,7 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	// against onUpstreamMessage in some edge cases.
 	p.subMux.Lock()
 	p.ensureSubscriptionMapsLocked()
-	if _, draining := p.drainingParams[param]; draining {
+	if len(p.drainingParams[param]) > 0 {
 		limit := p.maxSubscriptionsPerConn
 		p.subMux.Unlock()
 		return "", pendingUnsubscribeError(limit)
@@ -363,7 +363,7 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 		if isUncertainWSUpstreamOutcome(err) {
 			settled := uncertainWSUpstreamOutcomeSettlement(err)
 			p.subMux.Lock()
-			p.drainingParams[param] = lease
+			p.addDrainingLeaseLocked(param, lease)
 			p.subMux.Unlock()
 			err = uncertainWSUpstreamOutcomeWithSettlement(err, p.releaseDrainingLease(param, lease, settled))
 		} else {
@@ -420,7 +420,7 @@ func (p *UpstreamPool) ensureSubscriptionMapsLocked() {
 		p.migrating = make(map[string]struct{})
 	}
 	if p.drainingParams == nil {
-		p.drainingParams = make(map[string]*wsReservationLease)
+		p.drainingParams = make(map[string]map[*wsReservationLease]struct{})
 	}
 }
 
@@ -434,6 +434,23 @@ func (p *UpstreamPool) completeCreate(param string, pending *wsPoolCreate, id st
 	p.subMux.Unlock()
 }
 
+func (p *UpstreamPool) addDrainingLeaseLocked(param string, lease *wsReservationLease) {
+	drains := p.drainingParams[param]
+	if drains == nil {
+		drains = make(map[*wsReservationLease]struct{})
+		p.drainingParams[param] = drains
+	}
+	drains[lease] = struct{}{}
+}
+
+func (p *UpstreamPool) removeDrainingLeaseLocked(param string, lease *wsReservationLease) {
+	drains := p.drainingParams[param]
+	delete(drains, lease)
+	if len(drains) == 0 {
+		delete(p.drainingParams, param)
+	}
+}
+
 func (p *UpstreamPool) releaseDrainingLease(param string, lease *wsReservationLease, settled <-chan struct{}) <-chan struct{} {
 	return p.releaseDrainingLeaseAndReservation(param, lease, nil, settled)
 }
@@ -445,9 +462,7 @@ func (p *UpstreamPool) releaseDrainingLeaseAndReservation(param string, lease *w
 	done := make(chan struct{})
 	release := func() {
 		p.subMux.Lock()
-		if p.drainingParams[param] == lease {
-			delete(p.drainingParams, param)
-		}
+		p.removeDrainingLeaseLocked(param, lease)
 		lease.releaseLocked()
 		p.subMux.Unlock()
 		reservation.releaseWhenSettled(p.IdGen)
@@ -470,7 +485,7 @@ func (p *UpstreamPool) drainFailedMigration(oldID, param string, source Upstream
 	p.subMux.Lock()
 	tracked := p.subscriptionConn[oldID] == source
 	if tracked {
-		p.drainingParams[param] = lease
+		p.addDrainingLeaseLocked(param, lease)
 	}
 	p.subMux.Unlock()
 	if settled == nil {
@@ -478,9 +493,7 @@ func (p *UpstreamPool) drainFailedMigration(oldID, param string, source Upstream
 	}
 	release := func() {
 		p.subMux.Lock()
-		if p.drainingParams[param] == lease {
-			delete(p.drainingParams, param)
-		}
+		p.removeDrainingLeaseLocked(param, lease)
 		if p.subscriptionConn[oldID] == source {
 			delete(p.migrating, oldID)
 		}
@@ -591,7 +604,7 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 			p.subMux.Lock()
 			if p.subscriptionConn[subID] == conn {
 				p.removeRouteLocked(subID, param)
-				p.drainingParams[param] = lease
+				p.addDrainingLeaseLocked(param, lease)
 			}
 			p.subMux.Unlock()
 			err = uncertainWSUpstreamOutcomeWithSettlement(err, p.releaseDrainingLeaseAndReservation(param, lease, canonicalReservation, settled))
