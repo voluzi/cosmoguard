@@ -31,6 +31,8 @@ type limitingUpstream struct {
 	subscribeRelease   chan struct{}
 	unsubscribeStarted chan struct{}
 	unsubscribeRelease chan struct{}
+	localUnsubStarted  chan struct{}
+	localUnsubResult   chan error
 	once               sync.Once
 }
 
@@ -252,9 +254,14 @@ func (u *limitingUpstream) Unsubscribe(string) error {
 	}
 	return nil
 }
-func (*limitingUpstream) LocalUnsubscribe(string) <-chan error { return nil }
-func (u *limitingUpstream) IsHealthy() bool                    { return u.healthy.Load() }
-func (*limitingUpstream) Stop()                                {}
+func (u *limitingUpstream) LocalUnsubscribe(string) <-chan error {
+	if u.localUnsubStarted != nil {
+		u.localUnsubStarted <- struct{}{}
+	}
+	return u.localUnsubResult
+}
+func (u *limitingUpstream) IsHealthy() bool { return u.healthy.Load() }
+func (*limitingUpstream) Stop()             {}
 
 func limitingConstructor(u *limitingUpstream) UpstreamConnManagerConstructor {
 	return func(url.URL, *util.UniqueID, func(*JsonRpcMsg)) UpstreamConnManager { return u }
@@ -936,6 +943,63 @@ func TestUncertainMigrationBlocksRepeatUntilExactSocketSettles(t *testing.T) {
 			assert.Equal(t, alternate.calls.Load(), int32(2), "settlement must allow a later migration attempt")
 		})
 	}
+}
+
+func TestAbandonedMigrationClearsMarkerAfterDestinationRetires(t *testing.T) {
+	source := newLimitingUpstream()
+	destination := newLimitingUpstream()
+	destination.healthy.Store(false)
+	pool := &UpstreamPool{
+		conn:     []UpstreamConnManager{source, destination},
+		subCount: map[UpstreamConnManager]*atomic.Int64{source: {}, destination: {}},
+	}
+
+	id, err := pool.Subscribe("victim")
+	assert.NilError(t, err)
+	source.healthy.Store(false)
+	destination.healthy.Store(true)
+	destination.subscribeStarted = make(chan struct{})
+	destination.subscribeRelease = make(chan struct{})
+	destination.localUnsubStarted = make(chan struct{})
+	destination.localUnsubResult = make(chan error)
+	source.failUnsubscribe.Store(true)
+	source.unsubscribeStarted = make(chan struct{})
+	source.unsubscribeRelease = make(chan struct{})
+
+	migrationResult := make(chan []SubscriptionMigration, 1)
+	go func() { migrationResult <- pool.MigrateUnhealthy() }()
+	mustWait(t, destination.subscribeStarted, "destination subscribe start")
+
+	unsubscribeResult := startUnsubscribe(pool, id)
+	mustRecv(t, source.unsubscribeStarted, "source unsubscribe start")
+	close(destination.subscribeRelease)
+	mustRecv(t, destination.localUnsubStarted, "destination retirement start")
+	assert.Equal(t, len(mustRecv(t, migrationResult, "abandoned migration")), 0)
+	pool.subMux.Lock()
+	_, moving := pool.migrating[id]
+	pool.subMux.Unlock()
+	assert.Assert(t, moving, "migration must stay marked until destination retirement settles")
+	close(destination.localUnsubResult)
+	close(source.unsubscribeRelease)
+	assert.ErrorContains(t, mustRecv(t, unsubscribeResult, "definite unsubscribe failure"), "unsubscribe failed")
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		pool.subMux.Lock()
+		_, moving = pool.migrating[id]
+		pool.subMux.Unlock()
+		if !moving {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retired migration destination did not clear its attempt marker")
+		}
+		runtime.Gosched()
+	}
+
+	migrations := pool.MigrateUnhealthy()
+	assert.Equal(t, len(migrations), 1)
+	assert.Equal(t, migrations[0].OldID, id)
 }
 
 func TestOverlappingMigrationAndSourceDrainsBlockUntilBothSettle(t *testing.T) {

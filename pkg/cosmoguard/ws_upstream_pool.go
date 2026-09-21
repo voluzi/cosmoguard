@@ -31,7 +31,7 @@ type UpstreamPool struct {
 	canonicalReservations   map[string]*wsCanonicalReservation
 	pendingCreates          map[string]*wsPoolCreate
 	pendingUnsubscribe      map[string]struct{}
-	migrating               map[string]struct{}
+	migrating               map[string]*wsMigrationAttempt
 	drainingParams          map[string]map[*wsReservationLease]struct{}
 	subMux                  sync.Mutex
 	maxSubscriptionsPerConn int
@@ -62,6 +62,11 @@ type wsReservationLease struct {
 	pool *UpstreamPool
 	conn UpstreamConnManager
 	once sync.Once
+}
+
+type wsMigrationAttempt struct {
+	source      UpstreamConnManager
+	sourceLease *wsReservationLease
 }
 
 type wsMigrationHandleOwner interface {
@@ -186,7 +191,7 @@ func NewUpstreamPool(backends []string, path string, n int, onMessage func(*Json
 		canonicalReservations: make(map[string]*wsCanonicalReservation),
 		pendingCreates:        make(map[string]*wsPoolCreate),
 		pendingUnsubscribe:    make(map[string]struct{}),
-		migrating:             make(map[string]struct{}),
+		migrating:             make(map[string]*wsMigrationAttempt),
 		drainingParams:        make(map[string]map[*wsReservationLease]struct{}),
 		subCount:              make(map[UpstreamConnManager]*atomic.Int64, n),
 		onSubscriptionMessage: onMessage,
@@ -417,7 +422,7 @@ func (p *UpstreamPool) ensureSubscriptionMapsLocked() {
 		p.pendingUnsubscribe = make(map[string]struct{})
 	}
 	if p.migrating == nil {
-		p.migrating = make(map[string]struct{})
+		p.migrating = make(map[string]*wsMigrationAttempt)
 	}
 	if p.drainingParams == nil {
 		p.drainingParams = make(map[string]map[*wsReservationLease]struct{})
@@ -481,9 +486,9 @@ func (p *UpstreamPool) releaseDrainingLeaseAndReservation(param string, lease *w
 	return done
 }
 
-func (p *UpstreamPool) drainFailedMigration(oldID, param string, source UpstreamConnManager, lease *wsReservationLease, settled <-chan struct{}) {
+func (p *UpstreamPool) drainFailedMigration(oldID, param string, attempt *wsMigrationAttempt, lease *wsReservationLease, settled <-chan struct{}) {
 	p.subMux.Lock()
-	tracked := p.subscriptionConn[oldID] == source
+	tracked := p.migrationAttemptMatchesLocked(oldID, attempt)
 	if tracked {
 		p.addDrainingLeaseLocked(param, lease)
 	}
@@ -494,7 +499,7 @@ func (p *UpstreamPool) drainFailedMigration(oldID, param string, source Upstream
 	release := func() {
 		p.subMux.Lock()
 		p.removeDrainingLeaseLocked(param, lease)
-		if p.subscriptionConn[oldID] == source {
+		if p.migrationAttemptMatchesLocked(oldID, attempt) {
 			delete(p.migrating, oldID)
 		}
 		lease.releaseLocked()
@@ -511,6 +516,12 @@ func (p *UpstreamPool) drainFailedMigration(oldID, param string, source Upstream
 	}
 }
 
+func (p *UpstreamPool) migrationAttemptMatchesLocked(oldID string, attempt *wsMigrationAttempt) bool {
+	return p.migrating[oldID] == attempt &&
+		p.subscriptionConn[oldID] == attempt.source &&
+		p.subscriptionLease[oldID] == attempt.sourceLease
+}
+
 func (p *UpstreamPool) retireUncommitted(param string, conn UpstreamConnManager, lease *wsReservationLease) {
 	settled := conn.LocalUnsubscribe(param)
 	if settled == nil {
@@ -520,6 +531,27 @@ func (p *UpstreamPool) retireUncommitted(param string, conn UpstreamConnManager,
 	go func() {
 		if err, ok := <-settled; !ok || err == nil {
 			lease.release()
+		}
+	}()
+}
+
+func (p *UpstreamPool) retireMigrationDestination(oldID, param string, conn UpstreamConnManager, lease *wsReservationLease, attempt *wsMigrationAttempt) {
+	settled := conn.LocalUnsubscribe(param)
+	release := func() {
+		p.subMux.Lock()
+		lease.releaseLocked()
+		if p.migrationAttemptMatchesLocked(oldID, attempt) {
+			delete(p.migrating, oldID)
+		}
+		p.subMux.Unlock()
+	}
+	if settled == nil {
+		release()
+		return
+	}
+	go func() {
+		if err, ok := <-settled; !ok || err == nil {
+			release()
 		}
 	}()
 }
@@ -677,6 +709,7 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		destLease   *wsReservationLease
 		canonical   *wsCanonicalReservation
 		reservation string
+		attempt     *wsMigrationAttempt
 	}
 	p.subMux.Lock()
 	p.ensureSubscriptionMapsLocked()
@@ -703,7 +736,9 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		if err != nil {
 			continue
 		}
-		p.migrating[oldID] = struct{}{}
+		sourceLease := p.leaseForRouteLocked(oldID, conn)
+		attempt := &wsMigrationAttempt{source: conn, sourceLease: sourceLease}
+		p.migrating[oldID] = attempt
 		canonical := p.canonicalReservations[oldID]
 		reservation := ""
 		if canonical == nil {
@@ -713,8 +748,8 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		}
 		candidates = append(candidates, pending{
 			oldID: oldID, conn: conn, alt: alt, param: param,
-			sourceLease: p.leaseForRouteLocked(oldID, conn), destLease: destLease,
-			canonical: canonical, reservation: reservation,
+			sourceLease: sourceLease, destLease: destLease,
+			canonical: canonical, reservation: reservation, attempt: attempt,
 		})
 	}
 	p.subMux.Unlock()
@@ -724,11 +759,11 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		newID, err := c.alt.Subscribe(c.param)
 		if err != nil {
 			if isUncertainWSUpstreamOutcome(err) {
-				p.drainFailedMigration(c.oldID, c.param, c.conn, c.destLease, uncertainWSUpstreamOutcomeSettlement(err))
+				p.drainFailedMigration(c.oldID, c.param, c.attempt, c.destLease, uncertainWSUpstreamOutcomeSettlement(err))
 			} else {
 				c.destLease.release()
 				p.subMux.Lock()
-				if p.subscriptionConn[c.oldID] == c.conn {
+				if p.migrationAttemptMatchesLocked(c.oldID, c.attempt) {
 					delete(p.migrating, c.oldID)
 				}
 				p.subMux.Unlock()
@@ -756,10 +791,10 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		p.subMux.Lock()
 		current := p.subscriptionConn[c.oldID]
 		_, removing := p.pendingUnsubscribe[c.oldID]
-		_, moving := p.migrating[c.oldID]
+		moving := p.migrationAttemptMatchesLocked(c.oldID, c.attempt)
 		if current != c.conn || removing || !moving || p.subscriptionLease[c.oldID] != c.sourceLease {
 			p.subMux.Unlock()
-			p.retireUncommitted(c.param, c.alt, c.destLease)
+			p.retireMigrationDestination(c.oldID, c.param, c.alt, c.destLease, c.attempt)
 			continue
 		}
 		canonical := c.canonical
