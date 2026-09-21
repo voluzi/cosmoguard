@@ -48,13 +48,14 @@ func (f *fakeMigratingConn) Unsubscribe(id string) error {
 	delete(f.subscribed, id)
 	return nil
 }
-func (f *fakeMigratingConn) LocalUnsubscribe(param string) {
+func (f *fakeMigratingConn) LocalUnsubscribe(param string) <-chan error {
 	for id, p := range f.subscribed {
 		if p == param {
 			delete(f.subscribed, id)
-			return
+			return nil
 		}
 	}
+	return nil
 }
 func (f *fakeMigratingConn) Stop() {}
 

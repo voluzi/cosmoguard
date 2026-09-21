@@ -145,6 +145,10 @@ func NewJsonRpcHandler(name string, opts ...Option[JsonRpcHandlerOptions]) (*Jso
 		if err != nil {
 			return nil, err
 		}
+		if cfg.webSocketAdmission != nil {
+			handler.wsProxy.admission = cfg.webSocketAdmission
+			handler.wsProxy.broker.setAdmissionController(cfg.webSocketAdmission)
+		}
 		// Share the cache-freshness defaults + clock so the WS cache read
 		// applies the same staleness policy as the HTTP paths.
 		handler.wsProxy.cacheConfig = cfg.CacheConfig

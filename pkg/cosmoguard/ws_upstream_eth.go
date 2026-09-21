@@ -259,6 +259,10 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
+		var writeErr *wsWriteError
+		if errors.As(err, &writeErr) {
+			return nil, uncertainWSUpstreamOutcome(err)
+		}
 		return nil, err
 	}
 
@@ -280,14 +284,14 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
-		return nil, ErrClosed
+		return nil, uncertainWSUpstreamOutcome(ErrClosed)
 
 	case <-timeout.C:
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
 
-		return nil, fmt.Errorf("timeout waiting for response for request with ID %s", id)
+		return nil, uncertainWSUpstreamOutcome(fmt.Errorf("timeout waiting for response for request with ID %s", id))
 	}
 }
 
@@ -340,13 +344,16 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 	if err != nil {
 		return "", err
 	}
+	if err := validateWSJSONRPCResponse(methodSubscribeEth, resp); err != nil {
+		return "", err
+	}
 
 	// `Result` is held as RawMessage so the upstream's exact bytes are
 	// preserved. The eth_subscribe contract is that result is a JSON
 	// string carrying the subscription ID — decode it.
 	var subID string
 	if err := json.Unmarshal(resp.Result, &subID); err != nil {
-		return "", fmt.Errorf("unexpected subscription ID: %s", string(resp.Result))
+		return "", uncertainWSUpstreamOutcome(fmt.Errorf("decode subscription ID %q: %w", string(resp.Result), err))
 	}
 
 	u.subMux.Lock()
@@ -396,8 +403,11 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 		Params:  []string{id},
 	}
 
-	_, err := u.MakeRequest(msg)
+	response, err := u.MakeRequest(msg)
 	if err != nil {
+		return err
+	}
+	if err := validateEthUnsubscribeResponse(response); err != nil {
 		return err
 	}
 
@@ -421,11 +431,9 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 	return nil
 }
 
-// LocalUnsubscribe drops a subscription param from the local maps with
-// no network I/O — see the interface doc. subByParam maps param → the
-// current upstream subscription id; both entries are removed so a
-// reconnect won't re-issue this (migrated-away) subscription.
-func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) {
+// LocalUnsubscribe tombstones the param before asynchronously validating
+// cleanup of any subscription recreated by a racing reconnect.
+func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) <-chan error {
 	u.subMux.Lock()
 	// Tombstone so a concurrent resubmit can't re-add the migrated param.
 	// Persists until a genuine new subscription clears it (not reset per
@@ -437,21 +445,51 @@ func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) {
 		delete(u.subByID, id)
 	}
 	u.subMux.Unlock()
-	if ok {
-		// Best-effort eth_unsubscribe: a racing reconnect-resubmit may have
-		// re-created this subscription on the reconnected socket between the
-		// migration commit and this call; tear it down so it doesn't stream
-		// with no manager mapping. Run ASYNC so the migrator + the following
-		// SubscriptionManager update aren't blocked for up to responseTimeout
-		// on the old connection (which would drop notifications).
-		go func() {
-			_, _ = u.MakeRequest(&JsonRpcMsg{
-				Version: jsonRpcVersion,
-				Method:  methodUnsubscribeEth,
-				Params:  []string{id},
-			})
-		}()
+	cli := u.curClient()
+	if cli == nil || cli.IsClosed() {
+		return nil
 	}
+	result := make(chan error, 1)
+	if !ok {
+		go func() {
+			<-cli.Closed()
+			result <- nil
+			close(result)
+		}()
+		return result
+	}
+	go func() {
+		requestID := u.IdGen.ID()
+		response, err := u.makeRequestWithIDOnClient(cli, requestID, &JsonRpcMsg{
+			Version: jsonRpcVersion,
+			Method:  methodUnsubscribeEth,
+			Params:  []string{id},
+		})
+		u.IdGen.Release(requestID)
+		if err == nil {
+			err = validateEthUnsubscribeResponse(response)
+		}
+		if err != nil && !errors.Is(err, ErrClosed) {
+			<-cli.Closed()
+		}
+		result <- nil
+		close(result)
+	}()
+	return result
+}
+
+func validateEthUnsubscribeResponse(response *JsonRpcMsg) error {
+	if err := validateWSJSONRPCResponse(methodUnsubscribeEth, response); err != nil {
+		return err
+	}
+	var acknowledged bool
+	if err := json.Unmarshal(response.Result, &acknowledged); err != nil {
+		return fmt.Errorf("decode %s acknowledgement: %w", methodUnsubscribeEth, err)
+	}
+	if !acknowledged {
+		return fmt.Errorf("upstream %s did not confirm cleanup", methodUnsubscribeEth)
+	}
+	return nil
 }
 
 // resetConnectionState clears the per-connection in-flight response map

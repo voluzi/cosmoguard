@@ -289,6 +289,10 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClie
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
+		var writeErr *wsWriteError
+		if errors.As(err, &writeErr) {
+			return nil, uncertainWSUpstreamOutcome(err)
+		}
 		return nil, err
 	}
 
@@ -312,14 +316,14 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClie
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
-		return nil, ErrClosed
+		return nil, uncertainWSUpstreamOutcome(ErrClosed)
 
 	case <-timeout.C:
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
 
-		return nil, fmt.Errorf("timeout waiting for response for request with ID %s", id)
+		return nil, uncertainWSUpstreamOutcome(fmt.Errorf("timeout waiting for response for request with ID %s", id))
 	}
 }
 
@@ -365,8 +369,14 @@ func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient
 		Params:  []interface{}{param},
 	}
 
-	_, err := u.makeRequestWithIDOnClient(cli, id, msg)
+	response, err := u.makeRequestWithIDOnClient(cli, id, msg)
 	if err != nil {
+		if !isUncertainWSUpstreamOutcome(err) {
+			u.IdGen.Release(id)
+		}
+		return err
+	}
+	if err := validateWSJSONRPCResponse(methodSubscribeCosmos, response); err != nil {
 		u.IdGen.Release(id)
 		return err
 	}
@@ -428,8 +438,11 @@ func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
 		Params:  []interface{}{param},
 	}
 
-	_, err := u.MakeRequest(msg)
+	response, err := u.MakeRequest(msg)
 	if err != nil {
+		return err
+	}
+	if err := validateCosmosUnsubscribeResponse(response); err != nil {
 		return err
 	}
 
@@ -446,10 +459,9 @@ func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
 	return nil
 }
 
-// LocalUnsubscribe drops a subscription param from the local maps with
-// no network I/O — see the interface doc. Releases the id back to the
-// generator so it can be reused.
-func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) {
+// LocalUnsubscribe tombstones the param before asynchronously validating
+// cleanup of any subscription recreated by a racing reconnect.
+func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) <-chan error {
 	u.subMux.Lock()
 	// Tombstone the param so a concurrent resubmit can't re-add it. The
 	// tombstone persists (it is NOT reset per resubmit epoch) until a genuine
@@ -462,27 +474,55 @@ func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) {
 		delete(u.subByID, id)
 	}
 	u.subMux.Unlock()
-	if ok {
-		// Best-effort network unsubscribe: a racing reconnect-resubmit may
-		// have re-created this subscription on the current (reconnected)
-		// socket in the window between the migration commit and this call.
-		// Deleting the maps alone would leave that upstream subscription
-		// streaming with no manager mapping; tear it down. Run ASYNC so the
-		// migrator (and the SubscriptionManager update that follows it) isn't
-		// blocked for up to responseTimeout waiting on the old connection —
-		// which would drop notifications during the wait.
-		go func() {
-			_, _ = u.MakeRequest(&JsonRpcMsg{
-				Version: jsonRpcVersion,
-				Method:  methodUnsubscribeCosmos,
-				Params:  []interface{}{param},
-			})
-		}()
+	cli := u.curClient()
+	if cli == nil || cli.IsClosed() {
+		return nil
 	}
+	result := make(chan error, 1)
+	if !ok {
+		go func() {
+			<-cli.Closed()
+			result <- nil
+			close(result)
+		}()
+		return result
+	}
+	go func() {
+		requestID := u.IdGen.ID()
+		response, err := u.makeRequestWithIDOnClient(cli, requestID, &JsonRpcMsg{
+			Version: jsonRpcVersion,
+			Method:  methodUnsubscribeCosmos,
+			Params:  []interface{}{param},
+		})
+		u.IdGen.Release(requestID)
+		if err == nil {
+			err = validateCosmosUnsubscribeResponse(response)
+		}
+		if err != nil && !errors.Is(err, ErrClosed) {
+			<-cli.Closed()
+		}
+		result <- nil
+		close(result)
+	}()
 	// Deliberately DO NOT Release(id): it is the subscription's canonical
 	// (client-facing) id, still referenced by the broker's SubscriptionManager
 	// after the migration. Releasing it would let a later subscription draw
 	// the same id and overwrite the migrated subscription's SM maps.
+	return result
+}
+
+func validateCosmosUnsubscribeResponse(response *JsonRpcMsg) error {
+	if err := validateWSJSONRPCResponse(methodUnsubscribeCosmos, response); err != nil {
+		return err
+	}
+	var acknowledgement map[string]any
+	if err := json.Unmarshal(response.Result, &acknowledgement); err != nil {
+		return fmt.Errorf("decode %s acknowledgement: %w", methodUnsubscribeCosmos, err)
+	}
+	if acknowledgement == nil {
+		return fmt.Errorf("decode %s acknowledgement: expected object", methodUnsubscribeCosmos)
+	}
+	return nil
 }
 
 // Stop signals the Run loop to exit and closes the live WS client.

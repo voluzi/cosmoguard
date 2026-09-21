@@ -29,9 +29,10 @@ const (
 )
 
 type JsonRpcWebSocketProxy struct {
-	broker *Broker
-	cache  cache.Cache[uint64, *JsonRpcMsg]
-	sf     coalescer[wsCoalescedResponse]
+	broker    *Broker
+	admission *wsAdmissionController
+	cache     cache.Cache[uint64, *JsonRpcMsg]
+	sf        coalescer[wsCoalescedResponse]
 	// pendingMisses keeps a fetched response available while its detached
 	// foreground cache write is still in progress.
 	pendingMisses sync.Map // cache hash -> *wsPendingResponse
@@ -114,14 +115,21 @@ func (p *JsonRpcWebSocketProxy) SetAuthenticator(a *Authenticator) { p.auth = a 
 
 func NewJsonRpcWebSocketProxy(name string, backends []string, path string, connections int, upstreamConstructor UpstreamConnManagerConstructor,
 	cache cache.Cache[uint64, *JsonRpcMsg], metricsEnabled bool, serverCfg *ServerConfig) (*JsonRpcWebSocketProxy, error) {
+	limits := (&ServerConfig{}).EffectiveWebSocketLimits()
+	if serverCfg != nil {
+		limits = serverCfg.EffectiveWebSocketLimits()
+	}
+	admission := newWSAdmissionController(limits)
 	proxy := &JsonRpcWebSocketProxy{
 		broker:     NewBroker(backends, path, connections, upstreamConstructor),
+		admission:  admission,
 		wsBackends: backends,
 		upgrader:   &websocket.Upgrader{},
 		cache:      cache,
 		path:       path,
 		conns:      map[*JsonRpcWsClient]*wsConnInfo{},
 	}
+	proxy.broker.setAdmissionController(admission)
 	var allowed []string
 	if serverCfg != nil {
 		// EffectiveWSReadLimit honors an explicit 0 as "no limit" (per the
@@ -248,6 +256,12 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 	// rest of the request graph.
 	_, span := StartHTTPSpan(r, "ws")
 	defer span.End()
+	source := GetSourceIP(r)
+	if err := p.admission.reserveConnection(source); err != nil {
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+		return
+	}
+	defer p.admission.releaseConnection(source)
 
 	conn, err := p.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -264,7 +278,6 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 	// the connection closes cleanly on goroutine return.
 	defer recoverWS(p.log, r.RemoteAddr)
 
-	source := GetSourceIP(r)
 	identity := ""
 	// idObj is the connection-level identity resolved by the HTTP gate
 	// chain during the WS upgrade. The same identity applies to every
@@ -417,6 +430,7 @@ func (p *JsonRpcWebSocketProxy) StatsSnapshot() WSSectionStats {
 		UpstreamSubscriptions: len(subs),
 		UpstreamConnsHealthy:  healthy,
 		UpstreamConnsTotal:    len(ups),
+		Limits:                p.admission.Limits(),
 		Conns:                 conns,
 		Subs:                  subs,
 		Upstreams:             ups,
@@ -553,7 +567,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				var err error
 				storeResponse := cacheable
 				if hasSubscriptionMethod(request) {
-					res, err = p.broker.HandleSubscription(client, request)
+					identityName := ""
+					if identity != nil {
+						identityName = identity.Name
+					}
+					res, err = p.broker.HandleSubscription(client, request, identityName)
 					if err != nil {
 						return err
 					}
@@ -654,7 +672,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 		var res *JsonRpcMsg
 		var err error
 		if hasSubscriptionMethod(request) {
-			res, err = p.broker.HandleSubscription(client, request)
+			identityName := ""
+			if identity != nil {
+				identityName = identity.Name
+			}
+			res, err = p.broker.HandleSubscription(client, request, identityName)
 			if err != nil {
 				return err
 			}

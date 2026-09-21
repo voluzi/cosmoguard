@@ -58,6 +58,12 @@ server:
   idleTimeout: 60s
   maxRequestBody: 1048576       # 1 MiB
   wsReadLimit: 65536            # 64 KiB per WebSocket frame
+  # Limits are per CosmoGuard process. Explicit 0 disables one limit.
+  websocketLimits:
+    maxSubscriptionsPerClient: 32
+    maxSubscriptionsPerIdentity: 128
+    maxSubscriptionsPerUpstreamConnection: 4
+    maxConnectionsPerIP: 16
   # wsAllowedOrigins is empty by default — cross-origin WS upgrades denied.
   # Set to ["*"] to restore v3 behavior, or list specific origins:
   # wsAllowedOrigins:

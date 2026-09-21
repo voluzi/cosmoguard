@@ -109,6 +109,12 @@ config:
     maxRequestBody: 5242880
     # wsReadLimit defaults to 1 MiB (0 = no limit).
     wsReadLimit: 1048576
+    # Process-local WebSocket admission limits. Explicit 0 disables one limit.
+    websocketLimits:
+      maxSubscriptionsPerClient: 32
+      maxSubscriptionsPerIdentity: 128
+      maxSubscriptionsPerUpstreamConnection: 4
+      maxConnectionsPerIP: 16
   # Replace with your real Cosmos node(s). Multi-node + healthcheck
   # support enables horizontal HA at the cosmoguard layer.
   nodes:

@@ -101,6 +101,10 @@ type ServerConfig struct {
 	// a deliberate breaking change from v3. Use ["*"] to restore the v3
 	// behavior of accepting any Origin.
 	WSAllowedOrigins []string `yaml:"wsAllowedOrigins,omitempty"`
+	// WebSocketLimits bounds process-local WebSocket connections and
+	// subscriptions. Pointer fields distinguish an omitted value (default)
+	// from an explicit zero (disabled).
+	WebSocketLimits WebSocketLimitsConfig `yaml:"websocketLimits,omitempty"`
 
 	// TrustedProxies is the CIDR allowlist of upstream proxy hops whose
 	// X-Real-Ip / X-Forwarded-For headers cosmoguard will honor
@@ -117,6 +121,14 @@ type ServerConfig struct {
 	// caller's address. A proxy that supplies only X-Real-Ip must overwrite
 	// any value received from its client.
 	TrustedProxies []string `yaml:"trustedProxies,omitempty"`
+}
+
+// WebSocketLimitsConfig retains unset versus explicit-zero YAML values.
+type WebSocketLimitsConfig struct {
+	MaxSubscriptionsPerClient             *int `yaml:"maxSubscriptionsPerClient,omitempty"`
+	MaxSubscriptionsPerIdentity           *int `yaml:"maxSubscriptionsPerIdentity,omitempty"`
+	MaxSubscriptionsPerUpstreamConnection *int `yaml:"maxSubscriptionsPerUpstreamConnection,omitempty"`
+	MaxConnectionsPerIP                   *int `yaml:"maxConnectionsPerIP,omitempty"`
 }
 
 const (
@@ -140,6 +152,23 @@ func (s *ServerConfig) EffectiveWSReadLimit() int64 {
 		return defaultServerWSRead
 	}
 	return *s.WSReadLimit
+}
+
+func (s *ServerConfig) EffectiveWebSocketLimits() WebSocketLimits {
+	return WebSocketLimits{
+		MaxSubscriptionsPerClient:   effectiveIntLimit(s.WebSocketLimits.MaxSubscriptionsPerClient, defaultMaxSubscriptionsPerClient),
+		MaxSubscriptionsPerIdentity: effectiveIntLimit(s.WebSocketLimits.MaxSubscriptionsPerIdentity, defaultMaxSubscriptionsPerIdentity),
+		MaxSubscriptionsPerUpstreamConnection: effectiveIntLimit(s.WebSocketLimits.MaxSubscriptionsPerUpstreamConnection,
+			defaultMaxSubscriptionsPerUpstreamConnection),
+		MaxConnectionsPerIP: effectiveIntLimit(s.WebSocketLimits.MaxConnectionsPerIP, defaultMaxConnectionsPerIP),
+	}
+}
+
+func effectiveIntLimit(value *int, defaultValue int) int {
+	if value == nil {
+		return defaultValue
+	}
+	return *value
 }
 
 type NodeConfig struct {
@@ -1324,6 +1353,20 @@ func validateServerLimits(s *ServerConfig) error {
 	}
 	if s.WSReadLimit != nil && *s.WSReadLimit < 0 {
 		return fmt.Errorf("server.wsReadLimit must be >= 0 (0 means no limit); got %d", *s.WSReadLimit)
+	}
+	limits := []struct {
+		name  string
+		value *int
+	}{
+		{"maxSubscriptionsPerClient", s.WebSocketLimits.MaxSubscriptionsPerClient},
+		{"maxSubscriptionsPerIdentity", s.WebSocketLimits.MaxSubscriptionsPerIdentity},
+		{"maxSubscriptionsPerUpstreamConnection", s.WebSocketLimits.MaxSubscriptionsPerUpstreamConnection},
+		{"maxConnectionsPerIP", s.WebSocketLimits.MaxConnectionsPerIP},
+	}
+	for _, limit := range limits {
+		if limit.value != nil && *limit.value < 0 {
+			return fmt.Errorf("server.websocketLimits.%s must be >= 0 (0 disables the limit); got %d", limit.name, *limit.value)
+		}
 	}
 	return nil
 }

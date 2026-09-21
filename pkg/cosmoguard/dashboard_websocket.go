@@ -29,16 +29,17 @@ type WSSubInfo struct {
 // without walking the detail slices; Conns/Subs/Upstreams carry the
 // per-row detail for the tables.
 type WSSectionStats struct {
-	Section               string       `json:"section"`
-	Path                  string       `json:"path"`
-	Connections           int          `json:"connections"`
-	ClientSubscriptions   int          `json:"client_subscriptions"`
-	UpstreamSubscriptions int          `json:"upstream_subscriptions"`
-	UpstreamConnsHealthy  int          `json:"upstream_conns_healthy"`
-	UpstreamConnsTotal    int          `json:"upstream_conns_total"`
-	Conns                 []WSConnInfo `json:"conns"`
-	Subs                  []WSSubInfo  `json:"subs"`
-	Upstreams             []ConnStat   `json:"upstreams"`
+	Section               string          `json:"section"`
+	Path                  string          `json:"path"`
+	Connections           int             `json:"connections"`
+	ClientSubscriptions   int             `json:"client_subscriptions"`
+	UpstreamSubscriptions int             `json:"upstream_subscriptions"`
+	UpstreamConnsHealthy  int             `json:"upstream_conns_healthy"`
+	UpstreamConnsTotal    int             `json:"upstream_conns_total"`
+	Limits                WebSocketLimits `json:"limits"`
+	Conns                 []WSConnInfo    `json:"conns"`
+	Subs                  []WSSubInfo     `json:"subs"`
+	Upstreams             []ConnStat      `json:"upstreams"`
 }
 
 // listWebSocket is the JSON payload for GET /api/v1/websocket — one

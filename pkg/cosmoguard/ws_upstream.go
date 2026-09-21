@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"time"
 
@@ -30,6 +31,38 @@ var (
 	ErrSubscriptionExists = errors.New("subscription already exists")
 )
 
+// uncertainWSUpstreamOutcomeError means a request may have reached the
+// upstream even though its caller did not receive a usable acknowledgement.
+// Unwrap preserves errors.Is/errors.As checks for the original cause.
+type uncertainWSUpstreamOutcomeError struct {
+	cause error
+}
+
+func (e *uncertainWSUpstreamOutcomeError) Error() string { return e.cause.Error() }
+func (e *uncertainWSUpstreamOutcomeError) Unwrap() error { return e.cause }
+
+func uncertainWSUpstreamOutcome(err error) error {
+	if err == nil || isUncertainWSUpstreamOutcome(err) {
+		return err
+	}
+	return &uncertainWSUpstreamOutcomeError{cause: err}
+}
+
+func isUncertainWSUpstreamOutcome(err error) bool {
+	var uncertain *uncertainWSUpstreamOutcomeError
+	return errors.As(err, &uncertain)
+}
+
+func validateWSJSONRPCResponse(method string, response *JsonRpcMsg) error {
+	if response == nil {
+		return fmt.Errorf("upstream %s returned no response", method)
+	}
+	if response.Error != nil {
+		return fmt.Errorf("upstream %s rejected request with code %d: %s", method, response.Error.Code, response.Error.Message)
+	}
+	return nil
+}
+
 type UpstreamConnManagerConstructor func(url.URL, *util.UniqueID, func(msg *JsonRpcMsg)) UpstreamConnManager
 
 type UpstreamConnManager interface {
@@ -38,15 +71,10 @@ type UpstreamConnManager interface {
 	HasSubscription(string) bool
 	Subscribe(string) (string, error)
 	Unsubscribe(string) error
-	// LocalUnsubscribe forgets a subscription param from this manager's own
-	// bookkeeping and tombstones it so a concurrent reconnect-resubmit can't
-	// re-add it. Called by the pool's migrator after a subscription is
-	// re-established on a healthy upstream. If the param is still present (a
-	// racing resubmit re-created it on a reconnected socket), it also issues
-	// a best-effort network Unsubscribe so that subscription doesn't stream
-	// with no manager mapping. Idempotent; unknown params still set the
-	// tombstone.
-	LocalUnsubscribe(param string)
+	// LocalUnsubscribe forgets and tombstones a migrated subscription. A nil
+	// result means no live socket cleanup remains; otherwise the channel yields
+	// the cleanup outcome exactly once without blocking migration routing.
+	LocalUnsubscribe(param string) <-chan error
 	// IsHealthy reports whether the underlying WS connection is in a
 	// usable state. Returns false when the connection is closed, nil,
 	// or stuck in reconnect backoff. Used by the pool's subscription

@@ -42,9 +42,9 @@ func (u *notificationTestUpstream) Unsubscribe(string) error {
 	}
 	return nil
 }
-func (*notificationTestUpstream) LocalUnsubscribe(string) {}
-func (u *notificationTestUpstream) IsHealthy() bool       { return u.healthy.Load() }
-func (*notificationTestUpstream) Stop()                   {}
+func (*notificationTestUpstream) LocalUnsubscribe(string) <-chan error { return nil }
+func (u *notificationTestUpstream) IsHealthy() bool                    { return u.healthy.Load() }
+func (*notificationTestUpstream) Stop()                                {}
 
 func newNotificationTestBroker(t *testing.T, upstream *notificationTestUpstream) (*Broker, string) {
 	t.Helper()

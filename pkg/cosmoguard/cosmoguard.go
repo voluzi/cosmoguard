@@ -36,7 +36,8 @@ type CosmoGuard struct {
 	runDone     chan struct{}
 	runDoneOnce sync.Once
 
-	auth *Authenticator
+	auth        *Authenticator
+	wsAdmission *wsAdmissionController
 
 	lcdProxy       *HttpProxy
 	rpcProxy       *HttpProxy
@@ -238,6 +239,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		dashboard:      newDashboardObservability(),
 		requestLog:     newRequestLog(cfg.Dashboard.RequestLog),
 		metricsHistory: newMetricsHistory(defaultMetricsHistoryCap),
+		wsAdmission:    newWSAdmissionController(cfg.Server.EffectiveWebSocketLimits()),
 	}
 	if len(templates) > 0 {
 		cosmoGuard.discovery = NewDiscoverer(log, templates, lookup)
@@ -410,6 +412,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
 		WithCORSConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.CORS),
 		WithMaxBatchSize[JsonRpcHandlerOptions](*cosmoGuard.cfg.RPC.JsonRpc.MaxBatchSize),
+		withWebSocketAdmissionController[JsonRpcHandlerOptions](cosmoGuard.wsAdmission),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up jsonrpc handler: %w", err)
@@ -500,6 +503,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 			WithServerConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Server),
 			WithCORSConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.CORS),
+			withWebSocketAdmissionController[JsonRpcHandlerOptions](cosmoGuard.wsAdmission),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error setting up jsonrpc handler for evm-rpc: %w", err)
@@ -1042,7 +1046,7 @@ func (f *CosmoGuard) tryReload() {
 	// excluded — PrepareConfig re-publishes it via SetTrustedProxies, so it
 	// DOES hot-reload.)
 	if serverRuntimeImmutableChanged(&f.cfg.Server, &newCfg.Server) {
-		err := fmt.Errorf("server config change (timeouts / maxRequestBody / wsReadLimit / wsAllowedOrigins) requires a process restart")
+		err := fmt.Errorf("server config change (timeouts / maxRequestBody / wsReadLimit / websocketLimits / wsAllowedOrigins) requires a process restart")
 		slog.Warn("config reload rejected", "error", err)
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
@@ -1116,6 +1120,7 @@ func serverRuntimeImmutableChanged(old, new *ServerConfig) bool {
 		// reload.
 		old.EffectiveMaxRequestBody() != new.EffectiveMaxRequestBody() ||
 		old.EffectiveWSReadLimit() != new.EffectiveWSReadLimit() ||
+		old.EffectiveWebSocketLimits() != new.EffectiveWebSocketLimits() ||
 		!equalStringSet(old.WSAllowedOrigins, new.WSAllowedOrigins)
 }
 

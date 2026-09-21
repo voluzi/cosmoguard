@@ -602,6 +602,8 @@ function renderWebSockets(payload) {
     upTotal += s.upstream_conns_total | 0;
   }
   const ratio = upstreamSubs > 0 ? (clientSubs / upstreamSubs) : 0;
+  const limits = sections.length ? (sections[0].limits || {}) : {};
+  const showLimit = (value) => (value | 0) === 0 ? "off" : String(value | 0);
   const poolMod = upTotal === 0 ? "" : (upHealthy === upTotal ? "ok" : (upHealthy === 0 ? "bad" : "warn"));
   if (statsHost) {
     statsHost.innerHTML = [
@@ -610,6 +612,8 @@ function renderWebSockets(payload) {
       statTile("Upstream subscriptions", upstreamSubs, "",
         ratio > 0 ? `${ratio.toFixed(1)}× fan-out` : "deduplicated to upstream"),
       statTile("Upstream pool", `${upHealthy}/${upTotal}`, poolMod, "healthy backend conns"),
+      statTile("Admission limits", `${showLimit(limits.max_subscriptions_per_client)}/client`, "",
+        `${showLimit(limits.max_subscriptions_per_identity)}/identity · ${showLimit(limits.max_subscriptions_per_upstream_connection)}/upstream · ${showLimit(limits.max_connections_per_ip)}/IP · per process`),
     ].join("");
   }
 
@@ -627,7 +631,7 @@ function renderWebSockets(payload) {
         <td class="mono">${fmt(c.source_ip)}</td>
         <td>${fmt(c.identity)}</td>
         <td class="mono" title="${c.connected_ms ? new Date(c.connected_ms).toISOString() : ""}">${c.connected_ms ? timeAgo(c.connected_ms) : "—"}</td>
-        <td class="mono">${c.subscriptions | 0}</td>
+        <td class="mono">${c.subscriptions | 0}/${showLimit(limits.max_subscriptions_per_client)}</td>
       </tr>`).join("")
     : `<tr><td colspan="5" class="empty">no active connections</td></tr>`;
 
@@ -660,7 +664,7 @@ function renderWebSockets(payload) {
         <td>${fmt(section)}</td>
         <td class="mono">${fmt(u.target)}</td>
         <td>${u.healthy ? badge("ok", "healthy") : badge("bad", "down")}</td>
-        <td class="mono">${u.subscriptions | 0}</td>
+        <td class="mono">${u.subscriptions | 0}/${showLimit(limits.max_subscriptions_per_upstream_connection)}</td>
       </tr>`).join("")
     : `<tr><td colspan="4" class="empty">no upstream connections</td></tr>`;
 }

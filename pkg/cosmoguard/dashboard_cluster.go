@@ -721,6 +721,7 @@ func aggregateWebSocket(responses []peerResponse) []WSSectionStats {
 				agg = &WSSectionStats{
 					Section:   s.Section,
 					Path:      s.Path,
+					Limits:    s.Limits,
 					Conns:     []WSConnInfo{},
 					Subs:      []WSSubInfo{},
 					Upstreams: []ConnStat{},

@@ -24,10 +24,11 @@ type UpstreamPool struct {
 	log     *Entry
 	IdGen   *util.UniqueID
 
-	subscriptionConn  map[string]UpstreamConnManager
-	subscriptionID    map[string]string
-	subscriptionParam map[string]string
-	subMux            sync.Mutex
+	subscriptionConn        map[string]UpstreamConnManager
+	subscriptionID          map[string]string
+	subscriptionParam       map[string]string
+	subMux                  sync.Mutex
+	maxSubscriptionsPerConn int
 
 	// subCount maps each conn to its own atomic counter of pinned
 	// subscriptions. The MAP itself is built once at NewUpstreamPool
@@ -48,6 +49,14 @@ type UpstreamPool struct {
 	subCount map[UpstreamConnManager]*atomic.Int64
 
 	onSubscriptionMessage func(*JsonRpcMsg)
+}
+
+// SetMaxSubscriptionsPerConnection configures the per-connection admission
+// cap before the pool begins serving traffic. Zero disables the cap.
+func (p *UpstreamPool) SetMaxSubscriptionsPerConnection(limit int) {
+	p.subMux.Lock()
+	p.maxSubscriptionsPerConn = limit
+	p.subMux.Unlock()
 }
 
 // NewUpstreamPool builds the WS connection pool. `backends` is a list
@@ -243,7 +252,7 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 		p.subMux.Unlock()
 		return id, nil
 	}
-	conn, err := p.getConnection()
+	conn, err := p.reserveSubscriptionConnectionLocked(nil)
 	if err != nil {
 		p.subMux.Unlock()
 		return "", err
@@ -252,6 +261,11 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 
 	id, err := conn.Subscribe(param)
 	if err != nil {
+		if !isUncertainWSUpstreamOutcome(err) {
+			p.subMux.Lock()
+			p.addSubCount(conn, -1)
+			p.subMux.Unlock()
+		}
 		return "", err
 	}
 
@@ -261,23 +275,60 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	p.subMux.Lock()
 	if existing, ok := p.subscriptionID[param]; ok {
 		p.subMux.Unlock()
-		// No counter undo: we only increment inside the
-		// commit branch below, never on the race-loser path,
-		// so the inc/dec stays balanced (zero on each side).
-		_ = conn.Unsubscribe(id)
+		// The extra subscription exists. Release its capacity only after
+		// upstream cleanup is confirmed.
+		if err := conn.Unsubscribe(id); err == nil {
+			p.subMux.Lock()
+			p.addSubCount(conn, -1)
+			p.subMux.Unlock()
+		}
 		return existing, nil
 	}
 	p.subscriptionParam[id] = param
 	p.subscriptionID[param] = id
 	p.subscriptionConn[id] = conn
-	// Bump the per-conn subscription counter in lockstep with the
-	// subscriptionConn write so the picker's lock-free read can't
-	// observe a committed subscription whose counter hasn't been
-	// updated yet (or vice versa). The atomic itself is lock-free,
-	// but we're inside subMux here for ordering.
-	p.addSubCount(conn, 1)
 	p.subMux.Unlock()
 	return id, nil
+}
+
+// reserveSubscriptionConnectionLocked chooses a healthy connection with
+// available subscription capacity and increments its count before the caller
+// performs network I/O. The caller must hold subMux.
+func (p *UpstreamPool) reserveSubscriptionConnectionLocked(skip UpstreamConnManager) (UpstreamConnManager, error) {
+	n := len(p.conn)
+	start := int((atomic.AddUint32(&p.connIdx, 1) - 1) % uint32(n))
+	var best UpstreamConnManager
+	var bestCount int64
+	healthy := false
+	for i := 0; i < n; i++ {
+		c := p.conn[(start+i)%n]
+		if c == skip || !c.IsHealthy() {
+			continue
+		}
+		healthy = true
+		var count int64
+		if counter, ok := p.subCount[c]; ok {
+			count = counter.Load()
+		}
+		if p.maxSubscriptionsPerConn > 0 && count >= int64(p.maxSubscriptionsPerConn) {
+			continue
+		}
+		if best == nil || count < bestCount {
+			best = c
+			bestCount = count
+		}
+	}
+	if best != nil {
+		p.addSubCount(best, 1)
+		return best, nil
+	}
+	if healthy {
+		return nil, &WSResourceExhaustedError{
+			Scope: wsLimitScopeUpstreamConnection,
+			Limit: p.maxSubscriptionsPerConn,
+		}
+	}
+	return nil, ErrNoHealthyUpstream
 }
 
 func (p *UpstreamPool) Unsubscribe(subID string) error {
@@ -349,12 +400,6 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		return nil
 	}
 	candidates := make([]pending, 0)
-	// provisional tracks migrations already assigned to each alt in THIS
-	// pass so a backlog of orphaned subscriptions spreads across survivors
-	// instead of all landing on whichever conn is currently least-loaded
-	// (the per-conn subCount isn't incremented until the commit phase, so
-	// without this every candidate would pick the same alt).
-	provisional := make(map[UpstreamConnManager]int64)
 	for oldID, conn := range p.subscriptionConn {
 		if conn.IsHealthy() {
 			continue
@@ -363,11 +408,10 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		if !ok {
 			continue
 		}
-		alt := p.firstHealthyOther(conn, provisional)
-		if alt == nil {
+		alt, err := p.reserveSubscriptionConnectionLocked(conn)
+		if err != nil {
 			continue
 		}
-		provisional[alt]++
 		candidates = append(candidates, pending{oldID: oldID, conn: conn, alt: alt, param: param})
 	}
 	p.subMux.Unlock()
@@ -376,6 +420,11 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 	for _, c := range candidates {
 		newID, err := c.alt.Subscribe(c.param)
 		if err != nil {
+			if !isUncertainWSUpstreamOutcome(err) {
+				p.subMux.Lock()
+				p.addSubCount(c.alt, -1)
+				p.subMux.Unlock()
+			}
 			if p.log != nil {
 				p.log.WithFields(Fields{
 					"oldID": c.oldID,
@@ -399,7 +448,13 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		p.subMux.Lock()
 		if _, stillPinned := p.subscriptionConn[c.oldID]; !stillPinned {
 			p.subMux.Unlock()
-			_ = c.alt.Unsubscribe(newID)
+			// The replacement subscription exists. Release its capacity only
+			// after upstream cleanup is confirmed.
+			if err := c.alt.Unsubscribe(newID); err == nil {
+				p.subMux.Lock()
+				p.addSubCount(c.alt, -1)
+				p.subMux.Unlock()
+			}
 			continue
 		}
 		delete(p.subscriptionConn, c.oldID)
@@ -407,20 +462,13 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		p.subscriptionConn[newID] = c.alt
 		p.subscriptionParam[newID] = c.param
 		p.subscriptionID[c.param] = newID
-		// Move the subscription's tally from the unhealthy conn to
-		// the alt so the picker keeps an accurate load view across
-		// the migration. Both atomics are bumped under subMux so a
-		// concurrent picker can't see the subscription counted twice
-		// or not at all.
-		p.addSubCount(c.conn, -1)
-		p.addSubCount(c.alt, 1)
 		p.subMux.Unlock()
 
-		// Forget the param on the now-orphaned source conn so that when it
-		// eventually reconnects it does NOT re-subscribe the param we just
-		// migrated away — which would create a permanent duplicate upstream
-		// subscription whose events land on an id nobody is listening for.
-		c.conn.LocalUnsubscribe(c.param)
+		// A reconnect can recreate the source subscription while the alternate
+		// subscribe is in flight, so its slot stays reserved until cleanup proves
+		// that duplicate cannot remain.
+		cleanup := c.conn.LocalUnsubscribe(c.param)
+		p.releaseMigratedSourceCapacity(c.conn, cleanup)
 
 		if p.log != nil {
 			p.log.WithFields(Fields{
@@ -436,36 +484,21 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 	return migrated
 }
 
-// firstHealthyOther returns the healthiest, least-loaded alternative
-// UpstreamConnManager for migrating away from `skip`, or nil when no
-// alternative is available. Same selection policy as getConnection
-// (skip-unhealthy, prefer-fewest-subs) so migrations don't pile every
-// orphaned subscription onto whichever conn happens to be earliest
-// in the slice — a pool-wide outage that recovers one conn at a time
-// would otherwise clump the whole backlog on the first survivor,
-// defeating the load-aware promise of the picker.
-func (p *UpstreamPool) firstHealthyOther(skip UpstreamConnManager, provisional map[UpstreamConnManager]int64) UpstreamConnManager {
-	var best UpstreamConnManager
-	var bestCount int64
-	for _, c := range p.conn {
-		if c == skip || !c.IsHealthy() {
-			continue
-		}
-		var cnt int64
-		if p.subCount != nil {
-			if ctr, ok := p.subCount[c]; ok {
-				cnt = ctr.Load()
-			}
-		}
-		// Add migrations already assigned to this conn in the current
-		// pass so the backlog spreads instead of stacking on one conn.
-		cnt += provisional[c]
-		if best == nil || cnt < bestCount {
-			best = c
-			bestCount = cnt
-		}
+func (p *UpstreamPool) releaseMigratedSourceCapacity(conn UpstreamConnManager, cleanup <-chan error) {
+	release := func() {
+		p.subMux.Lock()
+		p.addSubCount(conn, -1)
+		p.subMux.Unlock()
 	}
-	return best
+	if cleanup == nil {
+		release()
+		return
+	}
+	go func() {
+		if err, ok := <-cleanup; ok && err == nil {
+			release()
+		}
+	}()
 }
 
 // ConnStat is one upstream connection's dashboard view: its backend
