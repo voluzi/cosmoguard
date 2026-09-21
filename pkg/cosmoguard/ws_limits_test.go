@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -27,6 +29,8 @@ type limitingUpstream struct {
 	failUnsubscribe    atomic.Bool
 	subscribeStarted   chan struct{}
 	subscribeRelease   chan struct{}
+	unsubscribeStarted chan struct{}
+	unsubscribeRelease chan struct{}
 	once               sync.Once
 }
 
@@ -35,6 +39,21 @@ type wsProtocolCase struct {
 	constructor UpstreamConnManagerConstructor
 	evm         bool
 }
+
+type migrationSubscribeProbe struct {
+	UpstreamConnManager
+	healthy atomic.Bool
+	calls   atomic.Int32
+}
+
+func (p *migrationSubscribeProbe) Subscribe(param string) (string, error) {
+	if p.calls.Add(1) > 1 {
+		return "", errors.New("unexpected migration retry")
+	}
+	return p.UpstreamConnManager.Subscribe(param)
+}
+
+func (p *migrationSubscribeProbe) IsHealthy() bool { return p.healthy.Load() }
 
 func wsProtocolCases() []wsProtocolCase {
 	return []wsProtocolCase{
@@ -175,6 +194,10 @@ func (u *limitingUpstream) Subscribe(param string) (string, error) {
 	return fmt.Sprintf("%s-%d", param, n), nil
 }
 func (u *limitingUpstream) Unsubscribe(string) error {
+	if u.unsubscribeStarted != nil {
+		u.unsubscribeStarted <- struct{}{}
+		<-u.unsubscribeRelease
+	}
 	if u.failUnsubscribe.Load() {
 		return errors.New("unsubscribe failed")
 	}
@@ -309,6 +332,44 @@ func TestBrokerSubscriptionLimitResponsesAndRelease(t *testing.T) {
 	response, err = broker.HandleSubscription(other, cosmos, "alice")
 	assert.NilError(t, err)
 	assert.Assert(t, response.Error == nil, "disconnect must release the identity slot exactly once")
+}
+
+func TestBrokerDisconnectReleasesAllAdmissionBeforeUpstreamCleanup(t *testing.T) {
+	upstream := newLimitingUpstream()
+	upstream.unsubscribeStarted = make(chan struct{}, 2)
+	upstream.unsubscribeRelease = make(chan struct{})
+	broker := NewBroker([]string{"ws://upstream.test"}, "/", 1, limitingConstructor(upstream))
+	broker.log = log.WithField("test", t.Name())
+	broker.setAdmissionController(newWSAdmissionController(WebSocketLimits{
+		MaxSubscriptionsPerClient:   2,
+		MaxSubscriptionsPerIdentity: 2,
+	}))
+	client := &JsonRpcWsClient{}
+
+	for i, param := range []string{"first", "second"} {
+		response, err := broker.HandleSubscription(client, &JsonRpcMsg{
+			Version: jsonRpcVersion,
+			ID:      i + 1,
+			Method:  methodSubscribeCosmos,
+			Params:  []any{param},
+		}, "alice")
+		assert.NilError(t, err)
+		assert.Assert(t, response.Error == nil)
+	}
+
+	disconnected := make(chan error, 1)
+	go func() { disconnected <- broker.removeAllSubscriptions(client) }()
+	<-upstream.unsubscribeStarted
+
+	replacement := &JsonRpcWsClient{}
+	assert.NilError(t, broker.admission.reserveSubscription(replacement, "alice"))
+	assert.NilError(t, broker.admission.reserveSubscription(replacement, "alice"),
+		"all disconnected memberships must release admission before cleanup I/O")
+	broker.admission.releaseSubscription(replacement)
+	broker.admission.releaseSubscription(replacement)
+
+	close(upstream.unsubscribeRelease)
+	assert.NilError(t, <-disconnected)
 }
 
 func TestBrokerFailedSubscribeRollsBackDownstreamAdmission(t *testing.T) {
@@ -723,6 +784,205 @@ func TestProviderRejectedMigrationCleanupKeepsCapacityOccupied(t *testing.T) {
 	}
 }
 
+func TestUncertainMigrationBlocksRepeatUntilExactSocketSettles(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			client, peer := newWSCacheClient(t)
+			manager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(manager, client)
+			setManagerLog(manager, log.WithField("test", t.Name()))
+			backend := newControlledWSBackend(manager, client, peer)
+			alternate := &migrationSubscribeProbe{UpstreamConnManager: manager}
+			alternate.healthy.Store(true)
+			source := newLimitingUpstream()
+			source.healthy.Store(false)
+			pool := &UpstreamPool{
+				conn:                    []UpstreamConnManager{source, alternate},
+				subscriptionConn:        map[string]UpstreamConnManager{"old": source},
+				subscriptionID:          map[string]string{"victim": "old"},
+				subscriptionParam:       map[string]string{"old": "victim"},
+				subCount:                map[UpstreamConnManager]*atomic.Int64{source: {}, alternate: {}},
+				maxSubscriptionsPerConn: 2,
+			}
+			pool.subCount[source].Store(1)
+
+			firstScan := make(chan []SubscriptionMigration, 1)
+			go func() { firstScan <- pool.MigrateUnhealthy() }()
+			request := <-backend.requests
+			backend.responses <- &JsonRpcMsg{Version: jsonRpcVersion, ID: request.ID}
+			assert.Equal(t, len(<-firstScan), 0)
+			assert.Equal(t, alternate.calls.Load(), int32(1))
+
+			assert.Equal(t, len(pool.MigrateUnhealthy()), 0)
+			assert.Equal(t, alternate.calls.Load(), int32(1),
+				"an ambiguous migration must not be retried before exact socket settlement")
+			_, err := pool.Subscribe("victim")
+			var pending *WSResourceExhaustedError
+			assert.Assert(t, errors.As(err, &pending), "ambiguous migration must block joins until settlement")
+
+			assert.NilError(t, client.Close())
+			deadline := time.Now().Add(time.Second)
+			for {
+				pool.subMux.Lock()
+				_, moving := pool.migrating["old"]
+				_, draining := pool.drainingParams["victim"]
+				count := pool.subCount[alternate].Load()
+				pool.subMux.Unlock()
+				if !moving && !draining && count == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("ambiguous migration did not settle: moving=%v draining=%v count=%d", moving, draining, count)
+				}
+				runtime.Gosched()
+			}
+
+			assert.Equal(t, len(pool.MigrateUnhealthy()), 0)
+			assert.Equal(t, alternate.calls.Load(), int32(2), "settlement must allow a later migration attempt")
+		})
+	}
+}
+
+func TestLocalRetirementReleasesPhysicalHandleReservation(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			candidates := make(chan string, 3)
+			candidates <- "retired"
+			candidates <- "retired"
+			candidates <- "fallback"
+			idGen := util.NewUniqueID(func() string { return <-candidates })
+			reservation := idGen.ID()
+			client, _ := newWSCacheClient(t)
+			assert.NilError(t, client.Close())
+			manager := protocol.constructor(url.URL{}, idGen, func(*JsonRpcMsg) {})
+			setManagerClient(manager, client)
+			setManagerLog(manager, log.WithField("test", t.Name()))
+			handle := reservation
+			if protocol.evm {
+				handle = manager.(*UpstreamConnManagerEth).stableHandle(reservation, "")
+			}
+			seedManagerSubscriptionWithReservation(manager, "victim", handle, reservation)
+
+			settled := manager.LocalUnsubscribe("victim")
+			assert.NilError(t, <-settled)
+			reused := idGen.ID()
+			assert.Equal(t, reused, reservation, "retired physical handle reservation must be reusable")
+			idGen.Release(reused)
+		})
+	}
+}
+
+func TestMigratedCanonicalReservationReleasesOnFinalRemoval(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			candidates := make(chan string, 8)
+			idGen := util.NewUniqueID(func() string { return <-candidates })
+			sourceClient, sourcePeer := newWSCacheClient(t)
+			source := protocol.constructor(url.URL{}, idGen, func(*JsonRpcMsg) {})
+			setManagerClient(source, sourceClient)
+			setManagerLog(source, log.WithField("test", t.Name()+"-source"))
+			sourceBackend := newControlledWSBackend(source, sourceClient, sourcePeer)
+
+			candidates <- "canonical"
+			created := startSubscribe(source, "victim")
+			request := <-sourceBackend.requests
+			sourceBackend.responses <- protocol.subscribeSuccess(request, "source")
+			initial := <-created
+			assert.NilError(t, initial.err)
+			assert.NilError(t, sourceClient.Close())
+
+			alternateClient, alternatePeer := newWSCacheClient(t)
+			alternate := protocol.constructor(url.URL{}, idGen, func(*JsonRpcMsg) {})
+			setManagerClient(alternate, alternateClient)
+			setManagerLog(alternate, log.WithField("test", t.Name()+"-alternate"))
+			alternateBackend := newControlledWSBackend(alternate, alternateClient, alternatePeer)
+			finalInitialClient, _ := newWSCacheClient(t)
+			assert.NilError(t, finalInitialClient.Close())
+			finalManager := protocol.constructor(url.URL{}, idGen, func(*JsonRpcMsg) {})
+			setManagerClient(finalManager, finalInitialClient)
+			setManagerLog(finalManager, log.WithField("test", t.Name()+"-final"))
+			pool := &UpstreamPool{
+				conn:                    []UpstreamConnManager{source, alternate, finalManager},
+				IdGen:                   idGen,
+				subscriptionConn:        map[string]UpstreamConnManager{initial.id: source},
+				subscriptionID:          map[string]string{"victim": initial.id},
+				subscriptionParam:       map[string]string{initial.id: "victim"},
+				subCount:                map[UpstreamConnManager]*atomic.Int64{source: {}, alternate: {}, finalManager: {}},
+				maxSubscriptionsPerConn: 2,
+			}
+			pool.subCount[source].Store(1)
+
+			candidates <- "destination"
+			migratedCall := make(chan []SubscriptionMigration, 1)
+			go func() { migratedCall <- pool.MigrateUnhealthy() }()
+			request = <-alternateBackend.requests
+			alternateBackend.responses <- protocol.subscribeSuccess(request, "alternate")
+			migrations := <-migratedCall
+			assert.Equal(t, len(migrations), 1)
+
+			candidates <- "canonical"
+			candidates <- "probe"
+			probe := idGen.ID()
+			assert.Equal(t, probe, "probe", "stable client-facing reservation must remain held after migration")
+			idGen.Release(probe)
+
+			assert.NilError(t, alternateClient.Close())
+			finalClient, finalPeer := newWSCacheClient(t)
+			setManagerClient(finalManager, finalClient)
+			finalBackend := newControlledWSBackend(finalManager, finalClient, finalPeer)
+			candidates <- "replacement"
+			migratedAgainCall := make(chan []SubscriptionMigration, 1)
+			go func() { migratedAgainCall <- pool.MigrateUnhealthy() }()
+			request = <-finalBackend.requests
+			finalBackend.responses <- protocol.subscribeSuccess(request, "final")
+			migratedAgain := <-migratedAgainCall
+			assert.Equal(t, len(migratedAgain), 1)
+			deadline := time.Now().Add(time.Second)
+			for pool.subCount[alternate].Load() != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("intermediate source cleanup did not settle")
+				}
+				runtime.Gosched()
+			}
+
+			candidates <- "destination"
+			physicalResult := make(chan string, 1)
+			go func() { physicalResult <- idGen.ID() }()
+			var physical string
+			select {
+			case physical = <-physicalResult:
+			case <-time.After(time.Second):
+				candidates <- "physical-fallback"
+				physical = <-physicalResult
+			}
+			assert.Equal(t, physical, "destination", "intermediate physical reservation must retire after migration")
+			idGen.Release(physical)
+
+			removed := startUnsubscribe(pool, migratedAgain[0].NewID)
+			request = <-finalBackend.requests
+			if protocol.evm {
+				finalBackend.responses <- WithResult(request, true)
+			} else {
+				finalBackend.responses <- WithResult(request, map[string]any{})
+			}
+			assert.NilError(t, <-removed)
+
+			candidates <- "canonical"
+			reusedResult := make(chan string, 1)
+			go func() { reusedResult <- idGen.ID() }()
+			var reused string
+			select {
+			case reused = <-reusedResult:
+			case <-time.After(time.Second):
+				candidates <- "fallback"
+				reused = <-reusedResult
+			}
+			assert.Equal(t, reused, "canonical", "final removal must release the stable reservation")
+			idGen.Release(reused)
+		})
+	}
+}
+
 func TestRejectedSourceCleanupAfterMigrationKeepsCapacityOccupied(t *testing.T) {
 	for _, protocol := range wsProtocolCases() {
 		t.Run(protocol.name, func(t *testing.T) {
@@ -914,10 +1174,14 @@ func TestCosmosReconnectFailurePreservesCanonicalID(t *testing.T) {
 }
 
 func seedManagerSubscription(manager UpstreamConnManager, param, id string) {
+	seedManagerSubscriptionWithReservation(manager, param, id, id)
+}
+
+func seedManagerSubscriptionWithReservation(manager UpstreamConnManager, param, id, reservation string) {
 	lifecycle := managerLifecycle(manager)
 	client := lifecycle.currentClient()
 	record := &wsSubscriptionRecord{
-		param: param, handle: id, reservation: id, state: wsSubscriptionActive, desired: true,
+		param: param, handle: id, reservation: reservation, state: wsSubscriptionActive, desired: true,
 		binding: &wsSubscriptionBinding{client: client, wireID: id}, settled: make(chan struct{}),
 	}
 	lifecycle.mu.Lock()

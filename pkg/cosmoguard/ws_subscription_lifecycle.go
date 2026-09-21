@@ -93,6 +93,16 @@ func (l *wsSubscriptionLifecycle) lookupParam(param string) *wsSubscriptionRecor
 	return l.byParam[param]
 }
 
+func (l *wsSubscriptionLifecycle) reservationForHandle(handle string) (string, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	record := l.byHandle[handle]
+	if record == nil || !record.desired {
+		return "", false
+	}
+	return record.reservation, true
+}
+
 func (l *wsSubscriptionLifecycle) route(client *JsonRpcWsClient, wireID string) (string, bool) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -233,6 +243,14 @@ func (l *wsSubscriptionLifecycle) unsubscribe(handle string, exchange wsSubscrip
 }
 
 func (l *wsSubscriptionLifecycle) retire(record *wsSubscriptionRecord, exchange wsSubscriptionExchange) <-chan error {
+	return l.retireWithHandleRelease(record, true, exchange)
+}
+
+func (l *wsSubscriptionLifecycle) retirePreservingHandle(record *wsSubscriptionRecord, exchange wsSubscriptionExchange) <-chan error {
+	return l.retireWithHandleRelease(record, false, exchange)
+}
+
+func (l *wsSubscriptionLifecycle) retireWithHandleRelease(record *wsSubscriptionRecord, releaseHandle bool, exchange wsSubscriptionExchange) <-chan error {
 	if record == nil {
 		return nil
 	}
@@ -260,7 +278,7 @@ func (l *wsSubscriptionLifecycle) retire(record *wsSubscriptionRecord, exchange 
 		l.mu.Unlock()
 
 		if binding == nil || binding.client.IsClosed() {
-			l.settle(record, false, exchange)
+			l.settle(record, releaseHandle, exchange)
 			l.opMu.Unlock()
 			result <- nil
 			close(result)
@@ -268,7 +286,7 @@ func (l *wsSubscriptionLifecycle) retire(record *wsSubscriptionRecord, exchange 
 		}
 		err := exchange.unsubscribeOn(*binding, record.param)
 		if err == nil {
-			l.settle(record, false, exchange)
+			l.settle(record, releaseHandle, exchange)
 			l.opMu.Unlock()
 			result <- nil
 			close(result)
@@ -279,7 +297,7 @@ func (l *wsSubscriptionLifecycle) retire(record *wsSubscriptionRecord, exchange 
 			record.state = wsSubscriptionDraining
 		}
 		l.mu.Unlock()
-		l.watchDrain(record, binding, false, exchange)
+		l.watchDrain(record, binding, releaseHandle, exchange)
 		settled := record.settled
 		l.opMu.Unlock()
 		<-settled

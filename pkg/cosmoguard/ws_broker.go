@@ -372,40 +372,33 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 	b.upstreamSubMux.Lock()
 	defer b.upstreamSubMux.Unlock()
 
-	// Collect errors across the loop instead of returning on the
-	// first failure. Previously a single transient pool.Unsubscribe
-	// error (e.g. upstream WS hiccup) aborted the loop mid-flight,
-	// leaving the remaining subscriptions with UnsubscribeClient
-	// already called (so the client is gone from sm) but
-	// pool.subscriptionConn still pinned — a permanent upstream
-	// subscription leak for every subsequent sub of this client
-	// (called from onClientDisconnect, so the client is gone for
-	// good). Now every sub gets its chance to drain; the joined
-	// error still surfaces to the caller via errors.Join semantics.
-	var errs []error
+	var emptySubscriptions []string
 	for _, subscriptionID := range b.sm.GetSubscriptions(client) {
 		b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
 		b.sm.UnsubscribeClient(subscriptionID, client)
 		b.admission.releaseSubscription(client)
-
 		if b.sm.SubscriptionEmpty(subscriptionID) {
-			b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
-			// pool.Unsubscribe keys on the CURRENT upstream id (post-migration).
-			upstreamID, _ := b.sm.UpstreamID(subscriptionID)
-			if err := b.pool.Unsubscribe(upstreamID); err != nil {
-				b.forgetSettlingSubscription(subscriptionID, err)
-				errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
-				continue
-			}
-			b.sm.RemoveSubscription(subscriptionID)
-
-			param, _ := b.sm.GetSubscriptionParam(subscriptionID)
-			b.log.WithFields(map[string]interface{}{
-				"ID":    subscriptionID,
-				"param": param,
-			}).Warn("unsubscribed upstream")
-
+			emptySubscriptions = append(emptySubscriptions, subscriptionID)
 		}
+	}
+
+	// Admission belongs to downstream membership, so all memberships must be
+	// released before any upstream cleanup can wait on network I/O.
+	var errs []error
+	for _, subscriptionID := range emptySubscriptions {
+		b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
+		upstreamID, _ := b.sm.UpstreamID(subscriptionID)
+		if err := b.pool.Unsubscribe(upstreamID); err != nil {
+			b.forgetSettlingSubscription(subscriptionID, err)
+			errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
+			continue
+		}
+		param, _ := b.sm.GetSubscriptionParam(subscriptionID)
+		b.sm.RemoveSubscription(subscriptionID)
+		b.log.WithFields(map[string]interface{}{
+			"ID":    subscriptionID,
+			"param": param,
+		}).Warn("unsubscribed upstream")
 	}
 	return errors.Join(errs...)
 }

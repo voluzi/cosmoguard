@@ -28,6 +28,7 @@ type UpstreamPool struct {
 	subscriptionID          map[string]string
 	subscriptionParam       map[string]string
 	subscriptionLease       map[string]*wsReservationLease
+	canonicalReservations   map[string]*wsCanonicalReservation
 	pendingCreates          map[string]*wsPoolCreate
 	pendingUnsubscribe      map[string]struct{}
 	migrating               map[string]struct{}
@@ -61,6 +62,46 @@ type wsReservationLease struct {
 	pool *UpstreamPool
 	conn UpstreamConnManager
 	once sync.Once
+}
+
+type wsMigrationHandleOwner interface {
+	reservationForHandle(string) (string, bool)
+	localUnsubscribePreservingHandle(string) <-chan error
+}
+
+type wsCanonicalReservation struct {
+	id          string
+	settled     chan struct{}
+	settleOnce  sync.Once
+	releaseOnce sync.Once
+}
+
+func newWSCanonicalReservation(id string) *wsCanonicalReservation {
+	return &wsCanonicalReservation{id: id, settled: make(chan struct{})}
+}
+
+func (r *wsCanonicalReservation) markSettled() {
+	if r != nil {
+		r.settleOnce.Do(func() { close(r.settled) })
+	}
+}
+
+func (r *wsCanonicalReservation) releaseWhenSettled(idGen *util.UniqueID) {
+	if r == nil || idGen == nil {
+		return
+	}
+	r.releaseOnce.Do(func() {
+		release := func() { idGen.Release(r.id) }
+		select {
+		case <-r.settled:
+			release()
+		default:
+			go func() {
+				<-r.settled
+				release()
+			}()
+		}
+	})
 }
 
 func (l *wsReservationLease) release() {
@@ -142,6 +183,7 @@ func NewUpstreamPool(backends []string, path string, n int, onMessage func(*Json
 		subscriptionID:        make(map[string]string),
 		subscriptionParam:     make(map[string]string),
 		subscriptionLease:     make(map[string]*wsReservationLease),
+		canonicalReservations: make(map[string]*wsCanonicalReservation),
 		pendingCreates:        make(map[string]*wsPoolCreate),
 		pendingUnsubscribe:    make(map[string]struct{}),
 		migrating:             make(map[string]struct{}),
@@ -285,6 +327,11 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	// against onUpstreamMessage in some edge cases.
 	p.subMux.Lock()
 	p.ensureSubscriptionMapsLocked()
+	if _, draining := p.drainingParams[param]; draining {
+		limit := p.maxSubscriptionsPerConn
+		p.subMux.Unlock()
+		return "", pendingUnsubscribeError(limit)
+	}
 	if id, ok := p.subscriptionID[param]; ok {
 		_, pending := p.pendingUnsubscribe[id]
 		limit := p.maxSubscriptionsPerConn
@@ -293,11 +340,6 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 			return "", pendingUnsubscribeError(limit)
 		}
 		return id, nil
-	}
-	if _, draining := p.drainingParams[param]; draining {
-		limit := p.maxSubscriptionsPerConn
-		p.subMux.Unlock()
-		return "", pendingUnsubscribeError(limit)
 	}
 	if pending := p.pendingCreates[param]; pending != nil {
 		p.subMux.Unlock()
@@ -365,6 +407,9 @@ func (p *UpstreamPool) ensureSubscriptionMapsLocked() {
 	if p.subscriptionLease == nil {
 		p.subscriptionLease = make(map[string]*wsReservationLease)
 	}
+	if p.canonicalReservations == nil {
+		p.canonicalReservations = make(map[string]*wsCanonicalReservation)
+	}
 	if p.pendingCreates == nil {
 		p.pendingCreates = make(map[string]*wsPoolCreate)
 	}
@@ -390,6 +435,10 @@ func (p *UpstreamPool) completeCreate(param string, pending *wsPoolCreate, id st
 }
 
 func (p *UpstreamPool) releaseDrainingLease(param string, lease *wsReservationLease, settled <-chan struct{}) <-chan struct{} {
+	return p.releaseDrainingLeaseAndReservation(param, lease, nil, settled)
+}
+
+func (p *UpstreamPool) releaseDrainingLeaseAndReservation(param string, lease *wsReservationLease, reservation *wsCanonicalReservation, settled <-chan struct{}) <-chan struct{} {
 	if settled == nil {
 		return nil
 	}
@@ -401,6 +450,7 @@ func (p *UpstreamPool) releaseDrainingLease(param string, lease *wsReservationLe
 		}
 		lease.releaseLocked()
 		p.subMux.Unlock()
+		reservation.releaseWhenSettled(p.IdGen)
 		close(done)
 	}
 	select {
@@ -414,6 +464,38 @@ func (p *UpstreamPool) releaseDrainingLease(param string, lease *wsReservationLe
 		release()
 	}()
 	return done
+}
+
+func (p *UpstreamPool) drainFailedMigration(oldID, param string, source UpstreamConnManager, lease *wsReservationLease, settled <-chan struct{}) {
+	p.subMux.Lock()
+	tracked := p.subscriptionConn[oldID] == source
+	if tracked {
+		p.drainingParams[param] = lease
+	}
+	p.subMux.Unlock()
+	if settled == nil {
+		return
+	}
+	release := func() {
+		p.subMux.Lock()
+		if p.drainingParams[param] == lease {
+			delete(p.drainingParams, param)
+		}
+		if p.subscriptionConn[oldID] == source {
+			delete(p.migrating, oldID)
+		}
+		lease.releaseLocked()
+		p.subMux.Unlock()
+	}
+	select {
+	case <-settled:
+		release()
+	default:
+		go func() {
+			<-settled
+			release()
+		}()
+	}
 }
 
 func (p *UpstreamPool) retireUncommitted(param string, conn UpstreamConnManager, lease *wsReservationLease) {
@@ -496,6 +578,7 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 	}
 	p.pendingUnsubscribe[subID] = struct{}{}
 	lease := p.leaseForRouteLocked(subID, conn)
+	canonicalReservation := p.canonicalReservations[subID]
 	param := p.subscriptionParam[subID]
 	p.subMux.Unlock()
 
@@ -511,7 +594,7 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 				p.drainingParams[param] = lease
 			}
 			p.subMux.Unlock()
-			err = uncertainWSUpstreamOutcomeWithSettlement(err, p.releaseDrainingLease(param, lease, settled))
+			err = uncertainWSUpstreamOutcomeWithSettlement(err, p.releaseDrainingLeaseAndReservation(param, lease, canonicalReservation, settled))
 		} else {
 			p.subMux.Lock()
 			delete(p.pendingUnsubscribe, subID)
@@ -524,6 +607,7 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 	p.removeRouteLocked(subID, param)
 	lease.releaseLocked()
 	p.subMux.Unlock()
+	canonicalReservation.releaseWhenSettled(p.IdGen)
 	return nil
 }
 
@@ -540,6 +624,7 @@ func (p *UpstreamPool) removeRouteLocked(id, param string) {
 	delete(p.subscriptionConn, id)
 	delete(p.subscriptionParam, id)
 	delete(p.subscriptionLease, id)
+	delete(p.canonicalReservations, id)
 	delete(p.pendingUnsubscribe, id)
 	delete(p.migrating, id)
 	if p.subscriptionID[param] == id {
@@ -577,6 +662,8 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		param       string
 		sourceLease *wsReservationLease
 		destLease   *wsReservationLease
+		canonical   *wsCanonicalReservation
+		reservation string
 	}
 	p.subMux.Lock()
 	p.ensureSubscriptionMapsLocked()
@@ -604,9 +691,17 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 			continue
 		}
 		p.migrating[oldID] = struct{}{}
+		canonical := p.canonicalReservations[oldID]
+		reservation := ""
+		if canonical == nil {
+			if owner, ok := conn.(wsMigrationHandleOwner); ok {
+				reservation, _ = owner.reservationForHandle(oldID)
+			}
+		}
 		candidates = append(candidates, pending{
 			oldID: oldID, conn: conn, alt: alt, param: param,
 			sourceLease: p.leaseForRouteLocked(oldID, conn), destLease: destLease,
+			canonical: canonical, reservation: reservation,
 		})
 	}
 	p.subMux.Unlock()
@@ -616,15 +711,15 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		newID, err := c.alt.Subscribe(c.param)
 		if err != nil {
 			if isUncertainWSUpstreamOutcome(err) {
-				p.releaseDrainingLease(c.param, c.destLease, uncertainWSUpstreamOutcomeSettlement(err))
+				p.drainFailedMigration(c.oldID, c.param, c.conn, c.destLease, uncertainWSUpstreamOutcomeSettlement(err))
 			} else {
 				c.destLease.release()
+				p.subMux.Lock()
+				if p.subscriptionConn[c.oldID] == c.conn {
+					delete(p.migrating, c.oldID)
+				}
+				p.subMux.Unlock()
 			}
-			p.subMux.Lock()
-			if p.subscriptionConn[c.oldID] == c.conn {
-				delete(p.migrating, c.oldID)
-			}
-			p.subMux.Unlock()
 			if p.log != nil {
 				p.log.WithFields(Fields{
 					"oldID": c.oldID,
@@ -654,25 +749,45 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 			p.retireUncommitted(c.param, c.alt, c.destLease)
 			continue
 		}
+		canonical := c.canonical
+		preserveSourceHandle := false
+		if canonical == nil && c.reservation != "" {
+			canonical = newWSCanonicalReservation(c.reservation)
+			preserveSourceHandle = true
+		}
 		p.removeRouteLocked(c.oldID, c.param)
 		p.subscriptionConn[newID] = c.alt
 		p.subscriptionParam[newID] = c.param
 		p.subscriptionID[c.param] = newID
 		p.subscriptionLease[newID] = c.destLease
+		if canonical != nil {
+			p.canonicalReservations[newID] = canonical
+		}
 		p.subMux.Unlock()
 
 		// A reconnect can recreate the source subscription while the alternate
 		// subscribe is in flight, so its slot stays reserved until cleanup proves
 		// that duplicate cannot remain.
-		cleanup := c.conn.LocalUnsubscribe(c.param)
+		var cleanup <-chan error
+		if preserveSourceHandle {
+			cleanup = c.conn.(wsMigrationHandleOwner).localUnsubscribePreservingHandle(c.param)
+		} else {
+			cleanup = c.conn.LocalUnsubscribe(c.param)
+		}
 		if cleanup == nil {
 			c.sourceLease.release()
+			if preserveSourceHandle {
+				canonical.markSettled()
+			}
 		} else {
-			go func(lease *wsReservationLease, settled <-chan error) {
+			go func(lease *wsReservationLease, settled <-chan error, canonical *wsCanonicalReservation, settleCanonical bool) {
 				if err, ok := <-settled; !ok || err == nil {
 					lease.release()
+					if settleCanonical {
+						canonical.markSettled()
+					}
 				}
-			}(c.sourceLease, cleanup)
+			}(c.sourceLease, cleanup, canonical, preserveSourceHandle)
 		}
 
 		if p.log != nil {

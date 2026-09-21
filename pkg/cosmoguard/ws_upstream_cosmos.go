@@ -374,6 +374,14 @@ func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) <-chan error 
 	return u.lifecycle.retire(u.lifecycle.lookupParam(param), u)
 }
 
+func (u *UpstreamConnManagerCosmos) localUnsubscribePreservingHandle(param string) <-chan error {
+	return u.lifecycle.retirePreservingHandle(u.lifecycle.lookupParam(param), u)
+}
+
+func (u *UpstreamConnManagerCosmos) reservationForHandle(handle string) (string, bool) {
+	return u.lifecycle.reservationForHandle(handle)
+}
+
 func (u *UpstreamConnManagerCosmos) unsubscribeOn(binding wsSubscriptionBinding, param string) error {
 	requestID := u.requestIDs.next()
 	response, err := u.makeRequestWithIDOnClient(binding.client, requestID, &JsonRpcMsg{

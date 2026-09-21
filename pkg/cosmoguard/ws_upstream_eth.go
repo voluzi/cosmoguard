@@ -353,6 +353,14 @@ func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) <-chan error {
 	return u.lifecycle.retire(u.lifecycle.lookupParam(param), u)
 }
 
+func (u *UpstreamConnManagerEth) localUnsubscribePreservingHandle(param string) <-chan error {
+	return u.lifecycle.retirePreservingHandle(u.lifecycle.lookupParam(param), u)
+}
+
+func (u *UpstreamConnManagerEth) reservationForHandle(handle string) (string, bool) {
+	return u.lifecycle.reservationForHandle(handle)
+}
+
 func (u *UpstreamConnManagerEth) unsubscribeOn(binding wsSubscriptionBinding, _ string) error {
 	requestID := u.requestIDs.next()
 	response, err := u.makeRequestWithIDOnClient(binding.client, requestID, &JsonRpcMsg{
