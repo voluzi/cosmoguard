@@ -27,6 +27,7 @@ type UpstreamPool struct {
 	subscriptionConn        map[string]UpstreamConnManager
 	subscriptionID          map[string]string
 	subscriptionParam       map[string]string
+	pendingUnsubscribe      map[string]struct{}
 	subMux                  sync.Mutex
 	maxSubscriptionsPerConn int
 
@@ -110,6 +111,7 @@ func NewUpstreamPool(backends []string, path string, n int, onMessage func(*Json
 		subscriptionConn:      make(map[string]UpstreamConnManager),
 		subscriptionID:        make(map[string]string),
 		subscriptionParam:     make(map[string]string),
+		pendingUnsubscribe:    make(map[string]struct{}),
 		subCount:              make(map[UpstreamConnManager]*atomic.Int64, n),
 		onSubscriptionMessage: onMessage,
 		IdGen:                 &util.UniqueID{},
@@ -249,7 +251,12 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	// against onUpstreamMessage in some edge cases.
 	p.subMux.Lock()
 	if id, ok := p.subscriptionID[param]; ok {
+		_, pending := p.pendingUnsubscribe[id]
+		limit := p.maxSubscriptionsPerConn
 		p.subMux.Unlock()
+		if pending {
+			return "", pendingUnsubscribeError(limit)
+		}
 		return id, nil
 	}
 	conn, err := p.reserveSubscriptionConnectionLocked(nil)
@@ -261,7 +268,9 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 
 	id, err := conn.Subscribe(param)
 	if err != nil {
-		if !isUncertainWSUpstreamOutcome(err) {
+		if isUncertainWSUpstreamOutcome(err) {
+			p.releaseUncertainReservation(conn, err)
+		} else {
 			p.subMux.Lock()
 			p.addSubCount(conn, -1)
 			p.subMux.Unlock()
@@ -274,6 +283,8 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	// unsubscribe ours so we don't double-subscribe upstream.
 	p.subMux.Lock()
 	if existing, ok := p.subscriptionID[param]; ok {
+		_, pending := p.pendingUnsubscribe[existing]
+		limit := p.maxSubscriptionsPerConn
 		p.subMux.Unlock()
 		// The extra subscription exists. Release its capacity only after
 		// upstream cleanup is confirmed.
@@ -281,6 +292,11 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 			p.subMux.Lock()
 			p.addSubCount(conn, -1)
 			p.subMux.Unlock()
+		} else if isUncertainWSUpstreamOutcome(err) {
+			p.releaseUncertainReservation(conn, err)
+		}
+		if pending {
+			return "", pendingUnsubscribeError(limit)
 		}
 		return existing, nil
 	}
@@ -289,6 +305,34 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	p.subscriptionConn[id] = conn
 	p.subMux.Unlock()
 	return id, nil
+}
+
+func pendingUnsubscribeError(limit int) error {
+	if limit > 0 {
+		return &WSResourceExhaustedError{Scope: wsLimitScopeUpstreamConnection, Limit: limit}
+	}
+	return errors.New("subscription removal is pending")
+}
+
+func (p *UpstreamPool) releaseUncertainReservation(conn UpstreamConnManager, err error) {
+	settled := uncertainWSUpstreamOutcomeSettlement(err)
+	if settled == nil {
+		return
+	}
+	release := func() {
+		p.subMux.Lock()
+		p.addSubCount(conn, -1)
+		p.subMux.Unlock()
+	}
+	select {
+	case <-settled:
+		release()
+	default:
+		go func() {
+			<-settled
+			release()
+		}()
+	}
 }
 
 // reserveSubscriptionConnectionLocked chooses a healthy connection with
@@ -340,17 +384,29 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 		p.subMux.Unlock()
 		return fmt.Errorf("connection for subscription not found")
 	}
+	if _, pending := p.pendingUnsubscribe[subID]; pending {
+		limit := p.maxSubscriptionsPerConn
+		p.subMux.Unlock()
+		return pendingUnsubscribeError(limit)
+	}
+	if p.pendingUnsubscribe == nil {
+		p.pendingUnsubscribe = make(map[string]struct{})
+	}
+	p.pendingUnsubscribe[subID] = struct{}{}
 	p.subMux.Unlock()
 
-	// If the upstream Unsubscribe RPC fails we bail without
-	// committing the cleanup — pre-existing behavior preserved so
-	// the broker's retry semantics don't change. Note: the per-conn
-	// counter has identical drift here (we never reached
-	// addSubCount), matching the maps. A fail-then-retry that
-	// eventually succeeds is balanced; a fail-then-give-up leaks
-	// both the map entry AND the counter slot until pool restart —
-	// same blast radius as before the counter existed.
+	// A definite failure preserves the existing subscription maps and
+	// clears the pending-removal marker so callers may retry. An uncertain
+	// outcome keeps the marker and capacity charged until the exact socket
+	// settles, when releaseUncertainUnsubscribe removes both atomically.
 	if err := conn.Unsubscribe(subID); err != nil {
+		if isUncertainWSUpstreamOutcome(err) {
+			p.releaseUncertainUnsubscribe(subID, conn, err)
+		} else {
+			p.subMux.Lock()
+			delete(p.pendingUnsubscribe, subID)
+			p.subMux.Unlock()
+		}
 		return err
 	}
 
@@ -358,11 +414,43 @@ func (p *UpstreamPool) Unsubscribe(subID string) error {
 	delete(p.subscriptionConn, subID)
 	delete(p.subscriptionID, p.subscriptionParam[subID])
 	delete(p.subscriptionParam, subID)
+	delete(p.pendingUnsubscribe, subID)
 	// Decrement the per-conn counter in lockstep with the
 	// subscriptionConn delete; same ordering rationale as Subscribe.
 	p.addSubCount(conn, -1)
 	p.subMux.Unlock()
 	return nil
+}
+
+func (p *UpstreamPool) releaseUncertainUnsubscribe(subID string, conn UpstreamConnManager, err error) {
+	settled := uncertainWSUpstreamOutcomeSettlement(err)
+	if settled == nil {
+		return
+	}
+	release := func() {
+		p.subMux.Lock()
+		defer p.subMux.Unlock()
+		if p.subscriptionConn[subID] != conn {
+			return
+		}
+		param := p.subscriptionParam[subID]
+		delete(p.subscriptionConn, subID)
+		delete(p.subscriptionParam, subID)
+		delete(p.pendingUnsubscribe, subID)
+		if p.subscriptionID[param] == subID {
+			delete(p.subscriptionID, param)
+		}
+		p.addSubCount(conn, -1)
+	}
+	select {
+	case <-settled:
+		release()
+	default:
+		go func() {
+			<-settled
+			release()
+		}()
+	}
 }
 
 // SubscriptionMigration is one (oldID, newID, param) tuple emitted by
@@ -401,6 +489,9 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 	}
 	candidates := make([]pending, 0)
 	for oldID, conn := range p.subscriptionConn {
+		if _, removing := p.pendingUnsubscribe[oldID]; removing {
+			continue
+		}
 		if conn.IsHealthy() {
 			continue
 		}
@@ -420,7 +511,9 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 	for _, c := range candidates {
 		newID, err := c.alt.Subscribe(c.param)
 		if err != nil {
-			if !isUncertainWSUpstreamOutcome(err) {
+			if isUncertainWSUpstreamOutcome(err) {
+				p.releaseUncertainReservation(c.alt, err)
+			} else {
 				p.subMux.Lock()
 				p.addSubCount(c.alt, -1)
 				p.subMux.Unlock()
@@ -446,7 +539,9 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		// stillPinned catches it) or it didn't (and the param mapping
 		// still points at oldID).
 		p.subMux.Lock()
-		if _, stillPinned := p.subscriptionConn[c.oldID]; !stillPinned {
+		_, stillPinned := p.subscriptionConn[c.oldID]
+		_, removing := p.pendingUnsubscribe[c.oldID]
+		if !stillPinned || removing {
 			p.subMux.Unlock()
 			// The replacement subscription exists. Release its capacity only
 			// after upstream cleanup is confirmed.
@@ -454,6 +549,8 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 				p.subMux.Lock()
 				p.addSubCount(c.alt, -1)
 				p.subMux.Unlock()
+			} else if isUncertainWSUpstreamOutcome(err) {
+				p.releaseUncertainReservation(c.alt, err)
 			}
 			continue
 		}

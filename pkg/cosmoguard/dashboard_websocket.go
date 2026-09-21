@@ -37,6 +37,8 @@ type WSSectionStats struct {
 	UpstreamConnsHealthy  int             `json:"upstream_conns_healthy"`
 	UpstreamConnsTotal    int             `json:"upstream_conns_total"`
 	Limits                WebSocketLimits `json:"limits"`
+	LimitsAvailable       bool            `json:"limits_available"`
+	LimitsConsistent      bool            `json:"limits_consistent"`
 	Conns                 []WSConnInfo    `json:"conns"`
 	Subs                  []WSSubInfo     `json:"subs"`
 	Upstreams             []ConnStat      `json:"upstreams"`

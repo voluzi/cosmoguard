@@ -602,8 +602,20 @@ function renderWebSockets(payload) {
     upTotal += s.upstream_conns_total | 0;
   }
   const ratio = upstreamSubs > 0 ? (clientSubs / upstreamSubs) : 0;
-  const limits = sections.length ? (sections[0].limits || {}) : {};
-  const showLimit = (value) => (value | 0) === 0 ? "off" : String(value | 0);
+  const limitKeys = [
+    "max_subscriptions_per_client",
+    "max_subscriptions_per_identity",
+    "max_subscriptions_per_upstream_connection",
+    "max_connections_per_ip",
+  ];
+  const limitsAvailable = sections.length > 0 && sections.every((s) => s.limits_available === true);
+  const limitsConsistent = limitsAvailable && sections.every((s) => s.limits_consistent === true);
+  const firstLimits = limitsConsistent ? (sections[0].limits || {}) : {};
+  const limitsMatch = limitsConsistent && sections.every((s) => limitKeys.every((key) =>
+    (s.limits || {})[key] === firstLimits[key]));
+  const limits = limitsMatch ? firstLimits : {};
+  const limitState = !limitsAvailable ? "unavailable" : (!limitsMatch ? "mixed" : "per process");
+  const showLimit = (value) => value == null ? "—" : (Number(value) === 0 ? "off" : String(value));
   const poolMod = upTotal === 0 ? "" : (upHealthy === upTotal ? "ok" : (upHealthy === 0 ? "bad" : "warn"));
   if (statsHost) {
     statsHost.innerHTML = [
@@ -613,7 +625,7 @@ function renderWebSockets(payload) {
         ratio > 0 ? `${ratio.toFixed(1)}× fan-out` : "deduplicated to upstream"),
       statTile("Upstream pool", `${upHealthy}/${upTotal}`, poolMod, "healthy backend conns"),
       statTile("Admission limits", `${showLimit(limits.max_subscriptions_per_client)}/client`, "",
-        `${showLimit(limits.max_subscriptions_per_identity)}/identity · ${showLimit(limits.max_subscriptions_per_upstream_connection)}/upstream · ${showLimit(limits.max_connections_per_ip)}/IP · per process`),
+        `${showLimit(limits.max_subscriptions_per_identity)}/identity · ${showLimit(limits.max_subscriptions_per_upstream_connection)}/upstream · ${showLimit(limits.max_connections_per_ip)}/IP · ${limitState}`),
     ].join("");
   }
 

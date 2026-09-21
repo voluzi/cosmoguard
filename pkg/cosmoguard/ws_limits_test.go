@@ -3,12 +3,14 @@ package cosmoguard
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -265,7 +267,10 @@ func TestBrokerSubscriptionLimitResponsesAndRelease(t *testing.T) {
 	upstream := newLimitingUpstream()
 	broker := NewBroker([]string{"ws://upstream.test"}, "/", 1, limitingConstructor(upstream))
 	broker.log = log.WithField("test", "ws-limits")
-	broker.setAdmissionController(newWSAdmissionController(WebSocketLimits{MaxSubscriptionsPerClient: 1}))
+	broker.setAdmissionController(newWSAdmissionController(WebSocketLimits{
+		MaxSubscriptionsPerClient:   1,
+		MaxSubscriptionsPerIdentity: 1,
+	}))
 	client := &JsonRpcWsClient{}
 
 	cosmos := &JsonRpcMsg{Version: "2.0", ID: 11, Method: methodSubscribeCosmos, Params: []any{"tm.event='NewBlock'"}}
@@ -475,6 +480,41 @@ func TestProviderRejectedSubscribeReleasesCapacity(t *testing.T) {
 	}
 }
 
+func TestMissingSubscribeResultReleasesCapacity(t *testing.T) {
+	responses := []struct {
+		name   string
+		result []byte
+	}{
+		{name: "missing"},
+		{name: "null", result: []byte("null")},
+	}
+	for _, protocol := range wsProtocolCases() {
+		for _, response := range responses {
+			t.Run(protocol.name+"/"+response.name, func(t *testing.T) {
+				pool, manager, backend := newRealManagerPool(t, protocol, 1)
+
+				firstCall := startSubscribe(pool, "first")
+				firstReq := <-backend.requests
+				backend.responses <- &JsonRpcMsg{
+					Version: jsonRpcVersion,
+					ID:      firstReq.ID,
+					Result:  response.result,
+				}
+				first := <-firstCall
+				assert.ErrorContains(t, first.err, "missing result")
+				assert.Assert(t, !isUncertainWSUpstreamOutcome(first.err))
+				assert.Assert(t, !manager.HasSubscription("first"))
+
+				secondCall := startSubscribe(pool, "second")
+				secondReq := <-backend.requests
+				backend.responses <- protocol.subscribeSuccess(secondReq, "second")
+				second := <-secondCall
+				assert.NilError(t, second.err, "definite malformed response must release capacity")
+			})
+		}
+	}
+}
+
 func TestInvalidUnsubscribeAcknowledgementKeepsPoolCapacityOccupied(t *testing.T) {
 	acknowledgements := []struct {
 		name     string
@@ -674,6 +714,148 @@ func TestRejectedSourceCleanupAfterMigrationKeepsCapacityOccupied(t *testing.T) 
 	}
 }
 
+func TestResubmitCleanupConfirmsLocalUnsubscribeWithoutSocketClose(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			client, peer := newWSCacheClient(t)
+			manager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(manager, client)
+			setManagerLog(manager, log.WithField("test", protocol.name+"-resubmit-cleanup"))
+			backend := newControlledWSBackend(manager, client, peer)
+			seedManagerSubscription(manager, "victim", "source-subscription")
+
+			resubmit := startManagerResubscribe(manager, client, "victim", "source-subscription")
+			subscribeReq := <-backend.requests
+			forgetManagerSubscription(manager, "victim", "source-subscription")
+			cleanup := manager.LocalUnsubscribe("victim")
+			if cleanup == nil {
+				t.Fatal("in-flight resubmit cleanup must be tracked")
+			}
+
+			backend.responses <- protocol.subscribeSuccess(subscribeReq, "resubmitted")
+			cleanupReq := <-backend.requests
+			if protocol.evm {
+				backend.responses <- WithResult(cleanupReq, true)
+			} else {
+				backend.responses <- WithResult(cleanupReq, map[string]any{})
+			}
+			assert.NilError(t, <-resubmit)
+			select {
+			case err := <-cleanup:
+				assert.NilError(t, err)
+			default:
+				t.Fatal("validated resubmit cleanup must release capacity before socket close")
+			}
+			assert.Assert(t, !client.IsClosed())
+		})
+	}
+}
+
+func TestEmptyResubmitEpochConfirmsStaleMigrationCleanup(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			client, peer := newWSCacheClient(t)
+			manager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(manager, client)
+			setManagerLog(manager, log.WithField("test", t.Name()))
+			backend := newControlledWSBackend(manager, client, peer)
+			seedManagerSubscription(manager, "victim", "stale-subscription")
+			epoch := beginManagerResubmit(manager)
+
+			cleanup := manager.LocalUnsubscribe("victim")
+			assert.Assert(t, cleanup != nil)
+			unsubscribeRequest := <-backend.requests
+			backend.responses <- providerRejectedResponse(unsubscribeRequest)
+
+			resubmit := startManagerResubmitEpoch(manager, client, epoch)
+			assert.NilError(t, <-resubmit)
+			select {
+			case err := <-cleanup:
+				assert.NilError(t, err)
+			case <-time.After(time.Second):
+				t.Fatal("empty reconnect epoch must prove no source subscription remains")
+			}
+			assert.Assert(t, !client.IsClosed())
+		})
+	}
+}
+
+func beginManagerResubmit(manager UpstreamConnManager) *wsResubmitEpoch {
+	switch manager := manager.(type) {
+	case *UpstreamConnManagerCosmos:
+		return manager.beginResubmit()
+	case *UpstreamConnManagerEth:
+		return manager.beginResubmit()
+	default:
+		panic("unsupported manager")
+	}
+}
+
+func startManagerResubmitEpoch(manager UpstreamConnManager, client *JsonRpcWsClient, epoch *wsResubmitEpoch) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		switch manager := manager.(type) {
+		case *UpstreamConnManagerCosmos:
+			result <- manager.reSubmitSubscriptionsOnClientEpoch(client, epoch)
+		case *UpstreamConnManagerEth:
+			result <- manager.reSubmitSubscriptionsOnClientEpoch(client, epoch)
+		}
+	}()
+	return result
+}
+
+func TestCosmosReconnectFailurePreservesCanonicalID(t *testing.T) {
+	cases := []struct {
+		name      string
+		response  func(*JsonRpcMsg) *JsonRpcMsg
+		uncertain bool
+	}{
+		{name: "provider rejection", response: providerRejectedResponse},
+		{name: "missing result", response: func(req *JsonRpcMsg) *JsonRpcMsg {
+			return &JsonRpcMsg{Version: jsonRpcVersion, ID: req.ID}
+		}},
+		{name: "null result", response: func(req *JsonRpcMsg) *JsonRpcMsg {
+			return &JsonRpcMsg{Version: jsonRpcVersion, ID: req.ID, Result: []byte("null")}
+		}},
+		{name: "socket close", uncertain: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var candidate atomic.Uint32
+			ids := []string{"canonical", "next"}
+			idGen := util.NewUniqueID(func() string {
+				return ids[(candidate.Add(1)-1)%uint32(len(ids))]
+			})
+			canonicalID := idGen.ID()
+			client, peer := newWSCacheClient(t)
+			manager := CosmosUpstreamConnManager(url.URL{}, idGen, func(*JsonRpcMsg) {}).(*UpstreamConnManagerCosmos)
+			setManagerClient(manager, client)
+			setManagerLog(manager, log.WithField("test", t.Name()))
+			backend := newControlledWSBackend(manager, client, peer)
+			seedManagerSubscription(manager, "victim", canonicalID)
+
+			resubmit := startManagerResubscribe(manager, client, "victim", canonicalID)
+			request := <-backend.requests
+			if tc.response == nil {
+				close(backend.responses)
+				assert.NilError(t, client.Close())
+			} else {
+				backend.responses <- tc.response(request)
+			}
+			err := <-resubmit
+			assert.Assert(t, err != nil)
+			assert.Equal(t, isUncertainWSUpstreamOutcome(err), tc.uncertain)
+			assert.Assert(t, manager.HasSubscription("victim"), "failed reconnect must retain logical membership")
+
+			candidate.Store(0)
+			nextID := idGen.ID()
+			assert.Assert(t, nextID != canonicalID,
+				"failed reconnect released canonical ID %s for reuse", canonicalID)
+			idGen.Release(nextID)
+		})
+	}
+}
+
 func seedManagerSubscription(manager UpstreamConnManager, param, id string) {
 	switch manager := manager.(type) {
 	case *UpstreamConnManagerCosmos:
@@ -682,6 +864,21 @@ func seedManagerSubscription(manager UpstreamConnManager, param, id string) {
 	case *UpstreamConnManagerEth:
 		manager.subByParam[param] = id
 		manager.subByID[id] = param
+	}
+}
+
+func forgetManagerSubscription(manager UpstreamConnManager, param, id string) {
+	switch manager := manager.(type) {
+	case *UpstreamConnManagerCosmos:
+		manager.subMux.Lock()
+		delete(manager.subByParam, param)
+		delete(manager.subByID, id)
+		manager.subMux.Unlock()
+	case *UpstreamConnManagerEth:
+		manager.subMux.Lock()
+		delete(manager.subByParam, param)
+		delete(manager.subByID, id)
+		manager.subMux.Unlock()
 	}
 }
 
@@ -699,58 +896,214 @@ func startManagerResubscribe(manager UpstreamConnManager, client *JsonRpcWsClien
 	return result
 }
 
-func TestUpstreamUncertainSubscribeOutcomeKeepsCapacityOccupied(t *testing.T) {
-	tests := []struct {
-		name        string
-		constructor UpstreamConnManagerConstructor
-	}{
-		{name: "cosmos", constructor: CosmosUpstreamConnManager},
-		{name: "evm", constructor: EthUpstreamConnManager},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			firstClient, firstBackend := newWSCacheClient(t)
-			manager := tt.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+func TestUpstreamUncertainSubscribeReservationEndsWithOriginSocket(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			firstClient, firstPeer := newWSCacheClient(t)
+			manager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
 			setManagerClient(manager, firstClient)
-			setManagerLog(manager, log.WithField("test", tt.name+"-uncertain"))
+			setManagerLog(manager, log.WithField("test", protocol.name+"-uncertain"))
 			pool := NewUpstreamPool([]string{"ws://upstream.test"}, "/", 1, func(*JsonRpcMsg) {},
 				func(url.URL, *util.UniqueID, func(*JsonRpcMsg)) UpstreamConnManager { return manager })
 			pool.SetMaxSubscriptionsPerConnection(1)
 
-			firstReceived := make(chan struct{})
+			firstCall := startSubscribe(pool, "first")
+			var firstReq JsonRpcMsg
+			assert.NilError(t, firstPeer.ReadJSON(&firstReq))
+
+			_, err := pool.Subscribe("second")
+			var exhausted *WSResourceExhaustedError
+			assert.Assert(t, errors.As(err, &exhausted), "pending uncertain request must hold the slot")
+
+			assert.NilError(t, firstClient.Close())
+			first := <-firstCall
+			assert.Assert(t, errors.Is(first.err, ErrClosed), "the original cause must remain discoverable")
+
+			secondClient, secondPeer := newWSCacheClient(t)
+			setManagerClient(manager, secondClient)
+			secondCall := startSubscribe(pool, "second")
 			go func() {
-				if _, _, err := firstBackend.ReadMessage(); err == nil {
-					close(firstReceived)
+				var req JsonRpcMsg
+				if secondPeer.ReadJSON(&req) == nil {
+					encoded, _ := protocol.subscribeSuccess(&req, "second").Marshal()
+					_ = secondPeer.WriteMessage(websocket.TextMessage, encoded)
 				}
-				_ = firstBackend.Close()
 			}()
-			go func() { _, _ = firstClient.ReceiveMsg() }()
+			go func() {
+				if msg, receiveErr := secondClient.ReceiveMsg(); receiveErr == nil {
+					dispatchManagerMessage(manager, msg)
+				}
+			}()
+			second := <-secondCall
+			assert.NilError(t, second.err, "closing the exact origin socket must reclaim capacity")
+		})
+	}
+}
+
+func TestUpstreamWriteFailureClosesOriginAndReclaimsReservation(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			client, _ := newWSCacheClient(t)
+			tcp, ok := client.conn.UnderlyingConn().(*net.TCPConn)
+			assert.Assert(t, ok)
+			assert.NilError(t, tcp.CloseWrite())
+
+			manager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(manager, client)
+			setManagerLog(manager, log.WithField("test", t.Name()))
+			pool := NewUpstreamPool([]string{"ws://upstream.test"}, "/", 1, func(*JsonRpcMsg) {},
+				func(url.URL, *util.UniqueID, func(*JsonRpcMsg)) UpstreamConnManager { return manager })
+			pool.SetMaxSubscriptionsPerConnection(1)
 
 			_, err := pool.Subscribe("first")
-			<-firstReceived
-			assert.Assert(t, errors.Is(err, ErrClosed), "the original cause must remain discoverable")
+			assert.Assert(t, isUncertainWSUpstreamOutcome(err))
+			assert.Assert(t, client.IsClosed(), "ambiguous write failure must settle by closing its origin")
 
-			secondClient, secondBackend := newWSCacheClient(t)
+			secondClient, secondPeer := newWSCacheClient(t)
 			setManagerClient(manager, secondClient)
-			unexpectedSecondCall := make(chan struct{}, 1)
-			go func() {
-				if _, _, err := secondBackend.ReadMessage(); err == nil {
-					unexpectedSecondCall <- struct{}{}
-				}
-				_ = secondBackend.Close()
-			}()
-			go func() { _, _ = secondClient.ReceiveMsg() }()
+			backend := newControlledWSBackend(manager, secondClient, secondPeer)
+			secondCall := startSubscribe(pool, "second")
+			request := <-backend.requests
+			backend.responses <- protocol.subscribeSuccess(request, "second")
+			second := <-secondCall
+			assert.NilError(t, second.err, "closed write-failure socket must release its reservation")
+		})
+	}
+}
 
+func TestUncertainFinalUnsubscribeDrainsAfterOriginCloses(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			pool, manager, backend := newRealManagerPool(t, protocol, 1)
+			client := currentManagerClient(manager)
+
+			firstCall := startSubscribe(pool, "first")
+			subscribeRequest := <-backend.requests
+			subscribeResponse := protocol.subscribeSuccess(subscribeRequest, "first")
+			if protocol.evm {
+				subscribeResponse = WithResult(subscribeRequest, "0xfirst")
+			}
+			backend.responses <- subscribeResponse
+			first := <-firstCall
+			assert.NilError(t, first.err)
+
+			unsubscribeCall := startUnsubscribe(pool, first.id)
+			<-backend.requests
+			_, err := pool.Subscribe("first")
+			var pendingRemoval *WSResourceExhaustedError
+			assert.Assert(t, errors.As(err, &pendingRemoval), "pending removal must not accept new membership")
 			_, err = pool.Subscribe("second")
 			var exhausted *WSResourceExhaustedError
-			assert.Assert(t, errors.As(err, &exhausted), "uncertain first outcome must retain the reserved slot")
-			assert.Equal(t, exhausted.Scope, wsLimitScopeUpstreamConnection)
+			assert.Assert(t, errors.As(err, &exhausted), "pending removal must remain charged")
+
+			close(backend.responses)
+			assert.NilError(t, client.Close())
+			unsubscribeErr := <-unsubscribeCall
+			assert.Assert(t, isUncertainWSUpstreamOutcome(unsubscribeErr))
+			assert.Assert(t, !manager.HasSubscription("first"), "settled removal must not survive for reconnect")
+
+			pool.subMux.Lock()
+			_, stillPinned := pool.subscriptionConn[first.id]
+			count := pool.subCount[manager].Load()
+			pool.subMux.Unlock()
+			assert.Assert(t, !stillPinned)
+			assert.Equal(t, count, int64(0))
+
+			secondClient, secondPeer := newWSCacheClient(t)
+			setManagerClient(manager, secondClient)
+			secondBackend := newControlledWSBackend(manager, secondClient, secondPeer)
+			assert.NilError(t, resubmitManagerSubscriptions(manager, secondClient))
 			select {
-			case <-unexpectedSecondCall:
-				t.Fatal("capacity bypass sent a second upstream subscribe")
+			case request := <-secondBackend.requests:
+				t.Fatalf("settled removal was resubmitted: %+v", request)
 			default:
 			}
+
+			secondCall := startSubscribe(pool, "second")
+			secondRequest := <-secondBackend.requests
+			secondBackend.responses <- protocol.subscribeSuccess(secondRequest, "second")
+			second := <-secondCall
+			assert.NilError(t, second.err)
 		})
+	}
+}
+
+func TestBrokerForgetsSettlingFinalUnsubscribe(t *testing.T) {
+	for _, protocol := range wsProtocolCases() {
+		t.Run(protocol.name, func(t *testing.T) {
+			upstreamClient, upstreamPeer := newWSCacheClient(t)
+			manager := protocol.constructor(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			setManagerClient(manager, upstreamClient)
+			setManagerLog(manager, log.WithField("test", t.Name()))
+			backend := newControlledWSBackend(manager, upstreamClient, upstreamPeer)
+			broker := NewBroker([]string{"ws://upstream.test"}, "/", 1,
+				func(url.URL, *util.UniqueID, func(*JsonRpcMsg)) UpstreamConnManager { return manager })
+			broker.log = log.WithField("test", t.Name())
+			downstream := &JsonRpcWsClient{}
+			param := "first"
+			subscribeMethod := methodSubscribeCosmos
+			if protocol.evm {
+				subscribeMethod = methodSubscribeEth
+			}
+			subscribeCall := make(chan *JsonRpcMsg, 1)
+			go func() {
+				response, _ := broker.HandleSubscription(downstream, &JsonRpcMsg{
+					Version: jsonRpcVersion, ID: 1, Method: subscribeMethod, Params: []any{param},
+				})
+				subscribeCall <- response
+			}()
+			subscribeRequest := <-backend.requests
+			subscribeResponse := protocol.subscribeSuccess(subscribeRequest, "first")
+			if protocol.evm {
+				subscribeResponse = WithResult(subscribeRequest, "0xfirst")
+			}
+			backend.responses <- subscribeResponse
+			assert.Assert(t, (<-subscribeCall).Error == nil)
+			canonicalID, exists := broker.sm.GetSubscriptionID(param)
+			assert.Assert(t, exists)
+
+			unsubscribeMethod := methodUnsubscribeCosmos
+			unsubscribeParam := param
+			if protocol.evm {
+				unsubscribeMethod = methodUnsubscribeEth
+				unsubscribeParam = canonicalID
+			}
+			unsubscribeCall := make(chan *JsonRpcMsg, 1)
+			go func() {
+				response, _ := broker.HandleSubscription(downstream, &JsonRpcMsg{
+					Version: jsonRpcVersion, ID: 2, Method: unsubscribeMethod, Params: []any{unsubscribeParam},
+				})
+				unsubscribeCall <- response
+			}()
+			<-backend.requests
+			close(backend.responses)
+			assert.NilError(t, upstreamClient.Close())
+			assert.Assert(t, (<-unsubscribeCall).Error != nil)
+			_, exists = broker.sm.GetSubscriptionID(param)
+			assert.Assert(t, !exists, "settling final unsubscribe must tombstone broker membership")
+		})
+	}
+}
+
+func currentManagerClient(manager UpstreamConnManager) *JsonRpcWsClient {
+	switch manager := manager.(type) {
+	case *UpstreamConnManagerCosmos:
+		return manager.curClient()
+	case *UpstreamConnManagerEth:
+		return manager.curClient()
+	default:
+		return nil
+	}
+}
+
+func resubmitManagerSubscriptions(manager UpstreamConnManager, client *JsonRpcWsClient) error {
+	switch manager := manager.(type) {
+	case *UpstreamConnManagerCosmos:
+		return manager.reSubmitSubscriptionsOnClient(client)
+	case *UpstreamConnManagerEth:
+		return manager.reSubmitSubscriptionsOnClient(client)
+	default:
+		return nil
 	}
 }
 
@@ -810,9 +1163,13 @@ func TestWebSocketDashboardIncludesLimitsAndPreservesAggregateSemantics(t *testi
 	}
 	snapshot := p.StatsSnapshot()
 	assert.DeepEqual(t, snapshot.Limits, limits)
+	assert.Assert(t, snapshot.LimitsAvailable)
+	assert.Assert(t, snapshot.LimitsConsistent)
 
 	body := []byte(`{"sections":[{"section":"rpc.jsonrpc","limits":{"max_subscriptions_per_client":32,"max_subscriptions_per_identity":128,"max_subscriptions_per_upstream_connection":4,"max_connections_per_ip":16}}]}`)
 	out := aggregateWebSocket([]peerResponse{{Body: body}, {Body: body}})
 	assert.Equal(t, len(out), 1)
 	assert.DeepEqual(t, out[0].Limits, limits)
+	assert.Assert(t, out[0].LimitsAvailable)
+	assert.Assert(t, out[0].LimitsConsistent)
 }

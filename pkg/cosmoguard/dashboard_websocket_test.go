@@ -172,3 +172,25 @@ func TestAggregateWebSocketSkipsErroredPeers(t *testing.T) {
 	assert.Equal(t, len(out), 1)
 	assert.Equal(t, out[0].Connections, 1)
 }
+
+func TestAggregateWebSocketReportsUnavailableAndDivergentLimits(t *testing.T) {
+	newPeer := peerResponse{Body: []byte(`{"sections":[{"section":"rpc.jsonrpc","limits":{"max_subscriptions_per_client":32,"max_subscriptions_per_identity":128,"max_subscriptions_per_upstream_connection":4,"max_connections_per_ip":16}}]}`)}
+	oldPeer := peerResponse{Body: []byte(`{"sections":[{"section":"rpc.jsonrpc","connections":1}]}`)}
+
+	mixedVersion := aggregateWebSocket([]peerResponse{newPeer, oldPeer})
+	assert.Equal(t, len(mixedVersion), 1)
+	assert.Assert(t, !mixedVersion[0].LimitsAvailable, "a peer with no limits must remain distinguishable from explicit zero")
+	assert.Assert(t, !mixedVersion[0].LimitsConsistent)
+
+	zeroPeer := peerResponse{Body: []byte(`{"sections":[{"section":"rpc.jsonrpc","limits":{"max_subscriptions_per_client":0,"max_subscriptions_per_identity":0,"max_subscriptions_per_upstream_connection":0,"max_connections_per_ip":0}}]}`)}
+	explicitZero := aggregateWebSocket([]peerResponse{zeroPeer, zeroPeer})
+	assert.Equal(t, len(explicitZero), 1)
+	assert.Assert(t, explicitZero[0].LimitsAvailable)
+	assert.Assert(t, explicitZero[0].LimitsConsistent)
+	assert.DeepEqual(t, explicitZero[0].Limits, WebSocketLimits{})
+
+	divergent := aggregateWebSocket([]peerResponse{newPeer, zeroPeer})
+	assert.Equal(t, len(divergent), 1)
+	assert.Assert(t, divergent[0].LimitsAvailable)
+	assert.Assert(t, !divergent[0].LimitsConsistent)
+}

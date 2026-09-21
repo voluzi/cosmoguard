@@ -41,8 +41,10 @@ type UpstreamConnManagerCosmos struct {
 	// subscription nobody is mapped to. The resubmit commit consults this
 	// set and drops (best-effort unsubscribes) any param migrated away
 	// mid-flight. Cleared at the start of each resubmit. Guarded by subMux.
-	migratedAway map[string]struct{}
-	subMux       sync.Mutex
+	migratedAway      map[string]struct{}
+	migrationCleanups map[string]*wsCleanupConfirmation
+	resubmitEpochs    map[*wsResubmitEpoch]struct{}
+	subMux            sync.Mutex
 
 	// failedReconnects counts consecutive Dial failures. Reset to 0 on
 	// any successful connect. Read by IsHealthy so the pool's
@@ -92,6 +94,8 @@ func CosmosUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscription
 		subByParam:            make(map[string]string),
 		subByID:               make(map[string]string),
 		migratedAway:          make(map[string]struct{}),
+		migrationCleanups:     make(map[string]*wsCleanupConfirmation),
+		resubmitEpochs:        make(map[*wsResubmitEpoch]struct{}),
 		respMap:               make(map[string]chan *JsonRpcMsg),
 		onSubscriptionMessage: onSubscriptionMessage,
 	}
@@ -128,12 +132,13 @@ func (u *UpstreamConnManagerCosmos) Run(log *Entry) error {
 			// timeout. The goroutine captures the newly-connected client
 			// so a fast subsequent reconnect can't redirect its calls
 			// to a different connection.
-			go func(cli *JsonRpcWsClient) {
-				if err := u.reSubmitSubscriptionsOnClient(cli); err != nil {
+			epoch := u.beginResubmit()
+			go func(cli *JsonRpcWsClient, epoch *wsResubmitEpoch) {
+				if err := u.reSubmitSubscriptionsOnClientEpoch(cli, epoch); err != nil {
 					u.log.Errorf("error re-submitting subscriptions: %v", err)
 					_ = cli.Close()
 				}
-			}(cli)
+			}(cli, epoch)
 		}
 		if cli == nil {
 			continue
@@ -291,7 +296,8 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClie
 		u.respMux.Unlock()
 		var writeErr *wsWriteError
 		if errors.As(err, &writeErr) {
-			return nil, uncertainWSUpstreamOutcome(err)
+			_ = cli.Close()
+			return nil, uncertainWSUpstreamOutcomeUntil(err, cli.Closed())
 		}
 		return nil, err
 	}
@@ -316,22 +322,23 @@ func (u *UpstreamConnManagerCosmos) makeRequestWithIDOnClient(cli *JsonRpcWsClie
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
-		return nil, uncertainWSUpstreamOutcome(ErrClosed)
+		return nil, uncertainWSUpstreamOutcomeUntil(ErrClosed, cli.Closed())
 
 	case <-timeout.C:
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
 
-		return nil, uncertainWSUpstreamOutcome(fmt.Errorf("timeout waiting for response for request with ID %s", id))
+		return nil, uncertainWSUpstreamOutcomeUntil(fmt.Errorf("timeout waiting for response for request with ID %s", id), cli.Closed())
 	}
 }
 
 func (u *UpstreamConnManagerCosmos) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, error) {
 	// Generate unique ID for request
 	ID := u.IdGen.ID()
-	defer u.IdGen.Release(ID)
-	return u.makeRequestWithID(ID, req)
+	response, err := u.makeRequestWithID(ID, req)
+	releaseWSRequestID(u.IdGen, ID, err)
+	return response, err
 }
 
 func (u *UpstreamConnManagerCosmos) HasSubscription(param string) bool {
@@ -371,19 +378,22 @@ func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient
 
 	response, err := u.makeRequestWithIDOnClient(cli, id, msg)
 	if err != nil {
-		if !isUncertainWSUpstreamOutcome(err) {
-			u.IdGen.Release(id)
+		if !resubmit {
+			releaseWSRequestID(u.IdGen, id, err)
 		}
 		return err
 	}
 	if err := validateWSJSONRPCResponse(methodSubscribeCosmos, response); err != nil {
-		u.IdGen.Release(id)
+		if !resubmit {
+			u.IdGen.Release(id)
+		}
 		return err
 	}
 
 	u.subMux.Lock()
 	if resubmit {
 		if _, migrated := u.migratedAway[param]; migrated {
+			confirmation := u.migrationCleanups[param]
 			// The pool migrated this param onto another conn while we were
 			// re-subscribing. Don't re-track it here (that would be a
 			// duplicate upstream subscription mapped to nobody); tear the
@@ -399,12 +409,18 @@ func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient
 			// The unsubscribe uses a SEPARATE temporary id, released after
 			// the round-trip so repeated races don't exhaust the id space.
 			cleanupID := u.IdGen.ID()
-			_, _ = u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
+			response, cleanupErr := u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
 				Version: jsonRpcVersion,
 				Method:  methodUnsubscribeCosmos,
 				Params:  []interface{}{param},
 			})
-			u.IdGen.Release(cleanupID)
+			if cleanupErr == nil {
+				cleanupErr = validateCosmosUnsubscribeResponse(response)
+			}
+			releaseWSRequestID(u.IdGen, cleanupID, cleanupErr)
+			if cleanupErr == nil && confirmation != nil {
+				u.finishMigrationCleanup(param, confirmation, nil)
+			}
 			return nil
 		}
 	} else {
@@ -440,6 +456,19 @@ func (u *UpstreamConnManagerCosmos) Unsubscribe(id string) error {
 
 	response, err := u.MakeRequest(msg)
 	if err != nil {
+		if isUncertainWSUpstreamOutcome(err) {
+			u.subMux.Lock()
+			delete(u.subByID, id)
+			delete(u.subByParam, param)
+			u.migratedAway[param] = struct{}{}
+			u.subMux.Unlock()
+			if settled := uncertainWSUpstreamOutcomeSettlement(err); settled != nil {
+				go func() {
+					<-settled
+					u.IdGen.Release(id)
+				}()
+			}
+		}
 		return err
 	}
 	if err := validateCosmosUnsubscribeResponse(response); err != nil {
@@ -473,19 +502,28 @@ func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) <-chan error 
 		delete(u.subByParam, param)
 		delete(u.subByID, id)
 	}
+	if u.migrationCleanups == nil {
+		u.migrationCleanups = make(map[string]*wsCleanupConfirmation)
+	}
+	confirmation := newWSCleanupConfirmation()
+	u.migrationCleanups[param] = confirmation
+	epochs := make([]*wsResubmitEpoch, 0, len(u.resubmitEpochs))
+	for epoch := range u.resubmitEpochs {
+		epochs = append(epochs, epoch)
+	}
 	u.subMux.Unlock()
 	cli := u.curClient()
 	if cli == nil || cli.IsClosed() {
+		u.finishMigrationCleanup(param, confirmation, nil)
 		return nil
 	}
-	result := make(chan error, 1)
+	go func() {
+		<-cli.Closed()
+		u.finishMigrationCleanup(param, confirmation, nil)
+	}()
+	u.confirmIfResubmitsSkipped(param, confirmation, epochs)
 	if !ok {
-		go func() {
-			<-cli.Closed()
-			result <- nil
-			close(result)
-		}()
-		return result
+		return confirmation.result
 	}
 	go func() {
 		requestID := u.IdGen.ID()
@@ -494,21 +532,43 @@ func (u *UpstreamConnManagerCosmos) LocalUnsubscribe(param string) <-chan error 
 			Method:  methodUnsubscribeCosmos,
 			Params:  []interface{}{param},
 		})
-		u.IdGen.Release(requestID)
+		releaseWSRequestID(u.IdGen, requestID, err)
 		if err == nil {
 			err = validateCosmosUnsubscribeResponse(response)
 		}
-		if err != nil && !errors.Is(err, ErrClosed) {
-			<-cli.Closed()
+		if err == nil {
+			u.finishMigrationCleanup(param, confirmation, nil)
 		}
-		result <- nil
-		close(result)
 	}()
 	// Deliberately DO NOT Release(id): it is the subscription's canonical
 	// (client-facing) id, still referenced by the broker's SubscriptionManager
 	// after the migration. Releasing it would let a later subscription draw
 	// the same id and overwrite the migrated subscription's SM maps.
-	return result
+	return confirmation.result
+}
+
+func (u *UpstreamConnManagerCosmos) confirmIfResubmitsSkipped(param string, confirmation *wsCleanupConfirmation, epochs []*wsResubmitEpoch) {
+	if len(epochs) == 0 {
+		return
+	}
+	go func() {
+		for _, epoch := range epochs {
+			<-epoch.done
+			if _, attempted := epoch.params[param]; attempted {
+				return
+			}
+		}
+		u.finishMigrationCleanup(param, confirmation, nil)
+	}()
+}
+
+func (u *UpstreamConnManagerCosmos) finishMigrationCleanup(param string, confirmation *wsCleanupConfirmation, err error) {
+	u.subMux.Lock()
+	if u.migrationCleanups[param] == confirmation {
+		delete(u.migrationCleanups, param)
+	}
+	u.subMux.Unlock()
+	confirmation.complete(err)
 }
 
 func validateCosmosUnsubscribeResponse(response *JsonRpcMsg) error {
@@ -543,6 +603,12 @@ func (u *UpstreamConnManagerCosmos) Stop() {
 }
 
 func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
+	epoch := u.beginResubmit()
+	return u.reSubmitSubscriptionsOnClientEpoch(cli, epoch)
+}
+
+func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClientEpoch(cli *JsonRpcWsClient, epoch *wsResubmitEpoch) error {
+	defer u.finishResubmit(epoch)
 	// Snapshot under subMux so we don't range over the map while
 	// subscribeWithID writes to it (which would also deadlock once
 	// subscribeWithID started taking subMux).
@@ -550,6 +616,7 @@ func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWs
 	pending := make(map[string]string, len(u.subByParam))
 	for param, id := range u.subByParam {
 		pending[param] = id
+		epoch.params[param] = struct{}{}
 	}
 	u.subMux.Unlock()
 
@@ -567,4 +634,22 @@ func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWs
 		}
 	}
 	return nil
+}
+
+func (u *UpstreamConnManagerCosmos) beginResubmit() *wsResubmitEpoch {
+	epoch := newWSResubmitEpoch()
+	u.subMux.Lock()
+	if u.resubmitEpochs == nil {
+		u.resubmitEpochs = make(map[*wsResubmitEpoch]struct{})
+	}
+	u.resubmitEpochs[epoch] = struct{}{}
+	u.subMux.Unlock()
+	return epoch
+}
+
+func (u *UpstreamConnManagerCosmos) finishResubmit(epoch *wsResubmitEpoch) {
+	u.subMux.Lock()
+	delete(u.resubmitEpochs, epoch)
+	close(epoch.done)
+	u.subMux.Unlock()
 }

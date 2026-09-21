@@ -431,6 +431,8 @@ func (p *JsonRpcWebSocketProxy) StatsSnapshot() WSSectionStats {
 		UpstreamConnsHealthy:  healthy,
 		UpstreamConnsTotal:    len(ups),
 		Limits:                p.admission.Limits(),
+		LimitsAvailable:       true,
+		LimitsConsistent:      true,
 		Conns:                 conns,
 		Subs:                  subs,
 		Upstreams:             ups,
@@ -567,11 +569,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				var err error
 				storeResponse := cacheable
 				if hasSubscriptionMethod(request) {
-					identityName := ""
-					if identity != nil {
-						identityName = identity.Name
-					}
-					res, err = p.broker.HandleSubscription(client, request, identityName)
+					res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
 					if err != nil {
 						return err
 					}
@@ -672,11 +670,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 		var res *JsonRpcMsg
 		var err error
 		if hasSubscriptionMethod(request) {
-			identityName := ""
-			if identity != nil {
-				identityName = identity.Name
-			}
-			res, err = p.broker.HandleSubscription(client, request, identityName)
+			res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
 			if err != nil {
 				return err
 			}
@@ -713,6 +707,13 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 	p.recordOutcome(request, source, cacheMiss, string(defaultActionSnap), nil, startTime,
 		fmt.Sprintf("request %s", defaultActionSnap))
 	return nil
+}
+
+func websocketAdmissionIdentity(identity *Identity) string {
+	if identity == nil || identity.Method == "anonymous" || identity.Degraded {
+		return ""
+	}
+	return identity.Name
 }
 
 func wsResponseShareable(res *JsonRpcMsg, cache *RuleCache) bool {

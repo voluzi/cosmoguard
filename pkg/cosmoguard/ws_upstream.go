@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -31,26 +32,84 @@ var (
 	ErrSubscriptionExists = errors.New("subscription already exists")
 )
 
+type wsCleanupConfirmation struct {
+	once   sync.Once
+	result chan error
+}
+
+type wsResubmitEpoch struct {
+	done   chan struct{}
+	params map[string]struct{}
+}
+
+func newWSResubmitEpoch() *wsResubmitEpoch {
+	return &wsResubmitEpoch{done: make(chan struct{}), params: make(map[string]struct{})}
+}
+
+func newWSCleanupConfirmation() *wsCleanupConfirmation {
+	return &wsCleanupConfirmation{result: make(chan error, 1)}
+}
+
+func (c *wsCleanupConfirmation) complete(err error) {
+	c.once.Do(func() {
+		c.result <- err
+		close(c.result)
+	})
+}
+
 // uncertainWSUpstreamOutcomeError means a request may have reached the
 // upstream even though its caller did not receive a usable acknowledgement.
 // Unwrap preserves errors.Is/errors.As checks for the original cause.
 type uncertainWSUpstreamOutcomeError struct {
-	cause error
+	cause   error
+	settled <-chan struct{}
 }
 
 func (e *uncertainWSUpstreamOutcomeError) Error() string { return e.cause.Error() }
 func (e *uncertainWSUpstreamOutcomeError) Unwrap() error { return e.cause }
 
 func uncertainWSUpstreamOutcome(err error) error {
+	return uncertainWSUpstreamOutcomeUntil(err, nil)
+}
+
+func uncertainWSUpstreamOutcomeUntil(err error, settled <-chan struct{}) error {
 	if err == nil || isUncertainWSUpstreamOutcome(err) {
 		return err
 	}
-	return &uncertainWSUpstreamOutcomeError{cause: err}
+	return &uncertainWSUpstreamOutcomeError{cause: err, settled: settled}
 }
 
 func isUncertainWSUpstreamOutcome(err error) bool {
 	var uncertain *uncertainWSUpstreamOutcomeError
 	return errors.As(err, &uncertain)
+}
+
+func uncertainWSUpstreamOutcomeSettlement(err error) <-chan struct{} {
+	var uncertain *uncertainWSUpstreamOutcomeError
+	if !errors.As(err, &uncertain) {
+		return nil
+	}
+	return uncertain.settled
+}
+
+func releaseWSRequestID(idGen *util.UniqueID, id string, err error) {
+	if !isUncertainWSUpstreamOutcome(err) {
+		idGen.Release(id)
+		return
+	}
+	settled := uncertainWSUpstreamOutcomeSettlement(err)
+	if settled == nil {
+		return
+	}
+	select {
+	case <-settled:
+		idGen.Release(id)
+	default:
+		go func() {
+			<-settled
+			idGen.Release(id)
+		}()
+	}
 }
 
 func validateWSJSONRPCResponse(method string, response *JsonRpcMsg) error {
@@ -59,6 +118,9 @@ func validateWSJSONRPCResponse(method string, response *JsonRpcMsg) error {
 	}
 	if response.Error != nil {
 		return fmt.Errorf("upstream %s rejected request with code %d: %s", method, response.Error.Code, response.Error.Message)
+	}
+	if response.IsEmptyResult() {
+		return fmt.Errorf("upstream %s returned a missing result", method)
 	}
 	return nil
 }

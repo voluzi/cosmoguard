@@ -245,6 +245,9 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 
 	id, exists := b.sm.GetSubscriptionID(param)
 	if exists && b.sm.ClientSubscribed(id, client) {
+		if msg.Method == methodSubscribeCosmos && msg.ID != nil {
+			b.sm.SubscribeClient(id, client, msg.ID)
+		}
 		return id, nil
 	}
 	identityName := ""
@@ -304,6 +307,7 @@ func (b *Broker) removeEmptySubscriptionLocked(id string) error {
 	}
 	upstreamID, _ := b.sm.UpstreamID(id)
 	if err := b.pool.Unsubscribe(upstreamID); err != nil {
+		b.forgetSettlingSubscription(id, err)
 		return err
 	}
 	b.sm.RemoveSubscription(id)
@@ -347,6 +351,7 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		// from the canonical subID after a migration.
 		upstreamID, _ := b.sm.UpstreamID(subID)
 		if err = b.pool.Unsubscribe(upstreamID); err != nil {
+			b.forgetSettlingSubscription(subID, err)
 			return err
 		}
 		param, _ := b.sm.GetSubscriptionParam(subID)
@@ -388,6 +393,7 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 			// pool.Unsubscribe keys on the CURRENT upstream id (post-migration).
 			upstreamID, _ := b.sm.UpstreamID(subscriptionID)
 			if err := b.pool.Unsubscribe(upstreamID); err != nil {
+				b.forgetSettlingSubscription(subscriptionID, err)
 				errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
 				continue
 			}
@@ -402,6 +408,12 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (b *Broker) forgetSettlingSubscription(id string, err error) {
+	if isUncertainWSUpstreamOutcome(err) && uncertainWSUpstreamOutcomeSettlement(err) != nil {
+		b.sm.RemoveSubscription(id)
+	}
 }
 
 func (b *Broker) onSubscriptionMessage(msg *JsonRpcMsg) {

@@ -32,8 +32,10 @@ type UpstreamConnManagerEth struct {
 	// migratedAway tombstones params LocalUnsubscribe removed due to a pool
 	// migration, so a concurrent reconnect-resubmit can't resurrect them —
 	// see the Cosmos impl for the full race. Guarded by subMux.
-	migratedAway map[string]struct{}
-	subMux       sync.Mutex
+	migratedAway      map[string]struct{}
+	migrationCleanups map[string]*wsCleanupConfirmation
+	resubmitEpochs    map[*wsResubmitEpoch]struct{}
+	subMux            sync.Mutex
 
 	// failedReconnects — consecutive dial failures; see Cosmos impl.
 	failedReconnects atomic.Int32
@@ -70,6 +72,8 @@ func EthUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMes
 		subByParam:            make(map[string]string),
 		subByID:               make(map[string]string),
 		migratedAway:          make(map[string]struct{}),
+		migrationCleanups:     make(map[string]*wsCleanupConfirmation),
+		resubmitEpochs:        make(map[*wsResubmitEpoch]struct{}),
 		respMap:               make(map[string]chan *JsonRpcMsg),
 		onSubscriptionMessage: onSubscriptionMessage,
 	}
@@ -107,12 +111,13 @@ func (u *UpstreamConnManagerEth) Run(log *Entry) error {
 			cli = u.curClient()
 			// See cosmos manager: resubmit must run off Run so it can
 			// read its own subscribe response.
-			go func(cli *JsonRpcWsClient) {
-				if err := u.reSubmitSubscriptionsOnClient(cli); err != nil {
+			epoch := u.beginResubmit()
+			go func(cli *JsonRpcWsClient, epoch *wsResubmitEpoch) {
+				if err := u.reSubmitSubscriptionsOnClientEpoch(cli, epoch); err != nil {
 					u.log.Errorf("error re-submitting subscriptions: %v", err)
 					_ = cli.Close()
 				}
-			}(cli)
+			}(cli, epoch)
 		}
 		if cli == nil {
 			continue
@@ -261,7 +266,8 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 		u.respMux.Unlock()
 		var writeErr *wsWriteError
 		if errors.As(err, &writeErr) {
-			return nil, uncertainWSUpstreamOutcome(err)
+			_ = cli.Close()
+			return nil, uncertainWSUpstreamOutcomeUntil(err, cli.Closed())
 		}
 		return nil, err
 	}
@@ -284,22 +290,23 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
-		return nil, uncertainWSUpstreamOutcome(ErrClosed)
+		return nil, uncertainWSUpstreamOutcomeUntil(ErrClosed, cli.Closed())
 
 	case <-timeout.C:
 		u.respMux.Lock()
 		delete(u.respMap, id)
 		u.respMux.Unlock()
 
-		return nil, uncertainWSUpstreamOutcome(fmt.Errorf("timeout waiting for response for request with ID %s", id))
+		return nil, uncertainWSUpstreamOutcomeUntil(fmt.Errorf("timeout waiting for response for request with ID %s", id), cli.Closed())
 	}
 }
 
 func (u *UpstreamConnManagerEth) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, error) {
 	// Generate unique ID for request
 	ID := u.IdGen.ID()
-	defer u.IdGen.Release(ID)
-	return u.makeRequestWithID(ID, req)
+	response, err := u.makeRequestWithID(ID, req)
+	releaseWSRequestID(u.IdGen, ID, err)
+	return response, err
 }
 
 func (u *UpstreamConnManagerEth) HasSubscription(subID string) bool {
@@ -330,8 +337,6 @@ func (u *UpstreamConnManagerEth) subscribeWithID(id string, param string) (strin
 // migrated away mid-flight, the commit is aborted and the freshly-created
 // upstream subscription is torn down — see migratedAway.
 func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) (string, error) {
-	defer u.IdGen.Release(id)
-
 	// Send subscribe request
 	msg := &JsonRpcMsg{
 		Version: jsonRpcVersion,
@@ -342,9 +347,11 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 
 	resp, err := u.makeRequestWithIDOnClient(cli, id, msg)
 	if err != nil {
+		releaseWSRequestID(u.IdGen, id, err)
 		return "", err
 	}
 	if err := validateWSJSONRPCResponse(methodSubscribeEth, resp); err != nil {
+		u.IdGen.Release(id)
 		return "", err
 	}
 
@@ -353,12 +360,16 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 	// string carrying the subscription ID — decode it.
 	var subID string
 	if err := json.Unmarshal(resp.Result, &subID); err != nil {
-		return "", uncertainWSUpstreamOutcome(fmt.Errorf("decode subscription ID %q: %w", string(resp.Result), err))
+		outcome := uncertainWSUpstreamOutcomeUntil(fmt.Errorf("decode subscription ID %q: %w", string(resp.Result), err), cli.Closed())
+		releaseWSRequestID(u.IdGen, id, outcome)
+		return "", outcome
 	}
+	u.IdGen.Release(id)
 
 	u.subMux.Lock()
 	if resubmit {
 		if _, migrated := u.migratedAway[param]; migrated {
+			confirmation := u.migrationCleanups[param]
 			// Migrated onto another conn while we re-subscribed. Don't
 			// re-track it (would be a duplicate); best-effort eth_unsubscribe
 			// the id we just minted so the upstream stops pushing on it.
@@ -372,12 +383,18 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 			// it after the round-trip so repeated races don't exhaust the id
 			// space.
 			cleanupID := u.IdGen.ID()
-			_, _ = u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
+			response, cleanupErr := u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
 				Version: jsonRpcVersion,
 				Method:  methodUnsubscribeEth,
 				Params:  []string{subID},
 			})
-			u.IdGen.Release(cleanupID)
+			if cleanupErr == nil {
+				cleanupErr = validateEthUnsubscribeResponse(response)
+			}
+			releaseWSRequestID(u.IdGen, cleanupID, cleanupErr)
+			if cleanupErr == nil && confirmation != nil {
+				u.finishMigrationCleanup(param, confirmation, nil)
+			}
 			return subID, nil
 		}
 	} else {
@@ -397,6 +414,9 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 }
 
 func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
+	u.subMux.Lock()
+	pendingParam, tracked := u.subByID[id]
+	u.subMux.Unlock()
 	msg := &JsonRpcMsg{
 		Version: jsonRpcVersion,
 		Method:  methodUnsubscribeEth,
@@ -405,6 +425,13 @@ func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
 
 	response, err := u.MakeRequest(msg)
 	if err != nil {
+		if tracked && isUncertainWSUpstreamOutcome(err) {
+			u.subMux.Lock()
+			delete(u.subByID, id)
+			delete(u.subByParam, pendingParam)
+			u.migratedAway[pendingParam] = struct{}{}
+			u.subMux.Unlock()
+		}
 		return err
 	}
 	if err := validateEthUnsubscribeResponse(response); err != nil {
@@ -444,19 +471,28 @@ func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) <-chan error {
 		delete(u.subByParam, param)
 		delete(u.subByID, id)
 	}
+	if u.migrationCleanups == nil {
+		u.migrationCleanups = make(map[string]*wsCleanupConfirmation)
+	}
+	confirmation := newWSCleanupConfirmation()
+	u.migrationCleanups[param] = confirmation
+	epochs := make([]*wsResubmitEpoch, 0, len(u.resubmitEpochs))
+	for epoch := range u.resubmitEpochs {
+		epochs = append(epochs, epoch)
+	}
 	u.subMux.Unlock()
 	cli := u.curClient()
 	if cli == nil || cli.IsClosed() {
+		u.finishMigrationCleanup(param, confirmation, nil)
 		return nil
 	}
-	result := make(chan error, 1)
+	go func() {
+		<-cli.Closed()
+		u.finishMigrationCleanup(param, confirmation, nil)
+	}()
+	u.confirmIfResubmitsSkipped(param, confirmation, epochs)
 	if !ok {
-		go func() {
-			<-cli.Closed()
-			result <- nil
-			close(result)
-		}()
-		return result
+		return confirmation.result
 	}
 	go func() {
 		requestID := u.IdGen.ID()
@@ -465,17 +501,39 @@ func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) <-chan error {
 			Method:  methodUnsubscribeEth,
 			Params:  []string{id},
 		})
-		u.IdGen.Release(requestID)
+		releaseWSRequestID(u.IdGen, requestID, err)
 		if err == nil {
 			err = validateEthUnsubscribeResponse(response)
 		}
-		if err != nil && !errors.Is(err, ErrClosed) {
-			<-cli.Closed()
+		if err == nil {
+			u.finishMigrationCleanup(param, confirmation, nil)
 		}
-		result <- nil
-		close(result)
 	}()
-	return result
+	return confirmation.result
+}
+
+func (u *UpstreamConnManagerEth) confirmIfResubmitsSkipped(param string, confirmation *wsCleanupConfirmation, epochs []*wsResubmitEpoch) {
+	if len(epochs) == 0 {
+		return
+	}
+	go func() {
+		for _, epoch := range epochs {
+			<-epoch.done
+			if _, attempted := epoch.params[param]; attempted {
+				return
+			}
+		}
+		u.finishMigrationCleanup(param, confirmation, nil)
+	}()
+}
+
+func (u *UpstreamConnManagerEth) finishMigrationCleanup(param string, confirmation *wsCleanupConfirmation, err error) {
+	u.subMux.Lock()
+	if u.migrationCleanups[param] == confirmation {
+		delete(u.migrationCleanups, param)
+	}
+	u.subMux.Unlock()
+	confirmation.complete(err)
 }
 
 func validateEthUnsubscribeResponse(response *JsonRpcMsg) error {
@@ -512,6 +570,12 @@ func (u *UpstreamConnManagerEth) resetConnectionState() {
 }
 
 func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
+	epoch := u.beginResubmit()
+	return u.reSubmitSubscriptionsOnClientEpoch(cli, epoch)
+}
+
+func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClientEpoch(cli *JsonRpcWsClient, epoch *wsResubmitEpoch) error {
+	defer u.finishResubmit(epoch)
 	// Snapshot under subMux so we don't range over the map while
 	// subscribeWithIDOnClient writes to it. subByParam survived the
 	// reconnect (see resetConnectionState); each param is re-issued on
@@ -521,6 +585,7 @@ func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsCli
 	pending := make([]string, 0, len(u.subByParam))
 	for param := range u.subByParam {
 		pending = append(pending, param)
+		epoch.params[param] = struct{}{}
 	}
 	u.subMux.Unlock()
 
@@ -538,6 +603,24 @@ func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsCli
 		}
 	}
 	return nil
+}
+
+func (u *UpstreamConnManagerEth) beginResubmit() *wsResubmitEpoch {
+	epoch := newWSResubmitEpoch()
+	u.subMux.Lock()
+	if u.resubmitEpochs == nil {
+		u.resubmitEpochs = make(map[*wsResubmitEpoch]struct{})
+	}
+	u.resubmitEpochs[epoch] = struct{}{}
+	u.subMux.Unlock()
+	return epoch
+}
+
+func (u *UpstreamConnManagerEth) finishResubmit(epoch *wsResubmitEpoch) {
+	u.subMux.Lock()
+	delete(u.resubmitEpochs, epoch)
+	close(epoch.done)
+	u.subMux.Unlock()
 }
 
 // IsHealthy mirrors the Cosmos manager's check: nil/closed client →
