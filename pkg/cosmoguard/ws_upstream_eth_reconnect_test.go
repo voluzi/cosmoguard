@@ -1,60 +1,85 @@
 package cosmoguard
 
 import (
-	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
+	"gotest.tools/assert"
 )
 
-// TestEthResetConnectionState_PreservesSubByParam is the regression test
-// for the EVM WS reconnect subscription-loss bug: the reconnect reset
-// must clear the connection-scoped maps (subByID, respMap) but PRESERVE
-// subByParam, which reSubmitSubscriptionsOnClient reads to know what to
-// re-issue on the new connection. The old resetAll wiped subByParam, so
-// client subscriptions were silently never re-established.
-func TestEthResetConnectionState_PreservesSubByParam(t *testing.T) {
-	u, _ := url.Parse("ws://127.0.0.1:0/")
-	mgr := EthUpstreamConnManager(*u, &util.UniqueID{}, func(*JsonRpcMsg) {}).(*UpstreamConnManagerEth)
+func TestEthRunReconnectReplaysEverySubscriptionAndScopesResponses(t *testing.T) {
+	backend := newLifecycleRunBackend(t)
+	replayed := make(chan struct{}, 2)
+	notifications := make(chan *JsonRpcMsg, 2)
+	manager := EthUpstreamConnManager(backend.wsURL(t), &util.UniqueID{}, func(msg *JsonRpcMsg) {
+		notifications <- msg
+	}).(*UpstreamConnManagerEth)
+	manager.afterResubmit = func() { replayed <- struct{}{} }
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(log.WithField("test", t.Name())) }()
+	t.Cleanup(func() {
+		manager.Stop()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("manager Run did not stop")
+		}
+	})
 
-	// Simulate an established subscription before the connection drops.
-	mgr.subByParam["newHeads"] = "0xold"
-	mgr.subByID["0xold"] = "newHeads"
-	mgr.respMap["req-1"] = make(chan *JsonRpcMsg, 1)
-
-	mgr.resetConnectionState()
-
-	if _, ok := mgr.subByParam["newHeads"]; !ok {
-		t.Fatal("subByParam must survive reconnect so the subscription is re-issued")
+	connA := backend.nextConn(t)
+	mustWait(t, replayed, "initial replay pass")
+	logicalByParam := make(map[string]string)
+	for _, param := range []string{"newHeads", "logs"} {
+		created := startSubscribe(manager, param)
+		request := connA.nextRequest(t)
+		connA.respond(t, WithResult(request, "wire-a-"+param))
+		result := mustRecv(t, created, param+" subscribe result")
+		assert.NilError(t, result.err)
+		logicalByParam[param] = result.id
 	}
-	if len(mgr.subByID) != 0 {
-		t.Fatalf("subByID (connection-scoped upstream ids) must be cleared, got %v", mgr.subByID)
-	}
-	if len(mgr.respMap) != 0 {
-		t.Fatalf("respMap (in-flight on dead conn) must be cleared, got %d entries", len(mgr.respMap))
-	}
-}
+	oldClient := manager.curClient()
 
-// TestEthReSubmitPendingFromSubByParam confirms reSubmitSubscriptionsOnClient
-// derives its work-list from the preserved subByParam — i.e. after a
-// reset that keeps subByParam, every param is still pending re-issue
-// (the previous HasSubscription skip would have dropped them all).
-func TestEthReSubmitPendingFromSubByParam(t *testing.T) {
-	u, _ := url.Parse("ws://127.0.0.1:0/")
-	mgr := EthUpstreamConnManager(*u, &util.UniqueID{}, func(*JsonRpcMsg) {}).(*UpstreamConnManagerEth)
-	mgr.subByParam["newHeads"] = "0xold"
-	mgr.subByParam["logs"] = "0xold2"
-	mgr.resetConnectionState()
-
-	// Mirror the snapshot logic of reSubmitSubscriptionsOnClient.
-	mgr.subMux.Lock()
-	pending := make([]string, 0, len(mgr.subByParam))
-	for p := range mgr.subByParam {
-		pending = append(pending, p)
+	assert.NilError(t, connA.close())
+	connB := backend.nextConn(t)
+	wireByParam := make(map[string]string)
+	for range 2 {
+		request := connB.nextRequest(t)
+		params := request.Params.([]any)
+		param := params[0].(string)
+		wireByParam[param] = "wire-b-" + param
+		connB.respond(t, WithResult(request, wireByParam[param]))
 	}
-	mgr.subMux.Unlock()
+	mustWait(t, replayed, "reconnect replay pass")
+	assert.Assert(t, manager.HasSubscription("newHeads"))
+	assert.Assert(t, manager.HasSubscription("logs"))
 
-	if len(pending) != 2 {
-		t.Fatalf("expected both params pending re-subscribe after reset, got %v", pending)
+	rpcResult := make(chan *JsonRpcMsg, 1)
+	rpcErr := make(chan error, 1)
+	go func() {
+		response, err := manager.MakeRequest(&JsonRpcMsg{Version: jsonRpcVersion, Method: "status"})
+		rpcResult <- response
+		rpcErr <- err
+	}()
+	rpcRequest := connB.nextRequest(t)
+	manager.onUpstreamMessage(oldClient, WithResult(rpcRequest, map[string]any{"socket": "old"}))
+	assert.Equal(t, managerResponseCount(manager), 1, "old socket response must not consume the replacement waiter")
+	connB.respond(t, WithResult(rpcRequest, map[string]any{"socket": "current"}))
+	assert.NilError(t, mustRecv(t, rpcErr, "ordinary RPC error"))
+	response := mustRecv(t, rpcResult, "ordinary RPC response")
+	assert.Assert(t, response != nil)
+	assert.Assert(t, strings.Contains(string(response.Result), "current"))
+
+	for _, param := range []string{"newHeads", "logs"} {
+		connB.respond(t, &JsonRpcMsg{Version: jsonRpcVersion, Params: map[string]any{
+			"subscription": wireByParam[param], "result": param,
+		}})
 	}
+	routed := map[any]bool{}
+	for range 2 {
+		routed[mustRecv(t, notifications, "replayed subscription notification").ID] = true
+	}
+	assert.Assert(t, routed[logicalByParam["newHeads"]])
+	assert.Assert(t, routed[logicalByParam["logs"]])
 }

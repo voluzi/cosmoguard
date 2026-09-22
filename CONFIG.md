@@ -48,6 +48,11 @@ server:
   idleTimeout: 60s          # keep-alive idle timeout
   maxRequestBody: 5242880   # bytes; requests exceeding this return 413 (0 = no limit)
   wsReadLimit: 1048576      # max bytes per inbound WebSocket frame (0 = no limit)
+  websocketLimits:          # process-local; explicit 0 disables one limit
+    maxSubscriptionsPerClient: 32
+    maxSubscriptionsPerIdentity: 128
+    maxSubscriptionsPerUpstreamConnection: 10
+    maxConnectionsPerIP: 16
   wsAllowedOrigins:         # cross-origin WS upgrade allowlist
     - https://app.example.com
     - https://*.preview.example.com
@@ -59,12 +64,16 @@ server:
 
 `trustedProxies` must contain only load balancers and ingress proxies under your control. CosmoGuard walks `X-Forwarded-For` from right to left across those trusted hops and selects the first untrusted address as the client, so prefixes supplied by the client are ignored. `X-Real-IP` is used only when no `X-Forwarded-For` header is present; a proxy relying on it must overwrite any client-supplied value. Leave the list empty when CosmoGuard is exposed directly, and never use `0.0.0.0/0` or `::/0` in production.
 
+WebSocket admission limits are local to each CosmoGuard process, not distributed across replicas. The client limit applies to one downstream socket, the identity limit uses the authenticated `Identity.Name` and is shared across the RPC and EVM WebSocket endpoints, and the upstream limit applies to each upstream connection. Anonymous clients do not consume identity quota, but remain subject to the client and source-IP limits. A connection rejected by the source-IP limit receives HTTP 429; an established connection rejected while subscribing receives JSON-RPC `-32005`.
+
+By default, each enabled protocol pool has 40 upstream WebSocket connections with 10 distinct upstream subscriptions per connection, for 400 nominal slots per RPC or EVM pool. The 40 connections are shared across that protocol's configured backends, not allocated per backend. This is local admission capacity with healthy upstreams that accept every connection and subscription, not a guarantee imposed on an upstream service. Downstream quotas still apply before that capacity: for example, 100 distinct subscriptions under one authenticated identity require at least four clients because each client is limited to 32, while the identity is limited to 128. Joining an already deduplicated upstream subscription still consumes downstream client and identity quota. Existing explicit smaller values remain unchanged, and changing these startup-captured settings requires a process restart.
+
 **Default changes since v4.0.0-rc.1** (all restore v3-compatible behaviour that the rc.1 defaults broke):
 - `writeTimeout` now defaults to **0 (no limit)**. A fixed deadline truncated large/slow streamed responses (`/block_results`, `/genesis`, big `eth_getLogs`) mid-body. Set an explicit ceiling if exposing cosmoguard to untrusted clients.
 - `maxRequestBody` default raised from 1 MiB to **5 MiB** so large payloads (e.g. a wasm `MsgStoreCode` broadcast) aren't rejected with 413.
 - `wsReadLimit` default raised from 64 KiB to **1 MiB**, and an explicit `0` now means "no limit" (as documented) instead of being silently forced to 64 KiB. Large frames (e.g. a big `eth_sendRawTransaction`) are no longer dropped.
 
-**Hot-reload:** `server:` timeouts / body caps, `cors:`, and dashboard `enable`/`port`/`basicAuth` are captured at startup and now **reject** a reload that changes them (with a clear "requires a process restart" message) instead of silently accepting a change that never takes effect. `dashboard.requestLog` and `server.trustedProxies` still hot-reload.
+**Hot-reload:** `server:` timeouts / body caps / WebSocket limits, `cors:`, and dashboard `enable`/`port`/`basicAuth` are captured at startup and now **reject** a reload that changes them (with a clear "requires a process restart" message) instead of silently accepting a change that never takes effect. `dashboard.requestLog` and `server.trustedProxies` still hot-reload.
 
 ---
 
@@ -476,7 +485,7 @@ lcd:
 rpc:
   default: deny
   webSocketEnabled: true
-  webSocketConnections: 10           # total WS conns across all backends; spread evenly
+  webSocketConnections: 40           # total WS conns across all backends; spread evenly
   rules: [ ... ]                     # HTTP rules
   jsonrpc:
     default: deny
@@ -494,7 +503,7 @@ evm:                                 # only when enableEvm: true
     httpRules: [ ... ]               # HTTP rules
   ws:
     default: deny
-    webSocketConnections: 10
+    webSocketConnections: 40
     rules: [ ... ]                   # JSON-RPC rules
 ```
 

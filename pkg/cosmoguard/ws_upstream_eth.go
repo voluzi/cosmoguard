@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,24 +17,23 @@ import (
 )
 
 type UpstreamConnManagerEth struct {
-	clientMu sync.RWMutex
-	client   *JsonRpcWsClient
-	url      url.URL
-	dialer   *websocket.Dialer
-	log      *Entry
-	IdGen    *util.UniqueID
+	url            url.URL
+	dialer         *websocket.Dialer
+	log            *Entry
+	IdGen          *util.UniqueID
+	lifecycle      *wsSubscriptionLifecycle
+	requestIDs     wsInternalRequestIDs
+	requestTimeout time.Duration
 
-	respMap map[string]chan *JsonRpcMsg
+	respMap map[wsResponseKey]chan *JsonRpcMsg
 	respMux sync.Mutex
 
 	onSubscriptionMessage func(msg *JsonRpcMsg)
-	subByID               map[string]string
-	subByParam            map[string]string
-	// migratedAway tombstones params LocalUnsubscribe removed due to a pool
-	// migration, so a concurrent reconnect-resubmit can't resurrect them —
-	// see the Cosmos impl for the full race. Guarded by subMux.
-	migratedAway map[string]struct{}
-	subMux       sync.Mutex
+
+	beforeUnsubscribeCommit func()
+	beforeInstall           func(*JsonRpcWsClient)
+	afterInstall            func(*JsonRpcWsClient)
+	afterResubmit           func()
 
 	// failedReconnects — consecutive dial failures; see Cosmos impl.
 	failedReconnects atomic.Int32
@@ -41,10 +41,39 @@ type UpstreamConnManagerEth struct {
 	// Lifecycle — see Cosmos impl for shape. stopCh closes on Stop()
 	// so the reconnect-backoff sleep wakes immediately; lazily
 	// allocated to keep direct-literal construction safe.
-	stopped  atomic.Bool
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	initOnce sync.Once
+	stopped   atomic.Bool
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	initOnce  sync.Once
+	stateOnce sync.Once
+}
+
+func (u *UpstreamConnManagerEth) initState() {
+	u.stateOnce.Do(func() {
+		if u.lifecycle == nil {
+			u.lifecycle = newWSSubscriptionLifecycle()
+		}
+		if u.IdGen == nil {
+			u.IdGen = &util.UniqueID{}
+		}
+		if u.respMap == nil {
+			u.respMap = make(map[wsResponseKey]chan *JsonRpcMsg)
+		}
+		if u.dialer == nil {
+			u.dialer = &websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: connectTimeout}
+		}
+		if u.log == nil {
+			u.log = log
+		}
+		if u.onSubscriptionMessage == nil {
+			u.onSubscriptionMessage = func(*JsonRpcMsg) {}
+		}
+	})
+}
+
+func (u *UpstreamConnManagerEth) subscriptionLifecycle() *wsSubscriptionLifecycle {
+	u.initState()
+	return u.lifecycle
 }
 
 func (u *UpstreamConnManagerEth) initStopCh() {
@@ -54,9 +83,7 @@ func (u *UpstreamConnManagerEth) initStopCh() {
 }
 
 func (u *UpstreamConnManagerEth) curClient() *JsonRpcWsClient {
-	u.clientMu.RLock()
-	defer u.clientMu.RUnlock()
-	return u.client
+	return u.subscriptionLifecycle().currentClient()
 }
 
 func EthUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMessage func(msg *JsonRpcMsg)) UpstreamConnManager {
@@ -67,15 +94,14 @@ func EthUpstreamConnManager(url url.URL, idGen *util.UniqueID, onSubscriptionMes
 			HandshakeTimeout: connectTimeout,
 		},
 		IdGen:                 idGen,
-		subByParam:            make(map[string]string),
-		subByID:               make(map[string]string),
-		migratedAway:          make(map[string]struct{}),
-		respMap:               make(map[string]chan *JsonRpcMsg),
+		lifecycle:             newWSSubscriptionLifecycle(),
+		respMap:               make(map[wsResponseKey]chan *JsonRpcMsg),
 		onSubscriptionMessage: onSubscriptionMessage,
 	}
 }
 
 func (u *UpstreamConnManagerEth) Run(log *Entry) error {
+	u.initState()
 	u.log = log
 	u.initStopCh()
 	for {
@@ -95,15 +121,6 @@ func (u *UpstreamConnManagerEth) Run(log *Entry) error {
 				continue
 			}
 			u.failedReconnects.Store(0)
-			// Reset only the per-connection response map. The
-			// subscription maps (subByParam / subByID) MUST survive the
-			// reconnect: reSubmitSubscriptionsOnClient reads subByParam to
-			// know what to re-issue. Wiping them here (the old resetAll)
-			// left an empty map, so client subscriptions were silently
-			// never re-established after an EVM WS reconnect. The new
-			// upstream subscription IDs are rewritten into subByID as each
-			// param is re-subscribed below.
-			u.resetConnectionState()
 			cli = u.curClient()
 			// See cosmos manager: resubmit must run off Run so it can
 			// read its own subscribe response.
@@ -111,6 +128,8 @@ func (u *UpstreamConnManagerEth) Run(log *Entry) error {
 				if err := u.reSubmitSubscriptionsOnClient(cli); err != nil {
 					u.log.Errorf("error re-submitting subscriptions: %v", err)
 					_ = cli.Close()
+				} else if u.afterResubmit != nil {
+					u.afterResubmit()
 				}
 			}(cli)
 		}
@@ -132,7 +151,7 @@ func (u *UpstreamConnManagerEth) Run(log *Entry) error {
 			}
 			continue
 		}
-		u.onUpstreamMessage(msg)
+		u.onUpstreamMessage(cli, msg)
 	}
 }
 
@@ -145,14 +164,23 @@ func (u *UpstreamConnManagerEth) connect() error {
 		// default is unbounded. See upstreamWSReadLimit's doc comment
 		// in ws_upstream.go for the size rationale.
 		conn.SetReadLimit(upstreamWSReadLimit)
-		u.clientMu.Lock()
-		u.client = NewJsonRpcWsClient(conn)
-		u.clientMu.Unlock()
+		client := NewJsonRpcWsClient(conn)
+		if u.beforeInstall != nil {
+			u.beforeInstall(client)
+		}
+		if !u.subscriptionLifecycle().install(client) {
+			_ = client.Close()
+			return ErrClosed
+		}
+		if u.afterInstall != nil {
+			u.afterInstall(client)
+		}
 	}
 	return err
 }
 
-func (u *UpstreamConnManagerEth) onUpstreamMessage(msg *JsonRpcMsg) {
+func (u *UpstreamConnManagerEth) onUpstreamMessage(client *JsonRpcWsClient, msg *JsonRpcMsg) {
+	u.initState()
 	// Defence-in-depth: a single malformed/duplicate upstream frame must
 	// never take down the process. The Run goroutine that calls this has
 	// no recover of its own.
@@ -184,15 +212,13 @@ func (u *UpstreamConnManagerEth) onUpstreamMessage(msg *JsonRpcMsg) {
 			u.log.Errorf("dropped message from upstream: subscription ID is not a string")
 			return
 		}
-		msg.ID = subscriptionID
-		u.subMux.Lock()
-		query, ok := u.subByID[subscriptionID]
-		u.subMux.Unlock()
+		handle, ok := u.subscriptionLifecycle().route(client, subscriptionID)
 		if ok {
 			u.log.WithFields(map[string]interface{}{
-				"ID":    subscriptionID,
-				"query": query,
+				"ID": handle,
 			}).Debug("got message from subscription")
+			msg.ID = handle
+			params["subscription"] = handle
 			u.onSubscriptionMessage(msg)
 			return
 		}
@@ -215,9 +241,10 @@ func (u *UpstreamConnManagerEth) onUpstreamMessage(msg *JsonRpcMsg) {
 		// which would crash the whole process from this recover-less
 		// goroutine.
 		u.respMux.Lock()
-		wc, ok := u.respMap[msgID]
+		key := wsResponseKey{client: client, id: msgID}
+		wc, ok := u.respMap[key]
 		if ok {
-			delete(u.respMap, msgID)
+			delete(u.respMap, key)
 		}
 		u.respMux.Unlock()
 		if ok {
@@ -238,6 +265,7 @@ func (u *UpstreamConnManagerEth) makeRequestWithID(id string, req *JsonRpcMsg) (
 // makeRequestWithIDOnClient drives a single round-trip over an explicit
 // client. See cosmos counterpart.
 func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient, id string, req *JsonRpcMsg) (*JsonRpcMsg, error) {
+	u.initState()
 	request := req.CloneWithID(id)
 
 	if cli == nil || cli.IsClosed() {
@@ -246,9 +274,10 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 
 	// Create a buffered channel to prevent goroutine leak on timeout
 	respChan := make(chan *JsonRpcMsg, 1)
+	key := wsResponseKey{client: cli, id: id}
 
 	u.respMux.Lock()
-	u.respMap[id] = respChan
+	u.respMap[key] = respChan
 	u.respMux.Unlock()
 
 	u.log.WithFields(map[string]interface{}{
@@ -257,20 +286,25 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 	}).Debug("submitting request")
 	if err := cli.SendMsg(request); err != nil {
 		u.respMux.Lock()
-		delete(u.respMap, id)
+		delete(u.respMap, key)
 		u.respMux.Unlock()
+		var writeErr *wsWriteError
+		if errors.As(err, &writeErr) {
+			_ = cli.Close()
+			return nil, uncertainWSUpstreamOutcomeUntil(err, cli.Closed())
+		}
 		return nil, err
 	}
 
 	// Stoppable timer (not time.After) so the happy path frees the
 	// runtime timer slot immediately — see the matching comment in
 	// the cosmos variant.
-	timeout := time.NewTimer(responseTimeout)
+	timeout := time.NewTimer(effectiveWSResponseTimeout(u.requestTimeout))
 	defer timeout.Stop()
 	select {
 	case response := <-respChan:
 		u.respMux.Lock()
-		delete(u.respMap, id)
+		delete(u.respMap, key)
 		u.respMux.Unlock()
 
 		response.ID = req.ID
@@ -278,66 +312,58 @@ func (u *UpstreamConnManagerEth) makeRequestWithIDOnClient(cli *JsonRpcWsClient,
 
 	case <-cli.Closed():
 		u.respMux.Lock()
-		delete(u.respMap, id)
+		delete(u.respMap, key)
 		u.respMux.Unlock()
-		return nil, ErrClosed
+		return nil, uncertainWSUpstreamOutcomeUntil(ErrClosed, cli.Closed())
 
 	case <-timeout.C:
 		u.respMux.Lock()
-		delete(u.respMap, id)
+		delete(u.respMap, key)
 		u.respMux.Unlock()
 
-		return nil, fmt.Errorf("timeout waiting for response for request with ID %s", id)
+		return nil, uncertainWSUpstreamOutcomeUntil(fmt.Errorf("timeout waiting for response for request with ID %s", id), cli.Closed())
 	}
 }
 
 func (u *UpstreamConnManagerEth) MakeRequest(req *JsonRpcMsg) (*JsonRpcMsg, error) {
-	// Generate unique ID for request
-	ID := u.IdGen.ID()
-	defer u.IdGen.Release(ID)
-	return u.makeRequestWithID(ID, req)
+	return u.makeRequestWithID(u.requestIDs.next(), req)
 }
 
 func (u *UpstreamConnManagerEth) HasSubscription(subID string) bool {
-	u.subMux.Lock()
-	defer u.subMux.Unlock()
-	_, ok := u.subByParam[subID]
-	return ok
+	return u.subscriptionLifecycle().hasParam(subID)
 }
 
 func (u *UpstreamConnManagerEth) Subscribe(query string) (string, error) {
-	// Check if this is already subscribed
-	if u.HasSubscription(query) {
-		return "", ErrSubscriptionExists
-	}
-
-	// Generate unique ID for subscription
-	ID := u.IdGen.ID()
-	return u.subscribeWithID(ID, query)
+	u.initState()
+	id := u.IdGen.ID()
+	return u.subscriptionLifecycle().subscribe(query, id, u.curClient(), u)
 }
 
-func (u *UpstreamConnManagerEth) subscribeWithID(id string, param string) (string, error) {
-	return u.subscribeWithIDOnClient(u.curClient(), id, param, false)
-}
-
-// subscribeWithIDOnClient binds the subscribe round-trip to an explicit
-// client so the resubmit-after-reconnect path can't get redirected to a
-// new connection mid-flight. When resubmit is true and the param was
-// migrated away mid-flight, the commit is aborted and the freshly-created
-// upstream subscription is torn down — see migratedAway.
 func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) (string, error) {
-	defer u.IdGen.Release(id)
+	if resubmit {
+		record := u.subscriptionLifecycle().lookupParam(param)
+		if record == nil {
+			return "", nil
+		}
+		return record.handle, u.subscriptionLifecycle().resubmitRecord(cli, record, u)
+	}
+	return u.subscriptionLifecycle().subscribe(param, id, cli, u)
+}
 
-	// Send subscribe request
+func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param string, _ bool) (string, error) {
+	requestID := u.requestIDs.next()
 	msg := &JsonRpcMsg{
 		Version: jsonRpcVersion,
-		ID:      id,
+		ID:      requestID,
 		Method:  methodSubscribeEth,
 		Params:  []interface{}{param},
 	}
 
-	resp, err := u.makeRequestWithIDOnClient(cli, id, msg)
+	resp, err := u.makeRequestWithIDOnClient(cli, requestID, msg)
 	if err != nil {
+		return "", err
+	}
+	if err := validateWSSubscribeResponse(methodSubscribeEth, resp, cli.Closed()); err != nil {
 		return "", err
 	}
 
@@ -346,160 +372,73 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 	// string carrying the subscription ID — decode it.
 	var subID string
 	if err := json.Unmarshal(resp.Result, &subID); err != nil {
-		return "", fmt.Errorf("unexpected subscription ID: %s", string(resp.Result))
+		outcome := uncertainWSUpstreamOutcomeUntil(fmt.Errorf("decode subscription ID %q: %w", string(resp.Result), err), cli.Closed())
+		return "", outcome
 	}
-
-	u.subMux.Lock()
-	if resubmit {
-		if _, migrated := u.migratedAway[param]; migrated {
-			// Migrated onto another conn while we re-subscribed. Don't
-			// re-track it (would be a duplicate); best-effort eth_unsubscribe
-			// the id we just minted so the upstream stops pushing on it.
-			u.subMux.Unlock()
-			u.log.WithField("param", param).Debug("resubmit aborted: param migrated away")
-			// Send the eth_unsubscribe on the SAME client the subscribe was
-			// created on — subID belongs to `cli`. Using MakeRequest (which
-			// targets curClient()) could hit a different socket after a
-			// concurrent reconnect, leaving the subscription streaming on the
-			// old connection with no mapping. Use a temporary id and RELEASE
-			// it after the round-trip so repeated races don't exhaust the id
-			// space.
-			cleanupID := u.IdGen.ID()
-			_, _ = u.makeRequestWithIDOnClient(cli, cleanupID, &JsonRpcMsg{
-				Version: jsonRpcVersion,
-				Method:  methodUnsubscribeEth,
-				Params:  []string{subID},
-			})
-			u.IdGen.Release(cleanupID)
-			return subID, nil
-		}
-	} else {
-		// A genuine (non-resubmit) subscription clears any stale migration
-		// tombstone for this param — it's legitimately live on this conn now.
-		delete(u.migratedAway, param)
-	}
-	u.subByParam[param] = subID
-	u.subByID[subID] = param
-	u.subMux.Unlock()
-
-	u.log.WithFields(map[string]interface{}{
-		"ID":    subID,
-		"param": param,
-	}).Debug("registered subscription with upstream")
 	return subID, nil
 }
 
 func (u *UpstreamConnManagerEth) Unsubscribe(id string) error {
-	msg := &JsonRpcMsg{
+	return u.subscriptionLifecycle().unsubscribe(id, u)
+}
+
+func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) <-chan error {
+	lifecycle := u.subscriptionLifecycle()
+	return lifecycle.retire(lifecycle.lookupParam(param), u)
+}
+
+func (u *UpstreamConnManagerEth) localUnsubscribePreservingHandle(param string) <-chan error {
+	lifecycle := u.subscriptionLifecycle()
+	return lifecycle.retirePreservingHandle(lifecycle.lookupParam(param), u)
+}
+
+func (u *UpstreamConnManagerEth) reservationForHandle(handle string) (string, bool) {
+	return u.subscriptionLifecycle().reservationForHandle(handle)
+}
+
+func (u *UpstreamConnManagerEth) unsubscribeOn(binding wsSubscriptionBinding, _ string) error {
+	requestID := u.requestIDs.next()
+	response, err := u.makeRequestWithIDOnClient(binding.client, requestID, &JsonRpcMsg{
 		Version: jsonRpcVersion,
 		Method:  methodUnsubscribeEth,
-		Params:  []string{id},
+		Params:  []string{binding.wireID},
+	})
+	if u.beforeUnsubscribeCommit != nil {
+		u.beforeUnsubscribeCommit()
 	}
-
-	_, err := u.MakeRequest(msg)
 	if err != nil {
 		return err
 	}
+	return validateEthUnsubscribeResponse(response)
+}
 
-	u.subMux.Lock()
-	defer u.subMux.Unlock()
+const evmLogicalHandleDomain = "cg:"
 
-	// Bail out if the subscription was already removed (e.g. by a
-	// concurrent migration). Without the existence check we'd happily
-	// `delete(subByParam, "")` and pollute the map with phantom keys.
-	param, ok := u.subByID[id]
-	if !ok {
-		return nil
+func (u *UpstreamConnManagerEth) stableHandle(provisional, _ string) string {
+	return "0x" + hex.EncodeToString([]byte(evmLogicalHandleDomain+provisional))
+}
+
+func (u *UpstreamConnManagerEth) releaseHandle(reservation string) {
+	u.initState()
+	u.IdGen.Release(reservation)
+}
+
+func validateEthUnsubscribeResponse(response *JsonRpcMsg) error {
+	if err := validateWSJSONRPCResponse(methodUnsubscribeEth, response); err != nil {
+		return err
 	}
-	delete(u.subByID, id)
-	delete(u.subByParam, param)
-
-	u.log.WithFields(map[string]interface{}{
-		"ID":    id,
-		"param": param,
-	}).Debug("removed subscription with upstream")
+	var acknowledged bool
+	if err := json.Unmarshal(response.Result, &acknowledged); err != nil {
+		return fmt.Errorf("decode %s acknowledgement: %w", methodUnsubscribeEth, err)
+	}
+	if !acknowledged {
+		return fmt.Errorf("upstream %s did not confirm cleanup", methodUnsubscribeEth)
+	}
 	return nil
-}
-
-// LocalUnsubscribe drops a subscription param from the local maps with
-// no network I/O — see the interface doc. subByParam maps param → the
-// current upstream subscription id; both entries are removed so a
-// reconnect won't re-issue this (migrated-away) subscription.
-func (u *UpstreamConnManagerEth) LocalUnsubscribe(param string) {
-	u.subMux.Lock()
-	// Tombstone so a concurrent resubmit can't re-add the migrated param.
-	// Persists until a genuine new subscription clears it (not reset per
-	// resubmit epoch — see the Cosmos impl for the ordering rationale).
-	u.migratedAway[param] = struct{}{}
-	id, ok := u.subByParam[param]
-	if ok {
-		delete(u.subByParam, param)
-		delete(u.subByID, id)
-	}
-	u.subMux.Unlock()
-	if ok {
-		// Best-effort eth_unsubscribe: a racing reconnect-resubmit may have
-		// re-created this subscription on the reconnected socket between the
-		// migration commit and this call; tear it down so it doesn't stream
-		// with no manager mapping. Run ASYNC so the migrator + the following
-		// SubscriptionManager update aren't blocked for up to responseTimeout
-		// on the old connection (which would drop notifications).
-		go func() {
-			_, _ = u.MakeRequest(&JsonRpcMsg{
-				Version: jsonRpcVersion,
-				Method:  methodUnsubscribeEth,
-				Params:  []string{id},
-			})
-		}()
-	}
-}
-
-// resetConnectionState clears the per-connection in-flight response map
-// AND the upstream-subscription-ID index (subByID): both are scoped to
-// the dead connection — response channels will never be fulfilled, and
-// the new connection mints fresh eth_subscribe IDs. subByParam is
-// deliberately PRESERVED: it is the source of truth for which params
-// must be re-subscribed on the new connection
-// (reSubmitSubscriptionsOnClient reads it). Wiping subByParam here — the
-// old resetAll behaviour — left an empty map, so client subscriptions
-// were silently never re-established after an EVM WS reconnect.
-func (u *UpstreamConnManagerEth) resetConnectionState() {
-	u.subMux.Lock()
-	u.subByID = make(map[string]string)
-	u.subMux.Unlock()
-
-	u.respMux.Lock()
-	u.respMap = make(map[string]chan *JsonRpcMsg)
-	u.respMux.Unlock()
 }
 
 func (u *UpstreamConnManagerEth) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
-	// Snapshot under subMux so we don't range over the map while
-	// subscribeWithIDOnClient writes to it. subByParam survived the
-	// reconnect (see resetConnectionState); each param is re-issued on
-	// the new client, and subscribeWithIDOnClient rewrites subByParam /
-	// subByID with the new upstream subscription ID.
-	u.subMux.Lock()
-	pending := make([]string, 0, len(u.subByParam))
-	for param := range u.subByParam {
-		pending = append(pending, param)
-	}
-	u.subMux.Unlock()
-
-	if len(pending) == 0 {
-		return nil
-	}
-	u.log.Info("re-submitting subscriptions")
-	for _, param := range pending {
-		u.log.WithFields(map[string]interface{}{
-			"param": param,
-		}).Debug("re-submitting subscription")
-		id := u.IdGen.ID()
-		if _, err := u.subscribeWithIDOnClient(cli, id, param, true); err != nil {
-			return err
-		}
-	}
-	return nil
+	return u.subscriptionLifecycle().resubmit(cli, u)
 }
 
 // IsHealthy mirrors the Cosmos manager's check: nil/closed client →
@@ -518,13 +457,10 @@ func (u *UpstreamConnManagerEth) IsHealthy() bool {
 // Idempotent — see Cosmos impl.
 func (u *UpstreamConnManagerEth) Stop() {
 	u.stopOnce.Do(func() {
+		u.initState()
 		u.initStopCh()
 		u.stopped.Store(true)
 		close(u.stopCh)
-		u.clientMu.Lock()
-		if u.client != nil {
-			u.client.Close()
-		}
-		u.clientMu.Unlock()
+		u.subscriptionLifecycle().stop(u)
 	})
 }

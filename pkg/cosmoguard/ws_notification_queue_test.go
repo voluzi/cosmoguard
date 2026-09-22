@@ -42,9 +42,9 @@ func (u *notificationTestUpstream) Unsubscribe(string) error {
 	}
 	return nil
 }
-func (*notificationTestUpstream) LocalUnsubscribe(string) {}
-func (u *notificationTestUpstream) IsHealthy() bool       { return u.healthy.Load() }
-func (*notificationTestUpstream) Stop()                   {}
+func (*notificationTestUpstream) LocalUnsubscribe(string) <-chan error { return nil }
+func (u *notificationTestUpstream) IsHealthy() bool                    { return u.healthy.Load() }
+func (*notificationTestUpstream) Stop()                                {}
 
 func newNotificationTestBroker(t *testing.T, upstream *notificationTestUpstream) (*Broker, string) {
 	t.Helper()
@@ -59,6 +59,53 @@ func newNotificationTestBroker(t *testing.T, upstream *notificationTestUpstream)
 	require.NoError(t, err)
 	broker.sm.AddSubscription("tm.event='NewBlock'", subscriptionID)
 	return broker, subscriptionID
+}
+
+func TestDuplicateCosmosSubscribeRefreshesNotificationRequestID(t *testing.T) {
+	upstream := newNotificationTestUpstream()
+	broker := NewBroker(
+		[]string{"ws://upstream.invalid"},
+		"/",
+		1,
+		func(url.URL, *util.UniqueID, func(*JsonRpcMsg)) UpstreamConnManager { return upstream },
+	)
+	broker.log = log.WithField("test", t.Name())
+	client, peer := newWSCacheClient(t)
+	request := func(id int) *JsonRpcMsg {
+		return &JsonRpcMsg{
+			Version: jsonRpcVersion,
+			ID:      id,
+			Method:  methodSubscribeCosmos,
+			Params:  []any{"tm.event='NewBlock'"},
+		}
+	}
+	if response, err := broker.HandleSubscription(client, request(1)); err != nil || response.Error != nil {
+		t.Fatalf("first subscribe failed: response=%+v err=%v", response, err)
+	}
+	if response, err := broker.HandleSubscription(client, request(2)); err != nil || response.Error != nil {
+		t.Fatalf("duplicate subscribe failed: response=%+v err=%v", response, err)
+	}
+	if response, err := broker.HandleSubscription(client, request(0).CloneWithID(nil)); err != nil || response.Error != nil {
+		t.Fatalf("notification-style duplicate subscribe failed: response=%+v err=%v", response, err)
+	}
+	broker.onSubscriptionMessage(&JsonRpcMsg{
+		Version: jsonRpcVersion,
+		ID:      "subscription",
+		Result:  []byte(`{"height":"1"}`),
+	})
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var notification JsonRpcMsg
+	if err := peer.ReadJSON(&notification); err != nil {
+		t.Fatal(err)
+	}
+	if notification.ID != 2 {
+		t.Fatalf("notification id = %#v, want latest request id 2", notification.ID)
+	}
+	if got := broker.ClientSubCount(client); got != 1 {
+		t.Fatalf("client subscription count = %d, want 1", got)
+	}
 }
 
 func TestBrokerNotificationFanoutBoundsBlockedWritersPerClient(t *testing.T) {

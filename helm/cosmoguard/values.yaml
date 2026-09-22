@@ -109,6 +109,14 @@ config:
     maxRequestBody: 5242880
     # wsReadLimit defaults to 1 MiB (0 = no limit).
     wsReadLimit: 1048576
+    # Process-local WebSocket admission limits. Explicit 0 disables one limit.
+    websocketLimits:
+      maxSubscriptionsPerClient: 32
+      maxSubscriptionsPerIdentity: 128
+      # Combined with 40 connections per enabled protocol pool, this provides
+      # 400 nominal distinct upstream subscription slots per pool.
+      maxSubscriptionsPerUpstreamConnection: 10
+      maxConnectionsPerIP: 16
   # Replace with your real Cosmos node(s). Multi-node + healthcheck
   # support enables horizontal HA at the cosmoguard layer.
   nodes:
@@ -173,8 +181,14 @@ config:
     default: allow
   rpc:
     default: allow
+    # Total connection budget across all configured Cosmos backends.
+    webSocketConnections: 40
     jsonrpc:
       default: allow
+  evm:
+    ws:
+      # Separate total connection budget across all configured EVM backends.
+      webSocketConnections: 40
   grpc:
     default: deny
 

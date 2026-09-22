@@ -36,12 +36,12 @@ func (u *wsCacheUpstream) MakeRequest(request *JsonRpcMsg) (*JsonRpcMsg, error) 
 	return WithResult(request, map[string]interface{}{"height": "42"}), nil
 }
 
-func (u *wsCacheUpstream) HasSubscription(string) bool      { return false }
-func (u *wsCacheUpstream) Subscribe(string) (string, error) { return "", nil }
-func (u *wsCacheUpstream) Unsubscribe(string) error         { return nil }
-func (u *wsCacheUpstream) LocalUnsubscribe(string)          {}
-func (u *wsCacheUpstream) IsHealthy() bool                  { return true }
-func (u *wsCacheUpstream) Stop()                            {}
+func (u *wsCacheUpstream) HasSubscription(string) bool          { return false }
+func (u *wsCacheUpstream) Subscribe(string) (string, error)     { return "", nil }
+func (u *wsCacheUpstream) Unsubscribe(string) error             { return nil }
+func (u *wsCacheUpstream) LocalUnsubscribe(string) <-chan error { return nil }
+func (u *wsCacheUpstream) IsHealthy() bool                      { return true }
+func (u *wsCacheUpstream) Stop()                                {}
 
 func newWSCacheProxy(t *testing.T, coalesce *bool, delay time.Duration) (*JsonRpcWebSocketProxy, *JsonRpcRule, *wsCacheUpstream) {
 	t.Helper()

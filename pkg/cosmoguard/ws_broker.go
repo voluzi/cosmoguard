@@ -20,6 +20,7 @@ const migrationInterval = 2 * time.Second
 type Broker struct {
 	IdGen          *util.UniqueID
 	pool           *UpstreamPool
+	admission      *wsAdmissionController
 	log            *Entry
 	sm             *SubscriptionManager
 	upstreamSubMux sync.Mutex
@@ -54,12 +55,21 @@ type Broker struct {
 func NewBroker(backends []string, path string, n int, upstreamConstructor UpstreamConnManagerConstructor) *Broker {
 	b := Broker{
 		IdGen:       &util.UniqueID{},
+		admission:   newWSAdmissionController(WebSocketLimits{}),
 		sm:          NewSubscriptionManager(),
 		stopMigrate: make(chan struct{}),
 		migrateDone: make(chan struct{}),
 	}
 	b.pool = NewUpstreamPool(backends, path, n, b.onSubscriptionMessage, upstreamConstructor)
 	return &b
+}
+
+func (b *Broker) setAdmissionController(admission *wsAdmissionController) {
+	if admission == nil {
+		admission = newWSAdmissionController(WebSocketLimits{})
+	}
+	b.admission = admission
+	b.pool.SetMaxSubscriptionsPerConnection(admission.Limits().MaxSubscriptionsPerUpstreamConnection)
 }
 
 func (b *Broker) Start(log *Entry) error {
@@ -169,7 +179,7 @@ func (b *Broker) HandleRequest(msg *JsonRpcMsg) (*JsonRpcMsg, error) {
 	return res.CloneWithID(msg.ID), nil
 }
 
-func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (*JsonRpcMsg, error) {
+func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, identity ...string) (*JsonRpcMsg, error) {
 	b.log.WithField("client", client).Debug("handling subscription")
 	client.SetOnDisconnectCallback(b.onClientDisconnect)
 	if client.IsClosed() {
@@ -178,8 +188,11 @@ func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (*
 
 	switch msg.Method {
 	case methodSubscribeCosmos:
-		_, err := b.addSubscription(client, msg)
+		_, err := b.addSubscription(client, msg, identity...)
 		if err != nil {
+			if data := wsResourceExhaustedData(err); data != nil {
+				return ErrorResponse(msg, -32005, "WebSocket resource exhausted", data), nil
+			}
 			return ErrorResponse(msg, -100, err.Error(), nil), nil
 		}
 		return EmptyResult(msg), nil
@@ -197,8 +210,11 @@ func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (*
 		return EmptyResult(msg), nil
 
 	case methodSubscribeEth:
-		id, err := b.addSubscription(client, msg)
+		id, err := b.addSubscription(client, msg, identity...)
 		if err != nil {
+			if data := wsResourceExhaustedData(err); data != nil {
+				return ErrorResponse(msg, -32005, "WebSocket resource exhausted", data), nil
+			}
 			return ErrorResponse(msg, -100, err.Error(), nil), nil
 		}
 		return WithResult(msg, id), nil
@@ -215,7 +231,7 @@ func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (*
 	}
 }
 
-func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (string, error) {
+func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, identity ...string) (string, error) {
 	param, err := getSubscriptionParam(msg)
 	if err != nil {
 		return "", err
@@ -228,6 +244,25 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (stri
 	}
 
 	id, exists := b.sm.GetSubscriptionID(param)
+	if exists && b.sm.ClientSubscribed(id, client) {
+		if msg.Method == methodSubscribeCosmos && msg.ID != nil {
+			b.sm.SubscribeClient(id, client, msg.ID)
+		}
+		return id, nil
+	}
+	identityName := ""
+	if len(identity) > 0 {
+		identityName = identity[0]
+	}
+	if err := b.admission.reserveSubscription(client, identityName); err != nil {
+		return "", err
+	}
+	admitted := true
+	defer func() {
+		if admitted {
+			b.admission.releaseSubscription(client)
+		}
+	}()
 	if !exists {
 		b.log.WithField("client", client).Debug("upstream subscription does not exist")
 
@@ -251,9 +286,11 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (stri
 		b.sm.SubscribeClient(id, client, msg.ID)
 	}
 	if client.IsClosed() {
-		b.sm.UnsubscribeClient(id, client)
-		return "", errors.Join(ErrClosed, b.removeEmptySubscriptionLocked(id))
+		emptySubscriptions := b.detachClientSubscriptionsLocked(client)
+		admitted = false
+		return "", errors.Join(ErrClosed, b.removeEmptySubscriptionsLocked(emptySubscriptions))
 	}
+	admitted = false
 
 	b.log.WithFields(map[string]interface{}{
 		"id":     id,
@@ -263,26 +300,15 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) (stri
 	return id, nil
 }
 
-// removeEmptySubscriptionLocked tears down an upstream subscription that lost
-// its last downstream client. The caller must hold upstreamSubMux.
-func (b *Broker) removeEmptySubscriptionLocked(id string) error {
-	if !b.sm.SubscriptionEmpty(id) {
-		return nil
-	}
-	upstreamID, _ := b.sm.UpstreamID(id)
-	if err := b.pool.Unsubscribe(upstreamID); err != nil {
-		return err
-	}
-	b.sm.RemoveSubscription(id)
-	return nil
-}
-
 func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) error {
 	b.log.WithField("client", client).Debug("unsubscribing client")
 	subParam, err := getSubscriptionParam(msg)
 	if err != nil {
 		return err
 	}
+
+	b.upstreamSubMux.Lock()
+	defer b.upstreamSubMux.Unlock()
 
 	var subID string
 	if isEthSubscriptionID(subParam) {
@@ -299,29 +325,36 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		return fmt.Errorf("subscription does not exist")
 	}
 
+	clientSubID := b.sm.GetSubscriptionClients(subID)[client]
 	b.sm.UnsubscribeClient(subID, client)
 	b.log.WithFields(map[string]interface{}{
 		"id":     subID,
 		"client": client,
 	}).Debug("unsubscribed client")
 
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
-
 	if b.sm.SubscriptionEmpty(subID) {
 		// pool.Unsubscribe keys on the CURRENT upstream id, which differs
 		// from the canonical subID after a migration.
 		upstreamID, _ := b.sm.UpstreamID(subID)
 		if err = b.pool.Unsubscribe(upstreamID); err != nil {
+			if !isUncertainWSUpstreamOutcome(err) && !client.IsClosed() {
+				b.sm.SubscribeClient(subID, client, clientSubID)
+				return err
+			}
+			b.admission.releaseSubscription(client)
+			b.abandonEmptySubscription(subID, upstreamID, err)
 			return err
 		}
 		param, _ := b.sm.GetSubscriptionParam(subID)
 		b.sm.RemoveSubscription(subID)
+		b.admission.releaseSubscription(client)
 
 		b.log.WithFields(map[string]interface{}{
 			"ID":    subID,
 			"param": param,
 		}).Warn("unsubscribed upstream")
+	} else {
+		b.admission.releaseSubscription(client)
 	}
 
 	return nil
@@ -333,40 +366,58 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 	b.upstreamSubMux.Lock()
 	defer b.upstreamSubMux.Unlock()
 
-	// Collect errors across the loop instead of returning on the
-	// first failure. Previously a single transient pool.Unsubscribe
-	// error (e.g. upstream WS hiccup) aborted the loop mid-flight,
-	// leaving the remaining subscriptions with UnsubscribeClient
-	// already called (so the client is gone from sm) but
-	// pool.subscriptionConn still pinned — a permanent upstream
-	// subscription leak for every subsequent sub of this client
-	// (called from onClientDisconnect, so the client is gone for
-	// good). Now every sub gets its chance to drain; the joined
-	// error still surfaces to the caller via errors.Join semantics.
-	var errs []error
+	emptySubscriptions := b.detachClientSubscriptionsLocked(client)
+	return b.removeEmptySubscriptionsLocked(emptySubscriptions)
+}
+
+func (b *Broker) detachClientSubscriptionsLocked(client *JsonRpcWsClient) []string {
+	var emptySubscriptions []string
 	for _, subscriptionID := range b.sm.GetSubscriptions(client) {
 		b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
 		b.sm.UnsubscribeClient(subscriptionID, client)
-
+		b.admission.releaseSubscription(client)
 		if b.sm.SubscriptionEmpty(subscriptionID) {
-			b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
-			// pool.Unsubscribe keys on the CURRENT upstream id (post-migration).
-			upstreamID, _ := b.sm.UpstreamID(subscriptionID)
-			if err := b.pool.Unsubscribe(upstreamID); err != nil {
-				errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
-				continue
-			}
-			b.sm.RemoveSubscription(subscriptionID)
-
-			param, _ := b.sm.GetSubscriptionParam(subscriptionID)
-			b.log.WithFields(map[string]interface{}{
-				"ID":    subscriptionID,
-				"param": param,
-			}).Warn("unsubscribed upstream")
-
+			emptySubscriptions = append(emptySubscriptions, subscriptionID)
 		}
 	}
+	return emptySubscriptions
+}
+
+func (b *Broker) removeEmptySubscriptionsLocked(emptySubscriptions []string) error {
+	// Admission belongs to downstream membership, so all memberships must be
+	// released before any upstream cleanup can wait on network I/O.
+	var errs []error
+	for _, subscriptionID := range emptySubscriptions {
+		b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
+		upstreamID, _ := b.sm.UpstreamID(subscriptionID)
+		if err := b.pool.Unsubscribe(upstreamID); err != nil {
+			b.abandonEmptySubscription(subscriptionID, upstreamID, err)
+			errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
+			continue
+		}
+		param, _ := b.sm.GetSubscriptionParam(subscriptionID)
+		b.sm.RemoveSubscription(subscriptionID)
+		b.log.WithFields(map[string]interface{}{
+			"ID":    subscriptionID,
+			"param": param,
+		}).Warn("unsubscribed upstream")
+	}
 	return errors.Join(errs...)
+}
+
+func (b *Broker) abandonEmptySubscription(id, upstreamID string, err error) {
+	if isUncertainWSUpstreamOutcome(err) {
+		b.forgetSettlingSubscription(id, err)
+		return
+	}
+	b.pool.retireSubscription(upstreamID)
+	b.sm.RemoveSubscription(id)
+}
+
+func (b *Broker) forgetSettlingSubscription(id string, err error) {
+	if isUncertainWSUpstreamOutcome(err) && uncertainWSUpstreamOutcomeSettlement(err) != nil {
+		b.sm.RemoveSubscription(id)
+	}
 }
 
 func (b *Broker) onSubscriptionMessage(msg *JsonRpcMsg) {

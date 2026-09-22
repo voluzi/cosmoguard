@@ -2,6 +2,9 @@ package cosmoguard
 
 import (
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -158,4 +161,60 @@ func TestJoinNonEmpty_ActuallyFiltersEmpties(t *testing.T) {
 		assert.Assert(t, !strings.Contains(got, "  "),
 			"output must not contain double spaces: %q", got)
 	}
+}
+
+func TestWebSocketLimitRenderingPreservesMissingZeroAndLargeValues(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	app, err := webFS.ReadFile("web/app.js")
+	assert.NilError(t, err)
+	source := string(app)
+	bootstrap := strings.LastIndex(source, "(async () => {")
+	assert.Assert(t, bootstrap > 0, "dashboard bootstrap not found")
+
+	harness := `
+const elements = new Map();
+function testElement(selector) {
+  if (!elements.has(selector)) elements.set(selector, {
+    innerHTML: "", textContent: "", dataset: {},
+    classList: { toggle() {} }, addEventListener() {},
+  });
+  return elements.get(selector);
+}
+globalThis.document = {
+  querySelector: testElement,
+  querySelectorAll() { return []; },
+};
+globalThis.window = {
+  dashCharts: { MetricsBuffer: class { push() {} } },
+};
+globalThis.localStorage = { getItem() { return null; }, setItem() {} };
+globalThis.fetch = async () => { throw new Error("unexpected fetch"); };
+globalThis.setTimeout = () => 0;
+`
+	assertions := `
+function wsSection(limits, available = true, consistent = true) {
+  return { section: "rpc.jsonrpc", limits, limits_available: available,
+    limits_consistent: consistent, conns: [], subs: [], upstreams: [] };
+}
+function rendered(section) {
+  renderWebSockets({ sections: [section] });
+  return elements.get("#ws-stats").innerHTML;
+}
+function includes(label, text, want) {
+  if (!text.includes(want)) throw new Error(label + ": expected " + JSON.stringify(want) + " in " + text);
+}
+includes("missing", rendered(wsSection({})), "—/client");
+includes("null", rendered(wsSection({ max_subscriptions_per_client: null })), "—/client");
+includes("zero", rendered(wsSection({ max_subscriptions_per_client: 0 })), "off/client");
+includes("large", rendered(wsSection({ max_subscriptions_per_client: 2147483648 })), "2147483648/client");
+includes("unavailable", rendered(wsSection({}, false, false)), "unavailable");
+includes("mixed", rendered(wsSection({}, true, false)), "mixed");
+`
+	script := filepath.Join(t.TempDir(), "websocket-limits.js")
+	assert.NilError(t, os.WriteFile(script, []byte(harness+source[:bootstrap]+assertions), 0o600))
+	output, err := exec.Command(node, script).CombinedOutput()
+	assert.NilError(t, err, string(output))
 }

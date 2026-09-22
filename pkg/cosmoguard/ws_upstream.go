@@ -2,7 +2,9 @@ package cosmoguard
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/voluzi/cosmoguard/pkg/util"
@@ -28,7 +30,86 @@ const (
 
 var (
 	ErrSubscriptionExists = errors.New("subscription already exists")
+	errWSMissingResult    = errors.New("missing result")
 )
+
+type wsResponseKey struct {
+	client *JsonRpcWsClient
+	id     string
+}
+
+type wsInternalRequestIDs struct {
+	sequence atomic.Uint64
+}
+
+// next never reuses completed or timed-out IDs, so a late response cannot be
+// mistaken for a newer request and no per-timeout reservation needs a waiter.
+func (ids *wsInternalRequestIDs) next() string {
+	return fmt.Sprintf("cosmoguard-request-%d", ids.sequence.Add(1))
+}
+
+func effectiveWSResponseTimeout(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return responseTimeout
+}
+
+// uncertainWSUpstreamOutcomeError means a request may have reached the
+// upstream even though its caller did not receive a usable acknowledgement.
+// Unwrap preserves errors.Is/errors.As checks for the original cause.
+type uncertainWSUpstreamOutcomeError struct {
+	cause   error
+	settled <-chan struct{}
+}
+
+func (e *uncertainWSUpstreamOutcomeError) Error() string { return e.cause.Error() }
+func (e *uncertainWSUpstreamOutcomeError) Unwrap() error { return e.cause }
+
+func uncertainWSUpstreamOutcome(err error) error {
+	return uncertainWSUpstreamOutcomeUntil(err, nil)
+}
+
+func uncertainWSUpstreamOutcomeUntil(err error, settled <-chan struct{}) error {
+	if err == nil || isUncertainWSUpstreamOutcome(err) {
+		return err
+	}
+	return &uncertainWSUpstreamOutcomeError{cause: err, settled: settled}
+}
+
+func isUncertainWSUpstreamOutcome(err error) bool {
+	var uncertain *uncertainWSUpstreamOutcomeError
+	return errors.As(err, &uncertain)
+}
+
+func uncertainWSUpstreamOutcomeSettlement(err error) <-chan struct{} {
+	var uncertain *uncertainWSUpstreamOutcomeError
+	if !errors.As(err, &uncertain) {
+		return nil
+	}
+	return uncertain.settled
+}
+
+func validateWSJSONRPCResponse(method string, response *JsonRpcMsg) error {
+	if response == nil {
+		return fmt.Errorf("upstream %s returned no response", method)
+	}
+	if response.Error != nil {
+		return fmt.Errorf("upstream %s rejected request with code %d: %s", method, response.Error.Code, response.Error.Message)
+	}
+	if response.IsEmptyResult() {
+		return fmt.Errorf("upstream %s returned a %w", method, errWSMissingResult)
+	}
+	return nil
+}
+
+func validateWSSubscribeResponse(method string, response *JsonRpcMsg, settled <-chan struct{}) error {
+	err := validateWSJSONRPCResponse(method, response)
+	if errors.Is(err, errWSMissingResult) {
+		return uncertainWSUpstreamOutcomeUntil(err, settled)
+	}
+	return err
+}
 
 type UpstreamConnManagerConstructor func(url.URL, *util.UniqueID, func(msg *JsonRpcMsg)) UpstreamConnManager
 
@@ -38,15 +119,10 @@ type UpstreamConnManager interface {
 	HasSubscription(string) bool
 	Subscribe(string) (string, error)
 	Unsubscribe(string) error
-	// LocalUnsubscribe forgets a subscription param from this manager's own
-	// bookkeeping and tombstones it so a concurrent reconnect-resubmit can't
-	// re-add it. Called by the pool's migrator after a subscription is
-	// re-established on a healthy upstream. If the param is still present (a
-	// racing resubmit re-created it on a reconnected socket), it also issues
-	// a best-effort network Unsubscribe so that subscription doesn't stream
-	// with no manager mapping. Idempotent; unknown params still set the
-	// tombstone.
-	LocalUnsubscribe(param string)
+	// LocalUnsubscribe retires a migrated subscription. A nil result means no
+	// physical cleanup remains; otherwise the channel closes after the exact
+	// subscription record has settled.
+	LocalUnsubscribe(param string) <-chan error
 	// IsHealthy reports whether the underlying WS connection is in a
 	// usable state. Returns false when the connection is closed, nil,
 	// or stuck in reconnect backoff. Used by the pool's subscription

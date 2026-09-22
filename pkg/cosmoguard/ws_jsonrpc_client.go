@@ -43,6 +43,16 @@ type queuedNotification struct {
 	cost uint64
 }
 
+// wsWriteError marks failures from the socket write path. A WebSocket write
+// can fail after transmitting a partial or complete frame, so callers cannot
+// infer that the peer did not act on it. Unwrap retains the transport cause.
+type wsWriteError struct {
+	cause error
+}
+
+func (e *wsWriteError) Error() string { return e.cause.Error() }
+func (e *wsWriteError) Unwrap() error { return e.cause }
+
 type JsonRpcWsClient struct {
 	conn     *websocket.Conn
 	closed   atomic.Bool
@@ -199,7 +209,10 @@ func (c *JsonRpcWsClient) SendMsg(msg *JsonRpcMsg) error {
 		return fmt.Errorf("error encoding msg: %v", err)
 	}
 
-	return c.writeMessage(websocket.TextMessage, b)
+	if err := c.writeMessage(websocket.TextMessage, b); err != nil {
+		return &wsWriteError{cause: err}
+	}
+	return nil
 }
 
 func (c *JsonRpcWsClient) Close() error {

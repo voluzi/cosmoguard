@@ -701,8 +701,14 @@ func aggregateCardinality(responses []peerResponse) map[string][]CardinalityRule
 // backend connection in the cluster.
 func aggregateWebSocket(responses []peerResponse) []WSSectionStats {
 	type subKey struct{ section, param string }
+	type limitState struct {
+		seen      bool
+		missing   bool
+		divergent bool
+	}
 	order := []string{}
 	bySection := map[string]*WSSectionStats{}
+	limitStates := map[string]*limitState{}
 	subAgg := map[subKey]*WSSubInfo{}
 	subOrder := map[string][]subKey{}
 	for _, r := range responses {
@@ -710,12 +716,22 @@ func aggregateWebSocket(responses []peerResponse) []WSSectionStats {
 			continue
 		}
 		var p struct {
-			Sections []WSSectionStats `json:"sections"`
+			Sections []stdjson.RawMessage `json:"sections"`
 		}
 		if err := stdjson.Unmarshal(r.Body, &p); err != nil {
 			continue
 		}
-		for _, s := range p.Sections {
+		for _, rawSection := range p.Sections {
+			var s WSSectionStats
+			if err := stdjson.Unmarshal(rawSection, &s); err != nil {
+				continue
+			}
+			var wire struct {
+				Limits *WebSocketLimits `json:"limits"`
+			}
+			if err := stdjson.Unmarshal(rawSection, &wire); err != nil {
+				continue
+			}
 			agg, ok := bySection[s.Section]
 			if !ok {
 				agg = &WSSectionStats{
@@ -726,8 +742,20 @@ func aggregateWebSocket(responses []peerResponse) []WSSectionStats {
 					Upstreams: []ConnStat{},
 				}
 				bySection[s.Section] = agg
+				limitStates[s.Section] = &limitState{}
 				order = append(order, s.Section)
 			}
+			state := limitStates[s.Section]
+			if wire.Limits == nil {
+				state.missing = true
+			} else if !state.seen {
+				agg.Limits = *wire.Limits
+				state.seen = true
+			} else if agg.Limits != *wire.Limits {
+				state.divergent = true
+			}
+			agg.LimitsAvailable = state.seen && !state.missing
+			agg.LimitsConsistent = agg.LimitsAvailable && !state.divergent
 			agg.Connections += s.Connections
 			agg.ClientSubscriptions += s.ClientSubscriptions
 			agg.UpstreamSubscriptions += s.UpstreamSubscriptions

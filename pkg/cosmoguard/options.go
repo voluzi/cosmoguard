@@ -64,13 +64,27 @@ type JsonRpcHandlerOptions struct {
 	WebsocketPath        string
 	UpstreamConstructor  UpstreamConnManagerConstructor
 	MaxBatchSize         int
+	webSocketAdmission   *wsAdmissionController
+}
+
+// withWebSocketAdmissionController shares one process-local admission policy
+// across WebSocket handlers built by CosmoGuard.
+func withWebSocketAdmissionController[T JsonRpcHandlerOptions](admission *wsAdmissionController) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *JsonRpcHandlerOptions:
+			x.webSocketAdmission = admission
+		default:
+			panic("unexpected use")
+		}
+	}
 }
 
 func DefaultJsonRpcHandlerOptions() *JsonRpcHandlerOptions {
 	cfg := &JsonRpcHandlerOptions{
 		WebsocketBackend:     "localhost:26657",
 		WebsocketEnabled:     true,
-		WebsocketConnections: 10,
+		WebsocketConnections: 40,
 		WebsocketPath:        defaultWebsocketPath,
 		UpstreamConstructor:  CosmosUpstreamConnManager,
 	}
