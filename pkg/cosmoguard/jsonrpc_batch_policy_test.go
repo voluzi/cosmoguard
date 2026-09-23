@@ -3,11 +3,65 @@ package cosmoguard
 import (
 	"context"
 	stdjson "encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
+
+func TestHandleHTTPInvalidBatchMembersWithNotifications(t *testing.T) {
+	h := newEnvelopeTestHandler(t)
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`[null,{"jsonrpc":"2.0","method":"notify"},{"jsonrpc":"2.0","id":null,"method":"call"},42]`))
+	recorder := httptest.NewRecorder()
+	h.handleHttp(recorder, request, func(w http.ResponseWriter, r *http.Request) {
+		forwarded, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.JSONEq(t, `[{"jsonrpc":"2.0","method":"notify"},{"jsonrpc":"2.0","id":null,"method":"call"}]`, string(forwarded))
+		_, _ = w.Write([]byte(`[{"jsonrpc":"2.0","id":null,"result":"ok"}]`))
+	}, time.Now())
+	require.JSONEq(t, `[{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null},{"jsonrpc":"2.0","id":null,"result":"ok"},{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}]`, recorder.Body.String())
+}
+
+func TestHandleHTTPAllInvalidBatch(t *testing.T) {
+	h := newEnvelopeTestHandler(t)
+	recorder := httptest.NewRecorder()
+	h.handleHttp(recorder, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`[null,42]`)), func(http.ResponseWriter, *http.Request) {
+		t.Fatal("invalid members reached upstream")
+	}, time.Now())
+	require.JSONEq(t, `[{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null},{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}]`, recorder.Body.String())
+}
+
+func TestHandleHTTPEmptyBatchWithWhitespace(t *testing.T) {
+	h := newEnvelopeTestHandler(t)
+	recorder := httptest.NewRecorder()
+	h.handleHttp(recorder, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(" \t\r\n[]")), func(http.ResponseWriter, *http.Request) {
+		t.Fatal("empty batch reached upstream")
+	}, time.Now())
+	require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+}
+
+func TestHandleHTTPInvalidMembersCountTowardBatchLimit(t *testing.T) {
+	h := newEnvelopeTestHandler(t)
+	h.maxBatchSize = 2
+	recorder := httptest.NewRecorder()
+	h.handleHttp(recorder, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`[null,42,{"jsonrpc":"2.0","id":1,"method":"ok"}]`)), func(http.ResponseWriter, *http.Request) {
+		t.Fatal("oversized batch reached upstream")
+	}, time.Now())
+	require.Equal(t, http.StatusRequestEntityTooLarge, recorder.Code)
+}
+
+func TestHandleHTTPBatchLeadingWhitespacePreservesCorrelation(t *testing.T) {
+	h := newEnvelopeTestHandler(t)
+	recorder := httptest.NewRecorder()
+	h.handleHttp(recorder, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(" \t\r\n"+`[{"jsonrpc":"2.0","id":1,"method":"one"},{"jsonrpc":"2.0","id":2,"method":"two"}]`)), func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(" \t\r\n" + `[{"jsonrpc":"2.0","id":2,"result":"two"},{"jsonrpc":"2.0","id":1,"result":"one"}]` + "\n"))
+	}, time.Now())
+	require.JSONEq(t, `[{"jsonrpc":"2.0","id":1,"result":"one"},{"jsonrpc":"2.0","id":2,"result":"two"}]`, recorder.Body.String())
+}
 
 // TestJsonRpcResponses_NotificationBatchNotDropped is the regression
 // test for the notification-batch 502: a batch mixing a call (with id)

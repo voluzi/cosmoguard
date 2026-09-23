@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	stdjson "encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -148,46 +149,73 @@ func TestHandleHTTPRejectsAmbiguousBatchEnvelopeBeforeUpstream(t *testing.T) {
 			}, time.Now())
 
 			require.Equal(t, http.StatusOK, recorder.Code)
-			require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+			require.JSONEq(t, `[{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}]`, recorder.Body.String())
 			require.Zero(t, upstreamCalls)
 		})
 	}
 }
 
-func TestHandleHTTPRejectsNonObjectBatchItemsBeforeUpstream(t *testing.T) {
+func TestHandleHTTPRejectsInvalidBatchMembersIndividually(t *testing.T) {
 	tests := []struct {
 		name string
-		body string
+		bad  string
 	}{
-		{
-			name: "null",
-			body: `[null,{"jsonrpc":"2.0","id":1,"method":"allowed"}]`,
-		},
-		{
-			name: "scalar",
-			body: `[42,{"jsonrpc":"2.0","id":1,"method":"allowed"}]`,
-		},
-		{
-			name: "array",
-			body: `[[{"jsonrpc":"2.0","id":2,"method":"nested"}],{"jsonrpc":"2.0","id":1,"method":"allowed"}]`,
-		},
+		{name: "null", bad: `null`},
+		{name: "number", bad: `42`},
+		{name: "string", bad: `"bad"`},
+		{name: "bool", bad: `true`},
+		{name: "array", bad: `[{"jsonrpc":"2.0","id":2,"method":"nested"}]`},
+		{name: "numeric method", bad: `{"jsonrpc":"2.0","id":2,"method":42}`},
+		{name: "structured id", bad: `{"jsonrpc":"2.0","id":{"x":2},"method":"bad"}`},
+		{name: "duplicate key", bad: `{"jsonrpc":"2.0","id":2,"method":"a","method":"b"}`},
+		{name: "escaped duplicate key", bad: `{"jsonrpc":"2.0","id":2,"method":"a","m\u0065thod":"b"}`},
+		{name: "case variant", bad: `{"jsonrpc":"2.0","id":2,"method":"a","Method":"b"}`},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := newEnvelopeTestHandler(t)
-			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
-			recorder := httptest.NewRecorder()
-			upstreamCalls := 0
+		for _, position := range []string{"first", "middle", "last"} {
+			t.Run(tt.name+"/"+position, func(t *testing.T) {
+				h := newEnvelopeTestHandler(t)
+				good1 := `{"jsonrpc":"2.0","id":1,"method":"one"}`
+				good2 := `{"jsonrpc":"2.0","id":3,"method":"three"}`
+				members := []string{good1, good2}
+				want := `[{"jsonrpc":"2.0","id":1,"result":"one"},{"jsonrpc":"2.0","id":3,"result":"three"}]`
+				switch position {
+				case "first":
+					members = []string{tt.bad, good1, good2}
+				case "middle":
+					members = []string{good1, tt.bad, good2}
+				case "last":
+					members = []string{good1, good2, tt.bad}
+				}
+				request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("["+strings.Join(members, ",")+"]"))
+				recorder := httptest.NewRecorder()
+				upstreamCalls := 0
 
-			h.handleHttp(recorder, request, func(http.ResponseWriter, *http.Request) {
-				upstreamCalls++
-			}, time.Now())
+				h.handleHttp(recorder, request, func(w http.ResponseWriter, r *http.Request) {
+					upstreamCalls++
+					forwarded, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					require.JSONEq(t, "["+good1+","+good2+"]", string(forwarded))
+					_, _ = w.Write([]byte(want))
+				}, time.Now())
 
-			require.Equal(t, http.StatusOK, recorder.Code)
-			require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
-			require.Zero(t, upstreamCalls)
-		})
+				require.Equal(t, http.StatusOK, recorder.Code)
+				var actual []map[string]any
+				require.NoError(t, stdjson.Unmarshal(recorder.Body.Bytes(), &actual))
+				require.Len(t, actual, 3)
+				badIndex := map[string]int{"first": 0, "middle": 1, "last": 2}[position]
+				require.Equal(t, float64(-32600), actual[badIndex]["error"].(map[string]any)["code"])
+				require.Nil(t, actual[badIndex]["id"])
+				goodIndex := []int{0, 1, 2}
+				goodIndex = append(goodIndex[:badIndex], goodIndex[badIndex+1:]...)
+				require.Equal(t, float64(1), actual[goodIndex[0]]["id"])
+				require.Equal(t, "one", actual[goodIndex[0]]["result"])
+				require.Equal(t, float64(3), actual[goodIndex[1]]["id"])
+				require.Equal(t, "three", actual[goodIndex[1]]["result"])
+				require.Equal(t, 1, upstreamCalls)
+			})
+		}
 	}
 }
 
@@ -255,7 +283,11 @@ func TestHandleHTTPClassifiesValidJSONDecodeFailuresAsInvalidRequests(t *testing
 			}, time.Now())
 
 			require.Equal(t, http.StatusOK, recorder.Code)
-			require.JSONEq(t, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`, recorder.Body.String())
+			want := `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`
+			if strings.HasPrefix(tt.body, "[") {
+				want = "[" + want + "]"
+			}
+			require.JSONEq(t, want, recorder.Body.String())
 			require.Zero(t, upstreamCalls)
 		})
 	}

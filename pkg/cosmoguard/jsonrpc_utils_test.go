@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"gotest.tools/assert"
 )
 
@@ -288,6 +289,66 @@ func TestParseJsonRpcMessage(t *testing.T) {
 		assert.Assert(t, single == nil)
 		assert.Equal(t, len(batch), 0)
 	})
+}
+
+func TestParseJsonRpcMessageLeadingWhitespace(t *testing.T) {
+	for _, prefix := range []string{" ", "\t", "\r", "\n", " \t\r\n"} {
+		t.Run("batch prefix "+prefix, func(t *testing.T) {
+			single, batch, err := ParseJsonRpcMessage([]byte(prefix + `[ {"jsonrpc":"2.0","id":1,"method":"status"} ]`))
+			require.NoError(t, err)
+			require.Nil(t, single)
+			require.Len(t, batch, 1)
+			require.Equal(t, "status", batch[0].Method)
+		})
+	}
+	for _, tt := range []struct {
+		body       string
+		wantSingle bool
+	}{
+		{body: ` {"jsonrpc":"2.0","id":1,"method":"status"}`, wantSingle: true},
+		{body: " \t\r\n" + `[{"jsonrpc":"2.0","id":1,"result":{"z":1,"a":2}}]`},
+		{body: " \n[]"},
+	} {
+		single, batch, err := ParseJsonRpcMessage([]byte(tt.body))
+		require.NoError(t, err)
+		if tt.wantSingle {
+			require.NotNil(t, single)
+			require.Nil(t, batch)
+		} else {
+			require.Nil(t, single)
+			require.NotNil(t, batch)
+		}
+	}
+	_, responseBatch, err := ParseJsonRpcMessage([]byte(" \t\r\n" + `[{"jsonrpc":"2.0","id":1,"result":{"z":1,"a":2}}]` + "\n"))
+	require.NoError(t, err)
+	require.Equal(t, `{"z":1,"a":2}`, string(responseBatch[0].Result))
+	require.Equal(t, "\n", string(trailingWhitespace([]byte(" \t\r\n[]\n"))))
+}
+
+func TestParseJsonRpcRequestPreservesInvalidBatchSlots(t *testing.T) {
+	input := `[null,{"jsonrpc":"2.0","id":1,"method":"a"},{"jsonrpc":"2.0","id":2,"method":42},{"jsonrpc":"2.0","method":"notify"},[1],{"jsonrpc":"2.0","id":3,"method":"b"}]`
+	single, batch, err := ParseJsonRpcRequest([]byte(input))
+	require.NoError(t, err)
+	require.Nil(t, single)
+	require.Len(t, batch, 6)
+	require.Nil(t, batch[0])
+	require.Equal(t, 1, batch[1].ID)
+	require.Nil(t, batch[2])
+	require.Nil(t, batch[3].ID)
+	require.Nil(t, batch[4])
+	require.Equal(t, 3, batch[5].ID)
+}
+
+func TestParseJsonRpcRequestRejectsMalformedBatchJSON(t *testing.T) {
+	for _, body := range []string{
+		`[{"jsonrpc":"2.0","id":1,"method":"a"},`,
+		`[{"jsonrpc":"2.0","id":1,"method":"a"}] false`,
+	} {
+		single, batch, err := ParseJsonRpcRequest([]byte(body))
+		require.Error(t, err)
+		require.Nil(t, single)
+		require.Nil(t, batch)
+	}
 }
 
 func TestUnauthorizedResponse(t *testing.T) {
