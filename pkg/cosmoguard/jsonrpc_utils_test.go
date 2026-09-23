@@ -301,14 +301,17 @@ func TestParseJsonRpcMessageLeadingWhitespace(t *testing.T) {
 			require.Equal(t, "status", batch[0].Method)
 		})
 	}
-	for _, body := range []string{
-		` {"jsonrpc":"2.0","id":1,"method":"status"}`,
-		" \t\r\n" + `[{"jsonrpc":"2.0","id":1,"result":{"z":1,"a":2}}]`,
-		" \n[]",
+	for _, tt := range []struct {
+		body       string
+		wantSingle bool
+	}{
+		{body: ` {"jsonrpc":"2.0","id":1,"method":"status"}`, wantSingle: true},
+		{body: " \t\r\n" + `[{"jsonrpc":"2.0","id":1,"result":{"z":1,"a":2}}]`},
+		{body: " \n[]"},
 	} {
-		single, batch, err := ParseJsonRpcMessage([]byte(body))
+		single, batch, err := ParseJsonRpcMessage([]byte(tt.body))
 		require.NoError(t, err)
-		if body[1] == '{' {
+		if tt.wantSingle {
 			require.NotNil(t, single)
 			require.Nil(t, batch)
 		} else {
