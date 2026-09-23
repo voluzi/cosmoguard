@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/voluzi/cosmoguard/pkg/util"
 )
 
@@ -26,6 +28,13 @@ const (
 	// while leaving an order-of-magnitude headroom over normal traffic
 	// and bounding worst-case abuse at a value the proxy can absorb.
 	upstreamWSReadLimit int64 = 16 << 20
+
+	// defaultUpstreamWSPingPeriod is how often an upstream socket is pinged.
+	// A socket that returns no pong for upstreamWSPongWaitPeriods pings is
+	// closed, so a half-open upstream is noticed in seconds rather than when
+	// TCP keepalive gives up minutes later.
+	defaultUpstreamWSPingPeriod = 10 * time.Second
+	upstreamWSPongWaitPeriods   = 3
 )
 
 var (
@@ -109,6 +118,35 @@ func validateWSSubscribeResponse(method string, response *JsonRpcMsg, settled <-
 		return uncertainWSUpstreamOutcomeUntil(err, settled)
 	}
 	return err
+}
+
+// startUpstreamKeepalive pings conn every period until client closes. Reads
+// fail once no pong has arrived for upstreamWSPongWaitPeriods periods, which
+// closes client and sends the manager's Run loop down its reconnect path.
+func startUpstreamKeepalive(conn *websocket.Conn, client *JsonRpcWsClient, period time.Duration) {
+	if period <= 0 {
+		period = defaultUpstreamWSPingPeriod
+	}
+	wait := upstreamWSPongWaitPeriods * period
+	_ = conn.SetReadDeadline(time.Now().Add(wait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wait))
+	})
+	go func() {
+		ticker := time.NewTicker(period)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-client.Closed():
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(period)); err != nil {
+					_ = client.Close()
+					return
+				}
+			}
+		}
+	}()
 }
 
 type UpstreamConnManagerConstructor func(url.URL, *util.UniqueID, func(msg *JsonRpcMsg)) UpstreamConnManager

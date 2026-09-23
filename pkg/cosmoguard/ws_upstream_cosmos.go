@@ -23,6 +23,7 @@ type UpstreamConnManagerCosmos struct {
 	lifecycle      *wsSubscriptionLifecycle
 	requestIDs     wsInternalRequestIDs
 	requestTimeout time.Duration
+	pingPeriod     time.Duration
 
 	respMap map[wsResponseKey]chan *JsonRpcMsg
 	respMux sync.Mutex
@@ -210,6 +211,7 @@ func (u *UpstreamConnManagerCosmos) connect() error {
 		// in ws_upstream.go for the size rationale.
 		conn.SetReadLimit(upstreamWSReadLimit)
 		client := NewJsonRpcWsClient(conn)
+		startUpstreamKeepalive(conn, client, u.pingPeriod)
 		if u.beforeInstall != nil {
 			u.beforeInstall(client)
 		}
