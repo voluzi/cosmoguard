@@ -175,8 +175,10 @@ func TestHTTPRetryReplaysRequestBody(t *testing.T) {
 
 	p := newHardeningProxy(t,
 		[]NodeConfig{{Name: "dead", LcdURL: deadUpstreamURL(t)}, {Name: "alive", LcdURL: alive.URL}},
+		WithCORSConfig[HttpProxyOptions](compiledTestCORS(t)),
 		WithUpstreamConfig[HttpProxyOptions](retryUpstreamConfig()))
-	front := httptest.NewServer(p.pool)
+	p.SetRules(nil, RuleActionAllow)
+	front := httptest.NewServer(p)
 	t.Cleanup(front.Close)
 
 	// Round-robin over two upstreams: across four requests the dead one is
@@ -184,13 +186,53 @@ func TestHTTPRetryReplaysRequestBody(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		req, err := http.NewRequest(http.MethodGet, front.URL+"/query", strings.NewReader(`{"q":1}`))
 		require.NoError(t, err)
+		req.Header.Set("Origin", "https://a.example")
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		require.Equal(t, http.StatusOK, resp.StatusCode, "request %d: %s", i, body)
 		require.Equal(t, `{"q":1}`, string(body))
+		require.Equal(t, []string{"https://a.example"}, resp.Header.Values("Access-Control-Allow-Origin"), "request %d", i)
 	}
+}
+
+func TestHTTPRetryOversizedChunkedBodyIs413WithCORS(t *testing.T) {
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("an oversized body must not reach the upstream")
+	}))
+	t.Cleanup(alive.Close)
+	limit := int64(4)
+	p := newHardeningProxy(t,
+		[]NodeConfig{{Name: "a", LcdURL: alive.URL}, {Name: "b", LcdURL: alive.URL}},
+		WithCORSConfig[HttpProxyOptions](compiledTestCORS(t)),
+		WithServerConfig[HttpProxyOptions](&ServerConfig{MaxRequestBody: &limit}),
+		WithUpstreamConfig[HttpProxyOptions](retryUpstreamConfig()))
+	p.SetRules(nil, RuleActionAllow)
+
+	req := httptest.NewRequest(http.MethodGet, "/query", strings.NewReader("0123456789"))
+	req.ContentLength = -1 // chunked: only the MaxBytesReader backstop sees the size
+	req.Header.Set("Origin", "https://a.example")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	require.Equal(t, []string{"https://a.example"}, rec.Header().Values("Access-Control-Allow-Origin"))
+}
+
+func TestHTTPSingleUpstreamTransportErrorCarriesCORS(t *testing.T) {
+	p := newHardeningProxy(t, []NodeConfig{{Name: "dead", LcdURL: deadUpstreamURL(t)}},
+		WithCORSConfig[HttpProxyOptions](compiledTestCORS(t)))
+	p.SetRules(nil, RuleActionAllow)
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.Header.Set("Origin", "https://a.example")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Equal(t, []string{"https://a.example"}, rec.Header().Values("Access-Control-Allow-Origin"))
+	require.Equal(t, []string{"Origin"}, rec.Header().Values("Vary"))
 }
 
 func TestHTTPProxyGeneratedResponsesCarryCORS(t *testing.T) {
@@ -327,4 +369,18 @@ func TestMetricsServerTimeouts(t *testing.T) {
 	withPprof := newMetricsServer("127.0.0.1:0", http.NotFoundHandler(), true)
 	require.Equal(t, 10*time.Second, withPprof.ReadHeaderTimeout)
 	require.Zero(t, withPprof.WriteTimeout, "pprof's default 30s profile must not exceed the write timeout")
+}
+
+func TestHTTPPoolWithoutTransportServesAddedUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(upstream.Close)
+	pool := newTestHTTPPool("round-robin", 0)
+	pool.service = serviceLCD
+	require.NoError(t, pool.AddUpstream(NodeConfig{Name: "up", LcdURL: upstream.URL}))
+
+	rec := httptest.NewRecorder()
+	pool.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
 }

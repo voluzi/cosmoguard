@@ -399,7 +399,9 @@ func (p *HttpUpstreamPool) AddUpstream(n NodeConfig) error {
 	if err != nil {
 		return err
 	}
-	u.proxy.Transport = p.transport
+	if p.transport != nil {
+		u.proxy.Transport = p.transport
+	}
 	// Install the proxy hooks (CORS apply / circuit-breaker outcome /
 	// retry-aware error handling) the proxy constructor installed on
 	// the constructor-seeded upstreams. Without these the dynamically
@@ -999,7 +1001,7 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// The transport closes the request body after a failed attempt, so a
 	// body (GET with a JSON payload) is buffered once and replayed per
-	// attempt. HttpProxy has already capped it with MaxBytesReader.
+	// attempt. It is bounded by server.maxRequestBody unless that is 0.
 	var body []byte
 	if r.Body != nil && r.Body != http.NoBody {
 		var err error
@@ -1262,6 +1264,9 @@ func (p *HttpUpstreamPool) StartHealthchecks() {
 // sees hcShutdown=true and bails, regardless of whether hcCancel was
 // nil (Shutdown-before-Start case) or not (normal teardown).
 func (p *HttpUpstreamPool) Shutdown() {
+	if p.transport != nil {
+		defer p.transport.CloseIdleConnections()
+	}
 	p.hcMu.Lock()
 	// Latch the pool shut: any future StartHealthchecks / AddUpstream
 	// will read this under hcMu and bail before touching hcCancel,
