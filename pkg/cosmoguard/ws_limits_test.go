@@ -584,7 +584,6 @@ func TestBrokerDisconnectDuringSubscribeReleasesAllAdmissionBeforeRollback(t *te
 		assert.Assert(t, time.Now().Before(deadline.Add(2*time.Second)), "unsubscribed %d of 3", upstream.unsubscribeCalls.Load())
 		time.Sleep(5 * time.Millisecond)
 	}
-	time.Sleep(20 * time.Millisecond)
 	assert.Equal(t, upstream.unsubscribeCalls.Load(), int32(3))
 }
 

@@ -47,19 +47,23 @@ func TestUpstreamKeepaliveDropsSilentUpstream(t *testing.T) {
 				manager := protocol.constructor(*target, &util.UniqueID{}, func(*JsonRpcMsg) {})
 				switch m := manager.(type) {
 				case *UpstreamConnManagerCosmos:
-					m.pingPeriod = 20 * time.Millisecond
+					m.pingPeriod = 50 * time.Millisecond
 				case *UpstreamConnManagerEth:
-					m.pingPeriod = 20 * time.Millisecond
+					m.pingPeriod = 50 * time.Millisecond
 				}
 				go func() { _ = manager.Run(log.WithField("test", t.Name())) }()
 				t.Cleanup(manager.Stop)
 
 				// Three silent ping periods close the socket; Run redials.
-				time.Sleep(500 * time.Millisecond)
 				if answersPings {
+					time.Sleep(time.Second)
 					assert.Equal(t, connections.Load(), int32(1))
-				} else {
-					assert.Assert(t, connections.Load() >= 2, "silent upstream was never dropped")
+					return
+				}
+				deadline := time.Now().Add(2 * time.Second)
+				for connections.Load() < 2 {
+					assert.Assert(t, time.Now().Before(deadline), "silent upstream was never dropped")
+					time.Sleep(10 * time.Millisecond)
 				}
 			})
 		}

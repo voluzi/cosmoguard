@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,11 +29,13 @@ type Broker struct {
 	// callers of that param.
 	paramLocksMu sync.Mutex
 	paramLocks   map[string]*brokerParamLock
-	// requests holds the subscribe request behind each client membership
-	// so a rule reload can re-evaluate it.
-	requestsMu  sync.Mutex
-	requests    map[brokerMembership]*JsonRpcMsg
-	stopMigrate chan struct{}
+	// membershipMu serialises client joins and leaves, which never wait on
+	// the network, so a disconnect releases admission without waiting for a
+	// param lock. It also guards requests, the subscribe request behind each
+	// membership, kept so a rule reload can re-evaluate it.
+	membershipMu sync.Mutex
+	requests     map[brokerMembership]*JsonRpcMsg
+	stopMigrate  chan struct{}
 	// migrateDone is closed by migrateLoop when it exits, so Stop()
 	// can wait for it before tearing down the pool. Without the
 	// join, runMigration could be mid-pool.MigrateUnhealthy while
@@ -273,21 +276,15 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 		return "", err
 	}
 
-	unlock := b.lockParam(param)
-	locked := true
-	defer func() {
-		if locked {
-			unlock()
-		}
-	}()
+	defer b.lockParam(param)()
 	if client.IsClosed() {
 		return "", ErrClosed
 	}
 
 	id, exists := b.sm.GetSubscriptionID(param)
 	if exists && b.sm.ClientSubscribed(id, client) {
-		if msg.Method == methodSubscribeCosmos && msg.ID != nil {
-			b.sm.SubscribeClient(id, client, msg.ID)
+		if msg.Method == methodSubscribeCosmos && msg.ID != nil && !b.joinClient(client, id, msg.ID, nil) {
+			return "", ErrClosed
 		}
 		return id, nil
 	}
@@ -320,20 +317,19 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 		}).Info("subscribed upstream")
 	}
 
-	if msg.Method == methodSubscribeEth {
-		// Eth does not send the ID on subscription notifications. Lets do the same
-		b.sm.SubscribeClient(id, client, nil)
-	} else {
-		b.sm.SubscribeClient(id, client, msg.ID)
+	// Eth does not send the ID on subscription notifications. Lets do the same
+	var clientSubID interface{}
+	if msg.Method != methodSubscribeEth {
+		clientSubID = msg.ID
 	}
-	b.setRequest(client, id, msg)
-	if client.IsClosed() {
-		// The disconnect callback may have listed the client's
-		// subscriptions before this one was added.
+	if !b.joinClient(client, id, clientSubID, msg) {
+		// Release admission before the upstream cleanup can wait on I/O.
 		admitted = false
-		unlock()
-		locked = false
-		return "", errors.Join(ErrClosed, b.removeAllSubscriptions(client))
+		b.admission.releaseSubscription(client)
+		if b.sm.SubscriptionEmpty(id) {
+			return "", errors.Join(ErrClosed, b.removeEmptySubscriptionLocked(id))
+		}
+		return "", ErrClosed
 	}
 	admitted = false
 
@@ -371,13 +367,10 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		subID = id
 	}
 
-	if !b.sm.ClientSubscribed(subID, client) {
+	clientSubID, request, ok := b.leaveClient(client, subID)
+	if !ok {
 		return fmt.Errorf("subscription does not exist")
 	}
-
-	clientSubID := b.sm.GetSubscriptionClients(subID)[client]
-	request := b.setRequest(client, subID, nil)
-	b.sm.UnsubscribeClient(subID, client)
 	b.log.WithFields(map[string]interface{}{
 		"id":     subID,
 		"client": client,
@@ -388,9 +381,7 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		// from the canonical subID after a migration.
 		upstreamID, _ := b.sm.UpstreamID(subID)
 		if err = b.pool.Unsubscribe(upstreamID); err != nil {
-			if !isUncertainWSUpstreamOutcome(err) && !client.IsClosed() {
-				b.sm.SubscribeClient(subID, client, clientSubID)
-				b.setRequest(client, subID, request)
+			if !isUncertainWSUpstreamOutcome(err) && b.joinClient(client, subID, clientSubID, request) {
 				return err
 			}
 			b.admission.releaseSubscription(client)
@@ -419,15 +410,9 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 	// released before any upstream cleanup can wait on network I/O.
 	var emptySubscriptions []string
 	for _, subscriptionID := range b.sm.GetSubscriptions(client) {
-		param, ok := b.sm.GetSubscriptionParam(subscriptionID)
-		if !ok {
-			continue
-		}
-		unlock := b.lockParam(param)
-		if b.detachClientLocked(client, subscriptionID) {
+		if b.detachClient(client, subscriptionID) {
 			emptySubscriptions = append(emptySubscriptions, subscriptionID)
 		}
-		unlock()
 	}
 
 	var errs []error
@@ -448,71 +433,91 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 	return errors.Join(errs...)
 }
 
-// detachClientLocked drops client from subscriptionID and reports whether
-// the subscription is left without clients. The caller holds the param lock.
-func (b *Broker) detachClientLocked(client *JsonRpcWsClient, subscriptionID string) bool {
-	if !b.sm.ClientSubscribed(subscriptionID, client) {
-		return false
-	}
-	b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
-	b.setRequest(client, subscriptionID, nil)
-	b.sm.UnsubscribeClient(subscriptionID, client)
-	b.admission.releaseSubscription(client)
-	return b.sm.SubscriptionEmpty(subscriptionID)
-}
-
 type brokerMembership struct {
 	client *JsonRpcWsClient
 	id     string
 }
 
-// setRequest records the subscribe request behind a membership, or forgets
-// it when request is nil, and returns the previous one.
-func (b *Broker) setRequest(client *JsonRpcWsClient, id string, request *JsonRpcMsg) *JsonRpcMsg {
-	b.requestsMu.Lock()
-	defer b.requestsMu.Unlock()
-	key := brokerMembership{client: client, id: id}
-	previous := b.requests[key]
-	if request == nil {
-		delete(b.requests, key)
-	} else {
+// joinClient adds client to subscription id unless the client has closed;
+// once it has, its disconnect cleanup may already have run. The caller holds
+// the param lock. A nil request keeps the one already recorded.
+func (b *Broker) joinClient(client *JsonRpcWsClient, id string, clientSubID interface{}, request *JsonRpcMsg) bool {
+	b.membershipMu.Lock()
+	defer b.membershipMu.Unlock()
+	if client.IsClosed() {
+		return false
+	}
+	b.sm.SubscribeClient(id, client, clientSubID)
+	if request != nil {
 		if b.requests == nil {
 			b.requests = make(map[brokerMembership]*JsonRpcMsg)
 		}
-		b.requests[key] = request
+		b.requests[brokerMembership{client: client, id: id}] = request
 	}
-	return previous
+	return true
+}
+
+// leaveClient removes client from subscription id and returns what joinClient
+// needs to restore it. Admission is left to the caller.
+func (b *Broker) leaveClient(client *JsonRpcWsClient, id string) (interface{}, *JsonRpcMsg, bool) {
+	b.membershipMu.Lock()
+	defer b.membershipMu.Unlock()
+	clientSubID, ok := b.sm.GetSubscriptionClients(id)[client]
+	if !ok {
+		return nil, nil, false
+	}
+	key := brokerMembership{client: client, id: id}
+	request := b.requests[key]
+	delete(b.requests, key)
+	b.sm.UnsubscribeClient(id, client)
+	return clientSubID, request, true
+}
+
+// detachClient removes client from subscription id, releases its admission
+// and reports whether the subscription is left without clients.
+func (b *Broker) detachClient(client *JsonRpcWsClient, id string) bool {
+	if _, _, ok := b.leaveClient(client, id); !ok {
+		return false
+	}
+	b.log.WithField("ID", id).Debug("unsubscribing client")
+	b.admission.releaseSubscription(client)
+	return b.sm.SubscriptionEmpty(id)
 }
 
 // revokeDenied ends every client membership whose subscribe request allowed
 // rejects, and tells the client.
 func (b *Broker) revokeDenied(allowed func(*JsonRpcMsg) bool) {
-	b.requestsMu.Lock()
-	var denied []brokerMembership
-	for membership, request := range b.requests {
+	b.membershipMu.Lock()
+	requests := maps.Clone(b.requests)
+	b.membershipMu.Unlock()
+	for membership, request := range requests {
 		if !allowed(request) {
-			denied = append(denied, membership)
+			b.revoke(membership.client, membership.id, allowed)
 		}
-	}
-	b.requestsMu.Unlock()
-	for _, membership := range denied {
-		b.revoke(membership.client, membership.id)
 	}
 }
 
-func (b *Broker) revoke(client *JsonRpcWsClient, id string) {
+func (b *Broker) revoke(client *JsonRpcWsClient, id string, allowed func(*JsonRpcMsg) bool) {
 	param, ok := b.sm.GetSubscriptionParam(id)
 	if !ok {
 		return
 	}
 	unlock := b.lockParam(param)
-	clientSubID, subscribed := b.sm.GetSubscriptionClients(id)[client]
-	request := b.setRequest(client, id, nil)
-	if !subscribed || request == nil {
+	// A later reload may have allowed it again while this one waited.
+	b.membershipMu.Lock()
+	request := b.requests[brokerMembership{client: client, id: id}]
+	b.membershipMu.Unlock()
+	if request == nil || allowed(request) {
 		unlock()
 		return
 	}
-	if b.detachClientLocked(client, id) {
+	clientSubID, _, ok := b.leaveClient(client, id)
+	if !ok {
+		unlock()
+		return
+	}
+	b.admission.releaseSubscription(client)
+	if b.sm.SubscriptionEmpty(id) {
 		if err := b.removeEmptySubscriptionLocked(id); err != nil {
 			b.log.WithError(err).Warn("error removing revoked subscription upstream")
 		}

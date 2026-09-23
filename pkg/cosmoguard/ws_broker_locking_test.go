@@ -1,8 +1,11 @@
 package cosmoguard
 
 import (
+	"net/url"
 	"testing"
+	"time"
 
+	"github.com/voluzi/cosmoguard/pkg/util"
 	"gotest.tools/assert"
 )
 
@@ -64,4 +67,48 @@ func TestBrokerSlowUpstreamOnlyBlocksItsParam(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Migration re-subscribes and commits under the param lock, so an
+// unsubscribe arriving mid-migration targets the migrated subscription.
+func TestBrokerUnsubscribeWaitsForMigrationOfItsParam(t *testing.T) {
+	dead, alive := newLimitingUpstream(), newLimitingUpstream()
+	alive.subscribeCalls.Store(10)
+	alive.healthy.Store(false)
+	upstreams := []*limitingUpstream{dead, alive}
+	built := 0
+	broker := NewBroker([]string{"ws://upstream.test"}, "/", 2, func(url.URL, *util.UniqueID, func(*JsonRpcMsg)) UpstreamConnManager {
+		built++
+		return upstreams[built-1]
+	})
+	broker.log = log.WithField("test", t.Name())
+	client := NewJsonRpcWsClient(nil)
+	_, err := broker.addSubscription(client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 1, Method: methodSubscribeCosmos, Params: []any{"p"},
+	})
+	assert.NilError(t, err)
+
+	dead.healthy.Store(false)
+	alive.healthy.Store(true)
+	alive.subscribeStarted = make(chan struct{})
+	alive.subscribeRelease = make(chan struct{})
+	migrated := make(chan struct{})
+	go func() { broker.runMigration(); close(migrated) }()
+	mustWait(t, alive.subscribeStarted, "migration re-subscribe")
+
+	unsubscribed := startBrokerCall(broker, client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 2, Method: methodUnsubscribeCosmos, Params: []any{"p"},
+	}, "")
+	select {
+	case <-unsubscribed:
+		t.Fatal("unsubscribe ran while its param was migrating")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(alive.subscribeRelease)
+	mustWait(t, migrated, "migration")
+	result := mustRecv(t, unsubscribed, "unsubscribe")
+	assert.NilError(t, result.err)
+	assert.Assert(t, result.response.Error == nil, "%+v", result.response.Error)
+	assert.Equal(t, dead.unsubscribeCalls.Load(), int32(0))
+	assert.Equal(t, alive.unsubscribeCalls.Load(), int32(1))
 }
