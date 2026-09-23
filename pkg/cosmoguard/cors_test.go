@@ -165,3 +165,57 @@ func TestCacheHitReDerivesACAOPerOrigin(t *testing.T) {
 		}
 	}
 }
+
+func TestCORSStripFromResponse(t *testing.T) {
+	c := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://a.example"}}
+	if err := c.Compile(); err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	tests := []struct {
+		name string
+		vary []string
+		want []string
+	}{
+		{name: "origin only", vary: []string{"Origin"}, want: nil},
+		{name: "multi-token value", vary: []string{"Accept-Encoding, Origin"}, want: []string{"Accept-Encoding"}},
+		{name: "origin first", vary: []string{"origin, Accept-Encoding"}, want: []string{"Accept-Encoding"}},
+		{name: "several lines", vary: []string{"Origin", "Accept-Encoding"}, want: []string{"Accept-Encoding"}},
+		{name: "no origin", vary: []string{"Accept-Encoding"}, want: []string{"Accept-Encoding"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.Header{}
+			h.Set("Access-Control-Allow-Origin", "https://a.example")
+			h.Set("Access-Control-Allow-Credentials", "true")
+			for _, v := range tt.vary {
+				h.Add("Vary", v)
+			}
+			c.StripFromResponse(h)
+			if got := h.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+				t.Fatalf("ACAO must be stripped, got %q", got)
+			}
+			if got := h.Values("Access-Control-Allow-Credentials"); len(got) != 0 {
+				t.Fatalf("ACAC must be stripped, got %q", got)
+			}
+			got := h.Values("Vary")
+			if len(got) != len(tt.want) {
+				t.Fatalf("Vary = %q, want %q", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("Vary = %q, want %q", got, tt.want)
+				}
+			}
+		})
+	}
+
+	t.Run("disabled", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Access-Control-Allow-Origin", "https://upstream.example")
+		h.Set("Vary", "Origin")
+		(&CORSConfig{Enable: false}).StripFromResponse(h)
+		if h.Get("Access-Control-Allow-Origin") == "" || h.Get("Vary") == "" {
+			t.Fatal("disabled CORS must not touch the headers")
+		}
+	})
+}
