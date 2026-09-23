@@ -773,5 +773,6 @@ Run `cosmoguard --migrate-config --config /path/to/cosmoguard.yaml` to rewrite t
 3. **Cache hits now replay upstream's `Content-Type`** instead of forcing `application/json`. Endpoints that returned `text/plain` etc. are no longer mis-labeled on hits.
 4. **JSON-RPC `path` Prometheus label removed.** Replaced with bounded `size_class` label on the batch histogram. Dashboards may need a refresh.
 5. **gRPC reflection is no longer force-allowed.** Add an explicit rule if you need it.
+6. **Every `rateLimit` block must set a finite positive `rate`.** Incomplete blocks previously passed config validation but failed when the runtime created the limiter; with the default `fail-open` mode, that silently left the matching rule unlimited. Add a `rate` (for example, `rate: 10/s`) or remove the block before upgrading.
 
 For the full list of changes since v3, see `git log main..v4`.
