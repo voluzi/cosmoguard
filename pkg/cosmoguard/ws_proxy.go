@@ -193,6 +193,22 @@ func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction Rul
 	p.rules = rules
 	p.defaultAction = defaultAction
 	p.limiters = limiters
+	// Upstream unsubscribes are network I/O; keep them off the reload path.
+	go p.broker.revokeDenied(p.subscriptionAllowed)
+}
+
+// subscriptionAllowed applies the current rules to a subscribe request the
+// way handleRequest does: the first matching rule decides, then the default.
+func (p *JsonRpcWebSocketProxy) subscriptionAllowed(request *JsonRpcMsg) bool {
+	p.rulesMutex.RLock()
+	rules, defaultAction := p.rules, p.defaultAction
+	p.rulesMutex.RUnlock()
+	for _, rule := range rules {
+		if rule.Match(request) {
+			return rule.Action == RuleActionAllow
+		}
+	}
+	return defaultAction == RuleActionAllow
 }
 
 // policyVerdict runs the matched rule's per-rule auth + rate-limit

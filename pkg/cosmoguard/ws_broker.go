@@ -28,7 +28,11 @@ type Broker struct {
 	// callers of that param.
 	paramLocksMu sync.Mutex
 	paramLocks   map[string]*brokerParamLock
-	stopMigrate  chan struct{}
+	// requests holds the subscribe request behind each client membership
+	// so a rule reload can re-evaluate it.
+	requestsMu  sync.Mutex
+	requests    map[brokerMembership]*JsonRpcMsg
+	stopMigrate chan struct{}
 	// migrateDone is closed by migrateLoop when it exits, so Stop()
 	// can wait for it before tearing down the pool. Without the
 	// join, runMigration could be mid-pool.MigrateUnhealthy while
@@ -322,6 +326,7 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 	} else {
 		b.sm.SubscribeClient(id, client, msg.ID)
 	}
+	b.setRequest(client, id, msg)
 	if client.IsClosed() {
 		// The disconnect callback may have listed the client's
 		// subscriptions before this one was added.
@@ -371,6 +376,7 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 	}
 
 	clientSubID := b.sm.GetSubscriptionClients(subID)[client]
+	request := b.setRequest(client, subID, nil)
 	b.sm.UnsubscribeClient(subID, client)
 	b.log.WithFields(map[string]interface{}{
 		"id":     subID,
@@ -384,6 +390,7 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		if err = b.pool.Unsubscribe(upstreamID); err != nil {
 			if !isUncertainWSUpstreamOutcome(err) && !client.IsClosed() {
 				b.sm.SubscribeClient(subID, client, clientSubID)
+				b.setRequest(client, subID, request)
 				return err
 			}
 			b.admission.releaseSubscription(client)
@@ -448,9 +455,90 @@ func (b *Broker) detachClientLocked(client *JsonRpcWsClient, subscriptionID stri
 		return false
 	}
 	b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
+	b.setRequest(client, subscriptionID, nil)
 	b.sm.UnsubscribeClient(subscriptionID, client)
 	b.admission.releaseSubscription(client)
 	return b.sm.SubscriptionEmpty(subscriptionID)
+}
+
+type brokerMembership struct {
+	client *JsonRpcWsClient
+	id     string
+}
+
+// setRequest records the subscribe request behind a membership, or forgets
+// it when request is nil, and returns the previous one.
+func (b *Broker) setRequest(client *JsonRpcWsClient, id string, request *JsonRpcMsg) *JsonRpcMsg {
+	b.requestsMu.Lock()
+	defer b.requestsMu.Unlock()
+	key := brokerMembership{client: client, id: id}
+	previous := b.requests[key]
+	if request == nil {
+		delete(b.requests, key)
+	} else {
+		if b.requests == nil {
+			b.requests = make(map[brokerMembership]*JsonRpcMsg)
+		}
+		b.requests[key] = request
+	}
+	return previous
+}
+
+// revokeDenied ends every client membership whose subscribe request allowed
+// rejects, and tells the client.
+func (b *Broker) revokeDenied(allowed func(*JsonRpcMsg) bool) {
+	b.requestsMu.Lock()
+	var denied []brokerMembership
+	for membership, request := range b.requests {
+		if !allowed(request) {
+			denied = append(denied, membership)
+		}
+	}
+	b.requestsMu.Unlock()
+	for _, membership := range denied {
+		b.revoke(membership.client, membership.id)
+	}
+}
+
+func (b *Broker) revoke(client *JsonRpcWsClient, id string) {
+	param, ok := b.sm.GetSubscriptionParam(id)
+	if !ok {
+		return
+	}
+	unlock := b.lockParam(param)
+	clientSubID, subscribed := b.sm.GetSubscriptionClients(id)[client]
+	request := b.setRequest(client, id, nil)
+	if !subscribed || request == nil {
+		unlock()
+		return
+	}
+	if b.detachClientLocked(client, id) {
+		if err := b.removeEmptySubscriptionLocked(id); err != nil {
+			b.log.WithError(err).Warn("error removing revoked subscription upstream")
+		}
+	}
+	unlock()
+
+	b.log.WithFields(Fields{"ID": id, "client": client}).Warn("subscription revoked by rule reload")
+	if request.Method == methodSubscribeEth {
+		// eth_subscribe has no server-side cancellation message; closing
+		// the socket is what the client library notices.
+		_ = client.Close()
+		return
+	}
+	// CometBFT's own cancellation notice, sent under the subscribe id.
+	notice := &JsonRpcMsg{
+		Version: jsonRpcVersion,
+		ID:      clientSubID,
+		Error: &JsonRpcError{
+			Code:    -32000,
+			Message: "Server error",
+			Data:    "subscription was canceled (reason: denied by policy)",
+		},
+	}
+	if err := client.enqueueNotification(notice, wsNotificationSharedCost(notice)); err != nil && !errors.Is(err, ErrClosed) {
+		b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
+	}
 }
 
 func (b *Broker) removeEmptySubscriptionLocked(subscriptionID string) error {
