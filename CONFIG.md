@@ -405,7 +405,7 @@ auth:
     enable: true                     # rejects re-used jti within token TTL
 ```
 
-Per-identity rate limits are expressed at the **rule** level via `rateLimit: { scope: per-identity }` (see the Rate limiting section). That covers the most common "give this api key its own quota" pattern without growing a separate enforcement surface — and the rule layer is the one the proxy already runs on every request.
+Per-identity rate limits are expressed at the **rule** level via `rateLimit: { rate: 10/s, scope: per-identity }` (see the Rate limiting section). That covers the most common "give this api key its own quota" pattern without growing a separate enforcement surface — and the rule layer is the one the proxy already runs on every request.
 
 When `auth.replayProtection.enable` is true and a verified JWT carries a `jti` claim, cosmoguard checks a seen-set keyed on `(issuer, jti)`. A repeat within the token's expiration window is rejected with **HTTP 401** and `reason=token replayed` in the audit log. Tokens without `jti` are not enforced — replay protection requires the IdP to mint unique identifiers. The store is backed by olric when cluster mode is on (so replicas share the seen-set); otherwise in-process with a periodic-GC sweep.
 
@@ -512,6 +512,7 @@ evm:                                 # only when enableEvm: true
 ## Rules
 
 All rules share `priority`, `action`, and an optional `match:` block. Lower priority numbers match first; first-match-wins.
+Each rule must set `action` to exactly `allow` or `deny`. Section `default` values accept the same two actions. Unknown configuration keys and additional YAML documents are rejected during validation.
 
 ### HTTP rule
 
@@ -534,15 +535,18 @@ match:
   all:                               # AND: every child must match
     - path: /block                   # single-value atom
     - paths: [/block, /commit]       # multi-value atom (any of)
-    - query.height: present          # presence-check (key must exist)
+    - query:                         # presence-check (key must exist)
+        height: present
   any:                               # OR: at least one child must match
     - method: GET
     - method: HEAD
   none:                              # NOT: no child may match
-    - header.x-debug: present
+    - header:
+        x-debug: present
   # Leaf atoms at this level are an implicit `all`:
   sourceIP: 10.0.0.0/8                # CIDR or single IP
-  header.authorization: "Bearer *"   # glob match on header value
+  header:                            # glob match on header value
+    authorization: "Bearer *"
 ```
 
 Multi-value atoms exist for `paths` and `methods` and behave as "any of": the atom matches if the request value equals (or globs to) any list entry. The singular `path`/`method` forms remain for single-value rules.
@@ -608,6 +612,7 @@ rateLimit:
 With a `cache.cluster` block present, rate-limit buckets are sharded across replicas through olric so the configured rate is a true cluster-wide budget. In single-pod / embedded olric mode the rate is enforced per pod.
 
 `failureMode` controls behaviour when the limiter backend errors (e.g. olric loses quorum). `fail-open` (default) admits the request so a coordination hiccup doesn't 429 all traffic; `fail-closed` denies it so a backend outage can't silently disable rate limiting cluster-wide. Applies uniformly across HTTP, JSON-RPC, WebSocket, and gRPC.
+When `rateLimit` is set on a rule, `rate` is required and must be a finite positive number. `burst` must be non-negative; `0` uses the default capacity.
 
 #### Examples
 
@@ -619,7 +624,8 @@ rules:
     match:
       all:
         - paths: [/block, /commit, /block_results]
-        - query.height: "[0-9]*"
+        - query:
+            height: "[0-9]*"
     cache: { enable: true, ttl: 1h }
 
   # Same paths without `height` always return the chain tip — never cache.
@@ -648,7 +654,8 @@ rules:
     match:
       all:
         - path: /internal/*
-        - header.origin: present
+        - header:
+            origin: present
 ```
 
 ### JSON-RPC rule
@@ -766,5 +773,6 @@ Run `cosmoguard --migrate-config --config /path/to/cosmoguard.yaml` to rewrite t
 3. **Cache hits now replay upstream's `Content-Type`** instead of forcing `application/json`. Endpoints that returned `text/plain` etc. are no longer mis-labeled on hits.
 4. **JSON-RPC `path` Prometheus label removed.** Replaced with bounded `size_class` label on the batch histogram. Dashboards may need a refresh.
 5. **gRPC reflection is no longer force-allowed.** Add an explicit rule if you need it.
+6. **Every `rateLimit` block must set a finite positive `rate`.** Incomplete blocks previously passed config validation but failed when the runtime created the limiter; with the default `fail-open` mode, that silently left the matching rule unlimited. Add a `rate` (for example, `rate: 10/s`) or remove the block before upgrading.
 
 For the full list of changes since v3, see `git log main..v4`.

@@ -643,6 +643,16 @@ func (p *HttpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.deny(w, r, start)
 		default:
 			p.log.Errorf("unrecognized rule action %q", matchedRule.Action)
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section:  p.section,
+				Reason:   "rule",
+				SourceIP: GetSourceIP(r),
+				Method:   r.Method,
+				Path:     r.URL.Path,
+				RuleTag:  ruleTagOrFingerprint(matchedRule.Tag, matchedRule.Fingerprint),
+			})
+			WriteError(w, http.StatusForbidden, "forbidden")
+			p.recordOutcome(r, http.StatusForbidden, cacheMiss, RuleActionDeny, start, "request denied (invalid rule action)")
 		}
 		return
 	}

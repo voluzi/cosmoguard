@@ -75,7 +75,7 @@ func TestHandleHTTPBatchRejectsDuplicateIDsBeforeWork(t *testing.T) {
 				Action:    RuleActionAllow,
 				Methods:   []string{"a", "b"},
 				Cache:     &RuleCache{Enable: true, TTL: time.Minute},
-				RateLimit: &RateLimitConfig{},
+				RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}},
 			}
 			require.NoError(t, rule.Compile())
 			h := &JsonRpcHandler{

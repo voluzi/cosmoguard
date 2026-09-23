@@ -478,10 +478,19 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 				RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
 			})
 			markErrSpan("denied by rule")
-			return ctx, status.Errorf(codes.Unavailable, "Unauthorized")
+			return ctx, status.Error(codes.PermissionDenied, "permission denied")
 
 		default:
 			log.Errorf("unrecognized rule action %q", rule.Action)
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section:  p.section,
+				Reason:   "rule",
+				SourceIP: source,
+				Method:   method,
+				RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+			})
+			markErrSpan("invalid rule action")
+			return ctx, status.Error(codes.PermissionDenied, "permission denied")
 		}
 	}
 
@@ -516,7 +525,7 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		SourceIP: source,
 		Method:   method,
 	})
-	return ctx, status.Errorf(codes.Unavailable, "Unauthorized")
+	return ctx, status.Error(codes.PermissionDenied, "permission denied")
 }
 
 // grpcUpstreamCtxKey carries the picked *GrpcUpstream from Handle to the

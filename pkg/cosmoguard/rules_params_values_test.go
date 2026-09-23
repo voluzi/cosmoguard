@@ -62,7 +62,7 @@ func TestJsonRpcRuleNumericParamsMatchEquivalentJSONValues(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rule := &JsonRpcRule{Methods: []string{"block"}, Params: tt.ruleParams}
+			rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"block"}, Params: tt.ruleParams}
 			require.NoError(t, rule.Compile())
 
 			request := parseSingleJSONRPCRequest(t, tt.request)
@@ -78,6 +78,7 @@ func TestJsonRpcRuleScalarParamsPreserveFlatMatchingSemantics(t *testing.T) {
 		t.Parallel()
 
 		rule := &JsonRpcRule{
+			Action:  RuleActionAllow,
 			Methods: []string{"query"},
 			Params: map[string]any{
 				"enabled": true,
@@ -100,7 +101,7 @@ func TestJsonRpcRuleScalarParamsPreserveFlatMatchingSemantics(t *testing.T) {
 	t.Run("slice prefix", func(t *testing.T) {
 		t.Parallel()
 
-		rule := &JsonRpcRule{Methods: []string{"query"}, Params: []any{10, true, nil}}
+		rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"query"}, Params: []any{10, true, nil}}
 		require.NoError(t, rule.Compile())
 
 		matching := parseSingleJSONRPCRequest(t, `{"jsonrpc":"2.0","id":1,"method":"query","params":[10,true,null,"extra"]}`)
@@ -135,7 +136,7 @@ func TestJsonRpcRuleMatchesProgrammaticIntegerRequestParams(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rule := &JsonRpcRule{Methods: []string{"block"}, Params: tt.ruleParams}
+			rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"block"}, Params: tt.ruleParams}
 			require.NoError(t, rule.Compile())
 			assert.True(t, rule.Match(&JsonRpcMsg{Method: "block", Params: tt.requestParams}))
 		})
@@ -173,7 +174,7 @@ func TestJsonRpcRuleCompileRejectsUnsupportedParamValues(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rule := &JsonRpcRule{Priority: 17, Params: tt.params}
+			rule := &JsonRpcRule{Priority: 17, Action: RuleActionAllow, Params: tt.params}
 			err := rule.Compile()
 			require.Error(t, err)
 			assert.ErrorContains(t, err, "jsonrpc rule (priority 17)")
@@ -185,7 +186,7 @@ func TestJsonRpcRuleCompileRejectsUnsupportedParamValues(t *testing.T) {
 func TestJsonRpcRuleCompileAcceptsExactIntegerBoundaries(t *testing.T) {
 	t.Parallel()
 
-	rule := &JsonRpcRule{Params: []any{maxExactJSONInteger, -maxExactJSONInteger, uint64(maxExactJSONInteger)}}
+	rule := &JsonRpcRule{Action: RuleActionAllow, Params: []any{maxExactJSONInteger, -maxExactJSONInteger, uint64(maxExactJSONInteger)}}
 	require.NoError(t, rule.Compile())
 
 	assert.True(t, rule.Match(&JsonRpcMsg{Params: []any{
@@ -199,7 +200,7 @@ func TestJsonRpcRuleCompileDoesNotMutateCallerParams(t *testing.T) {
 	t.Parallel()
 
 	mapInput := map[string]any{"height": 10}
-	mapRule := &JsonRpcRule{Params: mapInput}
+	mapRule := &JsonRpcRule{Action: RuleActionAllow, Params: mapInput}
 	require.NoError(t, mapRule.Compile())
 	require.IsType(t, int(0), mapInput["height"])
 	require.IsType(t, float64(0), mapRule.Params.(map[string]any)["height"])
@@ -209,7 +210,7 @@ func TestJsonRpcRuleCompileDoesNotMutateCallerParams(t *testing.T) {
 	assert.False(t, mapRule.Match(&JsonRpcMsg{Params: map[string]any{"height": 20}}))
 
 	sliceInput := []any{int32(10)}
-	sliceRule := &JsonRpcRule{Params: sliceInput}
+	sliceRule := &JsonRpcRule{Action: RuleActionAllow, Params: sliceInput}
 	require.NoError(t, sliceRule.Compile())
 	require.IsType(t, int32(0), sliceInput[0])
 	require.IsType(t, float64(0), sliceRule.Params.([]any)[0])
@@ -222,7 +223,7 @@ func TestJsonRpcRuleCompileDoesNotMutateCallerParams(t *testing.T) {
 func TestJsonRpcRuleCompilePublishesStateOnlyAfterSuccessfulValidation(t *testing.T) {
 	t.Parallel()
 
-	rule := &JsonRpcRule{Methods: []string{"block"}, Params: map[string]any{"height": 10}}
+	rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"block"}, Params: map[string]any{"height": 10}}
 	require.NoError(t, rule.Compile())
 	originalFingerprint := rule.Fingerprint
 
@@ -235,7 +236,7 @@ func TestJsonRpcRuleCompilePublishesStateOnlyAfterSuccessfulValidation(t *testin
 func TestJsonRpcRuleCompileClearsStaleParamMatcherState(t *testing.T) {
 	t.Parallel()
 
-	rule := &JsonRpcRule{Params: map[string]any{"path": "/cosmos/*"}}
+	rule := &JsonRpcRule{Action: RuleActionAllow, Params: map[string]any{"path": "/cosmos/*"}}
 	require.NoError(t, rule.Compile())
 	require.Contains(t, rule.ParamsGlobs, "path")
 
@@ -272,7 +273,7 @@ func TestJsonRpcRuleMatchRejectsNestedRequestValuesWithoutPanicking(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rule := &JsonRpcRule{Params: tt.ruleParams}
+			rule := &JsonRpcRule{Action: RuleActionAllow, Params: tt.ruleParams}
 			require.NoError(t, rule.Compile())
 
 			assert.NotPanics(t, func() {

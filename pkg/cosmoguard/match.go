@@ -42,9 +42,11 @@ func compileGlob(pattern string, separators ...rune) (glob.Glob, error) {
 //	match:
 //	  all:
 //	    - path: /block
-//	    - query.height: "*"
+//	    - query:
+//	        height: "*"
 //	  none:
-//	    - header.x-debug: present
+//	    - header:
+//	        x-debug: present
 //	  any:
 //	    - method: GET
 //	    - method: POST

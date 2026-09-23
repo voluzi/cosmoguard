@@ -89,7 +89,7 @@ func TestJSONRPCMetricMethodLabelsCoverMatchedPolicyDenials(t *testing.T) {
 		Tag:       "rate-rule",
 		Action:    RuleActionAllow,
 		Methods:   []string{"limited_*"},
-		RateLimit: &RateLimitConfig{Scope: RateLimitScopePerIP},
+		RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: RateLimitScopePerIP},
 	}
 	for _, rule := range []*JsonRpcRule{authRule, rateRule} {
 		require.NoError(t, rule.Compile())
@@ -155,7 +155,7 @@ func TestWebSocketMetricMethodLabelsCoverMatchesAndPolicyDenials(t *testing.T) {
 	exactGlobRule := &JsonRpcRule{Tag: "eth-rule", Action: RuleActionDeny, Methods: []string{"eth_*", "eth_blockNumber"}}
 	catchAllRule := &JsonRpcRule{Tag: "catch-all", Action: RuleActionDeny}
 	authRule := &JsonRpcRule{Tag: "auth-rule", Action: RuleActionAllow, Methods: []string{"private_*"}, Auth: &RuleAuthConfig{Scopes: []string{"admin"}}}
-	rateRule := &JsonRpcRule{Tag: "rate-rule", Action: RuleActionAllow, Methods: []string{"limited_*"}, RateLimit: &RateLimitConfig{Scope: RateLimitScopePerIP}}
+	rateRule := &JsonRpcRule{Tag: "rate-rule", Action: RuleActionAllow, Methods: []string{"limited_*"}, RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: RateLimitScopePerIP}}
 	for _, rule := range []*JsonRpcRule{exactGlobRule, catchAllRule, authRule, rateRule} {
 		require.NoError(t, rule.Compile())
 	}

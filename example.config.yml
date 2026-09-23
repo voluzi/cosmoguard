@@ -140,7 +140,7 @@ metrics:
 #       apiKey: "${PROD_API_KEY}"
 #       scopes: [read, broadcast]
 #       # Per-identity rate limits are expressed at the rule layer
-#       # (rateLimit: { scope: per-identity }); see the lcd: / rpc: blocks
+#       # (rateLimit: { rate: 10/s, scope: per-identity }); see the lcd: / rpc: blocks
 #       # below.
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,8 @@ lcd:
       match:
         all:
           - paths: [/cosmos/base/tendermint/v1beta1/blocks/*]
-          - query.height: "[0-9]*"
+          - query:
+              height: "[0-9]*"
       cache:
         enable: true
         # disableStaleWhileRevalidate: true  # opt out if a positive global stale window is unsafe for this rule

@@ -162,10 +162,11 @@ cosmoguard --config /etc/cosmoguard/cosmoguard.yaml
 CosmoGuard is designed as a drop-in stand-in for a direct Cosmos node
 connection. Any request that worked against a bare Tendermint/Cosmos/
 EVM node returns a byte-identical response through cosmoguard when
-allowed. There are five intentional v4 behavioral changes to review
+allowed. There are six intentional v4 behavioral changes to review
 before upgrading (default-deny on WS cross-origin, cosmoguard-owned
 CORS, content-type fidelity on cache hits, Prometheus label cleanup,
-no force-allowed gRPC reflection).
+no force-allowed gRPC reflection, and mandatory positive rates in
+configured rate-limit blocks).
 
 A compatibility test suite recordable via `scripts/record-golden.sh`
 captures live-node responses and replays them through cosmoguard,

@@ -37,10 +37,8 @@ const (
 	RateLimitScopeCompound RateLimitScope = "compound"
 )
 
-// validate rejects an unknown rateLimit.scope at config-compile time
-// rather than letting a typo (e.g. "per_identity") silently fall through
-// to the global bucket at request time — which would throttle every
-// caller of the rule. Empty is allowed (creasty/defaults fills "per-ip").
+// validate checks rate-limit settings during config compilation.
+// Empty scope is allowed (creasty/defaults fills "per-ip").
 // nil-safe so callers can invoke it unconditionally.
 func (c *RateLimitConfig) validate() error {
 	if c == nil {
@@ -53,10 +51,16 @@ func (c *RateLimitConfig) validate() error {
 	}
 	switch c.FailureMode {
 	case "", "fail-open", "fail-closed":
-		return nil
 	default:
 		return fmt.Errorf("rateLimit.failureMode %q is invalid (want fail-open or fail-closed)", c.FailureMode)
 	}
+	if math.IsNaN(c.Rate.PerSecond) || math.IsInf(c.Rate.PerSecond, 0) || c.Rate.PerSecond <= 0 {
+		return fmt.Errorf("rateLimit.rate must be finite and positive (got %v)", c.Rate.PerSecond)
+	}
+	if c.Burst < 0 {
+		return fmt.Errorf("rateLimit.burst must be non-negative (got %d)", c.Burst)
+	}
+	return nil
 }
 
 // RateLimitConfig is the YAML-facing shape attached to a rule (or, in the
@@ -217,18 +221,8 @@ func limiterForFailedInit(cfg *RateLimitConfig, initErr error) RateLimiter {
 // paths without a cluster runtime). A silent fallback in production
 // would multiply the operator's quota by replicaCount.
 func NewRateLimiter(cfg RateLimitConfig, olricClient *olric.EmbeddedClient, keyspace string) (RateLimiter, error) {
-	// Reject NaN / Inf / negative explicitly — `<= 0` lets NaN slip
-	// through (it compares false to every operator), which would
-	// produce a rate.Limit(NaN) bucket that never refills, or feed
-	// math.Inf into the refillExp expression below where it
-	// silently wraps into a negative time.Duration once cast to
-	// int64. Both surface as "operator's rule limiter just stopped
-	// working" with no log message.
-	if math.IsNaN(cfg.Rate.PerSecond) || math.IsInf(cfg.Rate.PerSecond, 0) {
-		return nil, fmt.Errorf("rate limit: rate must be a finite number (got %v)", cfg.Rate.PerSecond)
-	}
-	if cfg.Rate.PerSecond <= 0 {
-		return nil, fmt.Errorf("rate limit: non-positive rate")
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	burst := cfg.Burst
 	if burst <= 0 {

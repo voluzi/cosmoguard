@@ -100,6 +100,14 @@ func TestMemoryRateLimiter_SeparateBuckets(t *testing.T) {
 	assert.Equal(t, okB, true)
 }
 
+func TestNewRateLimiterRejectsNegativeBurst(t *testing.T) {
+	_, err := NewRateLimiter(RateLimitConfig{
+		Rate:  Rate{PerSecond: 1},
+		Burst: -1,
+	}, nil, "test")
+	assert.ErrorContains(t, err, "rateLimit.burst")
+}
+
 // TestMemoryRateLimiter_Refill verifies that tokens come back after the
 // configured interval. Uses a fast rate to keep the test snappy.
 func TestMemoryRateLimiter_Refill(t *testing.T) {
@@ -218,17 +226,17 @@ func TestRateLimitKey_CompoundFallsBackOnAnonymous(t *testing.T) {
 // rule compilation rather than degrade to a single global bucket at
 // request time. Known scopes (and empty) compile cleanly.
 func TestRateLimitScopeValidation(t *testing.T) {
-	bad := (&HttpRule{RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: "per_identity"}}).Compile()
+	bad := (&HttpRule{Action: RuleActionAllow, RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: "per_identity"}}).Compile()
 	assert.Assert(t, bad != nil, "misspelled scope must fail Compile")
 
 	for _, s := range []RateLimitScope{"", RateLimitScopeGlobal, RateLimitScopePerIP, RateLimitScopePerIdentity, RateLimitScopeCompound} {
-		err := (&HttpRule{RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: s}}).Compile()
+		err := (&HttpRule{Action: RuleActionAllow, RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: s}}).Compile()
 		assert.NilError(t, err, "scope %q must compile", s)
 	}
 
 	// Same enforcement on the JSON-RPC and gRPC rule compilers.
-	assert.Assert(t, (&JsonRpcRule{RateLimit: &RateLimitConfig{Scope: "bogus"}}).Compile() != nil,
+	assert.Assert(t, (&JsonRpcRule{Action: RuleActionAllow, RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: "bogus"}}).Compile() != nil,
 		"jsonrpc: misspelled scope must fail Compile")
-	assert.Assert(t, (&GrpcRule{RateLimit: &RateLimitConfig{Scope: "bogus"}}).Compile() != nil,
+	assert.Assert(t, (&GrpcRule{Action: RuleActionAllow, RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Scope: "bogus"}}).Compile() != nil,
 		"grpc: misspelled scope must fail Compile")
 }

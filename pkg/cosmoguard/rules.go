@@ -112,6 +112,10 @@ const (
 	RuleActionDeny  = "deny"
 )
 
+func (a RuleAction) valid() bool {
+	return a == RuleActionAllow || a == RuleActionDeny
+}
+
 type HttpRule struct {
 	Priority int        `yaml:"priority,omitempty" default:"1000"`
 	Action   RuleAction `yaml:"action"`
@@ -192,7 +196,10 @@ func (r *HttpRule) String() string {
 // result.
 func (r *HttpRule) Compile() error {
 	if err := r.RateLimit.validate(); err != nil {
-		return err
+		return fmt.Errorf("http rule (priority %d): %w", r.Priority, err)
+	}
+	if !r.Action.valid() {
+		return fmt.Errorf("http rule (priority %d) action %q is invalid (want allow or deny)", r.Priority, r.Action)
 	}
 	// Build a fresh effective match tree on every Compile call so two
 	// compiles in a row produce identical state (idempotent).
@@ -422,7 +429,10 @@ func (r *JsonRpcRule) String() string {
 // retain stale entries.
 func (r *JsonRpcRule) Compile() error {
 	if err := r.RateLimit.validate(); err != nil {
-		return err
+		return fmt.Errorf("jsonrpc rule (priority %d): %w", r.Priority, err)
+	}
+	if !r.Action.valid() {
+		return fmt.Errorf("jsonrpc rule (priority %d) action %q is invalid (want allow or deny)", r.Priority, r.Action)
 	}
 
 	var methodGlobs []glob.Glob
@@ -763,7 +773,10 @@ func (r *GrpcRule) String() string {
 // Also computes Fingerprint for per-rule cache-key namespacing.
 func (r *GrpcRule) Compile() error {
 	if err := r.RateLimit.validate(); err != nil {
-		return err
+		return fmt.Errorf("grpc rule (priority %d): %w", r.Priority, err)
+	}
+	if !r.Action.valid() {
+		return fmt.Errorf("grpc rule (priority %d) action %q is invalid (want allow or deny)", r.Priority, r.Action)
 	}
 	r.MethodGlobs = nil
 	if len(r.Methods) > 0 {
