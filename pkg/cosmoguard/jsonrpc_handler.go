@@ -208,7 +208,6 @@ func (h *JsonRpcHandler) recordSingle(r *http.Request, request *JsonRpcMsg, cach
 	h.log.WithFields(Fields{
 		"id":       request.ID,
 		"method":   request.Method,
-		"params":   request.Params,
 		"cache":    cacheState,
 		"duration": duration,
 		"source":   GetSourceIP(r),
@@ -233,7 +232,6 @@ func (h *JsonRpcHandler) recordBatchItem(r *http.Request, req *JsonRpcMsg, cache
 	h.log.WithFields(Fields{
 		"id":       req.ID,
 		"method":   req.Method,
-		"params":   req.Params,
 		"cache":    cacheState,
 		"source":   GetSourceIP(r),
 		"rule_id":  ruleID,

@@ -454,7 +454,6 @@ func (p *JsonRpcWebSocketProxy) recordOutcome(request *JsonRpcMsg, source, cache
 	p.log.WithFields(Fields{
 		"id":       request.ID,
 		"method":   request.Method,
-		"params":   request.Params,
 		"cache":    cacheState,
 		"duration": duration,
 		"source":   source,
