@@ -346,7 +346,11 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 
 		if err := p.handleRequest(client, req, source, idObj); err != nil {
 			p.log.Errorf("error handling request: %v", err)
-			continue
+			var writeErr *wsWriteError
+			if errors.As(err, &writeErr) || errors.Is(err, ErrClosed) {
+				client.Close()
+				break
+			}
 		}
 	}
 }
@@ -571,20 +575,14 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				storeResponse := cacheable
 				if hasSubscriptionMethod(request) {
 					res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
-					if err != nil {
-						return err
-					}
 				} else if cacheable && resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
 					res, err = p.coalescedWSRequest(context.Background(), hash, request, rule.Cache, ruleID)
-					if err != nil {
-						return err
-					}
 					storeResponse = false
 				} else {
 					res, err = p.broker.HandleRequest(request)
-					if err != nil {
-						return err
-					}
+				}
+				if err != nil {
+					return p.replyForwardError(client, request, err)
 				}
 
 				// Notifications (no id) get no response frame, even though
@@ -686,14 +684,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 		var err error
 		if hasSubscriptionMethod(request) {
 			res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
-			if err != nil {
-				return err
-			}
 		} else {
 			res, err = p.broker.HandleRequest(request)
-			if err != nil {
-				return err
-			}
+		}
+		if err != nil {
+			return p.replyForwardError(client, request, err)
 		}
 
 		// Notification (no id) → no response frame even on default-allow
@@ -722,6 +717,17 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 	p.recordOutcome(request, source, cacheMiss, string(defaultActionSnap), nil, startTime,
 		fmt.Sprintf("request %s", defaultActionSnap))
 	return nil
+}
+
+// replyForwardError answers a call the upstream could not serve, so the
+// client is not left waiting on an id that will never be answered. The
+// cause is only logged: it can name internal upstream addresses.
+func (p *JsonRpcWebSocketProxy) replyForwardError(client *JsonRpcWsClient, request *JsonRpcMsg, err error) error {
+	p.log.WithError(err).WithField("method", request.Method).Warn("websocket upstream forwarding failed")
+	if request.ID == nil {
+		return nil
+	}
+	return client.SendMsg(ErrorResponse(request, -32603, "upstream error", nil))
 }
 
 func websocketAdmissionIdentity(identity *Identity) string {
