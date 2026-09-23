@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
 
@@ -39,9 +40,9 @@ type GrpcUpstream struct {
 	// returns true (i.e. Enable is nil-default-enabled or *Enable is
 	// true). nil means "no active probing, rely on conn state only"
 	// (the old behaviour, kept for back-compat with single-node configs).
-	hcConfig     *NodeHealthcheckConfig
-	probeAddr    string
-	healthy atomic.Bool
+	hcConfig  *NodeHealthcheckConfig
+	probeAddr string
+	healthy   atomic.Bool
 	// everHealthy: whether confirmed healthy at least once. While false, the
 	// first successful probe clears the cold-start readiness gate; HealthyAfter
 	// applies only to runtime recovery. Mirrors HttpUpstream.
@@ -177,11 +178,14 @@ func grpcClientCaused(err error) bool {
 		codes.Unauthenticated,
 		codes.FailedPrecondition,
 		codes.OutOfRange,
-		codes.Unimplemented:
+		codes.Unimplemented,
+		// Quota or message-size rejections, including the proxy's own
+		// receive cap on a response the upstream delivered in full.
+		codes.ResourceExhausted:
 		return true
 	default:
-		// Unavailable, Internal, ResourceExhausted, DataLoss, Aborted,
-		// Unknown — genuine upstream/transport health signals.
+		// Unavailable, Internal, DataLoss, Aborted, Unknown — genuine
+		// upstream/transport health signals.
 		return false
 	}
 }
@@ -203,9 +207,7 @@ func (u *GrpcUpstream) RecordOutcomeErr(err error) {
 		return
 	}
 	if grpcNeutral(err) {
-		if u.cbOpen.Load() && u.cbOpenedAtUnixMs.Load() == 0 {
-			u.cbOpenedAtUnixMs.Store(time.Now().UnixMilli())
-		}
+		u.recordNeutral()
 		return
 	}
 	if grpcClientCaused(err) {
@@ -213,6 +215,18 @@ func (u *GrpcUpstream) RecordOutcomeErr(err error) {
 		return
 	}
 	u.RecordOutcome(false)
+}
+
+// recordNeutral records an outcome that says nothing about the upstream's
+// health. It only re-arms the cooldown when it lands on the half-open probe,
+// so the probe token is not consumed without a verdict.
+func (u *GrpcUpstream) recordNeutral() {
+	if u.cbConfig == nil || !u.cbConfig.IsEnabled() {
+		return
+	}
+	if u.cbOpen.Load() && u.cbOpenedAtUnixMs.Load() == 0 {
+		u.cbOpenedAtUnixMs.Store(time.Now().UnixMilli())
+	}
 }
 
 // RecordOutcome is called after every RPC. ok=true on success, false on
@@ -313,6 +327,10 @@ type GrpcUpstreamPool struct {
 	// important on this pool because Close is wrapped in sync.Once, so
 	// a second Close cannot recover from a leaked late spawn.
 	hcShutdown bool
+
+	// maxCallRecvMsgSize is applied to every upstream conn; 0 keeps the
+	// grpc-go default.
+	maxCallRecvMsgSize int
 }
 
 // upstreamsSnapshot returns the current upstreams slice. Immutable for
@@ -343,7 +361,7 @@ func NewGrpcUpstreamPool(name string, nodes []NodeConfig, logger *Entry, opts ..
 	registerSharedMetrics()
 	initial := make([]*GrpcUpstream, 0, len(nodes))
 	for _, n := range nodes {
-		u, err := buildGrpcUpstream(n)
+		u, err := buildGrpcUpstream(n, pool.maxCallRecvMsgSize)
 		if err != nil {
 			// Roll back any conns already dialled.
 			for _, prev := range initial {
@@ -371,7 +389,7 @@ func NewGrpcUpstreamPool(name string, nodes []NodeConfig, logger *Entry, opts ..
 // from a NodeConfig. Shared between the constructor and AddUpstream so
 // dynamically-discovered upstreams get the same TLS, healthcheck, and
 // circuit-breaker treatment as constructor-seeded ones.
-func buildGrpcUpstream(n NodeConfig) (*GrpcUpstream, error) {
+func buildGrpcUpstream(n NodeConfig, maxCallRecvMsgSize int) (*GrpcUpstream, error) {
 	w := n.Weight
 	if w < 1 {
 		w = 1
@@ -380,10 +398,18 @@ func buildGrpcUpstream(n NodeConfig) (*GrpcUpstream, error) {
 	if err != nil {
 		return nil, err
 	}
+	callOpts := []grpc.CallOption{grpc.ForceCodec(rawCodec{})}
+	if maxCallRecvMsgSize > 0 {
+		callOpts = append(callOpts, grpc.MaxCallRecvMsgSize(maxCallRecvMsgSize))
+	}
 	conn, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(creds),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
+		grpc.WithDefaultCallOptions(callOpts...),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:    grpcClientKeepaliveTime,
+			Timeout: grpcKeepaliveTimeout,
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", target, err)
@@ -440,7 +466,7 @@ func (p *GrpcUpstreamPool) AddUpstream(n NodeConfig) error {
 			return nil // already in pool
 		}
 	}
-	u, err := buildGrpcUpstream(n)
+	u, err := buildGrpcUpstream(n, p.maxCallRecvMsgSize)
 	if err != nil {
 		return err
 	}
@@ -779,6 +805,11 @@ func (p *GrpcUpstreamPool) Close() {
 
 // GrpcUpstreamPoolOption — pool config knob.
 type GrpcUpstreamPoolOption func(*GrpcUpstreamPool)
+
+// withGrpcMaxCallRecvMsgSize caps the response size accepted from upstreams.
+func withGrpcMaxCallRecvMsgSize(n int) GrpcUpstreamPoolOption {
+	return func(p *GrpcUpstreamPool) { p.maxCallRecvMsgSize = n }
+}
 
 // WithGrpcUpstreamStrategy selects the picker for gRPC.
 func WithGrpcUpstreamStrategy(s string) GrpcUpstreamPoolOption {

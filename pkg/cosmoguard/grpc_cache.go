@@ -66,9 +66,13 @@ const grpcCacheMetaKey = "x-cosmoguard-cache"
 // stored, so the freshness / stale-while-revalidate policy can be applied at
 // read time (the bare []byte value had no timestamp). Old []byte-schema entries
 // fail to decode into this struct and surface as a miss — a safe self-heal.
+// Header and Trailer are the upstream's response metadata, stored with the
+// payload so values such as x-cosmos-block-height stay paired with it.
 type grpcCachedResponse struct {
-	Payload   []byte    `msgpack:"payload"`
-	StoredAt  time.Time `msgpack:"stored_at,omitempty"`
+	Payload   []byte      `msgpack:"payload"`
+	StoredAt  time.Time   `msgpack:"stored_at,omitempty"`
+	Header    metadata.MD `msgpack:"header,omitempty"`
+	Trailer   metadata.MD `msgpack:"trailer,omitempty"`
 	shareable bool
 	owner     *grpcResponseOwner
 }
@@ -77,7 +81,30 @@ type grpcResponseOwner [1]byte
 
 // CacheCost implements the L1 cost accounting (cache.CacheCoster). 64 bytes of
 // slack covers the struct header + StoredAt + map/entry bookkeeping.
-func (g grpcCachedResponse) CacheCost() uint64 { return uint64(len(g.Payload)) + 64 }
+func (g grpcCachedResponse) CacheCost() uint64 {
+	return uint64(len(g.Payload)+grpcMDSize(g.Header)+grpcMDSize(g.Trailer)) + 64
+}
+
+func grpcMDSize(md metadata.MD) int {
+	n := 0
+	for k, vals := range md {
+		n += len(k)
+		for _, v := range vals {
+			n += len(v)
+		}
+	}
+	return n
+}
+
+// sendGRPCResponse replays the upstream metadata with cosmoguard's cache
+// marker added, then the payload.
+func sendGRPCResponse(stream grpc.ServerStream, resp grpcCachedResponse, cacheState string) error {
+	header := resp.Header.Copy()
+	header.Set(grpcCacheMetaKey, cacheState)
+	_ = stream.SetHeader(header)
+	stream.SetTrailer(resp.Trailer)
+	return stream.SendMsg(&rawFrame{Payload: resp.Payload})
+}
 
 // rawCodec is the codec cosmoguard installs on the gRPC server + per-call
 // on the upstream client. Hands raw protobuf bytes to handlers without
@@ -213,14 +240,12 @@ func cachingStreamHandler(
 			stale := resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig))
 			switch classifyFreshness(cached.StoredAt, nowOrDefault(p.now), effTTL, stale) {
 			case freshEntry:
-				_ = stream.SetHeader(metadata.Pairs(grpcCacheMetaKey, cacheHit))
-				return stream.SendMsg(&rawFrame{Payload: cached.Payload})
+				return sendGRPCResponse(stream, cached, cacheHit)
 			case staleEntry:
 				// Serve the stale payload immediately and refresh in the
 				// background (coalesced by key) so the client never waits.
-				_ = stream.SetHeader(metadata.Pairs(grpcCacheMetaKey, cacheStale))
 				p.sf.refresh(key, p.grpcRefreshFn(md, method, req.Payload, key, rule))
-				return stream.SendMsg(&rawFrame{Payload: cached.Payload})
+				return sendGRPCResponse(stream, cached, cacheStale)
 				// expiredEntry falls through to a miss.
 			}
 		}
@@ -246,10 +271,15 @@ func cachingStreamHandler(
 			out, fetchErr = p.grpcFetchAndStore(outCtx, method, req.Payload, key, rule, false)
 		}
 		if fetchErr != nil {
+			// Forward the upstream's error metadata as the transparent
+			// path would.
+			if len(out.Header) > 0 {
+				_ = stream.SetHeader(out.Header)
+			}
+			stream.SetTrailer(out.Trailer)
 			return fetchErr
 		}
-		_ = stream.SetHeader(metadata.Pairs(grpcCacheMetaKey, cacheMiss))
-		return stream.SendMsg(&rawFrame{Payload: out.Payload})
+		return sendGRPCResponse(stream, out, cacheMiss)
 	}
 }
 
@@ -285,9 +315,13 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 	if upstream == nil {
 		return grpcCachedResponse{}, status.Error(codes.Unavailable, "no upstream available")
 	}
-	var resp rawFrame
+	var (
+		resp            rawFrame
+		header, trailer metadata.MD
+	)
 	// Pick already reserved the in-flight lease; release it after Invoke.
-	invokeErr := upstream.conn.Invoke(fetchCtx, method, &rawFrame{Payload: reqPayload}, &resp, grpc.ForceCodec(rawCodec{}))
+	invokeErr := upstream.conn.Invoke(fetchCtx, method, &rawFrame{Payload: reqPayload}, &resp,
+		grpc.ForceCodec(rawCodec{}), grpc.Header(&header), grpc.Trailer(&trailer))
 	upstream.inFlight.Add(-1)
 	// One real upstream fetch. Coalesced single-flight waiters and cache hits
 	// never reach grpcFetchAndStore, so this counts only genuine Invokes.
@@ -306,10 +340,12 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 		upstream.RecordOutcomeErr(invokeErr)
 	}
 	if invokeErr != nil {
-		return grpcCachedResponse{}, invokeErr
+		return grpcCachedResponse{Header: header, Trailer: trailer}, invokeErr
 	}
 	out := grpcCachedResponse{
 		Payload:   resp.Payload,
+		Header:    header,
+		Trailer:   trailer,
 		StoredAt:  nowOrDefault(p.now).UTC(),
 		shareable: len(resp.Payload) > 0,
 	}
@@ -482,11 +518,18 @@ func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 		// traffic drives least-conn selection and the circuit breaker —
 		// previously only the cache-miss Invoke path did. nil-safe when
 		// no upstream was stashed (e.g. a non-GrpcProxy director in tests).
+		// inboundFailed marks the synthesized Internal below: the client
+		// side of the proxy failed, which says nothing about the upstream.
+		inboundFailed := false
 		if up := upstreamFromCtx(outCtx); up != nil {
 			// Pick (in the director) already reserved the in-flight lease;
 			// release it when the stream finishes.
 			defer func() {
 				up.inFlight.Add(-1)
+				if inboundFailed {
+					up.recordNeutral()
+					return
+				}
 				// Classify by status code: a client cancel/deadline or an
 				// app-level status the node returns (InvalidArgument,
 				// NotFound…) must not open the breaker on a healthy upstream.
@@ -534,6 +577,7 @@ func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 						return c2sErr
 					}
 				}
+				inboundFailed = true
 				return status.Errorf(codes.Internal, "raw proxy s2c: %v", s2cErr)
 			case c2sErr := <-c2sErrCh:
 				serverStream.SetTrailer(clientStream.Trailer())
@@ -588,10 +632,11 @@ func rawForwardServerToClient(src grpc.ServerStream, dst grpc.ClientStream) chan
 }
 
 // rawForwardClientToServer pumps upstream (cosmoguard → client) frames
-// to the inbound server stream. On the first iteration we also copy
-// the upstream's response headers before flushing the first message
-// — same hack mwitkow uses, since gRPC requires headers be sent
-// before any body frame on the server stream.
+// to the inbound server stream. The upstream's response headers are
+// forwarded first, as soon as they arrive, so a response with no
+// messages (or an error after explicit headers) keeps them too. Header
+// returns nil for a trailers-only response; the trailer carries its
+// metadata and the handler copies it.
 func rawForwardClientToServer(src grpc.ClientStream, dst grpc.ServerStream) chan error {
 	ret := make(chan error, 1)
 	go func() {
@@ -605,24 +650,22 @@ func rawForwardClientToServer(src grpc.ClientStream, dst grpc.ServerStream) chan
 				}
 			}
 		}()
-		first := true
+		md, err := src.Header()
+		if err != nil {
+			ret <- err
+			return
+		}
+		if md != nil {
+			if err := dst.SendHeader(md); err != nil {
+				ret <- err
+				return
+			}
+		}
 		for {
 			f := &rawFrame{}
 			if err := src.RecvMsg(f); err != nil {
 				ret <- err
 				return
-			}
-			if first {
-				first = false
-				md, err := src.Header()
-				if err != nil {
-					ret <- err
-					return
-				}
-				if err := dst.SendHeader(md); err != nil {
-					ret <- err
-					return
-				}
 			}
 			if err := dst.SendMsg(f); err != nil {
 				ret <- err

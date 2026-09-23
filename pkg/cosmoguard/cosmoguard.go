@@ -374,6 +374,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		WithOlricClient[GrpcProxyOptions](cosmoGuard.cluster.Client()),
 		WithMetricsEnabled[GrpcProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 		WithAuthenticator[GrpcProxyOptions](cosmoGuard.auth),
+		WithGrpcMessageLimits(cosmoGuard.cfg.GRPC.MaxRecvMsgSize, cosmoGuard.cfg.GRPC.MaxSendMsgSize),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up grpc cosmoguard proxy: %w", err)
@@ -1080,6 +1081,13 @@ func (f *CosmoGuard) tryReload() {
 	// calls SetRules. Now that an explicit `webSocketEnabled: false` survives
 	// defaulting, toggling it (or changing the connection count) on reload
 	// would be accepted but ignored — reject as restart-required.
+	if f.cfg.GRPC.MaxRecvMsgSize != newCfg.GRPC.MaxRecvMsgSize ||
+		f.cfg.GRPC.MaxSendMsgSize != newCfg.GRPC.MaxSendMsgSize {
+		err := fmt.Errorf("grpc message size change (maxRecvMsgSize / maxSendMsgSize) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
 	if f.cfg.RPC.WebSocketIsEnabled() != newCfg.RPC.WebSocketIsEnabled() ||
 		f.cfg.RPC.WebSocketConnections != newCfg.RPC.WebSocketConnections ||
 		f.cfg.EVM.WS.WebSocketConnections != newCfg.EVM.WS.WebSocketConnections {

@@ -41,10 +41,17 @@ func DefaultHttpProxyOptions() *HttpProxyOptions {
 
 type GrpcProxyOptions struct {
 	*SharedOptions
+	// MaxRecvMsgSize caps request messages from clients; MaxSendMsgSize
+	// caps response messages, on both the listener and the upstream conns.
+	MaxRecvMsgSize int
+	MaxSendMsgSize int
 }
 
 func DefaultGrpcProxyOptions() *GrpcProxyOptions {
-	cfg := &GrpcProxyOptions{}
+	cfg := &GrpcProxyOptions{
+		MaxRecvMsgSize: defaultGrpcMaxRecvMsgSize,
+		MaxSendMsgSize: defaultGrpcMaxSendMsgSize,
+	}
 	cfg.SharedOptions = DefaultSharedOptions()
 	return cfg
 }
@@ -329,5 +336,14 @@ func WithMaxBatchSize[T JsonRpcHandlerOptions](n int) Option[T] {
 		default:
 			panic("unexpected use")
 		}
+	}
+}
+
+// WithGrpcMessageLimits sets the gRPC request (recv) and response (send)
+// message size caps.
+func WithGrpcMessageLimits(maxRecv, maxSend int) Option[GrpcProxyOptions] {
+	return func(opts *GrpcProxyOptions) {
+		opts.MaxRecvMsgSize = maxRecv
+		opts.MaxSendMsgSize = maxSend
 	}
 }

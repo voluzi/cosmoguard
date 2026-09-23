@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -75,6 +77,26 @@ func synthRequestFromGrpcMD(md metadata.MD) *http.Request {
 	}
 	return r
 }
+
+const (
+	// Cosmos SDK node defaults (DefaultGRPCMaxRecvMsgSize /
+	// DefaultGRPCMaxSendMsgSize); grpc-go's own 4 MiB receive default
+	// would reject responses the node serves.
+	defaultGrpcMaxRecvMsgSize = 10 << 20
+	defaultGrpcMaxSendMsgSize = math.MaxInt32
+
+	// grpcMaxConcurrentStreams bounds the streams one client connection can
+	// hold open; clients over the cap queue rather than fail.
+	grpcMaxConcurrentStreams = 1000
+	// grpcServerKeepaliveTime pings idle client connections so a vanished
+	// client releases its streams in minutes rather than grpc-go's 2h.
+	grpcServerKeepaliveTime = 2 * time.Minute
+	// grpcClientKeepaliveTime must not undercut the upstream node's
+	// keepalive enforcement (grpc-go default MinTime 5m), or the node
+	// answers with GOAWAY too_many_pings.
+	grpcClientKeepaliveTime = 5 * time.Minute
+	grpcKeepaliveTimeout    = 20 * time.Second
+)
 
 type GrpcProxy struct {
 	defaultAction RuleAction
@@ -182,6 +204,7 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	if upstreamCfg != nil {
 		poolOpts = append(poolOpts, WithGrpcUpstreamStrategy(upstreamCfg.Strategy))
 	}
+	poolOpts = append(poolOpts, withGrpcMaxCallRecvMsgSize(cfg.MaxSendMsgSize))
 	pool, err := NewGrpcUpstreamPool(name, nodes, proxy.log, poolOpts...)
 	if err != nil {
 		return nil, err
@@ -223,6 +246,13 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	server := grpc.NewServer(
 		grpc.ForceServerCodec(rawCodec{}),
 		grpc.UnknownServiceHandler(handler),
+		grpc.MaxRecvMsgSize(cfg.MaxRecvMsgSize),
+		grpc.MaxSendMsgSize(cfg.MaxSendMsgSize),
+		grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    grpcServerKeepaliveTime,
+			Timeout: grpcKeepaliveTimeout,
+		}),
 	)
 	proxy.server = server
 
@@ -401,6 +431,17 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		// rejected above regardless of any rule.
 	}
 	outCtx := metadata.NewOutgoingContext(ctx, outMD)
+	// allow validates the forwarded metadata the way grpc-go's client does:
+	// HTTP/2 lets clients send metadata grpc-go refuses to send upstream,
+	// and that local refusal must surface as the client's error rather
+	// than an upstream failure charged to the circuit breaker.
+	allow := func() (context.Context, error) {
+		if err := validateOutgoingMetadata(outMD); err != nil {
+			markErrSpan("invalid metadata")
+			return ctx, status.Error(codes.InvalidArgument, err.Error())
+		}
+		return outCtx, nil
+	}
 
 	p.rulesMutex.RLock()
 	defer p.rulesMutex.RUnlock()
@@ -464,7 +505,7 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 			p.log.WithFields(map[string]interface{}{
 				"method": method, "source": source, "action": "allow",
 			}).Info("request allowed")
-			return outCtx, nil
+			return allow()
 
 		case RuleActionDeny:
 			p.log.WithFields(map[string]interface{}{
@@ -513,7 +554,7 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		p.log.WithFields(map[string]interface{}{
 			"method": method, "source": source, "action": "allow",
 		}).Info("request allowed")
-		return outCtx, nil
+		return allow()
 	}
 	markErrSpan("denied by default action")
 	p.log.WithFields(map[string]interface{}{
@@ -526,6 +567,37 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		Method:   method,
 	})
 	return ctx, status.Error(codes.PermissionDenied, "permission denied")
+}
+
+// validateOutgoingMetadata mirrors grpc-go's internal metadata.Validate:
+// keys in [0-9a-z-_.] (pseudo-headers are skipped by grpc-go), and values
+// of non "-bin" keys in printable ASCII.
+func validateOutgoingMetadata(md metadata.MD) error {
+	for k, vals := range md {
+		if k == "" {
+			return fmt.Errorf("metadata contains an empty key")
+		}
+		if k[0] == ':' {
+			continue
+		}
+		for i := 0; i < len(k); i++ {
+			c := k[i]
+			if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '.' && c != '-' && c != '_' {
+				return fmt.Errorf("metadata key %q contains illegal characters not in [0-9a-z-_.]", k)
+			}
+		}
+		if strings.HasSuffix(k, "-bin") {
+			continue
+		}
+		for _, v := range vals {
+			for i := 0; i < len(v); i++ {
+				if v[i] < 0x20 || v[i] > 0x7E {
+					return fmt.Errorf("metadata key %q contains value with non-printable ASCII characters", k)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // grpcUpstreamCtxKey carries the picked *GrpcUpstream from Handle to the
