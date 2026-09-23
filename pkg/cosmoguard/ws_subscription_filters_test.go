@@ -40,7 +40,8 @@ func TestEthSubscribeForwardsFiltersAndKeysOnCompleteParams(t *testing.T) {
 	assert.Assert(t, string(resultA.response.Result) != string(resultB.response.Result),
 		"distinct filters must not share a subscription")
 
-	// Same filter as the first client, keys in a different order.
+	// Equal to the first filter; the key encoder sorts object keys, so
+	// it does not depend on how the client ordered them.
 	sameAsA := []any{"logs", map[string]any{
 		"topics":  []any{"0xaa"},
 		"address": "0x1111111111111111111111111111111111111111",
@@ -76,4 +77,14 @@ func TestEthSubscribeWithoutOptionsKeepsNameKey(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, key, "newHeads")
 	assert.DeepEqual(t, ethSubscribeParams(key), []any{"newHeads"})
+}
+
+func TestEthSubscribeNameCannotAliasEncodedParams(t *testing.T) {
+	filtered := []any{"logs", map[string]any{"address": "0x1"}}
+	filteredKey, err := getSubscriptionParam(&JsonRpcMsg{Method: methodSubscribeEth, Params: filtered})
+	assert.NilError(t, err)
+	nameKey, err := getSubscriptionParam(&JsonRpcMsg{Method: methodSubscribeEth, Params: []any{filteredKey}})
+	assert.NilError(t, err)
+	assert.Assert(t, nameKey != filteredKey)
+	assert.DeepEqual(t, ethSubscribeParams(nameKey), []any{filteredKey})
 }

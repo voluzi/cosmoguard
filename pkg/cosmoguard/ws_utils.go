@@ -55,7 +55,9 @@ func getSubscriptionParam(req *JsonRpcMsg) (string, error) {
 	// follow the subscription name. The whole array is the subscription
 	// key so distinct filters get distinct upstream subscriptions; the
 	// encoder sorts object keys, so equivalent filters still share one.
-	if req.Method == methodSubscribeEth && len(params) > 1 {
+	// A bare name starting with "[" is encoded too, so it cannot pass for
+	// an encoded array.
+	if req.Method == methodSubscribeEth && (len(params) > 1 || strings.HasPrefix(query, "[")) {
 		key, err := json.Marshal(params)
 		if err != nil {
 			return "", fmt.Errorf("bad subscription params: %w", err)
