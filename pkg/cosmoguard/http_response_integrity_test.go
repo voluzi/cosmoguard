@@ -148,6 +148,30 @@ func TestHTTPResponseIntegrityIncompleteResponseIsNotShared(t *testing.T) {
 	}
 }
 
+func TestHTTPResponseIntegrityLegacyIncompleteCacheEntriesAreIgnored(t *testing.T) {
+	for _, status := range []int{http.StatusPartialContent, http.StatusNotModified} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			p, hits := newCacheTestProxy(t, 0, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, "complete")
+			})
+			rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute, CacheError: true})
+			request := httptest.NewRequest(http.MethodGet, "/status", nil)
+			key, err := p.getRequestHash(request, rule.Fingerprint, rule.Cache.EffectiveHTTPKeyMetadata())
+			require.NoError(t, err)
+			require.NoError(t, p.cache.Set(t.Context(), key, CachedResponse{
+				StatusCode: status,
+				Data:       []byte("legacy-incomplete"),
+				StoredAt:   time.Now(),
+			}, time.Minute))
+
+			got, _ := cacheRequest(p, rule, nil)
+			require.Equal(t, http.StatusOK, got.Code)
+			require.Equal(t, "complete", got.Body.String())
+			require.Equal(t, int32(1), hits.Load())
+		})
+	}
+}
+
 func TestHTTPResponseIntegrityAbortedUpstream(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -232,11 +256,13 @@ func TestHTTPResponseIntegrityAbortedRefresh(t *testing.T) {
 		w.(http.Flusher).Flush()
 		panic(http.ErrAbortHandler)
 	})
+	now := time.Unix(1_700_000_000, 123_456_789)
+	p.now = func() time.Time { return now }
 	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Second, StaleWhileRevalidate: time.Minute})
 	request := httptest.NewRequest(http.MethodGet, "/status", nil)
 	key, err := p.getRequestHash(request, rule.Fingerprint, rule.Cache.EffectiveHTTPKeyMetadata())
 	require.NoError(t, err)
-	stale := CachedResponse{StatusCode: http.StatusOK, Data: []byte("stale"), StoredAt: time.Now().Add(-2 * time.Second)}
+	stale := CachedResponse{StatusCode: http.StatusOK, Data: []byte("stale"), StoredAt: now.Add(-2 * time.Second)}
 	require.NoError(t, p.cache.Set(t.Context(), key, stale, time.Minute))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.sf.refresh(key, p.backgroundRefreshFn(r, key, rule.Cache, "test"))
@@ -257,7 +283,7 @@ func TestHTTPResponseIntegrityAbortedRefresh(t *testing.T) {
 	cached, err := p.cache.Get(t.Context(), key)
 	require.NoError(t, err)
 	require.Equal(t, stale.Data, cached.Data)
-	require.Equal(t, stale.StoredAt.Unix(), cached.StoredAt.Unix())
+	require.Equal(t, stale.StoredAt, cached.StoredAt)
 	_, staged := p.pendingMisses.Load(key)
 	require.False(t, staged)
 	require.NotContains(t, logs.String(), "panic in background cache refresh")
