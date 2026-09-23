@@ -51,7 +51,31 @@ func getSubscriptionParam(req *JsonRpcMsg) (string, error) {
 		return "", fmt.Errorf("bad query format (should be string)")
 	}
 
+	// eth_subscribe options (log address/topics filters and the like)
+	// follow the subscription name. The whole array is the subscription
+	// key so distinct filters get distinct upstream subscriptions; the
+	// encoder sorts object keys, so equivalent filters still share one.
+	if req.Method == methodSubscribeEth && len(params) > 1 {
+		key, err := json.Marshal(params)
+		if err != nil {
+			return "", fmt.Errorf("bad subscription params: %w", err)
+		}
+		return string(key), nil
+	}
+
 	return query, nil
+}
+
+// ethSubscribeParams rebuilds the eth_subscribe params from a key
+// produced by getSubscriptionParam.
+func ethSubscribeParams(param string) []interface{} {
+	if strings.HasPrefix(param, "[") {
+		var params []interface{}
+		if err := json.Unmarshal([]byte(param), &params); err == nil {
+			return params
+		}
+	}
+	return []interface{}{param}
 }
 
 func isEthSubscriptionID(params string) bool {

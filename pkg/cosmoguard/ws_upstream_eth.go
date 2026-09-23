@@ -356,7 +356,7 @@ func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param str
 		Version: jsonRpcVersion,
 		ID:      requestID,
 		Method:  methodSubscribeEth,
-		Params:  []interface{}{param},
+		Params:  ethSubscribeParams(param),
 	}
 
 	resp, err := u.makeRequestWithIDOnClient(cli, requestID, msg)
