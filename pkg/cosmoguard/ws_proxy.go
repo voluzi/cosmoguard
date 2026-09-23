@@ -503,9 +503,6 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 	startTime := time.Now()
 
 	for _, rule := range rulesSnap {
-		// Per-rule cache namespace: see HashWithRule for the cross-
-		// rule cache poisoning rationale.
-		hash := request.HashWithRule(rule.Fingerprint)
 		match := rule.Match(request)
 		if match {
 			ruleID := ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
@@ -538,7 +535,12 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				// pattern-based and may straddle subscription and
 				// non-subscription methods.
 				cacheable := request.ID != nil && rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
+				// Per-rule cache namespace: see HashWithRule for the cross-
+				// rule cache poisoning rationale. Only computed for a
+				// cacheable match because it marshals the params.
+				var hash uint64
 				if cacheable {
+					hash = request.HashWithRule(rule.Fingerprint)
 					// Single round-trip lookup: ErrNotFound is the miss
 					// signal, any other error is a backend failure that
 					// we log and fall through on. The previous shape

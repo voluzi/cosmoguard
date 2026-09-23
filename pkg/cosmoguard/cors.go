@@ -161,6 +161,49 @@ func (c *CORSConfig) HandlePreflight(w http.ResponseWriter, r *http.Request) boo
 	return true
 }
 
+var corsResponseHeaders = []string{
+	"Access-Control-Allow-Origin",
+	"Access-Control-Allow-Credentials",
+	"Access-Control-Allow-Methods",
+	"Access-Control-Allow-Headers",
+	"Access-Control-Expose-Headers",
+	"Access-Control-Max-Age",
+}
+
+// StripFromResponse undoes ApplyToResponse on a writer's headers before they
+// are merged with an upstream response that carries its own copy:
+// httputil.ReverseProxy appends header values, so leaving both would send
+// two Access-Control-Allow-Origin values, which browsers reject.
+func (c *CORSConfig) StripFromResponse(headers http.Header) {
+	if !c.Enable {
+		return
+	}
+	for _, h := range corsResponseHeaders {
+		headers.Del(h)
+	}
+	values := headers.Values("Vary")
+	if len(values) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(values))
+	for _, value := range values {
+		tokens := strings.Split(value, ",")
+		remaining := tokens[:0]
+		for _, token := range tokens {
+			if !strings.EqualFold(strings.TrimSpace(token), "Origin") {
+				remaining = append(remaining, token)
+			}
+		}
+		if len(remaining) > 0 {
+			kept = append(kept, strings.TrimSpace(strings.Join(remaining, ",")))
+		}
+	}
+	headers.Del("Vary")
+	for _, value := range kept {
+		headers.Add("Vary", value)
+	}
+}
+
 // ApplyToResponse strips upstream CORS headers from `headers` and replaces
 // them with cosmoguard's policy. Called from the cache-hit and cache-
 // miss paths so cosmoguard, not the upstream, owns the CORS surface.
@@ -169,14 +212,7 @@ func (c *CORSConfig) ApplyToResponse(headers http.Header, requestOrigin string) 
 		return
 	}
 	// Strip whatever upstream sent.
-	for _, h := range []string{
-		"Access-Control-Allow-Origin",
-		"Access-Control-Allow-Credentials",
-		"Access-Control-Allow-Methods",
-		"Access-Control-Allow-Headers",
-		"Access-Control-Expose-Headers",
-		"Access-Control-Max-Age",
-	} {
+	for _, h := range corsResponseHeaders {
 		headers.Del(h)
 	}
 	// Advertise Vary: Origin unconditionally whenever cosmoguard owns CORS —

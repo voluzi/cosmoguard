@@ -200,7 +200,7 @@ func TestE_MultiUpstream_HealthcheckFailover(t *testing.T) {
 }
 
 // TestE_CircuitBreaker_TripsOnConsecutiveFailures: one upstream always
-// returns 500. After ConsecutiveFailures back-to-back failures, the
+// returns 503. After ConsecutiveFailures back-to-back failures, the
 // circuit opens and the other upstream serves everything until the
 // cooldown elapses.
 func TestE_CircuitBreaker_TripsOnConsecutiveFailures(t *testing.T) {
@@ -208,7 +208,7 @@ func TestE_CircuitBreaker_TripsOnConsecutiveFailures(t *testing.T) {
 
 	sick := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sickHits.Add(1)
-		w.WriteHeader(http.StatusInternalServerError) // always fails
+		w.WriteHeader(http.StatusServiceUnavailable) // always fails
 	}))
 	defer sick.Close()
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

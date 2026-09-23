@@ -651,7 +651,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		// Opt-in pprof on the metrics port. Gated by COSMOGUARD_PPROF
 		// because /debug/pprof leaks symbol info and the heap profile
 		// is CPU-heavy; restrict via NetworkPolicy when enabled.
-		if os.Getenv("COSMOGUARD_PPROF") != "" {
+		pprofEnabled := os.Getenv("COSMOGUARD_PPROF") != ""
+		if pprofEnabled {
 			mux.HandleFunc("/debug/pprof/", pprof.Index)
 			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
@@ -724,10 +725,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		if cfg.Metrics.WebUI.Enable {
 			installWebUI(mux, cosmoGuard, &cfg.Metrics.WebUI)
 		}
-		cosmoGuard.metricsServer = &http.Server{
-			Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Metrics.Port),
-			Handler: mux,
-		}
+		cosmoGuard.metricsServer = newMetricsServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Metrics.Port), mux, pprofEnabled)
 	}
 
 	// Standalone read-only dashboard listener. Independent of
@@ -745,6 +743,26 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 
 	success = true
 	return cosmoGuard, nil
+}
+
+// newMetricsServer bounds slow clients on the metrics/ops listener (which
+// binds cfg.Host, 0.0.0.0 by default) with the standalone dashboard's
+// timeouts. WriteTimeout is left unset when pprof is enabled because
+// /debug/pprof/profile and /trace reject a duration at or above it, and their
+// default is 30s.
+func newMetricsServer(addr string, handler http.Handler, pprofEnabled bool) *http.Server {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if pprofEnabled {
+		srv.WriteTimeout = 0
+	}
+	return srv
 }
 
 func (f *CosmoGuard) Run() error {

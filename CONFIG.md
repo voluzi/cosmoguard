@@ -44,7 +44,7 @@ The `server:` block tunes HTTP/WS server timeouts and body caps. Defaults are co
 server:
   readHeaderTimeout: 10s    # cap on time to read HTTP headers (slowloris defense)
   readTimeout: 30s          # cap on total request-read time
-  writeTimeout: 0            # cap on response write time; 0 = no limit (default)
+  writeTimeout: 0            # cap on response write time, also the upstream response-header wait; 0 = no limit (default)
   idleTimeout: 60s          # keep-alive idle timeout
   maxRequestBody: 5242880   # bytes; requests exceeding this return 413 (0 = no limit)
   wsReadLimit: 1048576      # max bytes per inbound WebSocket frame (0 = no limit)
