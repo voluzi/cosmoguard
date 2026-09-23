@@ -182,6 +182,10 @@ func (u *UpstreamConnManagerCosmos) Run(log *Entry) error {
 // exists, isn't closed, and hasn't accumulated multiple consecutive
 // connect failures (so a backend in repeated reconnect backoff is
 // flagged unhealthy and the pool can migrate its subscriptions).
+//
+// A closed socket is unhealthy at once, with no grace period: the broker
+// moves its subscriptions on its next migration scan (migrationInterval)
+// so clients are not left without events while the node restarts.
 func (u *UpstreamConnManagerCosmos) IsHealthy() bool {
 	cli := u.curClient()
 	if cli == nil || cli.IsClosed() {
@@ -191,9 +195,9 @@ func (u *UpstreamConnManagerCosmos) IsHealthy() bool {
 }
 
 // unhealthyAfterFailedReconnects is the consecutive-failure threshold
-// past which a connection is considered "stuck" rather than briefly
-// flaky. ~3 × connectRetryPeriod (15s) gives the network a chance to
-// recover before the migrator starts moving subscriptions around.
+// past which a connection whose redials keep failing is considered
+// "stuck" rather than briefly flaky (~3 × connectRetryPeriod). It does
+// not delay migration after a socket closes; see IsHealthy.
 const unhealthyAfterFailedReconnects = 3
 
 func (u *UpstreamConnManagerCosmos) connect() error {
