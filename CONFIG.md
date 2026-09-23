@@ -695,6 +695,13 @@ are allowed. Nested objects/arrays, timestamps, non-finite numbers, unsupported
 top-level shapes, and integers outside the exact range reject the config at
 startup or reload.
 
+A reload re-applies the rules to live WebSocket subscriptions, matching each
+against its original subscribe request. A subscription the new rules deny is
+unsubscribed. A Cosmos client receives CometBFT's cancellation error under its
+subscribe id. `eth_subscribe` has no cancellation message, so an EVM client's
+connection is closed, together with its other subscriptions. Only the rule
+action is re-applied, not per-rule `auth` or `rateLimit`.
+
 ### gRPC rule
 
 | Field | Default | Description |

@@ -49,7 +49,8 @@ changed from v3; existing v3 configs continue to work — run
   validate` for CI gates, `cosmoguard migrate-config` for v3→v4 rewrites,
   `/healthz` / `/readyz` / `/info` / `/metrics` for k8s probes and
   Prometheus.
-- **Hot-reload** of config rules without dropping in-flight requests.
+- **Hot-reload** of config rules without dropping in-flight requests;
+  WebSocket subscriptions the new rules deny are revoked.
 - **Live observability dashboard**: a read-only UI with per-protocol
   traffic, cache hit rates, rule/identity views, recent denials,
   unmatched endpoints, a live request feed, and a WebSocket

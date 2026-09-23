@@ -64,8 +64,8 @@ func TestBrokerForgetsSubscribeRequestsWithMembership(t *testing.T) {
 		require.NoError(t, err)
 	}
 	requests := func() int {
-		broker.requestsMu.Lock()
-		defer broker.requestsMu.Unlock()
+		broker.membershipMu.Lock()
+		defer broker.membershipMu.Unlock()
 		return len(broker.requests)
 	}
 	require.Equal(t, 3, requests())
@@ -77,4 +77,56 @@ func TestBrokerForgetsSubscribeRequestsWithMembership(t *testing.T) {
 	require.Equal(t, 2, requests())
 	require.NoError(t, broker.removeAllSubscriptions(client))
 	require.Equal(t, 0, requests())
+}
+
+func TestWSRuleReloadDuringSubscribeRevokesIt(t *testing.T) {
+	upstream := newLimitingUpstream()
+	proxy, err := NewJsonRpcWebSocketProxy(t.Name(), []string{"ws://upstream.test"}, "/websocket", 1,
+		limitingConstructor(upstream), nil, false, nil)
+	require.NoError(t, err)
+	proxy.log = log.WithField("test", t.Name())
+	proxy.broker.log = proxy.log
+	proxy.cgDashboard = newDashboardObservability()
+	proxy.SetRules(nil, RuleActionAllow, nil)
+	client, peer := newWSCacheClient(t)
+
+	upstream.subscribeStarted = make(chan struct{})
+	upstream.subscribeRelease = make(chan struct{})
+	handled := make(chan error, 1)
+	go func() {
+		handled <- proxy.handleRequest(client, &JsonRpcMsg{
+			Version: jsonRpcVersion, ID: 5, Method: methodSubscribeCosmos, Params: []any{"tm.event='Tx'"},
+		}, "192.0.2.1", nil)
+	}()
+	<-upstream.subscribeStarted
+	proxy.SetRules(nil, RuleActionDeny, nil)
+	// Let the reload's own scan finish while the membership does not exist.
+	time.Sleep(50 * time.Millisecond)
+	close(upstream.subscribeRelease)
+	require.NoError(t, <-handled)
+
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(2*time.Second)))
+	var ack, notice JsonRpcMsg
+	require.NoError(t, peer.ReadJSON(&ack))
+	require.Nil(t, ack.Error)
+	require.NoError(t, peer.ReadJSON(&notice))
+	require.EqualValues(t, 5, notice.ID)
+	require.NotNil(t, notice.Error)
+	require.Eventually(t, func() bool { return proxy.broker.ClientSubCount(client) == 0 }, 2*time.Second, 5*time.Millisecond)
+}
+
+func TestBrokerRevokeRechecksCurrentRules(t *testing.T) {
+	upstream := newLimitingUpstream()
+	broker := NewBroker([]string{"ws://upstream.test"}, "/", 1, limitingConstructor(upstream))
+	broker.log = log.WithField("test", t.Name())
+	client := NewJsonRpcWsClient(nil)
+	id, err := broker.addSubscription(client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 1, Method: methodSubscribeCosmos, Params: []any{"q"},
+	})
+	require.NoError(t, err)
+
+	// Denied when scanned, allowed again by the time revoke holds the lock.
+	broker.revoke(client, id, func(*JsonRpcMsg) bool { return true })
+	require.Equal(t, 1, broker.ClientSubCount(client))
+	require.Zero(t, upstream.unsubscribeCalls.Load())
 }

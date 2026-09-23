@@ -197,6 +197,14 @@ func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction Rul
 	go p.broker.revokeDenied(p.subscriptionAllowed)
 }
 
+// recheckSubscription covers a reload that landed while request was being
+// subscribed: its revocation scan ran before the membership existed.
+func (p *JsonRpcWebSocketProxy) recheckSubscription(request *JsonRpcMsg) {
+	if (request.Method == methodSubscribeCosmos || request.Method == methodSubscribeEth) && !p.subscriptionAllowed(request) {
+		go p.broker.revokeDenied(p.subscriptionAllowed)
+	}
+}
+
 // subscriptionAllowed applies the current rules to a subscribe request the
 // way handleRequest does: the first matching rule decides, then the default.
 func (p *JsonRpcWebSocketProxy) subscriptionAllowed(request *JsonRpcMsg) bool {
@@ -614,6 +622,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				if err = client.SendMsg(res); err != nil {
 					return err
 				}
+				p.recheckSubscription(request)
 				p.recordOutcome(request, source, cacheMiss, RuleActionAllow, rule, startTime, "request allowed")
 
 				if !cacheable {
@@ -713,6 +722,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 			if err = client.SendMsg(res); err != nil {
 				return err
 			}
+			p.recheckSubscription(request)
 		}
 
 	} else {
