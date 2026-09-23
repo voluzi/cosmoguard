@@ -439,8 +439,8 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		if err := validateOutgoingMetadata(outMD); err != nil {
 			markErrSpan("invalid metadata")
 			p.log.WithFields(map[string]interface{}{
-				"method": method, "source": source, "action": "deny",
-			}).WithError(err).Info("request denied")
+				"method": method, "source": source,
+			}).WithError(err).Info("request rejected: invalid metadata")
 			return ctx, status.Error(codes.InvalidArgument, err.Error())
 		}
 		p.log.WithFields(map[string]interface{}{

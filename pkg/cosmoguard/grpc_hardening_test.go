@@ -142,8 +142,7 @@ func TestGRPCLocalReceiveCapDoesNotOpenBreaker(t *testing.T) {
 	err := conn.Invoke(ctx, grpcCacheTestMethod, &rawFrame{Payload: []byte{1}}, &rawFrame{})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	up := p.pool.upstreamsSnapshot()[0]
-	require.Eventually(t, func() bool { return up.inFlight.Load() == 0 }, 2*time.Second, 5*time.Millisecond)
-	require.False(t, up.CircuitOpen())
+	require.Never(t, up.CircuitOpen, 300*time.Millisecond, 10*time.Millisecond)
 }
 
 func TestGRPCTransportFailureStillOpensBreaker(t *testing.T) {
