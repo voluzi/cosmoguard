@@ -84,8 +84,8 @@ func usesV3FlatSyntax(r *HttpRule) bool {
 }
 
 // LogV3Detection emits a structured warning describing what was found
-// and recommending --migrate-config. Called from NewFromFile on every
-// load so operators see the message in their startup logs.
+// and recommending `cosmoguard migrate-config`. Called from NewFromFile on
+// every load so operators see the message in their startup logs.
 func LogV3Detection(d V3Detection, configPath string) {
 	if !d.HasAny() {
 		return
@@ -110,7 +110,7 @@ func LogV3Detection(d V3Detection, configPath string) {
 		fields["v3.flat_rules"] = strings.Join(parts, ",")
 	}
 	log.WithFields(fields).Warn(
-		"v3 config syntax detected; consider running with --migrate-config " +
+		"v3 config syntax detected; consider running `cosmoguard migrate-config` " +
 			"to rewrite the file in v4 form (functionally equivalent, just clearer)",
 	)
 }
@@ -199,7 +199,7 @@ func MigrateV3Config(configPath string) (int, error) {
 	}
 	enc.Close()
 
-	header := fmt.Sprintf("# cosmoguard config — migrated v3 → v4 by `cosmoguard --migrate-config`\n# original preserved at %s (timestamp %s)\n",
+	header := fmt.Sprintf("# cosmoguard config — migrated v3 → v4 by `cosmoguard migrate-config`\n# original preserved at %s (timestamp %s)\n",
 		filepath.Base(backupPath), time.Now().UTC().Format(time.RFC3339))
 	if err := os.WriteFile(configPath, []byte(header+buf.String()), 0o600); err != nil {
 		return 0, fmt.Errorf("write migrated config: %w", err)

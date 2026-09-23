@@ -477,7 +477,8 @@ networkPolicy:
     #       kubernetes.io/metadata.name: monitoring
 
 # Horizontal Pod Autoscaler — rate-limit state lives in olric, shared by
-# every replica, so scaling out doesn't multiply rate-limit budgets. Safe to enable when `config.cache.cluster.enable: true` (the
+# every replica, so scaling out doesn't multiply rate-limit budgets. Safe
+# to enable when `config.cache.cluster.enable: true` (the
 # default) — every replica shares the same olric-backed bucket pool,
 # so a configured `10 req/s per IP` rule stays at 10 req/s regardless
 # of replica count. Without cluster mode, each replica has its own

@@ -8,7 +8,7 @@ HELM_CHART_LATEST_TAG ?= $(shell git describe --tags --match 'chart/*' --abbrev=
 HELM_CHART_VERSION = $(HELM_CHART_LATEST_TAG:chart/v%=%)
 # Newest stable (non-prerelease) vX.Y.Z tag — drives the chart appVersion,
 # so a chart tagged next to an rc never defaults to the rc image.
-HELM_APP_VERSION ?= $(shell git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V | tail -n1)
+HELM_APP_VERSION ?= $(shell git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$$' | head -n1)
 
 BUILDDIR ?= $(CURDIR)/build
 
@@ -54,6 +54,7 @@ $(BUILDDIR)/:
 	mkdir -p $(BUILDDIR)/
 
 helm.package: $(BUILDDIR)/
+	@test -n "$(HELM_APP_VERSION)" || { echo "no stable vX.Y.Z tag found for the chart appVersion" >&2; exit 1; }
 	helm package helm/cosmoguard \
 		--version $(HELM_CHART_VERSION:v%=%) \
 		--app-version $(HELM_APP_VERSION:v%=%) \

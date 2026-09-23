@@ -1,16 +1,14 @@
 name: Test
 
 on:
-  # Run on every branch push. A `branches` filter (rather than `tags-ignore`)
-  # is required to exclude tags: specifying only a tag filter would scope the
-  # push event to tags. Tags are handled by the release workflows
-  # (docker.yml, goreleaser.yml, publish-chart.yml), which call this workflow
-  # as a gate via workflow_call, so a tag doesn't need a standalone run here.
+  # Pushes to main plus every pull request (fork PRs included). A `branches`
+  # filter (rather than `tags-ignore`) is required to exclude tags: specifying
+  # only a tag filter would scope the push event to tags. Tags are handled by
+  # the release workflows (docker.yml, goreleaser.yml, publish-chart.yml),
+  # which call this workflow as a gate via workflow_call.
   push:
     branches:
-      - "**"
-  # Fork PRs get no push run in this repo. Same-repo PRs are already covered
-  # by the push run, so every job skips them (see `if:` below).
+      - main
   pull_request:
   # Daily run so a new advisory against an idle main reaches govulncheck.
   schedule:
@@ -20,8 +18,8 @@ on:
 permissions:
   contents: read
 
-# Cancel superseded runs on work branches; main (including scheduled runs)
-# and tags always complete.
+# Cancel superseded pull request runs; main (including scheduled runs) and
+# tags always complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
@@ -29,7 +27,6 @@ concurrency:
 jobs:
   test:
     name: go test (race + cover)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -66,7 +63,6 @@ jobs:
 
   fuzz:
     name: short fuzz pass
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -83,7 +79,6 @@ jobs:
 
   helm:
     name: helm chart renders + config loads
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -174,7 +169,6 @@ jobs:
 
   govulncheck:
     name: govulncheck
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

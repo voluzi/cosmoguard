@@ -81,9 +81,14 @@ check "dashboard HTTPRoute routes to the internal Service" \
 
 check "NetworkPolicy keeps the metrics rule when proxyIngress is set" \
   'select(.kind == "NetworkPolicy")' '
-  [.spec.ingress[] | select(.ports[]?.port == 9001)] | length == 1
+  [.spec.ingress[] | select(.ports[]?.port == 9001)] | ((length == 1) and (.[0] | has("from") | not))
 ' --set networkPolicy.enabled=true \
   --set-json 'networkPolicy.proxyIngress=[{"from":[{"podSelector":{}}]}]'
+
+check "NetworkPolicy metrics rule allows any source by default" \
+  'select(.kind == "NetworkPolicy")' '
+  [.spec.ingress[] | select(.ports[]?.port == 9001)] | ((length == 1) and (.[0] | has("from") | not))
+' --set networkPolicy.enabled=true
 
 check "NetworkPolicy metrics rule honours metricsFrom" \
   'select(.kind == "NetworkPolicy")' '
@@ -91,6 +96,34 @@ check "NetworkPolicy metrics rule honours metricsFrom" \
   (.[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "monitoring"))
 ' --set networkPolicy.enabled=true \
   --set-json 'networkPolicy.metricsFrom=[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}}]'
+
+output="${tmp_dir}/servicemonitor.yaml"
+# Every selector label must be on the internal Service, which must also be
+# the Service carrying the endpoint's port name.
+servicemonitor_matches() {
+  local selector labels port
+  selector=$("${YQ_BIN}" 'select(.kind == "ServiceMonitor") | .spec.selector.matchLabels | to_entries[] | .key + "=" + .value' "$1") || return 1
+  labels=$("${YQ_BIN}" 'select(.kind == "Service" and .metadata.name == "hardening-test-internal") | .metadata.labels | to_entries[] | .key + "=" + .value' "$1") || return 1
+  port=$("${YQ_BIN}" 'select(.kind == "ServiceMonitor") | .spec.endpoints[0].port' "$1") || return 1
+  [ -n "${selector}" ] || return 1
+  [ -z "$(comm -23 <(sort <<<"${selector}") <(sort <<<"${labels}"))" ] || return 1
+  "${YQ_BIN}" -e 'select(.kind == "Service" and .metadata.name == "hardening-test-internal") | [.spec.ports[].name] | contains(["'"${port}"'"])' "$1" >/dev/null 2>&1
+}
+if render "${output}" --set serviceMonitor.enabled=true && servicemonitor_matches "${output}"; then
+  echo "ok - ServiceMonitor selector matches the internal Service"
+else
+  echo "not ok - ServiceMonitor selector matches the internal Service" >&2
+  failures=$((failures + 1))
+fi
+
+output="${tmp_dir}/no-operator-listeners.yaml"
+if render "${output}" --set config.metrics.enable=false --set config.dashboard.enable=false &&
+  "${YQ_BIN}" ea -e '[select(.kind == "Service" and .metadata.name == "hardening-test-internal")] | length == 0' "${output}" >/dev/null 2>&1; then
+  echo "ok - no internal Service without operator listeners"
+else
+  echo "not ok - no internal Service without operator listeners" >&2
+  failures=$((failures + 1))
+fi
 
 check "PDB accepts maxUnavailable alone" \
   'select(.kind == "PodDisruptionBudget")' '

@@ -221,6 +221,25 @@ metrics port (default 9001). `/readyz` returns 503 when zero upstreams
 are healthy across the LCD + RPC pools — k8s will then stop sending
 traffic to that pod.
 
+## Upgrading to 2.0.0
+
+Chart 2.0.0 changes these defaults; the pods restart on upgrade.
+
+- Metrics and dashboard ports move from `<fullname>` to the ClusterIP
+  Service `<fullname>-internal`. The bundled ServiceMonitor, dashboard
+  Ingress and dashboard HTTPRoute follow automatically; repoint any scrape
+  job, runbook or route that used `<fullname>:9001` or `:19999`.
+- Pods no longer mount a ServiceAccount token. Set
+  `serviceAccount.automountToken: true` if a sidecar (e.g. a Vault agent)
+  needs it.
+- Pods run with `seccompProfile: RuntimeDefault`.
+- With `networkPolicy.enabled` and `networkPolicy.proxyIngress` set, the
+  metrics port is now allowed from any source unless
+  `networkPolicy.metricsFrom` narrows it.
+- `podDisruptionBudget.minAvailable` is no longer set in `values.yaml`, so
+  `maxUnavailable` can be set on its own. With neither set the PDB still
+  uses `minAvailable: 1`.
+
 ## Customizing the cosmoguard config
 
 The simplest path is to inline your full config under `values.yaml`'s
