@@ -60,6 +60,7 @@ func TestRecordOutcomeErr_ClientErrorsDoNotTrip(t *testing.T) {
 	clientCaused := []codes.Code{
 		codes.Canceled, codes.DeadlineExceeded, codes.InvalidArgument,
 		codes.NotFound, codes.PermissionDenied, codes.Unauthenticated,
+		codes.ResourceExhausted,
 	}
 	for _, code := range clientCaused {
 		u := &GrpcUpstream{cbConfig: enabledBreaker(3, time.Minute)}

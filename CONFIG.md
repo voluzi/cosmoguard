@@ -707,7 +707,7 @@ startup or reload.
 | `cache.keyMode` | `raw` | `raw` hashes payload bytes verbatim; `method-only` excludes payload (parameter-less queries only); `canonical` decodes payload against operator-supplied protoset descriptors and re-encodes deterministically before hashing — cache hits across clients with different serialization (field order, default-vs-absent). |
 | `cache.keyMetadata` | `x-cosmos-block-height` | Metadata keys folded into the cache key; see [Cache features](#cache-features). |
 
-`grpc.maxRecvMsgSize` and `grpc.maxSendMsgSize` default to the Cosmos SDK node's own gRPC limits (10 MiB in, 2 GiB − 1 out), so the proxy relays every message the node serves. Both must be positive, and changing them requires a process restart. The gRPC listener also caps each client connection at 1000 concurrent streams (further streams queue) and pings idle clients every 2 minutes.
+`grpc.maxRecvMsgSize` and `grpc.maxSendMsgSize` default to the Cosmos SDK node's own gRPC limits (10 MiB in, 2 GiB − 1 out), so the proxy relays every message the node serves. Unset or `0` keeps the default, negative values are rejected, and changing them requires a process restart. The gRPC listener also caps each client connection at 1000 concurrent streams (further streams queue) and pings idle clients every 2 minutes.
 
 For `keyMode: canonical`, set `grpc.protosets:` at the top level. Each path is a binary `FileDescriptorSet` produced by `protoc --descriptor_set_out=foo.protoset -I path/to/protos path/to/protos/**/*.proto`. Methods absent from the loaded protosets silently degrade to `raw`.
 

@@ -572,15 +572,23 @@ func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 				clientCancel()
 				c2sErr := <-c2sErrCh
 				serverStream.SetTrailer(clientStream.Trailer())
+				if err, ok := inboundCause(c2sErr); ok {
+					inboundFailed = true
+					return err
+				}
 				if c2sErr != nil && c2sErr != io.EOF {
 					if _, ok := status.FromError(c2sErr); ok {
 						return c2sErr
 					}
 				}
-				inboundFailed = true
+				_, inboundFailed = inboundCause(s2cErr)
 				return status.Errorf(codes.Internal, "raw proxy s2c: %v", s2cErr)
 			case c2sErr := <-c2sErrCh:
 				serverStream.SetTrailer(clientStream.Trailer())
+				if err, ok := inboundCause(c2sErr); ok {
+					inboundFailed = true
+					return err
+				}
 				if c2sErr != io.EOF {
 					return c2sErr
 				}
@@ -589,6 +597,22 @@ func rawTransparentHandler(director rawStreamDirector) grpc.StreamHandler {
 		}
 		return status.Errorf(codes.Internal, "rawTransparentHandler: unreachable")
 	}
+}
+
+// inboundStreamError marks a failure on the client side of the proxy (a
+// read from or write to the inbound stream). grpc-go reports a dropped
+// client as Unavailable, which would otherwise read as an upstream failure.
+type inboundStreamError struct{ err error }
+
+func (e inboundStreamError) Error() string { return e.err.Error() }
+
+// inboundCause returns the underlying error when err came from the inbound
+// stream.
+func inboundCause(err error) (error, bool) {
+	if e, ok := err.(inboundStreamError); ok {
+		return e.err, true
+	}
+	return err, false
 }
 
 // rawForwardServerToClient pumps inbound (client → cosmoguard) frames
@@ -619,6 +643,9 @@ func rawForwardServerToClient(src grpc.ServerStream, dst grpc.ClientStream) chan
 		for {
 			f := &rawFrame{}
 			if err := src.RecvMsg(f); err != nil {
+				if err != io.EOF {
+					err = inboundStreamError{err}
+				}
 				ret <- err
 				return
 			}
@@ -657,7 +684,7 @@ func rawForwardClientToServer(src grpc.ClientStream, dst grpc.ServerStream) chan
 		}
 		if md != nil {
 			if err := dst.SendHeader(md); err != nil {
-				ret <- err
+				ret <- inboundStreamError{err}
 				return
 			}
 		}
@@ -668,7 +695,7 @@ func rawForwardClientToServer(src grpc.ClientStream, dst grpc.ServerStream) chan
 				return
 			}
 			if err := dst.SendMsg(f); err != nil {
-				ret <- err
+				ret <- inboundStreamError{err}
 				return
 			}
 		}

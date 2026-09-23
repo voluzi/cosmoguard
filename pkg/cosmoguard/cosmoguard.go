@@ -1081,17 +1081,17 @@ func (f *CosmoGuard) tryReload() {
 	// calls SetRules. Now that an explicit `webSocketEnabled: false` survives
 	// defaulting, toggling it (or changing the connection count) on reload
 	// would be accepted but ignored — reject as restart-required.
-	if f.cfg.GRPC.MaxRecvMsgSize != newCfg.GRPC.MaxRecvMsgSize ||
-		f.cfg.GRPC.MaxSendMsgSize != newCfg.GRPC.MaxSendMsgSize {
-		err := fmt.Errorf("grpc message size change (maxRecvMsgSize / maxSendMsgSize) requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
 	if f.cfg.RPC.WebSocketIsEnabled() != newCfg.RPC.WebSocketIsEnabled() ||
 		f.cfg.RPC.WebSocketConnections != newCfg.RPC.WebSocketConnections ||
 		f.cfg.EVM.WS.WebSocketConnections != newCfg.EVM.WS.WebSocketConnections {
 		err := fmt.Errorf("websocket config change (webSocketEnabled / webSocketConnections) requires a process restart")
+		slog.Warn("config reload rejected", "error", err)
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
+	if f.cfg.GRPC.MaxRecvMsgSize != newCfg.GRPC.MaxRecvMsgSize ||
+		f.cfg.GRPC.MaxSendMsgSize != newCfg.GRPC.MaxSendMsgSize {
+		err := fmt.Errorf("grpc message size change (maxRecvMsgSize / maxSendMsgSize) requires a process restart")
 		slog.Warn("config reload rejected", "error", err)
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return

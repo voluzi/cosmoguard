@@ -3,7 +3,6 @@ package cosmoguard
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net"
 	"os"
@@ -203,23 +202,32 @@ func TestValidateOutgoingMetadata(t *testing.T) {
 	require.Error(t, validateOutgoingMetadata(metadata.MD{"x-a": {"line\nbreak"}}))
 }
 
-// inboundFailingStream fails its RecvMsg once the forwarder is already
-// delivering an upstream message, whose delivery then fails with a
-// non-status error — the path where the forwarder synthesizes Internal.
+// inboundFailingStream is an inbound stream whose client has gone away:
+// writes fail as grpc-go reports a dropped connection (Unavailable). With
+// recvFirst its RecvMsg fails too, once a write is under way; otherwise
+// RecvMsg blocks until the test ends.
 type inboundFailingStream struct {
 	*grpcCacheTestStream
-	sending chan struct{}
+	recvFirst bool
+	sending   chan struct{}
+	done      chan struct{}
 }
 
 func (s *inboundFailingStream) RecvMsg(any) error {
+	if !s.recvFirst {
+		<-s.done
+		return io.EOF
+	}
 	<-s.sending
-	return errors.New("inbound reset")
+	return status.Error(codes.Unavailable, "client connection lost")
 }
 
 func (s *inboundFailingStream) SendMsg(any) error {
-	close(s.sending)
-	time.Sleep(50 * time.Millisecond)
-	return errors.New("inbound write failed")
+	if s.recvFirst {
+		close(s.sending)
+		time.Sleep(50 * time.Millisecond)
+	}
+	return status.Error(codes.Unavailable, "client connection lost")
 }
 
 func TestGRPCTransparentInboundFailureDoesNotOpenBreaker(t *testing.T) {
@@ -230,19 +238,28 @@ func TestGRPCTransparentInboundFailureDoesNotOpenBreaker(t *testing.T) {
 		<-s.Context().Done()
 		return s.Context().Err()
 	})
-	up, err := buildGrpcUpstream(NodeConfig{Name: "raw", Host: "127.0.0.1", GrpcPort: port}, 0)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = up.conn.Close() })
-	conn := up.conn
-	up.cbConfig = enabledBreaker(1, time.Minute)
-	director := func(ctx context.Context, _ string) (context.Context, *grpc.ClientConn, error) {
-		out := metadata.NewOutgoingContext(ctx, metadata.MD{})
-		return context.WithValue(out, grpcUpstreamCtxKey{}, up), conn, nil
+	for name, recvFirst := range map[string]bool{"write fails": false, "read fails during write": true} {
+		t.Run(name, func(t *testing.T) {
+			up, err := buildGrpcUpstream(NodeConfig{Name: "raw", Host: "127.0.0.1", GrpcPort: port}, 0)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = up.conn.Close() })
+			up.cbConfig = enabledBreaker(1, time.Minute)
+			director := func(ctx context.Context, _ string) (context.Context, *grpc.ClientConn, error) {
+				out := metadata.NewOutgoingContext(ctx, metadata.MD{})
+				return context.WithValue(out, grpcUpstreamCtxKey{}, up), up.conn, nil
+			}
+			s := &inboundFailingStream{
+				grpcCacheTestStream: newGRPCCacheTestStream(nil),
+				recvFirst:           recvFirst,
+				sending:             make(chan struct{}),
+				done:                make(chan struct{}),
+			}
+			t.Cleanup(func() { close(s.done) })
+			err = rawTransparentHandler(director)(nil, s)
+			require.Error(t, err)
+			require.False(t, up.CircuitOpen(), "inbound failure charged to the upstream: %v", err)
+		})
 	}
-	s := &inboundFailingStream{grpcCacheTestStream: newGRPCCacheTestStream(nil), sending: make(chan struct{})}
-	err = rawTransparentHandler(director)(nil, s)
-	require.Equal(t, codes.Internal, status.Code(err), "%v", err)
-	require.False(t, up.CircuitOpen())
 }
 
 // Upstream response headers reach the client even when no message follows

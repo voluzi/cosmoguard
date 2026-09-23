@@ -438,8 +438,14 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 	allow := func() (context.Context, error) {
 		if err := validateOutgoingMetadata(outMD); err != nil {
 			markErrSpan("invalid metadata")
+			p.log.WithFields(map[string]interface{}{
+				"method": method, "source": source, "action": "deny",
+			}).WithError(err).Info("request denied")
 			return ctx, status.Error(codes.InvalidArgument, err.Error())
 		}
+		p.log.WithFields(map[string]interface{}{
+			"method": method, "source": source, "action": "allow",
+		}).Info("request allowed")
 		return outCtx, nil
 	}
 
@@ -502,9 +508,6 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		}
 		switch rule.Action {
 		case RuleActionAllow:
-			p.log.WithFields(map[string]interface{}{
-				"method": method, "source": source, "action": "allow",
-			}).Info("request allowed")
 			return allow()
 
 		case RuleActionDeny:
@@ -551,9 +554,6 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 		}
 	}
 	if p.defaultAction == RuleActionAllow {
-		p.log.WithFields(map[string]interface{}{
-			"method": method, "source": source, "action": "allow",
-		}).Info("request allowed")
 		return allow()
 	}
 	markErrSpan("denied by default action")

@@ -340,10 +340,14 @@ func WithMaxBatchSize[T JsonRpcHandlerOptions](n int) Option[T] {
 }
 
 // WithGrpcMessageLimits sets the gRPC request (recv) and response (send)
-// message size caps.
+// message size caps; a value <= 0 keeps the default.
 func WithGrpcMessageLimits(maxRecv, maxSend int) Option[GrpcProxyOptions] {
 	return func(opts *GrpcProxyOptions) {
-		opts.MaxRecvMsgSize = maxRecv
-		opts.MaxSendMsgSize = maxSend
+		if maxRecv > 0 {
+			opts.MaxRecvMsgSize = maxRecv
+		}
+		if maxSend > 0 {
+			opts.MaxSendMsgSize = maxSend
+		}
 	}
 }
