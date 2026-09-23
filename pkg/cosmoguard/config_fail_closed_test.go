@@ -134,6 +134,22 @@ func TestPrepareConfigRejectsInvalidDefaults(t *testing.T) {
 	}
 }
 
+func TestPrepareConfigInvalidDefaultDoesNotPoisonRetry(t *testing.T) {
+	cfg := &Config{
+		Nodes: []NodeConfig{{Host: "10.0.0.1"}},
+		LCD:   LcdConfig{Default: "permit"},
+	}
+
+	if err := PrepareConfig(cfg); err == nil || !strings.Contains(err.Error(), "lcd.default") {
+		t.Fatalf("expected invalid default error, got %v", err)
+	}
+
+	cfg.LCD.Default = RuleActionAllow
+	if err := PrepareConfig(cfg); err != nil {
+		t.Fatalf("retry after correcting default: %v", err)
+	}
+}
+
 func TestRuleCompileRejectsInvalidRates(t *testing.T) {
 	compilers := []struct {
 		name    string

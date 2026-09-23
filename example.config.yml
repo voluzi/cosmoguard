@@ -140,7 +140,7 @@ metrics:
 #       apiKey: "${PROD_API_KEY}"
 #       scopes: [read, broadcast]
 #       # Per-identity rate limits are expressed at the rule layer
-#       # (rateLimit: { scope: per-identity }); see the lcd: / rpc: blocks
+#       # (rateLimit: { rate: 10/s, scope: per-identity }); see the lcd: / rpc: blocks
 #       # below.
 
 # ---------------------------------------------------------------------------

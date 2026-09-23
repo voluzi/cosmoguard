@@ -221,18 +221,8 @@ func limiterForFailedInit(cfg *RateLimitConfig, initErr error) RateLimiter {
 // paths without a cluster runtime). A silent fallback in production
 // would multiply the operator's quota by replicaCount.
 func NewRateLimiter(cfg RateLimitConfig, olricClient *olric.EmbeddedClient, keyspace string) (RateLimiter, error) {
-	// Reject NaN / Inf / negative explicitly — `<= 0` lets NaN slip
-	// through (it compares false to every operator), which would
-	// produce a rate.Limit(NaN) bucket that never refills, or feed
-	// math.Inf into the refillExp expression below where it
-	// silently wraps into a negative time.Duration once cast to
-	// int64. Both surface as "operator's rule limiter just stopped
-	// working" with no log message.
-	if math.IsNaN(cfg.Rate.PerSecond) || math.IsInf(cfg.Rate.PerSecond, 0) {
-		return nil, fmt.Errorf("rate limit: rate must be a finite number (got %v)", cfg.Rate.PerSecond)
-	}
-	if cfg.Rate.PerSecond <= 0 {
-		return nil, fmt.Errorf("rate limit: non-positive rate")
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	burst := cfg.Burst
 	if burst <= 0 {

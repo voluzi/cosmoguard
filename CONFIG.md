@@ -405,7 +405,7 @@ auth:
     enable: true                     # rejects re-used jti within token TTL
 ```
 
-Per-identity rate limits are expressed at the **rule** level via `rateLimit: { scope: per-identity }` (see the Rate limiting section). That covers the most common "give this api key its own quota" pattern without growing a separate enforcement surface — and the rule layer is the one the proxy already runs on every request.
+Per-identity rate limits are expressed at the **rule** level via `rateLimit: { rate: 10/s, scope: per-identity }` (see the Rate limiting section). That covers the most common "give this api key its own quota" pattern without growing a separate enforcement surface — and the rule layer is the one the proxy already runs on every request.
 
 When `auth.replayProtection.enable` is true and a verified JWT carries a `jti` claim, cosmoguard checks a seen-set keyed on `(issuer, jti)`. A repeat within the token's expiration window is rejected with **HTTP 401** and `reason=token replayed` in the audit log. Tokens without `jti` are not enforced — replay protection requires the IdP to mint unique identifiers. The store is backed by olric when cluster mode is on (so replicas share the seen-set); otherwise in-process with a periodic-GC sweep.
 

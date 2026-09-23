@@ -100,6 +100,14 @@ func TestMemoryRateLimiter_SeparateBuckets(t *testing.T) {
 	assert.Equal(t, okB, true)
 }
 
+func TestNewRateLimiterRejectsNegativeBurst(t *testing.T) {
+	_, err := NewRateLimiter(RateLimitConfig{
+		Rate:  Rate{PerSecond: 1},
+		Burst: -1,
+	}, nil, "test")
+	assert.ErrorContains(t, err, "rateLimit.burst")
+}
+
 // TestMemoryRateLimiter_Refill verifies that tokens come back after the
 // configured interval. Uses a fast rate to keep the test snappy.
 func TestMemoryRateLimiter_Refill(t *testing.T) {

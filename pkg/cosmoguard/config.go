@@ -999,21 +999,6 @@ func PrepareConfig(cfg *Config) error {
 	if err := defaults.Set(cfg); err != nil {
 		return fmt.Errorf("applying config defaults: %w", err)
 	}
-	for _, section := range []struct {
-		name   string
-		action RuleAction
-	}{
-		{"lcd.default", cfg.LCD.Default},
-		{"rpc.default", cfg.RPC.Default},
-		{"rpc.jsonrpc.default", cfg.RPC.JsonRpc.Default},
-		{"grpc.default", cfg.GRPC.Default},
-		{"evm.rpc.default", cfg.EVM.RPC.Default},
-		{"evm.ws.default", cfg.EVM.WS.Default},
-	} {
-		if !section.action.valid() {
-			return fmt.Errorf("%s: invalid action %q (want allow or deny)", section.name, section.action)
-		}
-	}
 	// MaxBatchSize is a *int so we can distinguish "unset" from
 	// "explicitly 0 (disable cap)". defaults.Set can't fill *int
 	// from a struct tag, so apply the default of 100 here when the
@@ -1041,6 +1026,21 @@ func PrepareConfig(cfg *Config) error {
 	// must read from cfg.Nodes only; leaving cfg.Node populated
 	// risks a future caller reading the stale pre-promotion shape.
 	cfg.Node = NodeConfig{}
+	for _, section := range []struct {
+		name   string
+		action RuleAction
+	}{
+		{"lcd.default", cfg.LCD.Default},
+		{"rpc.default", cfg.RPC.Default},
+		{"rpc.jsonrpc.default", cfg.RPC.JsonRpc.Default},
+		{"grpc.default", cfg.GRPC.Default},
+		{"evm.rpc.default", cfg.EVM.RPC.Default},
+		{"evm.ws.default", cfg.EVM.WS.Default},
+	} {
+		if !section.action.valid() {
+			return fmt.Errorf("%s: invalid action %q (want allow or deny)", section.name, section.action)
+		}
+	}
 	// Env overrides layer on top of YAML + defaults so external
 	// orchestrators (cosmopilot, Helm, plain `docker run -e …`) can
 	// inject the per-deployment plumbing without rewriting the YAML.
