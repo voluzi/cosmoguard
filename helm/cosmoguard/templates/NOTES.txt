@@ -10,11 +10,15 @@ Service ({{ .Values.service.type }}): {{ $fullName }}
   evm-rpc  → port {{ .Values.service.evmRpcPort | default .Values.config.evmRpcPort }}
   evm-ws   → port {{ .Values.service.evmRpcWsPort | default .Values.config.evmRpcWsPort }}
 {{- end }}
+{{- if or .Values.config.metrics.enable .Values.config.dashboard.enable }}
+
+Service (ClusterIP, operator-only): {{ include "cosmoguard.internalServiceName" . }}
 {{- if .Values.config.metrics.enable }}
   metrics  → port {{ .Values.service.metricsPort }} (/metrics, /healthz, /readyz)
 {{- end }}
 {{- if .Values.config.dashboard.enable }}
   dashboard → port {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }} (operator-only, no built-in auth)
+{{- end }}
 {{- end }}
 
 External exposure:
@@ -44,7 +48,7 @@ External exposure:
 
 NOTE: the dashboard listener is enabled but no external route exposes
 it. Reach it via:
-  kubectl port-forward svc/{{ $fullName }} {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}:{{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}
+  kubectl port-forward svc/{{ include "cosmoguard.internalServiceName" . }} {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}:{{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}
 {{- end }}
 
 {{- if eq (include "cosmoguard.clusterEnabled" .) "true" }}
@@ -66,9 +70,16 @@ Cluster mode:
   gossip port (TCP+UDP): {{ $gossip }}
   RESP bind port (TCP) : {{ $bind }}
   peer api port (TCP)  : {{ $peerApi }}
+{{- $dashPort := .Values.service.dashboardPort | default .Values.config.dashboard.port }}
 
-Inspect the cluster from any pod:
-  kubectl exec -it pod/{{ $fullName }}-0 -- wget -qO- http://localhost:{{ $peerApi }}/api/v1/cluster/peers
+{{ if .Values.config.dashboard.enable -}}
+Inspect the cluster membership through the dashboard listener:
+  kubectl port-forward svc/{{ include "cosmoguard.internalServiceName" . }} {{ $dashPort }}:{{ $dashPort }}
+  curl http://localhost:{{ $dashPort }}/api/v1/cluster/peers
+{{- else -}}
+Set config.dashboard.enable=true to inspect cluster membership at
+/api/v1/cluster/peers on the dashboard listener.
+{{- end }}
 
 Reminders:
   - memberlist needs BOTH TCP and UDP on the gossip port. Many default

@@ -14,7 +14,7 @@ clients via API keys / JWT / external validators.
 The current major version is **v4**. See the
 [release notes](https://github.com/voluzi/cosmoguard/releases) for what
 changed from v3; existing v3 configs continue to work — run
-`cosmoguard --migrate-config` to rewrite them in v4 form when ready.
+`cosmoguard migrate-config` to rewrite them in v4 form when ready.
 
 ## Highlights
 
@@ -46,7 +46,7 @@ changed from v3; existing v3 configs continue to work — run
   batch size caps, WS origin allowlist, atomic-fail-safe config reload,
   no `glob.MustCompile` panics.
 - **Production polish**: graceful shutdown on SIGTERM, `cosmoguard
-  --validate` for CI gates, `--migrate-config` for v3→v4 rewrites,
+  validate` for CI gates, `cosmoguard migrate-config` for v3→v4 rewrites,
   `/healthz` / `/readyz` / `/info` / `/metrics` for k8s probes and
   Prometheus.
 - **Hot-reload** of config rules without dropping in-flight requests.
@@ -148,10 +148,10 @@ See [CONFIG.md](./CONFIG.md) for the complete reference.
 
 ```sh
 # Pre-deploy / CI check: parse + compile the config without binding ports.
-cosmoguard --config /etc/cosmoguard/cosmoguard.yaml --validate
+cosmoguard validate --config /etc/cosmoguard/cosmoguard.yaml
 
 # Rewrite a v3 config in v4 form (the original is backed up to .v3.bak).
-cosmoguard --config /etc/cosmoguard/cosmoguard.yaml --migrate-config
+cosmoguard migrate-config --config /etc/cosmoguard/cosmoguard.yaml
 
 # Run cosmoguard.
 cosmoguard --config /etc/cosmoguard/cosmoguard.yaml

@@ -64,25 +64,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Go Cache for Docker Build
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            go-build
-            go-pkg-mod
-          key: ${{ runner.os }}-${{ runner.arch }}-cosmoguard-docker-${{ hashFiles('go.sum') }}
-
-      - name: Inject cache
-        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
-        with:
-          cache-map: |
-            {
-              "go-build": "/root/.cache/go-build",
-              "go-pkg-mod": "/go/pkg/mod"
-            }
-          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
-
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
@@ -129,10 +110,12 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(needs.version.outputs.version, '-') }}
 
       - name: Create manifest list and push
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           image=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON" | cut -d ':' -f 1)
           TAGS=$(jq -r '.tags[] | "--tag " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON" | tr '\n' ' ')
           docker buildx imagetools create \
             $TAGS \
-            "${image}:${{ needs.version.outputs.version }}-amd64" \
-            "${image}:${{ needs.version.outputs.version }}-arm64"
+            "${image}:${VERSION}-amd64" \
+            "${image}:${VERSION}-arm64"

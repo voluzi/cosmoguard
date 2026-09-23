@@ -16,6 +16,9 @@ spec:
   {{- if hasKey .Values.podDisruptionBudget "maxUnavailable" }}
   maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
   {{- end }}
+  {{- if not (or (hasKey .Values.podDisruptionBudget "minAvailable") (hasKey .Values.podDisruptionBudget "maxUnavailable")) }}
+  minAvailable: 1
+  {{- end }}
   selector:
     matchLabels: {{- include "cosmoguard.selectorLabels" . | nindent 6 }}
 {{- end -}}

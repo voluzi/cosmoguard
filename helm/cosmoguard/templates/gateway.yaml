@@ -164,7 +164,7 @@ spec:
     {{- toYaml .Values.gateway.dashboard.hostnames | nindent 4 }}
   rules:
     - backendRefs:
-        - name: {{ $fullName }}
+        - name: {{ include "cosmoguard.internalServiceName" . }}
           port: {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}
 {{- end }}
 {{- end -}}

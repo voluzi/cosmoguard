@@ -4,19 +4,32 @@ on:
   # Run on every branch push. A `branches` filter (rather than `tags-ignore`)
   # is required to exclude tags: specifying only a tag filter would scope the
   # push event to tags. Tags are handled by the release workflows
-  # (docker.yml, goreleaser.yml), which call this workflow as a gate via
-  # workflow_call, so a tag doesn't need a separate standalone run here.
+  # (docker.yml, goreleaser.yml, publish-chart.yml), which call this workflow
+  # as a gate via workflow_call, so a tag doesn't need a standalone run here.
   push:
     branches:
       - "**"
+  # Fork PRs get no push run in this repo. Same-repo PRs are already covered
+  # by the push run, so every job skips them (see `if:` below).
+  pull_request:
+  # Daily run so a new advisory against an idle main reaches govulncheck.
+  schedule:
+    - cron: "17 5 * * *"
   workflow_call:
 
 permissions:
   contents: read
 
+# Cancel superseded runs on work branches; main (including scheduled runs)
+# and tags always complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   test:
     name: go test (race + cover)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -25,6 +38,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: vet
         run: go vet ./...
@@ -48,6 +66,7 @@ jobs:
 
   fuzz:
     name: short fuzz pass
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -64,6 +83,7 @@ jobs:
 
   helm:
     name: helm chart renders + config loads
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -87,6 +107,9 @@ jobs:
 
       - name: config reload render regression matrix
         run: scripts/test-helm-config-reload.sh
+
+      - name: hardening render regression matrix
+        run: scripts/test-helm-hardening.sh
 
       - name: cluster mode renders (generated key path)
         run: |
@@ -151,6 +174,7 @@ jobs:
 
   govulncheck:
     name: govulncheck
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

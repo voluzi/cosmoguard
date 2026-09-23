@@ -7,11 +7,19 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  # Gate publishing on the full test suite, which includes helm lint and the
+  # chart render regression matrices.
+  test:
+    uses: ./.github/workflows/test.yml
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -23,11 +31,27 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Github Packages
-        run: echo ${{ secrets.GITHUB_TOKEN }} | helm registry login -u ${{ github.repository_owner }} --password-stdin ghcr.io
-
       - name: Package Chart
         run: make helm.package
+
+      # Path installs (helm install ./helm/cosmoguard) read Chart.yaml
+      # directly, so it must match what this tag publishes.
+      - name: Chart.yaml matches the published chart
+        run: |
+          packaged=$(helm show chart build/cosmoguard-*.tgz)
+          for field in version appVersion; do
+            want=$(yq ".${field}" <<< "$packaged")
+            got=$(yq ".${field}" helm/cosmoguard/Chart.yaml)
+            if [ "$got" != "$want" ]; then
+              echo "::error file=helm/cosmoguard/Chart.yaml::${field} is ${got}, but this tag publishes ${want}; update Chart.yaml before tagging"
+              exit 1
+            fi
+          done
+
+      - name: Login to Github Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | helm registry login -u "$GITHUB_REPOSITORY_OWNER" --password-stdin ghcr.io
 
       - name: Push Chart
         run: helm push build/cosmoguard-*.tgz oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/helm

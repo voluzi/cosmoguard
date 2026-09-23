@@ -126,6 +126,14 @@ peerService.nameOverride for existing NetworkPolicy selectors.
 {{- end -}}
 
 {{/*
+ClusterIP Service for the operator listeners (metrics, dashboard). Kept
+off the main Service so service.type: LoadBalancer never publishes them.
+*/}}
+{{- define "cosmoguard.internalServiceName" -}}
+{{- printf "%s-internal" (include "cosmoguard.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
 clusterValidation refuses to install the chart with internally inconsistent
 cluster-mode wiring. Two-replica clusters need quorum=1 (we don't enforce
 that here because the binary's own validation is clearer); the chart-side

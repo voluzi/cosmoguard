@@ -43,9 +43,11 @@ See `values.yaml` for the full reference. Highlights:
   default); without it, rate-limit budgets are per-replica and HPA
   multiplies them.
 - `serviceMonitor.enabled: true` — when prometheus-operator is in the
-  cluster, scrapes `/metrics` on the cosmoguard service.
+  cluster, scrapes `/metrics` on the `<fullname>-internal` Service.
 - `podDisruptionBudget.enabled: true` — caps voluntary disruptions so
-  the cluster keeps quorum during node drains.
+  the cluster keeps quorum during node drains. Set at most one of
+  `minAvailable` / `maxUnavailable`; with neither the PDB uses
+  `minAvailable: 1`.
 
 ## Cluster mode
 
@@ -183,6 +185,13 @@ config:
 Two mutually-exclusive routing modes are supported. Disabling all the
 options below means the cosmoguard Service is reachable only in-cluster
 (use `kubectl port-forward` for local access).
+
+The metrics and dashboard listeners are never published on the main
+Service. They live on a separate ClusterIP Service, `<fullname>-internal`,
+so `service.type: LoadBalancer` exposes only the proxy ports. With
+`networkPolicy.enabled`, the metrics port stays open even when
+`networkPolicy.proxyIngress` restricts the proxy listeners; narrow its
+sources with `networkPolicy.metricsFrom`.
 
 ### Ingress (networking.k8s.io/v1)
 

@@ -10,9 +10,9 @@ spec:
   # stable DNS record (<pod>.<svc>.<ns>.svc.cluster.local). When cluster
   # mode is on, the chart-rendered peer service is that record. When
   # cluster mode is off but the operator still chose StatefulSet (e.g.
-  # for stable hostnames alone), we fall back to the regular Service —
-  # the cluster-rpc/gossip ports aren't exposed there but the DNS
-  # record still works for hostname stability.
+  # for stable hostnames alone), we fall back to the regular Service.
+  # Pod hostnames stay stable, but that Service is not headless, so no
+  # per-pod DNS records exist.
   serviceName: {{ if eq (include "cosmoguard.clusterEnabled" .) "true" }}{{ include "cosmoguard.peerServiceName" . }}{{ else }}{{ include "cosmoguard.fullname" . }}{{ end }}
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
@@ -46,6 +46,7 @@ spec:
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "cosmoguard.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
       {{- with .Values.podSecurityContext }}
       securityContext: {{- toYaml . | nindent 8 }}
       {{- end }}
