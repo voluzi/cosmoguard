@@ -313,7 +313,7 @@ func trailingWhitespace(b []byte) []byte {
 func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 	validJSON := stdjson.Valid(b)
 	envelopeErr := validateJsonRpcEnvelopeKeysValid(b, validJSON)
-	if bytes.HasPrefix(b, []byte{'['}) {
+	if bytes.HasPrefix(bytes.TrimLeft(b, " \t\r\n"), []byte{'['}) {
 		var msg JsonRpcMsgs
 		err := classifyJsonRpcDecodeError(validJSON, json.Unmarshal(b, &msg))
 		if err == nil {
@@ -352,12 +352,33 @@ func ParseJsonRpcMessage(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
 // returning nothing, since an envelope that failed to parse cannot be
 // trusted to say whether it had an id.
 //
-// A batch comes back intact and is checked per member by
-// handleHttpBatch. §6 answers a well-formed array member by member, so
-// one oversized method must not cost its siblings their responses —
-// and a notification inside a batch has the same right to silence as
-// one sent on its own.
+// A valid request batch preserves its member count and order, with nil
+// slots for members whose JSON-RPC envelope could not be decoded. The
+// HTTP batch handler answers those slots with id:null invalid-request
+// errors. It checks method length per valid member so one oversized
+// method cannot cost its siblings their responses.
 func ParseJsonRpcRequest(b []byte) (*JsonRpcMsg, JsonRpcMsgs, error) {
+	if bytes.HasPrefix(bytes.TrimLeft(b, " \t\r\n"), []byte{'['}) {
+		var members []stdjson.RawMessage
+		if err := stdjson.Unmarshal(b, &members); err != nil {
+			return nil, nil, err
+		}
+		batch := make(JsonRpcMsgs, len(members))
+		for i, member := range members {
+			if !bytes.HasPrefix(bytes.TrimLeft(member, " \t\r\n"), []byte{'{'}) {
+				continue
+			}
+			msg, _, err := ParseJsonRpcMessage(member)
+			if errors.Is(err, ErrInvalidRequest) {
+				continue
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+			batch[i] = msg
+		}
+		return nil, batch, nil
+	}
 	msg, batch, err := ParseJsonRpcMessage(b)
 	if err != nil {
 		// Drop the partially-decoded message a syntax error leaves

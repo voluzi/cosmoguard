@@ -1199,6 +1199,11 @@ func (h *JsonRpcHandler) handleHttpBatch(requests JsonRpcMsgs, w http.ResponseWr
 
 RequestsLoop:
 	for i, req := range requests {
+		if req == nil {
+			denied++
+			responses = append(responses, &JsonRpcResponse{Response: InvalidRequestResponse()})
+			continue RequestsLoop
+		}
 		requestIDs[i] = req.ID
 		// The request-only method-length policy, per member and ahead
 		// of rule matching, so an oversized method reaches no rule and
