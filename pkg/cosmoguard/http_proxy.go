@@ -1422,9 +1422,12 @@ func (p *HttpProxy) persistCachedHTTPResponse(requestHash string, cached CachedR
 }
 
 // shouldStore reports whether an upstream response is cacheable: never cache
-// 5xx; cache non-2xx only when cacheError is set; honor upstream Cache-Control
-// no-store/private/max-age=0; refuse Vary headers not folded into the key.
+// incomplete representations or 5xx; cache non-200 statuses only when
+// cacheError is set; honor upstream Cache-Control and Vary restrictions.
 func (p *HttpProxy) shouldStore(status int, committed http.Header, cache *RuleCache) bool {
+	if status == http.StatusPartialContent || status == http.StatusNotModified {
+		return false
+	}
 	if status >= 500 {
 		return false
 	}

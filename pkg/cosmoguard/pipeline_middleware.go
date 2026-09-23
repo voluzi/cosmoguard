@@ -11,6 +11,7 @@ import (
 // MWPanicRecovery installs panic recovery as the outermost layer. A
 // recovered panic logs the stack and returns Decision{Stop: true,
 // Action: "deny", HTTPStatus: 500} so the adapter can write a 500.
+// http.ErrAbortHandler passes through to net/http.
 //
 // Distinct from the per-protocol `recoverHTTP` / `recoverStream`
 // helpers: those guard the raw protocol entry; this guards the
@@ -19,6 +20,9 @@ func MWPanicRecovery(logger *Entry) Middleware {
 	return func(req Request, next Next) (decision Decision) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
 				if logger != nil {
 					logger.WithFields(Fields{
 						"panic":     rec,

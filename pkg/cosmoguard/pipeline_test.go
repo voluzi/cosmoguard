@@ -1,10 +1,31 @@
 package cosmoguard
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+func TestMWPanicRecoveryPreservesAbortHandler(t *testing.T) {
+	var logs bytes.Buffer
+	chain := Chain(
+		MWPanicRecovery(newEntry(slog.New(slog.NewTextHandler(&logs, nil)))),
+		func(Request, Next) Decision { panic(http.ErrAbortHandler) },
+	)
+	var got any
+	func() {
+		defer func() { got = recover() }()
+		chain(newHTTPRequest(httptest.NewRequest(http.MethodGet, "/status", nil)))
+	}()
+	if got != http.ErrAbortHandler {
+		t.Fatalf("got panic %v, want exact http.ErrAbortHandler", got)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("abort logged as middleware panic: %s", logs.String())
+	}
+}
 
 // TestMWAuthGate_NilRuleAuthEnforcesDefaultRequire is the regression
 // test for the default-require bypass: a matched rule that omits an
