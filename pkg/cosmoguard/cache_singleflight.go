@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"runtime/debug"
 	"sync"
 
@@ -58,6 +59,9 @@ func (c *coalescer[V]) do(ctx context.Context, key string, fn func() (V, error))
 		return zero, ctx.Err()
 	case res := <-ch:
 		if panicErr, ok := res.Err.(*coalescedPanic); ok {
+			if panicErr.value == http.ErrAbortHandler {
+				panic(http.ErrAbortHandler)
+			}
 			panic(panicErr)
 		}
 		v, _ := res.Val.(V)
@@ -79,6 +83,9 @@ func (c *coalescer[V]) refresh(key string, fn func() (V, error)) {
 		defer c.inflight.Delete(key)
 		res := <-ch
 		if panicErr, ok := res.Err.(*coalescedPanic); ok {
+			if panicErr.value == http.ErrAbortHandler {
+				return
+			}
 			log.WithFields(Fields{
 				"key":   key,
 				"panic": panicErr.value,

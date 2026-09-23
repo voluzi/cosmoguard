@@ -10,18 +10,18 @@ import (
 )
 
 // recoverHTTP guards an HTTP handler against panics in the proxy
-// pipeline. On panic it logs the value + stack, then — if no response
-// header has been written — replies 500. If the upstream had already
-// committed bytes to the client, the recover just terminates the
-// goroutine cleanly so the connection drops.
+// pipeline. It passes http.ErrAbortHandler to net/http. Other panics are
+// logged with a stack and get a best-effort 500 response.
 //
-// Cosmoguard treats panics as bugs, not expected error paths. The
-// recover exists so one malformed request can't take down the goroutine
-// the http.Server hands it to.
+// Other panics are treated as bugs; the recover keeps them inside the
+// handler goroutine.
 func recoverHTTP(logger *Entry, w http.ResponseWriter, r *http.Request) {
 	rec := recover()
 	if rec == nil {
 		return
+	}
+	if rec == http.ErrAbortHandler {
+		panic(rec)
 	}
 	fields := Fields{
 		"panic":  rec,
@@ -32,10 +32,12 @@ func recoverHTTP(logger *Entry, w http.ResponseWriter, r *http.Request) {
 	if logger != nil {
 		logger.WithFields(fields).Error("panic in HTTP handler")
 	}
-	// Best-effort 500 — if upstream already wrote headers, this is a
-	// no-op at the wire (Go's response writer drops late WriteHeader),
-	// which is the correct outcome.
-	defer func() { _ = recover() }() // swallow any panic from the late write
+	// A late status cannot replace headers already sent to the client.
+	defer func() {
+		if late := recover(); late == http.ErrAbortHandler {
+			panic(late)
+		}
+	}()
 	w.WriteHeader(http.StatusInternalServerError)
 }
 

@@ -813,7 +813,7 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 				p.recordOutcome(r, ww.GetStatusCode(), cacheError, RuleActionAllow, startTime, "request allowed (cache backend error)")
 				return
 			}
-			if lookupErr == nil {
+			if lookupErr == nil && reusableCachedHTTPStatus(res.StatusCode) {
 				// Effective TTL = the rule's ttl, or the global default when the
 				// rule leaves it unset (same fallback the store uses). When SWR
 				// is off the backend deletes the entry at the logical TTL, so a
@@ -1205,29 +1205,34 @@ func (p *HttpProxy) foregroundFetchFn(r *http.Request, requestHash string, cache
 func (p *HttpProxy) recentHTTPResponse(r *http.Request, requestHash string, cache *RuleCache) (bufferedUpstreamResponse, bool) {
 	if pending, ok := p.pendingMisses.Load(requestHash); ok {
 		entry := pending.(*httpPendingResponse)
-		stale := cachedHTTPStaleWindow(entry.cached, resolveStaleWindow(cache, p.globalStaleWindow()))
-		now := p.timeNow()
-		state := classifyFreshness(entry.cached.StoredAt, now, effectiveTTL(cache, p.cacheConfig), stale)
-		switch state {
-		case freshEntry:
-			response := entry.response
-			response.SharedHeaders = maps.Clone(response.SharedHeaders)
-			if response.SharedHeaders == nil {
-				response.SharedHeaders = make(map[string]string)
+		if reusableCachedHTTPStatus(entry.cached.StatusCode) {
+			stale := cachedHTTPStaleWindow(entry.cached, resolveStaleWindow(cache, p.globalStaleWindow()))
+			now := p.timeNow()
+			state := classifyFreshness(entry.cached.StoredAt, now, effectiveTTL(cache, p.cacheConfig), stale)
+			switch state {
+			case freshEntry:
+				response := entry.response
+				response.SharedHeaders = maps.Clone(response.SharedHeaders)
+				if response.SharedHeaders == nil {
+					response.SharedHeaders = make(map[string]string)
+				}
+				if age, ok := cachedResponseAge(entry.cached, now); ok {
+					response.SharedHeaders["Age"] = strconv.Itoa(age)
+				}
+				return response, true
+			case staleEntry:
+				cached := entry.cached
+				return bufferedUpstreamResponse{Cached: &cached, CacheState: cacheStale}, true
 			}
-			if age, ok := cachedResponseAge(entry.cached, now); ok {
-				response.SharedHeaders["Age"] = strconv.Itoa(age)
-			}
-			return response, true
-		case staleEntry:
-			cached := entry.cached
-			return bufferedUpstreamResponse{Cached: &cached, CacheState: cacheStale}, true
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), httpCacheWriteTimeout)
 	defer cancel()
 	res, err := p.cache.Get(ctx, requestHash)
 	if err != nil {
+		return bufferedUpstreamResponse{}, false
+	}
+	if !reusableCachedHTTPStatus(res.StatusCode) {
 		return bufferedUpstreamResponse{}, false
 	}
 	stale := cachedHTTPStaleWindow(res, resolveStaleWindow(cache, p.globalStaleWindow()))
@@ -1422,9 +1427,12 @@ func (p *HttpProxy) persistCachedHTTPResponse(requestHash string, cached CachedR
 }
 
 // shouldStore reports whether an upstream response is cacheable: never cache
-// 5xx; cache non-2xx only when cacheError is set; honor upstream Cache-Control
-// no-store/private/max-age=0; refuse Vary headers not folded into the key.
+// incomplete representations or 5xx; cache non-200 statuses only when
+// cacheError is set; honor upstream Cache-Control and Vary restrictions.
 func (p *HttpProxy) shouldStore(status int, committed http.Header, cache *RuleCache) bool {
+	if !reusableCachedHTTPStatus(status) {
+		return false
+	}
 	if status >= 500 {
 		return false
 	}
@@ -1435,6 +1443,10 @@ func (p *HttpProxy) shouldStore(status int, committed http.Header, cache *RuleCa
 		return false
 	}
 	return cacheableByVary(committed, httpCacheKeyVary)
+}
+
+func reusableCachedHTTPStatus(status int) bool {
+	return status != http.StatusPartialContent && status != http.StatusNotModified
 }
 
 // redactCredentialQuery replaces the value of any credential-carrying query
