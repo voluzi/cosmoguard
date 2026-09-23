@@ -161,7 +161,8 @@ lcd:
       match:
         all:
           - paths: [/cosmos/base/tendermint/v1beta1/blocks/*]
-          - query.height: "[0-9]*"
+          - query:
+              height: "[0-9]*"
       cache:
         enable: true
         # disableStaleWhileRevalidate: true  # opt out if a positive global stale window is unsafe for this rule

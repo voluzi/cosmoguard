@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -929,17 +930,21 @@ func ReadConfigFromFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error interpolating env vars in %s: %w", path, err)
 	}
-	var cfg Config
-	if err := yaml.Unmarshal([]byte(interpolated), &cfg); err != nil {
-		return nil, fmt.Errorf("error in config file unmarshal: %v", err)
-	}
-	// yaml.Unmarshal silently drops keys with no matching struct field, so a
-	// v3 config's removed Redis backend would be ignored and each replica
-	// would fall back to an ISOLATED embedded cache instead of the shared one
-	// the operator intended. Detect the removed keys and fail loudly with a
-	// migration pointer rather than degrade silently.
 	if err := detectRemovedConfigKeys([]byte(interpolated)); err != nil {
 		return nil, err
+	}
+	var cfg Config
+	decoder := yaml.NewDecoder(strings.NewReader(interpolated))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("error in config file unmarshal: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("error after first config document: %w", err)
+		}
+		return nil, fmt.Errorf("config file must contain only one YAML document")
 	}
 	if err := PrepareConfig(&cfg); err != nil {
 		return nil, err
@@ -993,6 +998,21 @@ func PrepareConfig(cfg *Config) error {
 	nodeSet := cfg.Node != (NodeConfig{})
 	if err := defaults.Set(cfg); err != nil {
 		return fmt.Errorf("applying config defaults: %w", err)
+	}
+	for _, section := range []struct {
+		name   string
+		action RuleAction
+	}{
+		{"lcd.default", cfg.LCD.Default},
+		{"rpc.default", cfg.RPC.Default},
+		{"rpc.jsonrpc.default", cfg.RPC.JsonRpc.Default},
+		{"grpc.default", cfg.GRPC.Default},
+		{"evm.rpc.default", cfg.EVM.RPC.Default},
+		{"evm.ws.default", cfg.EVM.WS.Default},
+	} {
+		if !section.action.valid() {
+			return fmt.Errorf("%s: invalid action %q (want allow or deny)", section.name, section.action)
+		}
 	}
 	// MaxBatchSize is a *int so we can distinguish "unset" from
 	// "explicitly 0 (disable cap)". defaults.Set can't fill *int
@@ -1577,6 +1597,11 @@ func validateTracing(t *TracingConfig) error {
 }
 
 func sortAndCompileHttp(rules []*HttpRule) error {
+	for i, r := range rules {
+		if r == nil {
+			return fmt.Errorf("http rules[%d] must not be null", i)
+		}
+	}
 	sort.SliceStable(rules, func(i, j int) bool {
 		return rules[i].Priority < rules[j].Priority
 	})
@@ -1589,6 +1614,11 @@ func sortAndCompileHttp(rules []*HttpRule) error {
 }
 
 func sortAndCompileJsonRpc(rules []*JsonRpcRule) error {
+	for i, r := range rules {
+		if r == nil {
+			return fmt.Errorf("jsonrpc rules[%d] must not be null", i)
+		}
+	}
 	sort.SliceStable(rules, func(i, j int) bool {
 		return rules[i].Priority < rules[j].Priority
 	})
@@ -1601,6 +1631,11 @@ func sortAndCompileJsonRpc(rules []*JsonRpcRule) error {
 }
 
 func sortAndCompileGrpc(rules []*GrpcRule) error {
+	for i, r := range rules {
+		if r == nil {
+			return fmt.Errorf("grpc rules[%d] must not be null", i)
+		}
+	}
 	sort.SliceStable(rules, func(i, j int) bool {
 		return rules[i].Priority < rules[j].Priority
 	})

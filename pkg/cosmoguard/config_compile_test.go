@@ -235,8 +235,9 @@ lcd:
 func TestTryReload_BadConfigPreservesPrevious(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "cosmoguard.yaml")
+	header := portYAMLHeader(t)
 
-	goodYAML := portYAMLHeader(t) + `
+	goodYAML := header + `
 lcd:
   default: allow
   rules:
@@ -260,8 +261,11 @@ lcd:
 	assert.Equal(t, len(originalRules), 1)
 	originalPath := originalRules[0].Paths[0]
 
-	// Stomp the file with a config that fails to compile (invalid glob).
-	badYAML := portYAMLHeader(t) + `
+	for _, tt := range []struct {
+		name string
+		yaml string
+	}{
+		{"invalid glob", `
 lcd:
   default: allow
   rules:
@@ -269,17 +273,27 @@ lcd:
       action: allow
       paths: ["[invalid-glob"]
       methods: [GET]
-`
-	assert.NilError(t, os.WriteFile(cfgPath, []byte(badYAML), 0644))
-
-	cg.tryReload()
-
-	// Pointer identity preserved: cg.cfg was never reassigned.
-	assert.Equal(t, cg.cfg, originalCfgPtr,
-		"failed reload must not replace the *Config pointer")
-	// Rules still in place.
-	assert.Equal(t, cg.cfg.LCD.Rules[0].Paths[0], originalPath,
-		"failed reload must not mutate the running ruleset")
+`},
+		{"unknown key", "auth:\n  enabled: true\n"},
+		{"invalid default", "lcd:\n  default: permit\n"},
+		{"missing action", "lcd:\n  rules:\n    - priority: 100\n      paths: [/status]\n"},
+		{"missing rate", "lcd:\n  rules:\n    - priority: 100\n      action: allow\n      rateLimit: {}\n"},
+		{"null rule", "lcd:\n  rules: [null]\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if got := recover(); got != nil {
+					t.Errorf("invalid replacement panicked: %v", got)
+				}
+			}()
+			assert.NilError(t, os.WriteFile(cfgPath, []byte(header+tt.yaml), 0644))
+			cg.tryReload()
+			assert.Equal(t, cg.cfg, originalCfgPtr,
+				"failed reload must not replace the *Config pointer")
+			assert.Equal(t, cg.cfg.LCD.Rules[0].Paths[0], originalPath,
+				"failed reload must not mutate the running ruleset")
+		})
+	}
 }
 
 func TestTryReload_NestedJsonRpcParamsPreservePreviousRules(t *testing.T) {

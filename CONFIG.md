@@ -512,6 +512,7 @@ evm:                                 # only when enableEvm: true
 ## Rules
 
 All rules share `priority`, `action`, and an optional `match:` block. Lower priority numbers match first; first-match-wins.
+Each rule must set `action` to exactly `allow` or `deny`. Section `default` values accept the same two actions. Unknown configuration keys and additional YAML documents are rejected during validation.
 
 ### HTTP rule
 
@@ -534,15 +535,18 @@ match:
   all:                               # AND: every child must match
     - path: /block                   # single-value atom
     - paths: [/block, /commit]       # multi-value atom (any of)
-    - query.height: present          # presence-check (key must exist)
+    - query:                         # presence-check (key must exist)
+        height: present
   any:                               # OR: at least one child must match
     - method: GET
     - method: HEAD
   none:                              # NOT: no child may match
-    - header.x-debug: present
+    - header:
+        x-debug: present
   # Leaf atoms at this level are an implicit `all`:
   sourceIP: 10.0.0.0/8                # CIDR or single IP
-  header.authorization: "Bearer *"   # glob match on header value
+  header:                            # glob match on header value
+    authorization: "Bearer *"
 ```
 
 Multi-value atoms exist for `paths` and `methods` and behave as "any of": the atom matches if the request value equals (or globs to) any list entry. The singular `path`/`method` forms remain for single-value rules.
@@ -608,6 +612,7 @@ rateLimit:
 With a `cache.cluster` block present, rate-limit buckets are sharded across replicas through olric so the configured rate is a true cluster-wide budget. In single-pod / embedded olric mode the rate is enforced per pod.
 
 `failureMode` controls behaviour when the limiter backend errors (e.g. olric loses quorum). `fail-open` (default) admits the request so a coordination hiccup doesn't 429 all traffic; `fail-closed` denies it so a backend outage can't silently disable rate limiting cluster-wide. Applies uniformly across HTTP, JSON-RPC, WebSocket, and gRPC.
+When `rateLimit` is set on a rule, `rate` is required and must be a finite positive number. `burst` must be non-negative; `0` uses the default capacity.
 
 #### Examples
 
@@ -619,7 +624,8 @@ rules:
     match:
       all:
         - paths: [/block, /commit, /block_results]
-        - query.height: "[0-9]*"
+        - query:
+            height: "[0-9]*"
     cache: { enable: true, ttl: 1h }
 
   # Same paths without `height` always return the chain tip — never cache.
@@ -648,7 +654,8 @@ rules:
     match:
       all:
         - path: /internal/*
-        - header.origin: present
+        - header:
+            origin: present
 ```
 
 ### JSON-RPC rule

@@ -10,6 +10,7 @@ import "testing"
 func TestJsonRpcRule_ParamsShapeMismatchDoesNotBypass(t *testing.T) {
 	// Rule filters eth_call by a positional (slice) param value.
 	sliceRule := &JsonRpcRule{
+		Action:  RuleActionAllow,
 		Methods: []string{"eth_call"},
 		Params:  []interface{}{"0xdeadbeef"},
 	}
@@ -32,6 +33,7 @@ func TestJsonRpcRule_ParamsShapeMismatchDoesNotBypass(t *testing.T) {
 
 	// Mirror: rule filters by object (map) params.
 	mapRule := &JsonRpcRule{
+		Action:  RuleActionAllow,
 		Methods: []string{"eth_call"},
 		Params:  map[string]interface{}{"to": "0xdeadbeef"},
 	}
@@ -49,7 +51,7 @@ func TestJsonRpcRule_ParamsShapeMismatchDoesNotBypass(t *testing.T) {
 	}
 
 	// A rule with NO params constraint still matches either shape.
-	anyRule := &JsonRpcRule{Methods: []string{"eth_call"}}
+	anyRule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"eth_call"}}
 	if err := anyRule.Compile(); err != nil {
 		t.Fatal(err)
 	}

@@ -744,6 +744,18 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 
 			default:
 				h.log.Errorf("unrecognized rule action %q", rule.Action)
+				h.cgDashboard.RecordDeny(DenyRecord{
+					Section:  h.section,
+					Reason:   "rule",
+					SourceIP: GetSourceIP(r),
+					Method:   request.Method,
+					RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+				})
+				if request.ID != nil {
+					h.writeSingleResponse(w, r, UnauthorizedResponse(request))
+				}
+				h.recordSingle(r, request, cacheMiss, RuleActionDeny, startTime, "request denied")
+				return
 			}
 		}
 	}
@@ -1329,6 +1341,19 @@ RequestsLoop:
 
 				default:
 					h.log.Errorf("unrecognized rule action %q", rule.Action)
+					denied++
+					h.cgDashboard.RecordDeny(DenyRecord{
+						Section:  h.section,
+						Reason:   "rule",
+						SourceIP: GetSourceIP(r),
+						Method:   req.Method,
+						RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+					})
+					h.recordBatchItem(r, req, "", "request in batch denied")
+					if req.ID != nil {
+						responses.Deny(req)
+					}
+					continue RequestsLoop
 				}
 				break
 			}

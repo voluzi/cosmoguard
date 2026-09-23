@@ -482,6 +482,15 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 
 		default:
 			log.Errorf("unrecognized rule action %q", rule.Action)
+			p.cgDashboard.RecordDeny(DenyRecord{
+				Section:  p.section,
+				Reason:   "rule",
+				SourceIP: source,
+				Method:   method,
+				RuleTag:  ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
+			})
+			markErrSpan("invalid rule action")
+			return ctx, status.Error(codes.PermissionDenied, "Unauthorized")
 		}
 	}
 

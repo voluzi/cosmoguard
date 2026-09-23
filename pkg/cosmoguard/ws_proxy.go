@@ -641,6 +641,20 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 
 			default:
 				p.log.Errorf("unrecognized rule action %q", rule.Action)
+				p.cgDashboard.RecordDeny(DenyRecord{
+					Section:  p.section,
+					Reason:   "rule",
+					SourceIP: source,
+					Method:   request.Method,
+					RuleTag:  ruleID,
+				})
+				if request.ID != nil {
+					if err := client.SendMsg(UnauthorizedResponse(request)); err != nil {
+						return err
+					}
+				}
+				p.recordOutcome(request, source, cacheMiss, RuleActionDeny, rule, startTime, "request denied")
+				return nil
 			}
 		}
 	}
