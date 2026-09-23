@@ -144,15 +144,25 @@ func TestWebSocketUnknownRuleActionDenies(t *testing.T) {
 	}
 }
 
-func TestGRPCUnknownRuleActionDenies(t *testing.T) {
-	p := authProxyForTest(t, nil)
-	p.rules = []*GrpcRule{{Action: "permit", Tag: "invalid"}}
-	_, err := p.enforcePolicy(context.Background(), "/svc/M")
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("unknown action returned %v, want PermissionDenied", err)
+func TestGRPCPolicyDenialsUsePermissionDenied(t *testing.T) {
+	tests := []struct {
+		name          string
+		rules         []*GrpcRule
+		defaultAction RuleAction
+	}{
+		{"unknown action", []*GrpcRule{{Action: "permit", Tag: "invalid"}}, RuleActionAllow},
+		{"deny rule", []*GrpcRule{{Action: RuleActionDeny, Tag: "deny"}}, RuleActionAllow},
+		{"default deny", nil, RuleActionDeny},
 	}
-	denied := p.cgDashboard.denied.Snapshot()
-	if len(denied) != 1 || denied[0].Reason != "rule" || denied[0].RuleTag != "invalid" {
-		t.Fatalf("unknown action must record a rule denial: %+v", denied)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := authProxyForTest(t, nil)
+			p.rules = tt.rules
+			p.defaultAction = tt.defaultAction
+			_, err := p.enforcePolicy(context.Background(), "/svc/M")
+			if status.Code(err) != codes.PermissionDenied || status.Convert(err).Message() != "permission denied" {
+				t.Fatalf("policy denial returned %v, want PermissionDenied with matching message", err)
+			}
+		})
 	}
 }
