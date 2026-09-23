@@ -1355,7 +1355,6 @@ RequestsLoop:
 					}
 					continue RequestsLoop
 				}
-				break
 			}
 		}
 		// No rule matched this batch item — record it under the
