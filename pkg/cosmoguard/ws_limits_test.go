@@ -555,16 +555,36 @@ func TestBrokerDisconnectDuringSubscribeReleasesAllAdmissionBeforeRollback(t *te
 	close(upstream.subscribeRelease)
 	<-upstream.unsubscribeStarted
 
+	// Cleanup and rollback run concurrently, so poll; upstream cleanup
+	// stays blocked until every membership has been released.
 	replacement := &JsonRpcWsClient{}
-	for i := 0; i < 3; i++ {
-		assert.NilError(t, broker.admission.reserveSubscription(replacement, "alice"),
-			"disconnect rollback must release every membership before upstream cleanup")
+	released := func() bool {
+		reserved := 0
+		defer func() {
+			for ; reserved > 0; reserved-- {
+				broker.admission.releaseSubscription(replacement)
+			}
+		}()
+		for reserved < 3 {
+			if broker.admission.reserveSubscription(replacement, "alice") != nil {
+				return false
+			}
+			reserved++
+		}
+		return true
 	}
-	for i := 0; i < 3; i++ {
-		broker.admission.releaseSubscription(replacement)
+	deadline := time.Now().Add(2 * time.Second)
+	for !released() {
+		assert.Assert(t, time.Now().Before(deadline), "disconnect rollback must release every membership before upstream cleanup")
+		time.Sleep(5 * time.Millisecond)
 	}
 	close(upstream.unsubscribeRelease)
 	assert.Assert(t, errors.Is(<-result, ErrClosed))
+	for upstream.unsubscribeCalls.Load() < 3 {
+		assert.Assert(t, time.Now().Before(deadline.Add(2*time.Second)), "unsubscribed %d of 3", upstream.unsubscribeCalls.Load())
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
 	assert.Equal(t, upstream.unsubscribeCalls.Load(), int32(3))
 }
 

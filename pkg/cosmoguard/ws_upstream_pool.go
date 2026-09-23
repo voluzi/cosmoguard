@@ -734,6 +734,13 @@ type SubscriptionMigration struct {
 // algorithm is: snapshot candidates under lock, do the network calls
 // outside, commit successful migrations under lock.
 func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
+	return p.migrateUnhealthy(func(string) func() { return func() {} }, func(SubscriptionMigration) {})
+}
+
+// migrateUnhealthy is MigrateUnhealthy with hooks for the broker: lock is
+// held around each candidate's re-subscribe and commit, and onMigrated runs
+// before it is released.
+func (p *UpstreamPool) migrateUnhealthy(lock func(param string) (unlock func()), onMigrated func(SubscriptionMigration)) []SubscriptionMigration {
 	type pending struct {
 		oldID       string
 		conn        UpstreamConnManager
@@ -790,6 +797,7 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 
 	var migrated []SubscriptionMigration
 	for _, c := range candidates {
+		unlock := lock(c.param)
 		newID, err := c.alt.Subscribe(c.param)
 		if err != nil {
 			if isUncertainWSUpstreamOutcome(err) {
@@ -809,6 +817,7 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 					"error": err.Error(),
 				}).Warn("ws subscription migration: re-subscribe failed")
 			}
+			unlock()
 			continue
 		}
 		// Commit under lock. A concurrent client unsubscribe could
@@ -829,6 +838,7 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 		if current != c.conn || removing || !moving || p.subscriptionLease[c.oldID] != c.sourceLease {
 			p.subMux.Unlock()
 			p.retireMigrationDestination(c.oldID, c.param, c.alt, c.destLease, c.attempt)
+			unlock()
 			continue
 		}
 		canonical := c.canonical
@@ -879,9 +889,10 @@ func (p *UpstreamPool) MigrateUnhealthy() []SubscriptionMigration {
 				"param": c.param,
 			}).Info("ws subscription migrated to healthy upstream")
 		}
-		migrated = append(migrated, SubscriptionMigration{
-			OldID: c.oldID, NewID: newID, Param: c.param,
-		})
+		migration := SubscriptionMigration{OldID: c.oldID, NewID: newID, Param: c.param}
+		onMigrated(migration)
+		unlock()
+		migrated = append(migrated, migration)
 	}
 	return migrated
 }

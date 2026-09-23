@@ -18,13 +18,17 @@ import (
 const migrationInterval = 2 * time.Second
 
 type Broker struct {
-	IdGen          *util.UniqueID
-	pool           *UpstreamPool
-	admission      *wsAdmissionController
-	log            *Entry
-	sm             *SubscriptionManager
-	upstreamSubMux sync.Mutex
-	stopMigrate    chan struct{}
+	IdGen     *util.UniqueID
+	pool      *UpstreamPool
+	admission *wsAdmissionController
+	log       *Entry
+	sm        *SubscriptionManager
+	// paramLocks serialises subscription changes per subscription param,
+	// including the upstream round trips, so a slow upstream only stalls
+	// callers of that param.
+	paramLocksMu sync.Mutex
+	paramLocks   map[string]*brokerParamLock
+	stopMigrate  chan struct{}
 	// migrateDone is closed by migrateLoop when it exits, so Stop()
 	// can wait for it before tearing down the pool. Without the
 	// join, runMigration could be mid-pool.MigrateUnhealthy while
@@ -128,10 +132,7 @@ func (b *Broker) migrateLoop() {
 }
 
 func (b *Broker) runMigration() {
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
-
-	for _, m := range b.pool.MigrateUnhealthy() {
+	b.pool.migrateUnhealthy(b.lockParam, func(m SubscriptionMigration) {
 		if !b.sm.Migrate(m.OldID, m.NewID) {
 			b.log.WithFields(Fields{
 				"oldID": m.OldID,
@@ -139,6 +140,37 @@ func (b *Broker) runMigration() {
 				"param": m.Param,
 			}).Warn("migration: subscription manager unaware of oldID")
 		}
+	})
+}
+
+type brokerParamLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockParam locks param and returns its unlock function.
+func (b *Broker) lockParam(param string) func() {
+	b.paramLocksMu.Lock()
+	if b.paramLocks == nil {
+		b.paramLocks = make(map[string]*brokerParamLock)
+	}
+	l := b.paramLocks[param]
+	if l == nil {
+		l = &brokerParamLock{}
+		b.paramLocks[param] = l
+	}
+	l.refs++
+	b.paramLocksMu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		b.paramLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(b.paramLocks, param)
+		}
+		b.paramLocksMu.Unlock()
 	}
 }
 
@@ -237,8 +269,13 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 		return "", err
 	}
 
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
+	unlock := b.lockParam(param)
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 	if client.IsClosed() {
 		return "", ErrClosed
 	}
@@ -286,9 +323,12 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 		b.sm.SubscribeClient(id, client, msg.ID)
 	}
 	if client.IsClosed() {
-		emptySubscriptions := b.detachClientSubscriptionsLocked(client)
+		// The disconnect callback may have listed the client's
+		// subscriptions before this one was added.
 		admitted = false
-		return "", errors.Join(ErrClosed, b.removeEmptySubscriptionsLocked(emptySubscriptions))
+		unlock()
+		locked = false
+		return "", errors.Join(ErrClosed, b.removeAllSubscriptions(client))
 	}
 	admitted = false
 
@@ -307,8 +347,13 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		return err
 	}
 
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
+	param := subParam
+	if isEthSubscriptionID(subParam) {
+		if param, _ = b.sm.GetSubscriptionParam(subParam); param == "" {
+			return fmt.Errorf("subscription does not exist")
+		}
+	}
+	defer b.lockParam(param)()
 
 	var subID string
 	if isEthSubscriptionID(subParam) {
@@ -363,46 +408,65 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 	b.log.WithField("client", client).Debug("unsubscribing client from all subscriptions")
 
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
-
-	emptySubscriptions := b.detachClientSubscriptionsLocked(client)
-	return b.removeEmptySubscriptionsLocked(emptySubscriptions)
-}
-
-func (b *Broker) detachClientSubscriptionsLocked(client *JsonRpcWsClient) []string {
+	// Admission belongs to downstream membership, so all memberships are
+	// released before any upstream cleanup can wait on network I/O.
 	var emptySubscriptions []string
 	for _, subscriptionID := range b.sm.GetSubscriptions(client) {
-		b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
-		b.sm.UnsubscribeClient(subscriptionID, client)
-		b.admission.releaseSubscription(client)
-		if b.sm.SubscriptionEmpty(subscriptionID) {
-			emptySubscriptions = append(emptySubscriptions, subscriptionID)
-		}
-	}
-	return emptySubscriptions
-}
-
-func (b *Broker) removeEmptySubscriptionsLocked(emptySubscriptions []string) error {
-	// Admission belongs to downstream membership, so all memberships must be
-	// released before any upstream cleanup can wait on network I/O.
-	var errs []error
-	for _, subscriptionID := range emptySubscriptions {
-		b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
-		upstreamID, _ := b.sm.UpstreamID(subscriptionID)
-		if err := b.pool.Unsubscribe(upstreamID); err != nil {
-			b.abandonEmptySubscription(subscriptionID, upstreamID, err)
-			errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
+		param, ok := b.sm.GetSubscriptionParam(subscriptionID)
+		if !ok {
 			continue
 		}
-		param, _ := b.sm.GetSubscriptionParam(subscriptionID)
-		b.sm.RemoveSubscription(subscriptionID)
-		b.log.WithFields(map[string]interface{}{
-			"ID":    subscriptionID,
-			"param": param,
-		}).Warn("unsubscribed upstream")
+		unlock := b.lockParam(param)
+		if b.detachClientLocked(client, subscriptionID) {
+			emptySubscriptions = append(emptySubscriptions, subscriptionID)
+		}
+		unlock()
+	}
+
+	var errs []error
+	for _, subscriptionID := range emptySubscriptions {
+		param, ok := b.sm.GetSubscriptionParam(subscriptionID)
+		if !ok {
+			continue
+		}
+		unlock := b.lockParam(param)
+		// Another client may have joined since the detach.
+		if id, _ := b.sm.GetSubscriptionID(param); id == subscriptionID && b.sm.SubscriptionEmpty(subscriptionID) {
+			if err := b.removeEmptySubscriptionLocked(subscriptionID); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		unlock()
 	}
 	return errors.Join(errs...)
+}
+
+// detachClientLocked drops client from subscriptionID and reports whether
+// the subscription is left without clients. The caller holds the param lock.
+func (b *Broker) detachClientLocked(client *JsonRpcWsClient, subscriptionID string) bool {
+	if !b.sm.ClientSubscribed(subscriptionID, client) {
+		return false
+	}
+	b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
+	b.sm.UnsubscribeClient(subscriptionID, client)
+	b.admission.releaseSubscription(client)
+	return b.sm.SubscriptionEmpty(subscriptionID)
+}
+
+func (b *Broker) removeEmptySubscriptionLocked(subscriptionID string) error {
+	b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
+	upstreamID, _ := b.sm.UpstreamID(subscriptionID)
+	if err := b.pool.Unsubscribe(upstreamID); err != nil {
+		b.abandonEmptySubscription(subscriptionID, upstreamID, err)
+		return fmt.Errorf("subscription %s: %w", subscriptionID, err)
+	}
+	param, _ := b.sm.GetSubscriptionParam(subscriptionID)
+	b.sm.RemoveSubscription(subscriptionID)
+	b.log.WithFields(map[string]interface{}{
+		"ID":    subscriptionID,
+		"param": param,
+	}).Warn("unsubscribed upstream")
+	return nil
 }
 
 func (b *Broker) abandonEmptySubscription(id, upstreamID string, err error) {
