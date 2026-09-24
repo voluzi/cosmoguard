@@ -101,7 +101,8 @@ Secret and Helm release must use the same namespace (both commands above use
 
 Installing from a checkout (`./helm/cosmoguard`) deploys the floating
 `latest` image, because the chart's version fields are only stamped at
-release; pin `image.tag` for anything but local testing.
+release. Pin the image for anything but local testing, e.g.
+`--set image.tag=4.0.3` (no `v` prefix).
 
 See `helm/cosmoguard/README.md` for cluster-mode + HPA setup.
 
