@@ -103,6 +103,9 @@ func compareSub(ctx context.Context, s wsSub, node, guard string) Result {
 	guardCh, err := subscribe(ctx, guard+s.path, s)
 	if err != nil {
 		res.Class, res.Detail = Differs, "cosmoguard: "+err.Error()
+		if ctx.Err() != nil {
+			res.Class, res.Detail = Unstable, "interrupted before a verdict"
+		}
 		return res
 	}
 	seen := [2]map[string]any{{}, {}}

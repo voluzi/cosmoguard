@@ -27,6 +27,7 @@ func TestClassify(t *testing.T) {
 		{"cosmoguard gateway error", ok(`{}`), []Response{{Status: 504}}, false, Differs, "status node=200 cosmoguard=504"},
 		{"denied", ok(`{}`), []Response{{Status: 403, Denied: true}}, false, Denied, "refused with 403"},
 		{"node rate-limited", Response{Status: 429, Throttled: true}, []Response{ok(`{}`)}, false, Failed, "rate-limited"},
+		{"oversized answer", ok(`{}`), []Response{{Status: 200, Body: []byte(`{}`), Oversized: true}}, false, Skipped, "larger than 32 MiB"},
 		{"content type", Response{Status: 200, Body: []byte("{}"), ContentType: "application/json"}, []Response{{Status: 200, Body: []byte("{}"), ContentType: "text/plain"}}, false, Differs, "Content-Type"},
 		{"both deny", Response{Status: 403, Denied: true}, []Response{{Status: 403, Denied: true}}, false, Identical, ""},
 		{"status", ok(`{}`), []Response{{Status: 502}}, false, Differs, "status node=200 cosmoguard=502"},
@@ -38,7 +39,11 @@ func TestClassify(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, detail := Classify(tc.direct, tc.proxies, tc.volatile)
 			assert.Equal(t, got, tc.want, detail)
-			assert.Assert(t, strings.Contains(detail, tc.detail), "detail %q lacks %q", detail, tc.detail)
+			if tc.detail == "" {
+				assert.Equal(t, detail, "")
+			} else {
+				assert.Assert(t, strings.Contains(detail, tc.detail), "detail %q lacks %q", detail, tc.detail)
+			}
 		})
 	}
 }
@@ -64,4 +69,8 @@ func TestShapeDiff(t *testing.T) {
 	assert.Equal(t, ShapeDiff([]byte(`{"a":"1"}`), []byte(`{"a":1}`)), "at $.a: node has string, cosmoguard number")
 	assert.Equal(t, ShapeDiff([]byte(`{"a":[{"x":1}]}`), []byte(`{"a":[{"y":1}]}`)), "at $.a[0]: keys on one side only: x, y")
 	assert.Assert(t, ShapeDiff([]byte("x"), []byte("y")) != "")
+	// Trailing data makes a body not JSON, even a stray closing bracket.
+	assert.Assert(t, ShapeDiff([]byte(`{}]`), []byte(`{}`)) != "")
+	assert.Assert(t, ShapeDiff([]byte(`{} {}`), []byte(`{}`)) != "")
+	assert.Equal(t, ShapeDiff([]byte("{}\n"), []byte(`{}`)), "")
 }

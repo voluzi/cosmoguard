@@ -75,10 +75,6 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "unknown chain %q and no --node-* URLs\n", *chain)
 		return 2
 	}
-	if node.LCD == "" || node.RPC == "" || node.GRPC == "" {
-		fmt.Fprintln(os.Stderr, "need --node-lcd, --node-rpc and --node-grpc (or a --chain preset)")
-		return 2
-	}
 	node, guard = trimSlashes(node), trimSlashes(guard)
 
 	protocols := map[string]bool{}
@@ -97,6 +93,16 @@ func run() int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	enabled := func(p string) bool { return len(protocols) == 0 || protocols[p] }
+	if missing := requiredURLs(node, enabled, true); len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "need %s (or a --chain preset)\n", strings.Join(missing, ", "))
+		return 2
+	}
+	if missing := requiredURLs(guard, enabled, false); *spawnBin == "" && len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "need --spawn or %s\n", strings.Join(missing, ", "))
+		return 2
+	}
 
 	var spawned *spawned
 	if *spawnBin != "" {
@@ -125,12 +131,11 @@ func run() int {
 // or nothing could be compared.
 func compare(ctx context.Context, chain string, node, guard compat.Endpoints, height int64, concurrency int,
 	timeout, roundDelay time.Duration, protocols map[string]bool, report string, params compat.Params, spawned bool) int {
-	if guard.LCD == "" || guard.RPC == "" || guard.GRPC == "" {
-		fmt.Fprintln(os.Stderr, "need --spawn or --guard-lcd, --guard-rpc and --guard-grpc")
-		return 2
-	}
 	if guard.EVM == "" {
-		node.EVM, node.EVMWS = "", ""
+		node.EVM = ""
+	}
+	if guard.EVMWS == "" {
+		node.EVMWS = ""
 	}
 
 	rep, err := compat.Run(ctx, compat.Options{
@@ -180,6 +185,26 @@ func endpointFlags(e *compat.Endpoints, prefix, who string) {
 	flag.StringVar(&e.GRPC, prefix+"-grpc", "", "gRPC target of "+who+" (https://host[:port] for TLS, http://host:port plaintext)")
 	flag.StringVar(&e.EVM, prefix+"-evm", "", "EVM JSON-RPC URL of "+who+" (optional)")
 	flag.StringVar(&e.EVMWS, prefix+"-evm-ws", "", "EVM WebSocket URL of "+who+" (optional)")
+}
+
+// requiredURLs lists the flags a run of the enabled protocols needs. The
+// node's LCD and RPC are always needed: they give the pinned height and
+// the live request values. Its gRPC is needed for discovery (gRPC and LCD).
+func requiredURLs(e compat.Endpoints, enabled func(string) bool, isNode bool) []string {
+	prefix := "--guard-"
+	if isNode {
+		prefix = "--node-"
+	}
+	var missing []string
+	need := func(url, name string, when bool) {
+		if when && url == "" {
+			missing = append(missing, prefix+name)
+		}
+	}
+	need(e.LCD, "lcd", isNode || enabled(compat.ProtoLCD))
+	need(e.RPC, "rpc", isNode || enabled(compat.ProtoRPC) || enabled(compat.ProtoWS))
+	need(e.GRPC, "grpc", enabled(compat.ProtoGRPC) || (isNode && enabled(compat.ProtoLCD)))
+	return missing
 }
 
 // overlay returns preset with every URL set in flags replacing its own.

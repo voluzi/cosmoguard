@@ -89,8 +89,8 @@ func FillPath(tmpl string, p Params) (string, []string) {
 		switch {
 		case !ok:
 			missing = append(missing, field)
-		case strings.Contains(pattern, "**"):
-			// Multi-segment variables (e.g. denoms with slashes) keep
+		case strings.Contains(pattern, "**") || strings.Contains(pattern, "/"):
+			// Multi-segment variables ({denom=**}, {name=a/*/b/*}) keep
 			// their slashes; each segment is escaped on its own.
 			segs := strings.Split(v, "/")
 			for i, s := range segs {

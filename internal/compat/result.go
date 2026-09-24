@@ -63,6 +63,8 @@ func (r *Report) HasDifferences() bool { return r.Count(Differs) > 0 }
 
 // Count returns how many endpoints got class c.
 func (r *Report) Count(c Class) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	n := 0
 	for _, res := range r.Results {
 		if res.Class == c {
@@ -73,7 +75,9 @@ func (r *Report) Count(c Class) int {
 }
 
 func (r *Report) sorted() []Result {
+	r.mu.Lock()
 	out := append([]Result(nil), r.Results...)
+	r.mu.Unlock()
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Protocol != out[j].Protocol {
 			return out[i].Protocol < out[j].Protocol

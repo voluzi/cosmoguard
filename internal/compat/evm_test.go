@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -68,9 +67,23 @@ func TestEvmCallName(t *testing.T) {
 // TestEvmCallsReadOnly guards the safety of running against public nodes:
 // nothing that sends, signs or installs server-side state.
 func TestEvmCallsReadOnly(t *testing.T) {
+	// Every method here was checked to read state only. Adding one to
+	// evmCalls means checking it and adding it here.
+	readOnly := map[string]bool{
+		"web3_clientVersion": true, "net_version": true, "net_listening": true, "net_peerCount": true,
+		"eth_chainId": true, "eth_protocolVersion": true, "eth_accounts": true, "eth_mining": true,
+		"eth_hashrate": true, "eth_coinbase": true, "eth_blockNumber": true, "eth_syncing": true,
+		"eth_gasPrice": true, "eth_maxPriorityFeePerGas": true, "eth_feeHistory": true,
+		"eth_getBlockByNumber": true, "eth_getBlockByHash": true,
+		"eth_getBlockTransactionCountByNumber": true, "eth_getBlockTransactionCountByHash": true,
+		"eth_getUncleCountByBlockNumber": true, "eth_getUncleByBlockNumberAndIndex": true,
+		"eth_getBlockReceipts": true, "eth_getLogs": true, "eth_getBalance": true,
+		"eth_getTransactionCount": true, "eth_getCode": true, "eth_getStorageAt": true,
+		"eth_getProof": true, "eth_call": true, "eth_estimateGas": true,
+		"eth_getTransactionByHash": true, "eth_getTransactionReceipt": true,
+		"eth_getTransactionByBlockNumberAndIndex": true, "eth_getTransactionByBlockHashAndIndex": true,
+	}
 	for _, c := range evmCalls(evmChain{block: "0x1", txHash: "0xt", blockHash: "0xb"}) {
-		for _, bad := range []string{"eth_send", "eth_sign", "personal_", "eth_newFilter", "eth_newBlockFilter", "eth_newPendingTransactionFilter", "eth_uninstallFilter", "debug_", "admin_", "miner_"} {
-			assert.Assert(t, !strings.HasPrefix(c.method, bad), c.method)
-		}
+		assert.Assert(t, readOnly[c.method], "%s is not on the verified read-only list", c.method)
 	}
 }

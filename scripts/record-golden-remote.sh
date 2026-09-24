@@ -64,10 +64,8 @@ OUT_DIR="pkg/cosmoguard/testharness/testdata/golden/${CHAIN}-live"
 mkdir -p "$OUT_DIR"
 
 # Curated endpoints — kept small and deterministic so a recording made
-# moments before a test replay is unlikely to drift. Anything
-# height-sensitive (latest block, status's block height) is recorded
-# but the replay treats `/status` specially in case the timestamp
-# changes between record and replay.
+# moments before a test replay is unlikely to drift. Height-sensitive
+# answers (latest block, status's block height) are recorded as they are.
 LCD_ENDPOINTS=(
   "/cosmos/base/tendermint/v1beta1/node_info"
   "/cosmos/bank/v1beta1/params"

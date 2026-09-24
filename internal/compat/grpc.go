@@ -106,6 +106,9 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 		if err != nil {
 			return nil, fmt.Errorf("reflection list: %w", err)
 		}
+		if e := resp.GetErrorResponse(); e != nil {
+			return nil, fmt.Errorf("reflection list: %s", e.GetErrorMessage())
+		}
 		break
 	}
 	if resp == nil {
@@ -252,7 +255,10 @@ func httpGETs(md protoreflect.MethodDescriptor) []string {
 	return out
 }
 
-// buildRequest fills every top-level request field that has a live value.
+// buildRequest fills every top-level scalar request field that has a live
+// value. Bytes, message and float fields are left unset. A value that does
+// not parse as its field's type is an error, so no call goes out with a
+// silently defaulted field.
 func buildRequest(md protoreflect.MethodDescriptor, p Params) ([]byte, error) {
 	msg := dynamicpb.NewMessage(md.Input())
 	fields := md.Input().Fields()
@@ -265,20 +271,49 @@ func buildRequest(md protoreflect.MethodDescriptor, p Params) ([]byte, error) {
 		if !ok {
 			continue
 		}
-		switch f.Kind() {
-		case protoreflect.StringKind:
-			msg.Set(f, protoreflect.ValueOfString(v))
-		case protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-				msg.Set(f, protoreflect.ValueOfUint64(n))
-			}
-		case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
-			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-				msg.Set(f, protoreflect.ValueOfInt64(n))
-			}
+		val, err := scalarValue(f, v)
+		if err != nil {
+			return nil, fmt.Errorf("field %s: %w", f.Name(), err)
+		}
+		if val.IsValid() {
+			msg.Set(f, val)
 		}
 	}
 	return proto.Marshal(msg)
+}
+
+// scalarValue parses v as field f's type; an invalid Value means the kind
+// is not filled from parameters.
+func scalarValue(f protoreflect.FieldDescriptor, v string) (protoreflect.Value, error) {
+	switch f.Kind() {
+	case protoreflect.StringKind:
+		return protoreflect.ValueOfString(v), nil
+	case protoreflect.BoolKind:
+		b, err := strconv.ParseBool(v)
+		return protoreflect.ValueOfBool(b), err
+	case protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
+		n, err := strconv.ParseUint(v, 10, 64)
+		return protoreflect.ValueOfUint64(n), err
+	case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
+		n, err := strconv.ParseInt(v, 10, 64)
+		return protoreflect.ValueOfInt64(n), err
+	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind:
+		n, err := strconv.ParseUint(v, 10, 32)
+		return protoreflect.ValueOfUint32(uint32(n)), err
+	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind:
+		n, err := strconv.ParseInt(v, 10, 32)
+		return protoreflect.ValueOfInt32(int32(n)), err
+	case protoreflect.EnumKind:
+		if ev := f.Enum().Values().ByName(protoreflect.Name(v)); ev != nil {
+			return protoreflect.ValueOfEnum(ev.Number()), nil
+		}
+		n, err := strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("%q is not a value of %s", v, f.Enum().FullName())
+		}
+		return protoreflect.ValueOfEnum(protoreflect.EnumNumber(n)), nil
+	}
+	return protoreflect.Value{}, nil
 }
 
 // rawCodec passes already-encoded protobuf bytes through unchanged, so

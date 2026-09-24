@@ -19,6 +19,8 @@ func TestFillPath(t *testing.T) {
 		// ...a ** variable keeps them.
 		{"/cosmos/bank/v1beta1/supply/by_denom/{denom=**}", "/cosmos/bank/v1beta1/supply/by_denom/tf/nibi1z/utestate", nil},
 		{"/blocks/{height}", "/blocks/10", nil},
+		// A pattern with slashes is multi-segment too.
+		{"/v1/{denom=tf/*/*}", "/v1/tf/nibi1z/utestate", nil},
 		{"/emissions/{topic_id}/{address}", "/emissions//nibi1abc", []string{"topic_id"}},
 		{"/no/vars", "/no/vars", nil},
 	}

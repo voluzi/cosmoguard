@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"text/template"
 	"time"
@@ -96,6 +97,19 @@ evm:
 {{- end}}
 `))
 
+// withoutOverrides drops COSMOGUARD_* variables, which would override the
+// generated config (e.g. COSMOGUARD_NODE_RPC_URL pointing cosmoguard at
+// another node than the one compared).
+func withoutOverrides(env []string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "COSMOGUARD_") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 const (
 	spawnCacheTTL   = 2 * time.Second
 	spawnRoundDelay = spawnCacheTTL + time.Second
@@ -164,6 +178,7 @@ func spawn(ctx context.Context, bin, chain string, node compat.Endpoints) (*spaw
 		return fail(err)
 	}
 	s.cmd = exec.Command(bin, "--config", cfgPath, "--log-level", "warn", "--log-format", "text")
+	s.cmd.Env = withoutOverrides(os.Environ())
 	s.cmd.Stdout, s.cmd.Stderr = logFile, logFile
 	if err := s.cmd.Start(); err != nil {
 		logFile.Close()

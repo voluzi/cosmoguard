@@ -185,12 +185,15 @@ asserting byte-identical relay.
 both directly and through cosmoguard, and reports where the answers
 differ. It finds the endpoints itself: gRPC query methods through server
 reflection, the LCD routes annotated on them, every read-only CometBFT RPC
-method (URI and JSON-RPC forms, plus a batch), the read-only EVM JSON-RPC
-methods, and the NewBlock / newHeads WebSocket subscriptions. Queries are
-pinned to one height so the answers compare byte for byte, and each
-cosmoguard answer is fetched twice so cached answers are checked too. The
-status, body and Content-Type are compared; other response headers are
-not. A few `cross-height` probes also ask for the same query at two
+method (URI and JSON-RPC forms, plus a batch), a fixed set of read-only
+EVM JSON-RPC methods, and the NewBlock / newHeads WebSocket subscriptions.
+Queries that take a height are pinned to one, so their answers compare
+byte for byte; answers about the latest state or the answering node
+(status, latest block, node info, gas price and the like) are compared by
+JSON shape only, and a WebSocket event is compared as a JSON value for the
+same block. Each cosmoguard answer is fetched twice so cached answers are
+checked too. The status, body and Content-Type are compared; other
+response headers are not. A few `cross-height` probes also ask for the same query at two
 heights, so a cache that ignores the requested height is caught.
 
 The node side must be a raw node. A chain's public endpoints usually sit

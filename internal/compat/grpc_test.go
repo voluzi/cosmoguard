@@ -226,3 +226,44 @@ func TestAsJSONResolvesAny(t *testing.T) {
 	c, _ := Classify(r, []Response{r}, true)
 	assert.Equal(t, c, Skipped)
 }
+
+func TestScalarValue(t *testing.T) {
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name: proto.String("test/kinds.proto"), Package: proto.String("test.v1"), Syntax: proto.String("proto3"),
+		EnumType: []*descriptorpb.EnumDescriptorProto{{Name: proto.String("Status"), Value: []*descriptorpb.EnumValueDescriptorProto{
+			{Name: proto.String("STATUS_UNSPECIFIED"), Number: proto.Int32(0)},
+			{Name: proto.String("STATUS_BONDED"), Number: proto.Int32(3)},
+		}}},
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("Req"), Field: []*descriptorpb.FieldDescriptorProto{
+			{Name: proto.String("flag"), Number: proto.Int32(1), Type: descriptorpb.FieldDescriptorProto_TYPE_BOOL.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+			{Name: proto.String("small"), Number: proto.Int32(2), Type: descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+			{Name: proto.String("status"), Number: proto.Int32(3), Type: descriptorpb.FieldDescriptorProto_TYPE_ENUM.Enum(), TypeName: proto.String(".test.v1.Status"), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+			{Name: proto.String("key"), Number: proto.Int32(4), Type: descriptorpb.FieldDescriptorProto_TYPE_BYTES.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+		}}},
+	}
+	files := buildFiles(map[string]*descriptorpb.FileDescriptorProto{fdp.GetName(): fdp})
+	d, err := files.FindDescriptorByName("test.v1.Req")
+	assert.NilError(t, err)
+	fields := d.(protoreflect.MessageDescriptor).Fields()
+
+	v, err := scalarValue(fields.ByName("flag"), "true")
+	assert.NilError(t, err)
+	assert.Equal(t, v.Bool(), true)
+	v, err = scalarValue(fields.ByName("small"), "-7")
+	assert.NilError(t, err)
+	assert.Equal(t, v.Int(), int64(-7))
+	v, err = scalarValue(fields.ByName("status"), "STATUS_BONDED")
+	assert.NilError(t, err)
+	assert.Equal(t, v.Enum(), protoreflect.EnumNumber(3))
+	v, err = scalarValue(fields.ByName("status"), "3")
+	assert.NilError(t, err)
+	assert.Equal(t, v.Enum(), protoreflect.EnumNumber(3))
+
+	_, err = scalarValue(fields.ByName("status"), "BONDED")
+	assert.ErrorContains(t, err, "is not a value of test.v1.Status")
+	_, err = scalarValue(fields.ByName("small"), "abc")
+	assert.Assert(t, err != nil, "a malformed value must not become a default")
+	v, err = scalarValue(fields.ByName("key"), "x")
+	assert.NilError(t, err)
+	assert.Assert(t, !v.IsValid(), "bytes fields are not filled from parameters")
+}

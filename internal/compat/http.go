@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// maxBody bounds how much of one response is read. Both sides are cut at
-// the same length, so a larger body is compared by its prefix.
+// maxBody bounds how much of one response is read; a larger answer is
+// marked oversized and not compared.
 const maxBody = 32 << 20
 
 type httpDoer struct {
@@ -59,9 +59,13 @@ func (h *httpDoer) once(ctx context.Context, method, url string, body []byte, he
 		return Response{Err: err}
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return Response{Err: fmt.Errorf("reading body: %w", err)}
+	}
+	oversized := len(b) > maxBody
+	if oversized {
+		b = b[:maxBody]
 	}
 	height, _ := strconv.ParseInt(resp.Header.Get("X-Cosmos-Block-Height"), 10, 64)
 	if height == 0 {
@@ -73,6 +77,7 @@ func (h *httpDoer) once(ctx context.Context, method, url string, body []byte, he
 		Height:      height,
 		ContentType: resp.Header.Get("Content-Type"),
 		Throttled:   resp.StatusCode == http.StatusTooManyRequests,
+		Oversized:   oversized,
 		// cosmoguard refuses with 401; 403 is kept for other gateways.
 		Denied: resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden,
 	}

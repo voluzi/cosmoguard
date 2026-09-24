@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 )
@@ -28,6 +29,8 @@ type Response struct {
 	// Unrenderable says why a volatile answer could not be rendered for
 	// shape comparison.
 	Unrenderable string
+	// Oversized marks a body cut at maxBody, which cannot be compared.
+	Oversized bool
 }
 
 // Classify compares the node's answer with one or more cosmoguard answers
@@ -40,6 +43,11 @@ func Classify(direct Response, proxies []Response, volatile bool) (Class, string
 	}
 	if direct.Unrenderable != "" {
 		return Skipped, direct.Unrenderable
+	}
+	for _, r := range append([]Response{direct}, proxies...) {
+		if r.Oversized {
+			return Skipped, fmt.Sprintf("an answer is larger than %d MiB, so it was not compared", maxBody>>20)
+		}
 	}
 	if gatewayStatus(direct.Status) {
 		// The node's own edge failed; there is no node answer to compare.
@@ -108,7 +116,9 @@ func decodeJSON(b []byte) (any, bool) {
 	if err := dec.Decode(&v); err != nil {
 		return nil, false
 	}
-	if dec.More() {
+	// Anything but whitespace after the value, even a stray ']', is not
+	// one JSON document.
+	if _, err := dec.Token(); err != io.EOF {
 		return nil, false
 	}
 	return v, true

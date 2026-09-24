@@ -89,10 +89,14 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 			return nil, fmt.Errorf("dial node gRPC: %w", err)
 		}
 		defer node.Close()
-		if guard, err = dialGRPC(o.Guard.GRPC); err != nil {
-			return nil, fmt.Errorf("dial cosmoguard gRPC: %w", err)
+		// LCD needs only the node's reflection; cosmoguard's gRPC is
+		// dialled only when gRPC is compared.
+		if o.enabled(ProtoGRPC) {
+			if guard, err = dialGRPC(o.Guard.GRPC); err != nil {
+				return nil, fmt.Errorf("dial cosmoguard gRPC: %w", err)
+			}
+			defer guard.Close()
 		}
-		defer guard.Close()
 		dctx, cancel := context.WithTimeout(ctx, max(2*time.Minute, 6*o.Timeout))
 		methods, err := discoverMethods(dctx, node)
 		cancel()
@@ -133,9 +137,15 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 }
 
 // taskBudget bounds one endpoint's comparison, so one pathological
-// endpoint cannot hold up the report.
+// endpoint cannot hold up the report. It covers the worst case that still
+// answers: a cross-height probe's two comparisons, each of up to rounds
+// rounds of heightRetries fetches of five calls, plus its two node calls
+// and every pause.
 func taskBudget(o Options) time.Duration {
-	return 12*o.Timeout + rounds*o.RoundDelay
+	const settles = 2
+	calls := settles*rounds*heightRetries*5 + 2
+	pauses := settles * rounds * heightRetries
+	return time.Duration(calls)*o.Timeout + time.Duration(pauses)*o.RoundDelay
 }
 
 func runTasks(ctx context.Context, tasks []task, o Options, rep *Report) {
@@ -149,6 +159,11 @@ func runTasks(ctx context.Context, tasks []task, o Options, rep *Report) {
 			wg.Wait()
 			return
 		case sem <- struct{}{}:
+		}
+		if ctx.Err() != nil {
+			// Both cases were ready; the interrupt wins.
+			<-sem
+			break
 		}
 		wg.Add(1)
 		go func() {
