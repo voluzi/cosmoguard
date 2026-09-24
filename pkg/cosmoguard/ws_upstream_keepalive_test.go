@@ -44,19 +44,25 @@ func TestUpstreamKeepaliveDropsSilentUpstream(t *testing.T) {
 				target, err := url.Parse("ws" + strings.TrimPrefix(server.URL, "http"))
 				assert.NilError(t, err)
 
+				// A longer period for the answering case keeps a scheduling
+				// stall on a loaded runner from reading as a lost pong.
+				period := 50 * time.Millisecond
+				if answersPings {
+					period = 200 * time.Millisecond
+				}
 				manager := protocol.constructor(*target, &util.UniqueID{}, func(*JsonRpcMsg) {})
 				switch m := manager.(type) {
 				case *UpstreamConnManagerCosmos:
-					m.pingPeriod = 50 * time.Millisecond
+					m.pingPeriod = period
 				case *UpstreamConnManagerEth:
-					m.pingPeriod = 50 * time.Millisecond
+					m.pingPeriod = period
 				}
 				go func() { _ = manager.Run(log.WithField("test", t.Name())) }()
 				t.Cleanup(manager.Stop)
 
 				// Three silent ping periods close the socket; Run redials.
 				if answersPings {
-					time.Sleep(time.Second)
+					time.Sleep(1500 * time.Millisecond)
 					assert.Equal(t, connections.Load(), int32(1))
 					return
 				}

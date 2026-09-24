@@ -408,8 +408,13 @@ func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 
 	// Admission belongs to downstream membership, so all memberships are
 	// released before any upstream cleanup can wait on network I/O.
+	// Listing under membershipMu means a concurrent joinClient either lands
+	// in the list or sees the client closed.
+	b.membershipMu.Lock()
+	subscriptionIDs := b.sm.GetSubscriptions(client)
+	b.membershipMu.Unlock()
 	var emptySubscriptions []string
-	for _, subscriptionID := range b.sm.GetSubscriptions(client) {
+	for _, subscriptionID := range subscriptionIDs {
 		if b.detachClient(client, subscriptionID) {
 			emptySubscriptions = append(emptySubscriptions, subscriptionID)
 		}

@@ -30,8 +30,8 @@ const (
 	upstreamWSReadLimit int64 = 16 << 20
 
 	// defaultUpstreamWSPingPeriod is how often an upstream socket is pinged.
-	// A socket that returns no pong for upstreamWSPongWaitPeriods pings is
-	// closed, so a half-open upstream is noticed in seconds rather than when
+	// A socket that returns no pong within upstreamWSPongWaitPeriods periods
+	// is closed, so a half-open upstream is noticed in seconds rather than when
 	// TCP keepalive gives up minutes later.
 	defaultUpstreamWSPingPeriod = 10 * time.Second
 	upstreamWSPongWaitPeriods   = 3
