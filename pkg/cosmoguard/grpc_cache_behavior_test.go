@@ -644,6 +644,18 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		require.True(t, up.cbOpen.Load(), "proxy foreground/refresh timeout must trip the breaker")
 	})
 
+	// The upstream's reset can land after the deadline has passed but before
+	// the context's timer has fired, so Err() is still nil at classification.
+	t.Run("proxy deadline trips breaker before the context timer fires", func(t *testing.T) {
+		p, rule, up := build(t)
+		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
+		ctx := lateTimerCtx{Context: context.Background(), deadline: time.Now().Add(-time.Millisecond)}
+		_, err := p.grpcFetchAndStore(ctx, grpcCacheTestMethod, []byte("req"), key, rule, true)
+		require.Error(t, err)
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+		require.True(t, up.cbOpen.Load(), "an expired proxy deadline must trip the breaker even before ctx.Err() is set")
+	})
+
 	t.Run("caller deadline stays neutral", func(t *testing.T) {
 		p, rule, up := build(t)
 		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
@@ -655,6 +667,14 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		require.False(t, up.cbOpen.Load(), "caller cancellation/deadline must not trip the breaker")
 	})
 }
+
+// lateTimerCtx has a deadline in the past but a timer that has not fired yet.
+type lateTimerCtx struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c lateTimerCtx) Deadline() (time.Time, bool) { return c.deadline, true }
 
 // The transparent (non-cached / streaming / reflection) forwarder must also
 // count its upstream fetch, so the counter isn't blind to non-cached gRPC.
