@@ -644,6 +644,44 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		require.True(t, up.cbOpen.Load(), "proxy foreground/refresh timeout must trip the breaker")
 	})
 
+	// The upstream's reset can land after the deadline has passed but before
+	// the context's timer has fired, so Err() is still nil at classification.
+	t.Run("proxy deadline trips breaker before the context timer fires", func(t *testing.T) {
+		p, rule, up := build(t)
+		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
+		// The embedded timeout only gives Done() a real channel, so a stuck
+		// Invoke fails this subtest instead of hanging the package.
+		base, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ctx := lateTimerCtx{Context: base, deadline: time.Now().Add(-time.Millisecond)}
+		_, err := p.grpcFetchAndStore(ctx, grpcCacheTestMethod, []byte("req"), key, rule, true)
+		require.NoError(t, base.Err(), "the context timer fired, so this did not exercise the Err()==nil window")
+		require.Error(t, err)
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+		require.True(t, up.cbOpen.Load(), "an expired proxy deadline must trip the breaker even before ctx.Err() is set")
+	})
+
+	// A status the upstream actually sent keeps its normal classification even
+	// when the deadline passes between the reply and the classification.
+	t.Run("upstream reply at the deadline is not forced to a failure", func(t *testing.T) {
+		p, rule, up := build(t)
+		base, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ctx := &expiringCtx{Context: base, deadline: time.Now().Add(-time.Millisecond)}
+		up.conn = newRawGRPCTestUpstream(t, func(_ any, stream grpc.ServerStream) error {
+			var frame rawFrame
+			if err := stream.RecvMsg(&frame); err != nil {
+				return err
+			}
+			ctx.expired.Store(true) // the deadline passes after the reply
+			return status.Error(codes.NotFound, "no such height")
+		})
+		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
+		_, err := p.grpcFetchAndStore(ctx, grpcCacheTestMethod, []byte("req"), key, rule, true)
+		require.Equal(t, codes.NotFound, status.Code(err))
+		require.False(t, up.cbOpen.Load(), "an application-level reply must not count as a breaker failure")
+	})
+
 	t.Run("caller deadline stays neutral", func(t *testing.T) {
 		p, rule, up := build(t)
 		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
@@ -654,6 +692,29 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
 		require.False(t, up.cbOpen.Load(), "caller cancellation/deadline must not trip the breaker")
 	})
+}
+
+// lateTimerCtx has a deadline in the past but a timer that has not fired yet.
+type lateTimerCtx struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c lateTimerCtx) Deadline() (time.Time, bool) { return c.deadline, true }
+
+// expiringCtx reports no deadline until expired is set, then a past one, so
+// the deadline can pass between the upstream's reply and its classification.
+type expiringCtx struct {
+	context.Context
+	deadline time.Time
+	expired  atomic.Bool
+}
+
+func (c *expiringCtx) Deadline() (time.Time, bool) {
+	if c.expired.Load() {
+		return c.deadline, true
+	}
+	return time.Time{}, false
 }
 
 // The transparent (non-cached / streaming / reflection) forwarder must also

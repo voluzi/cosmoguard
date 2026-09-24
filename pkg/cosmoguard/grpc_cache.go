@@ -333,8 +333,12 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 	// WithoutCancel / Background), an expiry means the UPSTREAM failed to answer
 	// within our budget — a genuine health failure the breaker must count, not
 	// caller noise. Without this a wedged node keeps getting re-selected for
-	// every coalesced miss/refresh.
-	if invokeErr != nil && proxyDeadline && fetchCtx.Err() == context.DeadlineExceeded {
+	// every coalesced miss/refresh. The deadline is read from the clock, not
+	// fetchCtx.Err(): the upstream's reset can arrive after the deadline has
+	// passed but before the context's timer has fired and set Err(). Only a
+	// DeadlineExceeded is forced; any other status (including a Canceled from
+	// a closing connection) keeps the normal classification.
+	if invokeErr != nil && proxyDeadline && status.Code(invokeErr) == codes.DeadlineExceeded && deadlinePassed(fetchCtx) {
 		upstream.RecordOutcome(false)
 	} else {
 		upstream.RecordOutcomeErr(invokeErr)
@@ -707,3 +711,9 @@ func rawForwardClientToServer(src grpc.ClientStream, dst grpc.ServerStream) chan
 // refactor drops the explicit reference. The pkg/cache import is held
 // here for the gRPC cache integration to use.
 var _ = struct{}{}
+
+// deadlinePassed reports whether ctx carries a deadline that is now in the past.
+func deadlinePassed(ctx context.Context) bool {
+	dl, ok := ctx.Deadline()
+	return ok && !time.Now().Before(dl)
+}
