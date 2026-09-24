@@ -649,7 +649,11 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 	t.Run("proxy deadline trips breaker before the context timer fires", func(t *testing.T) {
 		p, rule, up := build(t)
 		key := grpcCacheKey(rule.Fingerprint, grpcCacheTestMethod, []byte("req"), rule.Cache.KeyMode, p.canonical, "")
-		ctx := lateTimerCtx{Context: context.Background(), deadline: time.Now().Add(-time.Millisecond)}
+		// The embedded timeout only gives Done() a real channel, so a stuck
+		// Invoke fails this subtest instead of hanging the package.
+		base, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ctx := lateTimerCtx{Context: base, deadline: time.Now().Add(-time.Millisecond)}
 		_, err := p.grpcFetchAndStore(ctx, grpcCacheTestMethod, []byte("req"), key, rule, true)
 		require.Error(t, err)
 		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
