@@ -339,14 +339,17 @@ func TestWSRevocationSkipsClosingClient(t *testing.T) {
 }
 
 func TestWSRevocationOfNotificationSubscribeSendsNothing(t *testing.T) {
-	proxy := newReloadTestProxy(t, newLimitingUpstream())
+	upstream := newLimitingUpstream()
+	proxy := newReloadTestProxy(t, upstream)
 	client, peer := newWSCacheClient(t)
 	_, err := proxy.broker.HandleSubscription(client, &JsonRpcMsg{
 		Version: jsonRpcVersion, Method: methodSubscribeCosmos, Params: []any{"q"},
 	})
 	require.NoError(t, err)
 	proxy.SetRules(nil, RuleActionDeny, nil)
-	require.Eventually(t, func() bool { return proxy.broker.ClientSubCount(client) == 0 }, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return proxy.broker.ClientSubCount(client) == 0 && upstream.unsubscribeCalls.Load() == 1
+	}, 2*time.Second, 5*time.Millisecond, "revocation must also remove the upstream subscription")
 	require.NoError(t, peer.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
 	_, _, err = peer.ReadMessage()
 	require.Error(t, err, "a notification must get no reply")
