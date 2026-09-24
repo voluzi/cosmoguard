@@ -82,3 +82,15 @@ func TestEvmNewHeadsEvent(t *testing.T) {
 	_, _, ok = evmNewHeads.event(map[string]any{"id": 1, "result": "0x1"})
 	assert.Assert(t, !ok, "the subscribe ack is not an event")
 }
+
+func TestWsCompareSkipsEVMWithoutWebSocket(t *testing.T) {
+	node := fakeWS(t, false, "P", 10)
+	o := Options{
+		Node:  Endpoints{RPC: strings.Replace(node, "ws", "http", 1), EVM: "http://evm"},
+		Guard: Endpoints{RPC: strings.Replace(node, "ws", "http", 1), EVM: "http://evm"},
+	}
+	res := wsCompare(t.Context(), o)
+	assert.Equal(t, len(res), 2)
+	assert.Equal(t, res[1].Class, Skipped)
+	assert.Equal(t, res[1].Name, evmNewHeads.name)
+}

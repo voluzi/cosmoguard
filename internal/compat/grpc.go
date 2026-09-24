@@ -34,15 +34,21 @@ type Method struct {
 	Desc     protoreflect.MethodDescriptor
 	// GETs are the google.api.http GET templates the LCD serves it on.
 	GETs []string
+	// Types resolves the reflected messages, including those packed in
+	// google.protobuf.Any fields.
+	Types *dynamicpb.Types
 }
 
 // volatileMethods answer about the latest state whatever height is
-// requested, so only their shape is compared.
+// requested, or about the particular node that answered, so only their
+// shape is compared.
 var volatileMethods = map[string]bool{
 	"/cosmos.base.tendermint.v1beta1.Service/GetLatestBlock":        true,
 	"/cosmos.base.tendermint.v1beta1.Service/GetLatestValidatorSet": true,
 	"/cosmos.base.tendermint.v1beta1.Service/GetSyncing":            true,
+	"/cosmos.base.tendermint.v1beta1.Service/GetNodeInfo":           true,
 	"/cosmos.base.node.v1beta1.Service/Status":                      true,
+	"/cosmos.base.node.v1beta1.Service/Config":                      true,
 }
 
 // reflectionMethods are tried in order. Many Cosmos nodes serve only
@@ -154,6 +160,7 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 	}
 
 	files := buildFiles(fdps)
+	types := dynamicpb.NewTypes(files)
 	var methods []Method
 	for _, s := range services {
 		d, err := files.FindDescriptorByName(protoreflect.FullName(s))
@@ -173,6 +180,7 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 				FullName: fmt.Sprintf("/%s/%s", s, md.Name()),
 				Desc:     md,
 				GETs:     httpGETs(md),
+				Types:    types,
 			})
 		}
 	}
@@ -296,7 +304,7 @@ func (rawCodec) Unmarshal(data []byte, v any) error {
 func (rawCodec) Name() string { return "proto" }
 
 // invoke calls one method pinned to height. An error status is an answer;
-// only Unavailable and DeadlineExceeded mean no answer arrived.
+// only Unavailable, DeadlineExceeded and Canceled mean no answer arrived.
 func invoke(ctx context.Context, conn *grpc.ClientConn, method string, req []byte, height int64) Response {
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-cosmos-block-height", strconv.FormatInt(height, 10))
 	var out []byte
@@ -311,28 +319,40 @@ func invoke(ctx context.Context, conn *grpc.ClientConn, method string, req []byt
 	}
 	st := status.Convert(err)
 	switch st.Code() {
-	case codes.Unavailable, codes.DeadlineExceeded:
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
 		return Response{Err: err}
 	}
 	return Response{
 		Status: int(st.Code()),
 		Body:   []byte(st.Message()),
 		Height: h,
-		Denied: st.Code() == codes.PermissionDenied,
+		// cosmoguard refuses with Unauthenticated; PermissionDenied is
+		// kept for other gateways.
+		Denied: st.Code() == codes.Unauthenticated || st.Code() == codes.PermissionDenied,
+		// ResourceExhausted is also how an oversized message is refused,
+		// which is a deterministic answer, not a rate limit.
+		Throttled: st.Code() == codes.ResourceExhausted && !strings.Contains(st.Message(), "larger than max"),
 	}
 }
 
-// asJSON renders a successful response as JSON, for shape comparison.
-func asJSON(md protoreflect.MethodDescriptor, r Response) Response {
+// asJSON renders a successful response as JSON, for shape comparison. A
+// response that cannot be rendered (an Any whose type reflection did not
+// return) is marked, and the endpoint skipped, rather than falling back to
+// comparing bytes that change every block. Its LCD route is still
+// compared, as the node renders that JSON itself.
+func asJSON(m Method, r Response) Response {
 	if r.Err != nil || r.Status != int(codes.OK) {
 		return r
 	}
-	msg := dynamicpb.NewMessage(md.Output())
-	if err := proto.Unmarshal(r.Body, msg); err != nil {
-		return r
-	}
-	if b, err := protojson.Marshal(msg); err == nil {
+	msg := dynamicpb.NewMessage(m.Desc.Output())
+	err := proto.Unmarshal(r.Body, msg)
+	if err == nil {
+		var b []byte
+		b, err = protojson.MarshalOptions{Resolver: m.Types}.Marshal(msg)
 		r.Body = b
+	}
+	if err != nil {
+		r.Unrenderable = "cannot render the answer for shape comparison: " + err.Error()
 	}
 	return r
 }

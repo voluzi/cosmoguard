@@ -17,7 +17,9 @@ import (
 
 // spawnConfig allows everything, so no rule hides a difference, and caches
 // every rule, as a production config would, so cached answers are
-// compared too. Subscriptions are never cached.
+// compared too. Subscriptions are never cached. The cache TTL is kept
+// short so the rounds of a differing endpoint (spawnRoundDelay apart) each
+// reach the node instead of replaying one cached answer.
 var spawnConfig = template.Must(template.New("config").Parse(`host: 127.0.0.1
 lcdPort: {{.LCD}}
 rpcPort: {{.RPC}}
@@ -32,7 +34,7 @@ nodes:
     grpcURL: {{.Node.GRPC}}
 {{- if .EVM}}
     evmRpcURL: {{.Node.EVM}}
-    evmRpcWsURL: {{.Node.EVMWS}}
+    evmRpcWsURL: {{.EVMWSUpstream}}
 {{- end}}
 metrics:
   enable: true
@@ -40,7 +42,7 @@ metrics:
 dashboard:
   enable: false
 cache:
-  ttl: 30s
+  ttl: {{.CacheTTL}}
 lcd:
   default: allow
   rules:
@@ -87,8 +89,17 @@ evm:
           enable: true
   ws:
     default: allow
+{{- if not .Node.EVMWS}}
+    # No EVM WebSocket to compare; keep the proxy's upstream pool minimal.
+    webSocketConnections: 1
+{{- end}}
 {{- end}}
 `))
+
+const (
+	spawnCacheTTL   = 2 * time.Second
+	spawnRoundDelay = spawnCacheTTL + time.Second
+)
 
 type spawned struct {
 	cmd     *exec.Cmd
@@ -117,35 +128,46 @@ func spawn(ctx context.Context, bin, chain string, node compat.Endpoints) (*spaw
 		Chain                                  string
 		Node                                   compat.Endpoints
 		EVM                                    bool
+		EVMWSUpstream                          string
+		CacheTTL                               time.Duration
 		LCD, RPC, GRPC, EVMRPC, EVMWS, Metrics int
-	}{chain, node, node.EVM != "", ports[0], ports[1], ports[2], ports[3], ports[4], ports[5]}
+	}{chain, node, node.EVM != "", node.EVMWS, spawnCacheTTL, ports[0], ports[1], ports[2], ports[3], ports[4], ports[5]}
+	if data.EVMWSUpstream == "" {
+		// cosmoguard always proxies EVM WebSocket with EVM on; point it at
+		// the node's host so it never falls back to a local default port.
+		data.EVMWSUpstream = node.EVM
+	}
 
 	dir, err := os.MkdirTemp("", "cosmoguard-compat-")
 	if err != nil {
+		return nil, compat.Endpoints{}, err
+	}
+	fail := func(err error) (*spawned, compat.Endpoints, error) {
+		_ = os.RemoveAll(dir)
 		return nil, compat.Endpoints{}, err
 	}
 	s := &spawned{dir: dir, logPath: filepath.Join(dir, "cosmoguard.log"), done: make(chan struct{})}
 	cfgPath := filepath.Join(dir, "cosmoguard.yaml")
 	f, err := os.Create(cfgPath)
 	if err != nil {
-		return nil, compat.Endpoints{}, err
+		return fail(err)
 	}
 	err = spawnConfig.Execute(f, data)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		return nil, compat.Endpoints{}, err
+		return fail(err)
 	}
 	logFile, err := os.Create(s.logPath)
 	if err != nil {
-		return nil, compat.Endpoints{}, err
+		return fail(err)
 	}
 	s.cmd = exec.Command(bin, "--config", cfgPath, "--log-level", "warn", "--log-format", "text")
 	s.cmd.Stdout, s.cmd.Stderr = logFile, logFile
 	if err := s.cmd.Start(); err != nil {
 		logFile.Close()
-		return nil, compat.Endpoints{}, err
+		return fail(err)
 	}
 	go func() {
 		_ = s.cmd.Wait()
@@ -164,7 +186,8 @@ func spawn(ctx context.Context, bin, chain string, node compat.Endpoints) (*spaw
 	}
 	if err := waitReady(ctx, fmt.Sprintf("http://127.0.0.1:%d/readyz", data.Metrics), s); err != nil {
 		s.stop()
-		return nil, compat.Endpoints{}, fmt.Errorf("%w (log: %s)", err, s.logPath)
+		logText, _ := os.ReadFile(s.logPath)
+		return fail(fmt.Errorf("%w; cosmoguard log:\n%s", err, logText))
 	}
 	return s, guard, nil
 }
@@ -191,18 +214,29 @@ func waitReady(ctx context.Context, url string, s *spawned) error {
 	}
 }
 
-// stop terminates cosmoguard, giving it 10s to drain.
+// stop terminates cosmoguard, giving it 10s to drain. Spawn mode is
+// written for Unix: elsewhere SIGTERM fails and stop falls back to Kill.
 func (s *spawned) stop() {
-	if s.exited() {
-		return
+	if !s.exited() {
+		_ = s.cmd.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-s.done:
+		case <-time.After(10 * time.Second):
+			_ = s.cmd.Process.Kill()
+			<-s.done
+		}
 	}
-	_ = s.cmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-s.done:
-	case <-time.After(10 * time.Second):
-		_ = s.cmd.Process.Kill()
-		<-s.done
+}
+
+// cleanup removes the config and log, unless keepLog asks to keep the log
+// for a run that found problems; it returns the kept log's path.
+func (s *spawned) cleanup(keepLog bool) string {
+	_ = os.Remove(filepath.Join(s.dir, "cosmoguard.yaml"))
+	if keepLog {
+		return s.logPath
 	}
+	_ = os.RemoveAll(s.dir)
+	return ""
 }
 
 func freePorts(n int) ([]int, error) {

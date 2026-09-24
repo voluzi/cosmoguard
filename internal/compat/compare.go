@@ -18,8 +18,16 @@ type Response struct {
 	// Height is the block height the answer was served at, when the
 	// protocol reports it; 0 means unknown.
 	Height int64
-	// Denied marks a refusal status (HTTP 403, gRPC PermissionDenied).
+	// Denied marks a refusal status (HTTP 401/403, gRPC Unauthenticated/
+	// PermissionDenied).
 	Denied bool
+	// ContentType is the HTTP Content-Type; empty for gRPC.
+	ContentType string
+	// Throttled marks a rate-limit answer that survived the retries.
+	Throttled bool
+	// Unrenderable says why a volatile answer could not be rendered for
+	// shape comparison.
+	Unrenderable string
 }
 
 // Classify compares the node's answer with one or more cosmoguard answers
@@ -30,9 +38,15 @@ func Classify(direct Response, proxies []Response, volatile bool) (Class, string
 	if direct.Err != nil {
 		return Failed, "node: " + direct.Err.Error()
 	}
+	if direct.Unrenderable != "" {
+		return Skipped, direct.Unrenderable
+	}
 	if gatewayStatus(direct.Status) {
 		// The node's own edge failed; there is no node answer to compare.
 		return Failed, fmt.Sprintf("node: gateway status %d", direct.Status)
+	}
+	if direct.Throttled {
+		return Failed, "node: still rate-limited after retries"
 	}
 	for i, p := range proxies {
 		call := ""
@@ -47,6 +61,9 @@ func Classify(direct Response, proxies []Response, volatile bool) (Class, string
 		}
 		if p.Status != direct.Status {
 			return Differs, fmt.Sprintf("%sstatus node=%d cosmoguard=%d", call, direct.Status, p.Status)
+		}
+		if p.ContentType != direct.ContentType {
+			return Differs, fmt.Sprintf("%sContent-Type node=%q cosmoguard=%q", call, direct.ContentType, p.ContentType)
 		}
 		if volatile {
 			if d := ShapeDiff(direct.Body, p.Body); d != "" {

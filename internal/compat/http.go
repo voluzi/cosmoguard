@@ -28,7 +28,7 @@ func newHTTPDoer(timeout time.Duration) *httpDoer {
 func (h *httpDoer) do(ctx context.Context, method, url string, body []byte, header map[string]string) Response {
 	for attempt := 0; ; attempt++ {
 		r := h.once(ctx, method, url, body, header)
-		if r.Err != nil || r.Status != http.StatusTooManyRequests || attempt == 3 {
+		if !r.Throttled || attempt == 3 {
 			return r
 		}
 		select {
@@ -68,10 +68,13 @@ func (h *httpDoer) once(ctx context.Context, method, url string, body []byte, he
 		height, _ = strconv.ParseInt(resp.Header.Get("Grpc-Metadata-X-Cosmos-Block-Height"), 10, 64)
 	}
 	return Response{
-		Status: resp.StatusCode,
-		Body:   b,
-		Height: height,
-		Denied: resp.StatusCode == http.StatusForbidden,
+		Status:      resp.StatusCode,
+		Body:        b,
+		Height:      height,
+		ContentType: resp.Header.Get("Content-Type"),
+		Throttled:   resp.StatusCode == http.StatusTooManyRequests,
+		// cosmoguard refuses with 401; 403 is kept for other gateways.
+		Denied: resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden,
 	}
 }
 

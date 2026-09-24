@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // rpcParam is one CometBFT parameter in both of its encodings: the URI
@@ -55,7 +56,8 @@ func cometCalls(height int64, blockHash, txHash string) []rpcCall {
 		{method: "consensus_state", volatile: true},
 		{method: "dump_consensus_state", volatile: true},
 		{method: "genesis_chunked", params: []rpcParam{num("chunk", "0")}},
-		{method: "blockchain", params: []rpcParam{num("minHeight", strconv.FormatInt(height-2, 10)), num("maxHeight", h)}},
+		// blockchain also reports the answering node's tip (last_height).
+		{method: "blockchain", params: []rpcParam{num("minHeight", strconv.FormatInt(height-2, 10)), num("maxHeight", h)}, volatile: true},
 		{method: "block", params: []rpcParam{num("height", h)}},
 		{method: "block_results", params: []rpcParam{num("height", h)}},
 		{method: "commit", params: []rpcParam{num("height", h)}},
@@ -111,11 +113,11 @@ func cometTasks(ctx context.Context, h *httpDoer, o Options, p Params, height in
 		tasks = append(tasks,
 			httpPairTask(ProtoRPC, "GET /"+c.method, c.skip, c.volatile, func(ctx context.Context, base string) Response {
 				return h.do(ctx, http.MethodGet, base+c.uri(), nil, nil)
-			}, o.Node.RPC, o.Guard.RPC),
+			}, o.Node.RPC, o.Guard.RPC, o.RoundDelay),
 			httpPairTask(ProtoRPC, "POST "+c.method, c.skip, c.volatile, func(ctx context.Context, base string) Response {
 				b, _ := json.Marshal(c.body(1))
 				return post(ctx, base, b)
-			}, o.Node.RPC, o.Guard.RPC),
+			}, o.Node.RPC, o.Guard.RPC, o.RoundDelay),
 		)
 	}
 
@@ -130,23 +132,26 @@ func cometTasks(ctx context.Context, h *httpDoer, o Options, p Params, height in
 	tasks = append(tasks, httpPairTask(ProtoRPC, "POST batch(block,validators,abci_query)", "", false, func(ctx context.Context, base string) Response {
 		b, _ := json.Marshal(batch)
 		return post(ctx, base, b)
-	}, o.Node.RPC, o.Guard.RPC))
+	}, o.Node.RPC, o.Guard.RPC, o.RoundDelay))
 	return tasks
 }
 
 // httpPairTask compares node and cosmoguard answers (see settle) to the
 // request built by send.
-func httpPairTask(proto, name, skip string, volatile bool, send func(context.Context, string) Response, node, guard string) task {
+func httpPairTask(proto, name, skip string, volatile bool, send func(context.Context, string) Response, node, guard string, delay time.Duration) task {
 	return func(ctx context.Context) Result {
 		res := Result{Protocol: proto, Name: name}
 		if skip != "" {
 			res.Class, res.Detail = Skipped, skip
 			return res
 		}
-		fetch := func() (Response, Response, Response, Response) {
-			return send(ctx, node), send(ctx, guard), send(ctx, node), send(ctx, guard)
-		}
-		res.Class, res.Detail = settle(fetch, volatile, func(r Response) Response { return r })
+		res.Class, res.Detail = settle(ctx, comparison{
+			fetch: func() (Response, Response, Response, Response) {
+				return send(ctx, node), send(ctx, guard), send(ctx, node), send(ctx, guard)
+			},
+			volatile: volatile,
+			delay:    delay,
+		})
 		return res
 	}
 }

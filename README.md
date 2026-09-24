@@ -205,15 +205,23 @@ go run ./cmd/cosmoguard-compat \
 ```
 
 Each endpoint is reported as `identical`, `differs` (cosmoguard answered
-differently; the run exits 1), `denied` (cosmoguard refused a request the
-node answered), `failed` (the node itself did not answer), `unstable` or
-`skipped` (a path parameter has no live value; `--param name=value`
-supplies chain-specific ones). An endpoint is `unstable` when the node
-disagrees with itself between two calls, or answers at a different height
-despite the pin. Public endpoints are often load-balanced pools of nodes
-on different versions, so a differing endpoint is compared again, up to
-three rounds, and only reported as `differs` when every round differs.
-For a definitive result, point the tool at a single node.
+differently), `denied` (cosmoguard refused a request the node answered),
+`failed` (the node itself did not answer), `unstable` or `skipped` (a path
+parameter has no live value; `--param name=value` supplies chain-specific
+ones). An endpoint is `unstable` when the node disagrees with itself
+between two calls, or answers at a different height despite the pin.
+Public endpoints are often load-balanced pools of nodes on different
+versions, so a differing endpoint is compared again, up to three rounds,
+and only reported as `differs` when every round differs. Rounds are
+`--round-delay` apart (3s with `make compat`, whose cosmoguard caches for
+2s), so each round reaches the node rather than cosmoguard's cache; set it
+above your cache TTL when checking a running deployment. For a definitive
+result, point the tool at a single node.
+
+The run exits 1 when any endpoint differs, when nothing could be compared,
+or, with `make compat` (whose config allows everything), when any request
+was denied. With `make compat` the cosmoguard log is kept after a failing
+run and its path is printed.
 
 The tool needs network access and is not part of `make test`.
 

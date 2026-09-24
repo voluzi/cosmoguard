@@ -59,13 +59,17 @@ func (r *Report) Add(res Result) {
 }
 
 // HasDifferences reports whether any endpoint differs.
-func (r *Report) HasDifferences() bool {
+func (r *Report) HasDifferences() bool { return r.Count(Differs) > 0 }
+
+// Count returns how many endpoints got class c.
+func (r *Report) Count(c Class) int {
+	n := 0
 	for _, res := range r.Results {
-		if res.Class == Differs {
-			return true
+		if res.Class == c {
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 func (r *Report) sorted() []Result {

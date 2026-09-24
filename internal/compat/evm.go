@@ -37,16 +37,17 @@ func evmCalls(c evmChain) []evmCall {
 	}
 	b := c.block
 	return []evmCall{
-		{method: "web3_clientVersion"},
+		// clientVersion, accounts and coinbase describe the answering node.
+		{method: "web3_clientVersion", volatile: true},
 		{method: "net_version"},
 		{method: "net_listening"},
 		{method: "net_peerCount", volatile: true},
 		{method: "eth_chainId"},
 		{method: "eth_protocolVersion"},
-		{method: "eth_accounts"},
+		{method: "eth_accounts", volatile: true},
 		{method: "eth_mining"},
 		{method: "eth_hashrate"},
-		{method: "eth_coinbase"},
+		{method: "eth_coinbase", volatile: true},
 		{method: "eth_blockNumber", volatile: true},
 		{method: "eth_syncing", volatile: true},
 		{method: "eth_gasPrice", volatile: true},
@@ -76,6 +77,9 @@ func evmCalls(c evmChain) []evmCall {
 }
 
 func (c evmCall) name() string {
+	if len(c.params) == 0 {
+		return c.method
+	}
 	b, _ := json.Marshal(c.params)
 	if len(b) > 70 {
 		b = append(b[:67], "..."...)
@@ -87,18 +91,21 @@ func (c evmCall) name() string {
 // that carries a transaction, for hash and address parameters.
 func discoverEVM(ctx context.Context, h *httpDoer, url string, height int64) evmChain {
 	c := evmChain{block: fmt.Sprintf("0x%x", height), addr: zeroAddress}
-	var blk struct {
-		Hash         string `json:"hash"`
-		Transactions []struct {
-			Hash string `json:"hash"`
-			From string `json:"from"`
-		} `json:"transactions"`
+	var pinned struct {
+		Hash string `json:"hash"`
 	}
-	if err := h.postJSONRPC(ctx, url, "eth_getBlockByNumber", []any{c.block, false}, &blk); err == nil {
-		c.blockHash = blk.Hash
+	if err := h.postJSONRPC(ctx, url, "eth_getBlockByNumber", []any{c.block, false}, &pinned); err == nil {
+		c.blockHash = pinned.Hash
 	}
 	for hh := height; hh > height-50 && hh > 0; hh-- {
 		num := fmt.Sprintf("0x%x", hh)
+		var blk struct {
+			Hash         string `json:"hash"`
+			Transactions []struct {
+				Hash string `json:"hash"`
+				From string `json:"from"`
+			} `json:"transactions"`
+		}
 		if err := h.postJSONRPC(ctx, url, "eth_getBlockByNumber", []any{num, true}, &blk); err != nil {
 			break
 		}
@@ -129,11 +136,11 @@ func evmTasks(ctx context.Context, h *httpDoer, o Options, height int64) []task 
 		if c.params == nil {
 			body["params"] = []any{}
 		}
-		tasks = append(tasks, httpPairTask(ProtoEVM, c.name(), c.skip, c.volatile, post(body), o.Node.EVM, o.Guard.EVM))
-		if c.method == "eth_chainId" || c.method == "eth_getBlockByNumber" || c.method == "eth_getBalance" {
+		tasks = append(tasks, httpPairTask(ProtoEVM, c.name(), c.skip, c.volatile, post(body), o.Node.EVM, o.Guard.EVM, o.RoundDelay))
+		if c.method == "eth_chainId" || c.method == "eth_getBalance" || (c.method == "eth_getBlockByNumber" && c.params[1] == false) {
 			batch = append(batch, body)
 		}
 	}
-	tasks = append(tasks, httpPairTask(ProtoEVM, "batch(eth_chainId,eth_getBlockByNumber,eth_getBalance)", "", false, post(batch), o.Node.EVM, o.Guard.EVM))
+	tasks = append(tasks, httpPairTask(ProtoEVM, "batch(eth_chainId,eth_getBlockByNumber,eth_getBalance)", "", false, post(batch), o.Node.EVM, o.Guard.EVM, o.RoundDelay))
 	return tasks
 }

@@ -55,6 +55,7 @@ func run() int {
 		height      = flag.Int64("height", 0, "height to pin queries to (default: node latest - 5)")
 		concurrency = flag.Int("concurrency", 4, "comparisons in flight at once")
 		timeout     = flag.Duration("timeout", 20*time.Second, "timeout per request")
+		roundDelay  = flag.Duration("round-delay", 0, "pause between comparison rounds of a differing endpoint; set above cosmoguard's cache TTL (default with --spawn: 3s)")
 		node        compat.Endpoints
 		guard       compat.Endpoints
 		params      = compat.Params{}
@@ -87,18 +88,33 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var spawned *spawned
 	if *spawnBin != "" {
 		s, g, err := spawn(ctx, *spawnBin, *chain, node)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "starting cosmoguard: %v\n", err)
 			return 2
 		}
-		defer func() {
-			s.stop()
-			_ = os.RemoveAll(s.dir)
-		}()
-		guard = g
+		spawned, guard = s, g
+		if *roundDelay == 0 {
+			*roundDelay = spawnRoundDelay
+		}
 	}
+	code := compare(ctx, *chain, node, guard, *height, *concurrency, *timeout, *roundDelay, *only, *report, params, spawned != nil)
+	if spawned != nil {
+		spawned.stop()
+		if log := spawned.cleanup(code != 0); log != "" {
+			fmt.Fprintf(os.Stderr, "cosmoguard log: %s\n", log)
+		}
+	}
+	return code
+}
+
+// compare runs the comparison and returns the exit code: 1 when cosmoguard
+// answered differently, refused a request under the allow-all spawn config,
+// or nothing could be compared.
+func compare(ctx context.Context, chain string, node, guard compat.Endpoints, height int64, concurrency int,
+	timeout, roundDelay time.Duration, only, report string, params compat.Params, spawned bool) int {
 	if guard.LCD == "" || guard.RPC == "" || guard.GRPC == "" {
 		fmt.Fprintln(os.Stderr, "need --spawn or --guard-lcd, --guard-rpc and --guard-grpc")
 		return 2
@@ -108,21 +124,29 @@ func run() int {
 	}
 
 	protocols := map[string]bool{}
-	for _, p := range strings.Split(*only, ",") {
-		if p = strings.TrimSpace(p); p != "" {
+	for _, p := range strings.Split(only, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		switch p {
+		case compat.ProtoGRPC, compat.ProtoLCD, compat.ProtoRPC, compat.ProtoEVM, compat.ProtoWS:
 			protocols[p] = true
+		default:
+			fmt.Fprintf(os.Stderr, "unknown protocol %q in --only\n", p)
+			return 2
 		}
 	}
 
 	rep, err := compat.Run(ctx, compat.Options{
-		Chain:       *chain,
+		Chain:       chain,
 		Node:        node,
 		Guard:       guard,
-		Height:      *height,
-		Concurrency: *concurrency,
-		Timeout:     *timeout,
+		Height:      height,
+		Concurrency: concurrency,
+		Timeout:     timeout,
 		Protocols:   protocols,
 		Params:      params,
+		RoundDelay:  roundDelay,
 		Log:         os.Stderr,
 	})
 	if err != nil {
@@ -131,17 +155,24 @@ func run() int {
 	}
 	fmt.Println()
 	rep.WriteSummary(os.Stdout)
-	if *report != "" {
-		if err := rep.WriteJSON(*report); err != nil {
+	if report != "" {
+		if err := rep.WriteJSON(report); err != nil {
 			fmt.Fprintf(os.Stderr, "writing report: %v\n", err)
 			return 2
 		}
-		fmt.Printf("\nfull report: %s\n", *report)
+		fmt.Printf("\nfull report: %s\n", report)
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return 130
 	}
-	if rep.HasDifferences() {
+	switch {
+	case rep.HasDifferences():
+		return 1
+	case spawned && rep.Count(compat.Denied) > 0:
+		// The spawned config allows everything; a refusal is a defect.
+		return 1
+	case rep.Count(compat.Identical) == 0:
+		fmt.Fprintln(os.Stderr, "nothing was compared")
 		return 1
 	}
 	return 0

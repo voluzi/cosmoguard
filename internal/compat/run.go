@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 )
 
 // Endpoints are the base URLs of one side. GRPC is https://host[:port]
@@ -38,6 +37,9 @@ type Options struct {
 	// Params adds or overrides request field values, for chain-specific
 	// fields discovery does not know (e.g. topic_id).
 	Params Params
+	// RoundDelay separates the comparison rounds of a differing endpoint;
+	// set it above cosmoguard's cache TTL so each round reaches upstream.
+	RoundDelay time.Duration
 	// Log receives progress lines.
 	Log io.Writer
 }
@@ -91,7 +93,7 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 			return nil, fmt.Errorf("dial cosmoguard gRPC: %w", err)
 		}
 		defer guard.Close()
-		dctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		dctx, cancel := context.WithTimeout(ctx, max(2*time.Minute, 6*o.Timeout))
 		methods, err := discoverMethods(dctx, node)
 		cancel()
 		if err != nil {
@@ -100,7 +102,7 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 		logf("discovered %d query methods", len(methods))
 		for _, m := range methods {
 			if o.enabled(ProtoGRPC) {
-				tasks = append(tasks, grpcTask(node, guard, m, params, height))
+				tasks = append(tasks, grpcTask(node, guard, m, params, height, o))
 			}
 			if o.enabled(ProtoLCD) {
 				for _, tmpl := range m.GETs {
@@ -128,17 +130,30 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 	return rep, nil
 }
 
+// taskBudget bounds one endpoint's comparison, so one pathological
+// endpoint cannot hold up the report.
+func taskBudget(o Options) time.Duration {
+	return 12*o.Timeout + rounds*o.RoundDelay
+}
+
 func runTasks(ctx context.Context, tasks []task, o Options, rep *Report) {
 	sem := make(chan struct{}, max(o.Concurrency, 1))
 	var wg sync.WaitGroup
+	budget := taskBudget(o)
 	for _, t := range tasks {
 		sem <- struct{}{}
 		wg.Add(1)
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			cctx, cancel := context.WithTimeout(ctx, 4*o.Timeout)
+			tctx, cancel := context.WithTimeout(ctx, budget)
 			defer cancel()
-			rep.Add(t(cctx))
+			res := t(tctx)
+			if ctx.Err() == nil && tctx.Err() != nil {
+				// Calls cut off by the budget would read as cosmoguard
+				// failures; there is no verdict.
+				res.Class, res.Detail = Unstable, fmt.Sprintf("no verdict within %s", budget)
+			}
+			rep.Add(res)
 		}()
 	}
 	wg.Wait()
@@ -148,7 +163,7 @@ func runTasks(ctx context.Context, tasks []task, o Options, rep *Report) {
 // fetched again before it is called unstable.
 const heightRetries = 3
 
-func grpcTask(node, guard *grpc.ClientConn, m Method, p Params, height int64) task {
+func grpcTask(node, guard *grpc.ClientConn, m Method, p Params, height int64, o Options) task {
 	return func(ctx context.Context) Result {
 		res := Result{Protocol: ProtoGRPC, Name: m.FullName}
 		req, err := buildRequest(m.Desc, p)
@@ -158,8 +173,10 @@ func grpcTask(node, guard *grpc.ClientConn, m Method, p Params, height int64) ta
 		}
 		call := func(conn *grpc.ClientConn) Response {
 			for attempt := 0; ; attempt++ {
-				r := invoke(ctx, conn, m.FullName, req, height)
-				if r.Status != int(codes.ResourceExhausted) || attempt == 3 {
+				cctx, cancel := context.WithTimeout(ctx, o.Timeout)
+				r := invoke(cctx, conn, m.FullName, req, height)
+				cancel()
+				if !r.Throttled || attempt == 3 {
 					return r
 				}
 				select {
@@ -169,15 +186,18 @@ func grpcTask(node, guard *grpc.ClientConn, m Method, p Params, height int64) ta
 				}
 			}
 		}
-		volatile := volatileMethods[m.FullName]
-		fetch := func() (Response, Response, Response, Response) {
-			return call(node), call(guard), call(node), call(guard)
+		c := comparison{
+			fetch: func() (Response, Response, Response, Response) {
+				return call(node), call(guard), call(node), call(guard)
+			},
+			volatile: volatileMethods[m.FullName],
+			pinned:   height,
+			delay:    o.RoundDelay,
 		}
-		render := func(r Response) Response { return r }
-		if volatile {
-			render = func(r Response) Response { return asJSON(m.Desc, r) }
+		if c.volatile {
+			c.render = func(r Response) Response { return asJSON(m, r) }
 		}
-		res.Class, res.Detail = settle(fetch, volatile, render)
+		res.Class, res.Detail = settle(ctx, c)
 		return res
 	}
 }
@@ -188,18 +208,34 @@ func grpcTask(node, guard *grpc.ClientConn, m Method, p Params, height int64) ta
 // reproduces in every round.
 const rounds = 3
 
+// comparison is one endpoint's request, played against both sides.
+type comparison struct {
+	// fetch returns two node answers and two cosmoguard answers, taken
+	// interleaved (node, cosmoguard, node, cosmoguard); the second
+	// cosmoguard answer is normally served from cache.
+	fetch    func() (d1, g1, d2, g2 Response)
+	volatile bool
+	// render converts answers before comparison; nil keeps them as is.
+	render func(Response) Response
+	// pinned is the height the request pins, when answers report one.
+	pinned int64
+	// delay separates rounds, so a later round is not served from the
+	// cache entry an earlier one filled.
+	delay time.Duration
+}
+
 // settle compares an endpoint over up to rounds rounds and returns the
 // verdict. It differs only when every round differs; a later match makes
 // it unstable, keeping the first difference in the detail.
-func settle(fetch func() (d1, g1, d2, g2 Response), volatile bool, render func(Response) Response) (Class, string) {
+func settle(ctx context.Context, c comparison) (Class, string) {
 	var first string
 	for round := 1; ; round++ {
-		c, detail := settleRound(fetch, volatile, render)
-		if c != Differs {
-			if first != "" && c == Identical {
+		class, detail := settleRound(c)
+		if class != Differs {
+			if first != "" && class == Identical {
 				return Unstable, fmt.Sprintf("matched in round %d after differing: %s", round, first)
 			}
-			return c, detail
+			return class, detail
 		}
 		if first == "" {
 			first = detail
@@ -207,34 +243,63 @@ func settle(fetch func() (d1, g1, d2, g2 Response), volatile bool, render func(R
 		if round == rounds {
 			return Differs, detail
 		}
+		select {
+		case <-ctx.Done():
+			return Differs, detail
+		case <-time.After(c.delay):
+		}
 	}
 }
 
-// settleRound compares two node answers and two cosmoguard answers to one
-// request, taken interleaved (node, cosmoguard, node, cosmoguard); the
-// second cosmoguard answer is normally served from cache.
-//
-// Answers that report different heights are fetched again: a pinned query
-// should never drift, but some public nodes ignore the pin. When the
-// node's own two answers disagree, cosmoguard cannot be judged against
-// it, so the endpoint is reported as unstable.
-func settleRound(fetch func() (d1, g1, d2, g2 Response), volatile bool, render func(Response) Response) (Class, string) {
+// settleRound compares one round. Answers at the wrong height are fetched
+// again: a pinned query should never drift, but some public nodes ignore
+// the pin. With a pin, any answer stating another height is wrong (a
+// cosmoguard cache hit may state none); without one, the answers must
+// agree. If the node keeps honouring the pin while cosmoguard keeps
+// answering at another height, cosmoguard lost the pin. When the node's
+// own two answers disagree, cosmoguard cannot be judged against it, so the
+// endpoint is reported as unstable.
+func settleRound(c comparison) (Class, string) {
+	render := c.render
+	if render == nil {
+		render = func(r Response) Response { return r }
+	}
 	for attempt := 1; ; attempt++ {
-		d1, g1, d2, g2 := fetch()
-		if !volatile && !SameHeight(d1, g1, d2, g2) {
+		d1, g1, d2, g2 := c.fetch()
+		drift := !SameHeight(d1, g1, d2, g2)
+		if c.pinned != 0 {
+			drift = offPin(d1, c.pinned) || offPin(d2, c.pinned) || offPin(g1, c.pinned) || offPin(g2, c.pinned)
+		}
+		if !c.volatile && drift {
 			if attempt < heightRetries {
 				continue
 			}
-			return Unstable, fmt.Sprintf("answered at heights node=%d,%d cosmoguard=%d,%d despite the pin", d1.Height, d2.Height, g1.Height, g2.Height)
+			detail := fmt.Sprintf("answered at heights node=%d,%d cosmoguard=%d,%d", d1.Height, d2.Height, g1.Height, g2.Height)
+			if c.pinned != 0 && d1.Height == c.pinned && d2.Height == c.pinned &&
+				offPin(g1, c.pinned) && offPin(g2, c.pinned) {
+				return Differs, fmt.Sprintf("the node honours the pinned height %d, cosmoguard does not: %s", c.pinned, detail)
+			}
+			return Unstable, detail + " despite the pin"
 		}
 		d1, g1, d2, g2 = render(d1), render(g1), render(d2), render(g2)
-		if d1.Err == nil && d2.Err == nil {
-			if c, _ := Classify(d1, []Response{d2}, volatile); c != Identical {
-				return Unstable, "the node's own answers differ between calls (load-balanced or non-deterministic)"
+		switch class, detail := Classify(d1, []Response{d2}, c.volatile); class {
+		case Identical:
+		case Failed:
+			return class, detail
+		default:
+			// Either node answer may be the failing one.
+			if class, detail := Classify(d2, nil, c.volatile); class == Failed {
+				return class, detail
 			}
+			return Unstable, "the node's own answers differ between calls (load-balanced or non-deterministic)"
 		}
-		return Classify(d1, []Response{g1, g2}, volatile)
+		return Classify(d1, []Response{g1, g2}, c.volatile)
 	}
+}
+
+// offPin reports an answer that states a height other than the pinned one.
+func offPin(r Response, pinned int64) bool {
+	return r.Height != 0 && r.Height != pinned
 }
 
 func lcdTask(h *httpDoer, o Options, m Method, tmpl string, p Params, height int64) task {
@@ -248,10 +313,14 @@ func lcdTask(h *httpDoer, o Options, m Method, tmpl string, p Params, height int
 		}
 		pin := map[string]string{"x-cosmos-block-height": strconv.FormatInt(height, 10)}
 		get := func(base string) Response { return h.do(ctx, http.MethodGet, base+path, nil, pin) }
-		fetch := func() (Response, Response, Response, Response) {
-			return get(o.Node.LCD), get(o.Guard.LCD), get(o.Node.LCD), get(o.Guard.LCD)
-		}
-		res.Class, res.Detail = settle(fetch, volatileMethods[m.FullName], func(r Response) Response { return r })
+		res.Class, res.Detail = settle(ctx, comparison{
+			fetch: func() (Response, Response, Response, Response) {
+				return get(o.Node.LCD), get(o.Guard.LCD), get(o.Node.LCD), get(o.Guard.LCD)
+			},
+			volatile: volatileMethods[m.FullName],
+			pinned:   height,
+			delay:    o.RoundDelay,
+		})
 		return res
 	}
 }

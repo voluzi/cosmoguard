@@ -1,13 +1,24 @@
 package compat
 
 import (
+	"context"
+	"encoding/json"
+	"net"
 	"testing"
+	"time"
 
 	"google.golang.org/genproto/googleapis/api/annotations"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/anypb"
 	"gotest.tools/assert"
 )
 
@@ -107,4 +118,111 @@ func TestCometCallEncoding(t *testing.T) {
 	for _, c := range calls {
 		assert.Assert(t, c.method != "broadcast_tx_sync" && c.method != "genesis", c.method)
 	}
+}
+
+// statusServer answers every method with the status in the request's
+// "want" metadata.
+func statusServer(t *testing.T) *grpc.ClientConn {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NilError(t, err)
+	srv := grpc.NewServer(grpc.ForceServerCodec(rawCodec{}), grpc.UnknownServiceHandler(func(_ any, stream grpc.ServerStream) error {
+		md, _ := metadata.FromIncomingContext(stream.Context())
+		_ = stream.SetHeader(metadata.Pairs("x-cosmos-block-height", "7"))
+		switch md.Get("want")[0] {
+		case "ok":
+			return stream.SendMsg([]byte{})
+		case "unauthenticated":
+			return status.Error(codes.Unauthenticated, "denied")
+		case "throttled":
+			return status.Error(codes.ResourceExhausted, "rate limited")
+		case "too-large":
+			return status.Error(codes.ResourceExhausted, "grpc: received message larger than max (5 vs. 4)")
+		case "not-found":
+			return status.Error(codes.NotFound, "nope")
+		}
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	}))
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	conn, err := dialGRPC("http://" + lis.Addr().String())
+	assert.NilError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	return conn
+}
+
+func TestInvokeStatusMapping(t *testing.T) {
+	conn := statusServer(t)
+	call := func(ctx context.Context, want string) Response {
+		ctx = metadata.AppendToOutgoingContext(ctx, "want", want)
+		return invoke(ctx, conn, "/x.Query/M", []byte{}, 7)
+	}
+	r := call(t.Context(), "ok")
+	assert.NilError(t, r.Err)
+	assert.Equal(t, r.Status, 0)
+	assert.Equal(t, r.Height, int64(7))
+
+	r = call(t.Context(), "unauthenticated")
+	assert.Assert(t, r.Denied, "cosmoguard refuses with Unauthenticated")
+
+	assert.Assert(t, call(t.Context(), "throttled").Throttled)
+	assert.Assert(t, !call(t.Context(), "too-large").Throttled, "an oversized message is an answer, not a rate limit")
+
+	r = call(t.Context(), "not-found")
+	assert.NilError(t, r.Err, "an error status is an answer")
+	assert.Equal(t, r.Status, int(codes.NotFound))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	assert.Assert(t, call(ctx, "hang").Err != nil, "a cancelled call is no answer")
+}
+
+func TestAsJSONResolvesAny(t *testing.T) {
+	// A response message holding an Any whose type only the reflected
+	// files know, as GetLatestValidatorSet's pub_key does.
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String("test/any.proto"),
+		Package:    proto.String("test.v1"),
+		Syntax:     proto.String("proto3"),
+		Dependency: []string{"google/protobuf/any.proto"},
+		MessageType: []*descriptorpb.DescriptorProto{
+			{Name: proto.String("PubKey"), Field: []*descriptorpb.FieldDescriptorProto{
+				{Name: proto.String("key"), JsonName: proto.String("key"), Number: proto.Int32(1), Type: descriptorpb.FieldDescriptorProto_TYPE_BYTES.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+			}},
+			{Name: proto.String("Resp"), Field: []*descriptorpb.FieldDescriptorProto{
+				{Name: proto.String("pub_key"), JsonName: proto.String("pubKey"), Number: proto.Int32(1), Type: descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(), TypeName: proto.String(".google.protobuf.Any"), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+			}},
+		},
+		Service: []*descriptorpb.ServiceDescriptorProto{{
+			Name:   proto.String("Query"),
+			Method: []*descriptorpb.MethodDescriptorProto{{Name: proto.String("Get"), InputType: proto.String(".test.v1.Resp"), OutputType: proto.String(".test.v1.Resp")}},
+		}},
+	}
+	anyFile := protodesc.ToFileDescriptorProto(anypb.File_google_protobuf_any_proto)
+	files := buildFiles(map[string]*descriptorpb.FileDescriptorProto{fdp.GetName(): fdp, anyFile.GetName(): anyFile})
+	types := dynamicpb.NewTypes(files)
+	d, err := files.FindDescriptorByName("test.v1.Query")
+	assert.NilError(t, err)
+	m := Method{FullName: "/test.v1.Query/Get", Desc: d.(protoreflect.ServiceDescriptor).Methods().Get(0), Types: types}
+
+	pubKey := dynamicpb.NewMessage(m.Desc.Output().ParentFile().Messages().ByName("PubKey"))
+	pubKey.Set(pubKey.Descriptor().Fields().ByName("key"), protoreflect.ValueOfBytes([]byte{1}))
+	packed, err := proto.Marshal(pubKey)
+	assert.NilError(t, err)
+	resp := dynamicpb.NewMessage(m.Desc.Output())
+	resp.Set(resp.Descriptor().Fields().ByName("pub_key"), protoreflect.ValueOfMessage((&anypb.Any{TypeUrl: "/test.v1.PubKey", Value: packed}).ProtoReflect()))
+	body, err := proto.Marshal(resp)
+	assert.NilError(t, err)
+
+	r := asJSON(m, Response{Status: 0, Body: body})
+	assert.NilError(t, r.Err)
+	var got any
+	assert.NilError(t, json.Unmarshal(r.Body, &got)) // protojson randomises whitespace
+	assert.DeepEqual(t, got, map[string]any{"pubKey": map[string]any{"@type": "/test.v1.PubKey", "key": "AQ=="}})
+
+	r = asJSON(Method{FullName: m.FullName, Desc: m.Desc, Types: dynamicpb.NewTypes(new(protoregistry.Files))}, Response{Body: body})
+	assert.Assert(t, r.Unrenderable != "", "an unrenderable answer must not fall back to comparing bytes")
+	c, _ := Classify(r, []Response{r}, true)
+	assert.Equal(t, c, Skipped)
 }

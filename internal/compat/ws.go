@@ -61,8 +61,11 @@ var evmNewHeads = wsSub{
 
 func wsCompare(ctx context.Context, o Options) []Result {
 	results := []Result{compareSub(ctx, cometNewBlock, wsURL(o.Node.RPC), wsURL(o.Guard.RPC))}
-	if o.Node.EVMWS != "" && o.Guard.EVMWS != "" {
+	switch {
+	case o.Node.EVMWS != "" && o.Guard.EVMWS != "":
 		results = append(results, compareSub(ctx, evmNewHeads, wsURL(o.Node.EVMWS), wsURL(o.Guard.EVMWS)))
+	case o.Node.EVM != "":
+		results = append(results, Result{Protocol: ProtoWS, Name: evmNewHeads.name, Class: Skipped, Detail: "no EVM WebSocket URL for both sides"})
 	}
 	return results
 }
@@ -119,6 +122,16 @@ func compareSub(ctx context.Context, s wsSub, node, guard string) Result {
 			side = 0
 		case ev, ok = <-guardCh:
 			side = 1
+		}
+		if !ok && ctx.Err() != nil {
+			// The window closed the connections; report the timeout
+			// on the next turn rather than a closed subscription.
+			if side == 0 {
+				nodeCh = nil
+			} else {
+				guardCh = nil
+			}
+			continue
 		}
 		if !ok || ev.err != "" {
 			why := "closed the subscription"

@@ -26,6 +26,8 @@ func TestClassify(t *testing.T) {
 		{"node gateway error", Response{Status: 504, Body: []byte("<html>")}, []Response{ok(`{}`)}, false, Failed, "node: gateway status 504"},
 		{"cosmoguard gateway error", ok(`{}`), []Response{{Status: 504}}, false, Differs, "status node=200 cosmoguard=504"},
 		{"denied", ok(`{}`), []Response{{Status: 403, Denied: true}}, false, Denied, "refused with 403"},
+		{"node rate-limited", Response{Status: 429, Throttled: true}, []Response{ok(`{}`)}, false, Failed, "rate-limited"},
+		{"content type", Response{Status: 200, Body: []byte("{}"), ContentType: "application/json"}, []Response{{Status: 200, Body: []byte("{}"), ContentType: "text/plain"}}, false, Differs, "Content-Type"},
 		{"both deny", Response{Status: 403, Denied: true}, []Response{{Status: 403, Denied: true}}, false, Identical, ""},
 		{"status", ok(`{}`), []Response{{Status: 502}}, false, Differs, "status node=200 cosmoguard=502"},
 		{"cached answer differs", ok(`{"a":1}`), []Response{ok(`{"a":1}`), ok(`{"a":2}`)}, false, Differs, "call 2: at $.a"},
