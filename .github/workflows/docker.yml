@@ -1,9 +1,20 @@
 name: Build Cosmoguard Image
 
+# Tags publish a release (versioned image + chart); main publishes the
+# rolling `edge` image only.
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+
+# Serialize per ref so an older main build can't overwrite a newer `edge`.
+# The group must differ from test.yml's, which a called workflow evaluates
+# with this workflow's name.
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -20,13 +31,32 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.extract.outputs.version }}
+      build_version: ${{ steps.extract.outputs.build_version }}
+      latest: ${{ steps.extract.outputs.latest }}
     steps:
-      - name: Extract version from tag
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # version is the image tag (X.Y.Z[-pre] or `edge`); build_version is
+      # what the binary reports. `latest` moves only for the highest stable
+      # tag, so a maintenance release on an older line never rewinds it.
+      - name: Extract version
         id: extract
         run: |
-          TAG_REF="${GITHUB_REF#refs/tags/}"
-          VERSION_WITHOUT_V="${TAG_REF#v}"
-          echo "version=$VERSION_WITHOUT_V" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG_REF="${GITHUB_REF#refs/tags/}"
+            echo "version=${TAG_REF#v}" >> "$GITHUB_OUTPUT"
+            echo "build_version=$TAG_REF" >> "$GITHUB_OUTPUT"
+            newest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+            [[ "$TAG_REF" == "$newest" ]] && latest=true || latest=false
+            echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=edge" >> "$GITHUB_OUTPUT"
+            echo "build_version=$(git describe --tags --exclude 'chart/*')" >> "$GITHUB_OUTPUT"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
   build:
     name: Build and Push Cosmoguard Images
     needs:
@@ -80,7 +110,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
-            VERSION=v${{ needs.version.outputs.version }}
+            VERSION=${{ needs.version.outputs.build_version }}
             COMMIT=${{ github.sha }}
 
   merge:
@@ -107,7 +137,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=${{ needs.version.outputs.version }}
-            type=raw,value=latest,enable=${{ !contains(needs.version.outputs.version, '-') }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
 
       - name: Create manifest list and push
         env:
@@ -123,6 +153,7 @@ jobs:
   # image (appVersion, stamped from the same tag) can always be pulled.
   chart:
     name: Publish Helm Chart
+    if: startsWith(github.ref, 'refs/tags/')
     needs:
       - version
       - merge
