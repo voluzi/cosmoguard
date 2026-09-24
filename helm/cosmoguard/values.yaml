@@ -463,12 +463,19 @@ networkPolicy:
   # By default the proxy listeners are NOT restricted by this policy
   # (we add nothing for them — they're the public ingress surface and
   # the controller / mesh handles auth/IP-allowlist). Add rules here
-  # to lock them down to specific namespaces / pod selectors.
+  # to lock them down to specific namespaces / pod selectors. A rule
+  # without `ports` admits every port from its sources, including the
+  # metrics, dashboard, gossip, RESP and peer-api ports, so list the
+  # proxy ports explicitly.
   proxyIngress: []
     # - from:
     #     - namespaceSelector:
     #         matchLabels:
     #           kubernetes.io/metadata.name: trusted-clients
+    #   ports:
+    #     - port: 11317
+    #     - port: 16657
+    #     - port: 19090
   # Sources allowed to scrape the metrics port. The metrics rule is rendered
   # whether or not proxyIngress is set; empty allows any source.
   metricsFrom: []

@@ -10,7 +10,7 @@ spec:
   ports:
     {{- if .Values.config.metrics.enable }}
     - name: metrics
-      port: {{ .Values.service.metricsPort }}
+      port: {{ .Values.service.metricsPort | default .Values.config.metrics.port }}
       targetPort: metrics
       protocol: TCP
     {{- end }}

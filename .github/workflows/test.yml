@@ -72,10 +72,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Cap each target at 10s so a regular PR run takes <1 min total.
-      # Run nightly with FUZZTIME=5m for deeper coverage.
+      # Cap each target at 10s so a regular PR run takes <1 min total; the
+      # scheduled nightly run gives each target 5m for deeper coverage.
       - name: fuzz
-        run: make fuzz FUZZTIME=10s
+        env:
+          FUZZTIME: ${{ github.event_name == 'schedule' && '5m' || '10s' }}
+        run: make fuzz FUZZTIME="$FUZZTIME"
 
   helm:
     name: helm chart renders + config loads

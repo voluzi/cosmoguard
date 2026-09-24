@@ -1,7 +1,8 @@
 {{- if .Values.podDisruptionBudget.enabled -}}
-{{- $hasMin := hasKey .Values.podDisruptionBudget "minAvailable" -}}
-{{- $hasMax := hasKey .Values.podDisruptionBudget "maxUnavailable" -}}
-{{- if and $hasMin $hasMax (ne (toString .Values.podDisruptionBudget.minAvailable) "<nil>") (ne (toString .Values.podDisruptionBudget.maxUnavailable) "<nil>") -}}
+{{- /* An explicit null counts as unset, so a values file can clear either key. */ -}}
+{{- $hasMin := ne (toString (index .Values.podDisruptionBudget "minAvailable")) "<nil>" -}}
+{{- $hasMax := ne (toString (index .Values.podDisruptionBudget "maxUnavailable")) "<nil>" -}}
+{{- if and $hasMin $hasMax -}}
 {{- fail "cosmoguard: podDisruptionBudget.minAvailable and .maxUnavailable are mutually exclusive — pick one" -}}
 {{- end -}}
 apiVersion: policy/v1
@@ -10,13 +11,13 @@ metadata:
   name: {{ include "cosmoguard.fullname" . }}
   labels: {{- include "cosmoguard.labels" . | nindent 4 }}
 spec:
-  {{- if hasKey .Values.podDisruptionBudget "minAvailable" }}
+  {{- if $hasMin }}
   minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
   {{- end }}
-  {{- if hasKey .Values.podDisruptionBudget "maxUnavailable" }}
+  {{- if $hasMax }}
   maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
   {{- end }}
-  {{- if not (or (hasKey .Values.podDisruptionBudget "minAvailable") (hasKey .Values.podDisruptionBudget "maxUnavailable")) }}
+  {{- if not (or $hasMin $hasMax) }}
   minAvailable: 1
   {{- end }}
   selector:

@@ -66,6 +66,11 @@ check "internal ClusterIP Service carries metrics and dashboard" \
   (.spec.type == "ClusterIP") and ([.spec.ports[].name] | contains(["metrics", "dashboard"]))
 ' --set service.type=LoadBalancer --set config.dashboard.enable=true
 
+check "internal Service metrics port falls back to the listener port" \
+  'select(.kind == "Service" and .metadata.name == "hardening-test-internal")' '
+  [.spec.ports[] | select(.name == "metrics") | .port] | ((length == 1) and (.[0] == 9001))
+' --set service.metricsPort=null
+
 check "dashboard Ingress routes to the internal Service" \
   'select(.kind == "Ingress")' '
   .spec.rules[0].http.paths[0].backend.service.name == "hardening-test-internal"
@@ -106,6 +111,7 @@ servicemonitor_matches() {
   labels=$("${YQ_BIN}" 'select(.kind == "Service" and .metadata.name == "hardening-test-internal") | .metadata.labels | to_entries[] | .key + "=" + .value' "$1") || return 1
   port=$("${YQ_BIN}" 'select(.kind == "ServiceMonitor") | .spec.endpoints[0].port' "$1") || return 1
   [ -n "${selector}" ] || return 1
+  grep -qx 'app.kubernetes.io/instance=hardening-test' <<<"${selector}" || return 1
   [ -z "$(comm -23 <(sort <<<"${selector}") <(sort <<<"${labels}"))" ] || return 1
   "${YQ_BIN}" -e 'select(.kind == "Service" and .metadata.name == "hardening-test-internal") | [.spec.ports[].name] | contains(["'"${port}"'"])' "$1" >/dev/null 2>&1
 }
@@ -145,6 +151,20 @@ check "PDB accepts maxUnavailable alone" \
   'select(.kind == "PodDisruptionBudget")' '
   (.spec.maxUnavailable == 1) and (.spec | has("minAvailable") | not)
 ' --set podDisruptionBudget.enabled=true --set podDisruptionBudget.maxUnavailable=1
+
+null_values="${tmp_dir}/pdb-null-values.yaml"
+printf 'podDisruptionBudget:\n  enabled: true\n  minAvailable: null\n  maxUnavailable: null\n' >"${null_values}"
+check "PDB treats explicit nulls as unset" \
+  'select(.kind == "PodDisruptionBudget")' '
+  (.spec.minAvailable == 1) and (.spec | has("maxUnavailable") | not)
+' -f "${null_values}"
+
+null_values_max="${tmp_dir}/pdb-null-min-values.yaml"
+printf 'podDisruptionBudget:\n  enabled: true\n  minAvailable: null\n  maxUnavailable: 1\n' >"${null_values_max}"
+check "PDB with a null minAvailable keeps maxUnavailable alone" \
+  'select(.kind == "PodDisruptionBudget")' '
+  (.spec.maxUnavailable == 1) and (.spec | has("minAvailable") | not)
+' -f "${null_values_max}"
 
 check "PDB defaults to minAvailable 1" \
   'select(.kind == "PodDisruptionBudget")' '.spec.minAvailable == 1' --set podDisruptionBudget.enabled=true
