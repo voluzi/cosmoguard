@@ -99,12 +99,23 @@ func uncertainWSUpstreamOutcomeSettlement(err error) <-chan struct{} {
 	return uncertain.settled
 }
 
+// upstreamRPCError is a JSON-RPC error the upstream answered a
+// subscription request with. It is relayed to the client as sent.
+type upstreamRPCError struct {
+	method string
+	rpc    *JsonRpcError
+}
+
+func (e *upstreamRPCError) Error() string {
+	return fmt.Sprintf("upstream %s rejected request with code %d: %s", e.method, e.rpc.Code, e.rpc.Message)
+}
+
 func validateWSJSONRPCResponse(method string, response *JsonRpcMsg) error {
 	if response == nil {
 		return fmt.Errorf("upstream %s returned no response", method)
 	}
 	if response.Error != nil {
-		return fmt.Errorf("upstream %s rejected request with code %d: %s", method, response.Error.Code, response.Error.Message)
+		return &upstreamRPCError{method: method, rpc: response.Error.Clone()}
 	}
 	if response.IsEmptyResult() {
 		return fmt.Errorf("upstream %s returned a %w", method, errWSMissingResult)
