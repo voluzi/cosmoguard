@@ -403,7 +403,9 @@ func TestGRPCCachePreservesUpstreamMetadata(t *testing.T) {
 	offset.Store(int64(2500 * time.Millisecond))
 	require.Eventually(t, func() bool {
 		s := newGRPCCacheTestStream([]byte("req"))
-		require.NoError(t, handler(nil, s))
+		if err := handler(nil, s); err != nil {
+			return false
+		}
 		state, _ := s.result()
 		return state == cacheHit
 	}, 2*time.Second, 5*time.Millisecond)
