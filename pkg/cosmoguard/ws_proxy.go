@@ -98,6 +98,9 @@ type wsConnInfo struct {
 	sourceIP    string
 	identity    string
 	connectedAt time.Time
+	// resolved is the identity per-rule auth is checked against when a
+	// reload re-applies the rules to live subscriptions.
+	resolved *Identity
 }
 
 // SetRequestLog wires the Live-traffic request log. Nil-safe.
@@ -194,29 +197,82 @@ func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction Rul
 	p.defaultAction = defaultAction
 	p.limiters = limiters
 	// Upstream unsubscribes are network I/O; keep them off the reload path.
-	go p.broker.revokeDenied(p.subscriptionAllowed)
+	go p.revokeDenied()
+}
+
+func (p *JsonRpcWebSocketProxy) revokeDenied() {
+	p.broker.revokeDenied(p.subscriptionAllowed, p.recordRevocation)
 }
 
 // recheckSubscription covers a reload that landed while request was being
 // subscribed: its revocation scan ran before the membership existed.
-func (p *JsonRpcWebSocketProxy) recheckSubscription(request *JsonRpcMsg) {
-	if (request.Method == methodSubscribeCosmos || request.Method == methodSubscribeEth) && !p.subscriptionAllowed(request) {
-		go p.broker.revokeDenied(p.subscriptionAllowed)
+func (p *JsonRpcWebSocketProxy) recheckSubscription(client *JsonRpcWsClient, request *JsonRpcMsg) {
+	if (request.Method == methodSubscribeCosmos || request.Method == methodSubscribeEth) && !p.subscriptionAllowed(client, request) {
+		go p.revokeDenied()
 	}
 }
 
-// subscriptionAllowed applies the current rules to a subscribe request the
-// way handleRequest does: the first matching rule decides, then the default.
-func (p *JsonRpcWebSocketProxy) subscriptionAllowed(request *JsonRpcMsg) bool {
+func (p *JsonRpcWebSocketProxy) subscriptionAllowed(client *JsonRpcWsClient, request *JsonRpcMsg) bool {
+	reason, _ := p.subscriptionDenial(client, request)
+	return reason == ""
+}
+
+// subscriptionDenial applies the current rules and per-rule auth to a live
+// subscription's subscribe request the way handleRequest does, returning
+// the deny reason and the deciding rule, or "" when it is still allowed.
+// Rate limits are not re-applied: they meter requests, and a live
+// subscription makes none.
+func (p *JsonRpcWebSocketProxy) subscriptionDenial(client *JsonRpcWsClient, request *JsonRpcMsg) (string, *JsonRpcRule) {
 	p.rulesMutex.RLock()
 	rules, defaultAction := p.rules, p.defaultAction
 	p.rulesMutex.RUnlock()
+	p.connsMu.Lock()
+	var identity *Identity
+	if info := p.conns[client]; info != nil {
+		identity = info.resolved
+	}
+	p.connsMu.Unlock()
 	for _, rule := range rules {
-		if rule.Match(request) {
-			return rule.Action == RuleActionAllow
+		if !rule.Match(request) {
+			continue
+		}
+		if p.auth != nil {
+			if ok, _ := p.auth.Authorize(rule.Auth, identity); !ok {
+				return "auth", rule
+			}
+		}
+		if rule.Action != RuleActionAllow {
+			return "rule", rule
+		}
+		return "", rule
+	}
+	if defaultAction != RuleActionAllow {
+		return "default", nil
+	}
+	if p.auth != nil {
+		if ok, _ := p.auth.Authorize(nil, identity); !ok {
+			return "auth", nil
 		}
 	}
-	return defaultAction == RuleActionAllow
+	return "", nil
+}
+
+// recordRevocation shows a reload revocation in the dashboard's denials.
+func (p *JsonRpcWebSocketProxy) recordRevocation(client *JsonRpcWsClient, request *JsonRpcMsg) {
+	reason, rule := p.subscriptionDenial(client, request)
+	if reason == "" {
+		return
+	}
+	record := DenyRecord{Section: p.section, Reason: reason, Method: request.Method}
+	if rule != nil {
+		record.RuleTag = ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
+	}
+	p.connsMu.Lock()
+	if info := p.conns[client]; info != nil {
+		record.SourceIP = info.sourceIP
+	}
+	p.connsMu.Unlock()
+	p.cgDashboard.RecordDeny(record)
 }
 
 // policyVerdict runs the matched rule's per-rule auth + rate-limit
@@ -314,6 +370,9 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 	}
 	connectedAt := time.Now()
 	p.registerConn(client, source, identity, connectedAt)
+	p.connsMu.Lock()
+	p.conns[client].resolved = idObj
+	p.connsMu.Unlock()
 	p.recordLifecycle("CONNECT", source, identity, http.StatusSwitchingProtocols, 0)
 	defer func() {
 		p.deregisterConn(client)
@@ -598,7 +657,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				var err error
 				storeResponse := cacheable
 				if hasSubscriptionMethod(request) {
-					res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
+					var delivered func()
+					res, delivered, err = p.broker.handleSubscription(client, request, websocketAdmissionIdentity(identity))
+					// Deferred calls run after the acknowledgement is written.
+					defer delivered()
+					defer p.recheckSubscription(client, request)
 				} else if cacheable && resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
 					res, err = p.coalescedWSRequest(context.Background(), hash, request, rule.Cache, ruleID)
 					storeResponse = false
@@ -622,7 +685,6 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				if err = client.SendMsg(res); err != nil {
 					return err
 				}
-				p.recheckSubscription(request)
 				p.recordOutcome(request, source, cacheMiss, RuleActionAllow, rule, startTime, "request allowed")
 
 				if !cacheable {
@@ -708,7 +770,11 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 		var res *JsonRpcMsg
 		var err error
 		if hasSubscriptionMethod(request) {
-			res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
+			var delivered func()
+			res, delivered, err = p.broker.handleSubscription(client, request, websocketAdmissionIdentity(identity))
+			// Deferred calls run after the acknowledgement is written.
+			defer delivered()
+			defer p.recheckSubscription(client, request)
 		} else {
 			res, err = p.broker.HandleRequest(request)
 		}
@@ -722,7 +788,6 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 			if err = client.SendMsg(res); err != nil {
 				return err
 			}
-			p.recheckSubscription(request)
 		}
 
 	} else {

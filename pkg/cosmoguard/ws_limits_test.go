@@ -1211,7 +1211,7 @@ func TestLocalRetirementReleasesPhysicalHandleReservation(t *testing.T) {
 			setManagerLog(manager, log.WithField("test", t.Name()))
 			handle := reservation
 			if protocol.evm {
-				handle = manager.(*UpstreamConnManagerEth).stableHandle(reservation, "")
+				handle = manager.(*UpstreamConnManagerEth).stableHandle(reservation)
 			}
 			seedManagerSubscriptionWithReservation(manager, "victim", handle, reservation)
 

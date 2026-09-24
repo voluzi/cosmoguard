@@ -28,14 +28,20 @@ type wsSubscriptionRecord struct {
 	state       wsSubscriptionState
 	desired     bool
 	binding     *wsSubscriptionBinding
-	settled     chan struct{}
+	// early routes events that arrive before subscribeOn returns: the
+	// upstream may send one right behind its acknowledgement.
+	early   *wsSubscriptionBindingKey
+	settled chan struct{}
 }
 
 type wsSubscriptionExchange interface {
 	subscribeOn(*JsonRpcWsClient, string, string, bool) (string, error)
 	unsubscribeOn(wsSubscriptionBinding, string) error
-	stableHandle(string, string) string
+	stableHandle(string) string
 	releaseHandle(string)
+	// knownWireID reports the wire id a subscribe sent with request id id
+	// will carry, when the protocol fixes it in advance.
+	knownWireID(id string) (string, bool)
 }
 
 type wsSubscriptionLifecycle struct {
@@ -107,13 +113,43 @@ func (l *wsSubscriptionLifecycle) route(client *JsonRpcWsClient, wireID string) 
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	record := l.byWire[wsSubscriptionBindingKey{client: client, wireID: wireID}]
-	if record == nil || !record.desired || record.state != wsSubscriptionActive {
+	if record == nil || !record.desired || (record.state != wsSubscriptionActive && record.state != wsSubscriptionCreating) {
 		return "", false
 	}
 	return record.handle, true
 }
 
-func (l *wsSubscriptionLifecycle) subscribe(param, provisional string, client *JsonRpcWsClient, exchange wsSubscriptionExchange) (string, error) {
+// bindEarly routes wireID on client to the record for param before the
+// subscribe that produced wireID has returned.
+func (l *wsSubscriptionLifecycle) bindEarly(client *JsonRpcWsClient, param, wireID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if record := l.byParam[param]; record != nil && record.desired {
+		l.bindEarlyLocked(record, client, wireID)
+	}
+}
+
+func (l *wsSubscriptionLifecycle) bindEarlyLocked(record *wsSubscriptionRecord, client *JsonRpcWsClient, wireID string) {
+	l.unbindEarlyLocked(record)
+	key := wsSubscriptionBindingKey{client: client, wireID: wireID}
+	l.byWire[key] = record
+	record.early = &key
+}
+
+func (l *wsSubscriptionLifecycle) unbindEarlyLocked(record *wsSubscriptionRecord) {
+	if record.early == nil {
+		return
+	}
+	if l.byWire[*record.early] == record {
+		delete(l.byWire, *record.early)
+	}
+	record.early = nil
+}
+
+// subscribe creates the subscription for param. created, when set, receives
+// the subscription's handle before the subscribe request is sent, so the
+// caller can route events that follow the acknowledgement immediately.
+func (l *wsSubscriptionLifecycle) subscribe(param, provisional string, client *JsonRpcWsClient, exchange wsSubscriptionExchange, created func(string)) (string, error) {
 	l.opMu.Lock()
 	defer l.opMu.Unlock()
 
@@ -128,17 +164,25 @@ func (l *wsSubscriptionLifecycle) subscribe(param, provisional string, client *J
 		exchange.releaseHandle(provisional)
 		return "", ErrSubscriptionExists
 	}
+	handle := exchange.stableHandle(provisional)
 	record := &wsSubscriptionRecord{
-		param: param, handle: provisional, reservation: provisional, state: wsSubscriptionCreating,
+		param: param, handle: handle, reservation: provisional, state: wsSubscriptionCreating,
 		desired: true, settled: make(chan struct{}),
 	}
 	l.byParam[param] = record
-	l.byHandle[provisional] = record
+	l.byHandle[handle] = record
+	if wireID, ok := exchange.knownWireID(provisional); ok {
+		l.bindEarlyLocked(record, client, wireID)
+	}
 	l.mu.Unlock()
 
+	if created != nil {
+		created(handle)
+	}
 	wireID, err := exchange.subscribeOn(client, provisional, param, false)
 	if err != nil {
 		l.mu.Lock()
+		l.unbindEarlyLocked(record)
 		if record.state == wsSubscriptionRetired {
 			l.mu.Unlock()
 			return "", err
@@ -146,8 +190,8 @@ func (l *wsSubscriptionLifecycle) subscribe(param, provisional string, client *J
 		if l.byParam[param] == record {
 			delete(l.byParam, param)
 		}
-		if l.byHandle[provisional] == record {
-			delete(l.byHandle, provisional)
+		if l.byHandle[handle] == record {
+			delete(l.byHandle, handle)
 		}
 		record.desired = false
 		if isUncertainWSUpstreamOutcome(err) {
@@ -166,8 +210,8 @@ func (l *wsSubscriptionLifecycle) subscribe(param, provisional string, client *J
 		return "", err
 	}
 
-	handle := exchange.stableHandle(provisional, wireID)
 	l.mu.Lock()
+	l.unbindEarlyLocked(record)
 	if record.state == wsSubscriptionRetired {
 		l.mu.Unlock()
 		return "", ErrClosed
@@ -178,16 +222,13 @@ func (l *wsSubscriptionLifecycle) subscribe(param, provisional string, client *J
 		record.binding = &wsSubscriptionBinding{client: client, wireID: wireID}
 		binding := record.binding
 		delete(l.byParam, param)
-		delete(l.byHandle, provisional)
+		delete(l.byHandle, handle)
 		l.mu.Unlock()
 		l.watchDrain(record, binding, true, exchange)
 		return "", ErrClosed
 	}
-	delete(l.byHandle, provisional)
-	record.handle = handle
 	record.state = wsSubscriptionActive
 	record.binding = &wsSubscriptionBinding{client: client, wireID: wireID}
-	l.byHandle[handle] = record
 	l.byWire[wsSubscriptionBindingKey{client: client, wireID: wireID}] = record
 	l.mu.Unlock()
 	return handle, nil
@@ -341,11 +382,15 @@ func (l *wsSubscriptionLifecycle) resubmitRecord(client *JsonRpcWsClient, record
 		delete(l.byWire, wsSubscriptionBindingKey{client: oldBinding.client, wireID: oldBinding.wireID})
 	}
 	record.binding = nil
+	if wireID, ok := exchange.knownWireID(record.handle); ok {
+		l.bindEarlyLocked(record, client, wireID)
+	}
 	l.mu.Unlock()
 
 	wireID, err := exchange.subscribeOn(client, record.handle, record.param, true)
 	if err != nil {
 		l.mu.Lock()
+		l.unbindEarlyLocked(record)
 		if l.byParam[record.param] == record && record.desired {
 			if isUncertainWSUpstreamOutcome(err) {
 				record.binding = &wsSubscriptionBinding{client: client, wireID: wireID}
@@ -358,6 +403,7 @@ func (l *wsSubscriptionLifecycle) resubmitRecord(client *JsonRpcWsClient, record
 	}
 
 	l.mu.Lock()
+	l.unbindEarlyLocked(record)
 	if l.stopped || l.current != client || l.byParam[record.param] != record || !record.desired {
 		l.mu.Unlock()
 		binding := wsSubscriptionBinding{client: client, wireID: wireID}
@@ -387,6 +433,7 @@ func (l *wsSubscriptionLifecycle) settle(record *wsSubscriptionRecord, releaseHa
 	if record.binding != nil {
 		delete(l.byWire, wsSubscriptionBindingKey{client: record.binding.client, wireID: record.binding.wireID})
 	}
+	l.unbindEarlyLocked(record)
 	record.desired = false
 	record.state = wsSubscriptionRetired
 	record.binding = nil

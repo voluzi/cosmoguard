@@ -1,9 +1,14 @@
 package cosmoguard
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 )
 
@@ -126,7 +131,175 @@ func TestBrokerRevokeRechecksCurrentRules(t *testing.T) {
 	require.NoError(t, err)
 
 	// Denied when scanned, allowed again by the time revoke holds the lock.
-	broker.revoke(client, id, func(*JsonRpcMsg) bool { return true })
+	broker.revoke(client, id, func(*JsonRpcWsClient, *JsonRpcMsg) bool { return true })
 	require.Equal(t, 1, broker.ClientSubCount(client))
 	require.Zero(t, upstream.unsubscribeCalls.Load())
+}
+
+func newReloadTestProxy(t *testing.T, upstream *limitingUpstream) *JsonRpcWebSocketProxy {
+	t.Helper()
+	proxy, err := NewJsonRpcWebSocketProxy(t.Name(), []string{"ws://upstream.test"}, "/websocket", 1,
+		limitingConstructor(upstream), nil, false, nil)
+	require.NoError(t, err)
+	proxy.log = log.WithField("test", t.Name())
+	proxy.broker.log = proxy.log
+	proxy.cgDashboard = newDashboardObservability()
+	proxy.section = "rpc.jsonrpc"
+	proxy.SetRules(nil, RuleActionAllow, nil)
+	return proxy
+}
+
+// A subscribe queued behind another subscribe of the same param joins after
+// the reload's scan; the recheck after it covers that, id or no id.
+func TestWSRuleReloadDuringQueuedSubscribeRevokesIt(t *testing.T) {
+	allow := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{methodSubscribeCosmos}}
+	require.NoError(t, allow.Compile())
+	for _, tc := range []struct {
+		id    any
+		rules []*JsonRpcRule
+	}{{nil, nil}, {7, nil}, {nil, []*JsonRpcRule{allow}}, {7, []*JsonRpcRule{allow}}} {
+		id := tc.id
+		upstream := newLimitingUpstream()
+		proxy := newReloadTestProxy(t, upstream)
+		if tc.rules != nil {
+			proxy.SetRules(tc.rules, RuleActionDeny, nil)
+		}
+		first, _ := newWSCacheClient(t)
+		queued, _ := newWSCacheClient(t)
+		subscribe := func(client *JsonRpcWsClient, id any) <-chan error {
+			done := make(chan error, 1)
+			go func() {
+				done <- proxy.handleRequest(client, &JsonRpcMsg{
+					Version: jsonRpcVersion, ID: id, Method: methodSubscribeCosmos, Params: []any{"q"},
+				}, "192.0.2.1", nil)
+			}()
+			return done
+		}
+
+		upstream.subscribeStarted = make(chan struct{})
+		upstream.subscribeRelease = make(chan struct{})
+		// Straight to the broker, so only the queued request rechecks.
+		firstDone := make(chan error, 1)
+		go func() {
+			_, err := proxy.broker.HandleSubscription(first, &JsonRpcMsg{
+				Version: jsonRpcVersion, ID: 1, Method: methodSubscribeCosmos, Params: []any{"q"},
+			})
+			firstDone <- err
+		}()
+		<-upstream.subscribeStarted
+		queuedDone := subscribe(queued, id)
+		time.Sleep(50 * time.Millisecond)
+		proxy.SetRules(nil, RuleActionDeny, nil)
+		time.Sleep(50 * time.Millisecond)
+		close(upstream.subscribeRelease)
+		require.NoError(t, <-firstDone)
+		require.NoError(t, <-queuedDone)
+		require.Eventually(t, func() bool {
+			return proxy.broker.ClientSubCount(first) == 0 && proxy.broker.ClientSubCount(queued) == 0
+		}, 2*time.Second, 5*time.Millisecond, "id %v", id)
+	}
+}
+
+func TestWSRuleReloadDuringFailedUnsubscribeRevokesIt(t *testing.T) {
+	upstream := newLimitingUpstream()
+	proxy := newReloadTestProxy(t, upstream)
+	client, peer := newWSCacheClient(t)
+	_, err := proxy.broker.HandleSubscription(client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 4, Method: methodSubscribeCosmos, Params: []any{"q"},
+	})
+	require.NoError(t, err)
+
+	upstream.failUnsubscribe.Store(true)
+	upstream.unsubscribeStarted = make(chan struct{}, 2)
+	upstream.unsubscribeRelease = make(chan struct{})
+	unsubscribed := startBrokerCall(proxy.broker, client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 5, Method: methodUnsubscribeCosmos, Params: []any{"q"},
+	}, "")
+	<-upstream.unsubscribeStarted
+	proxy.SetRules(nil, RuleActionDeny, nil)
+	time.Sleep(50 * time.Millisecond)
+	close(upstream.unsubscribeRelease)
+	result := mustRecv(t, unsubscribed, "failed unsubscribe")
+	require.NoError(t, result.err)
+	require.NotNil(t, result.response.Error)
+
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(2*time.Second)))
+	var notice JsonRpcMsg
+	require.NoError(t, peer.ReadJSON(&notice))
+	require.EqualValues(t, 4, notice.ID)
+	require.NotNil(t, notice.Error)
+	require.Equal(t, 0, proxy.broker.ClientSubCount(client))
+}
+
+func TestWSRuleReloadRevocationIsRecordedAsDenial(t *testing.T) {
+	proxy := newReloadTestProxy(t, newLimitingUpstream())
+	client, _ := newWSCacheClient(t)
+	proxy.registerConn(client, "198.51.100.7", "", time.Now())
+	_, err := proxy.broker.HandleSubscription(client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 1, Method: methodSubscribeCosmos, Params: []any{"q"},
+	})
+	require.NoError(t, err)
+
+	deny := &JsonRpcRule{Action: RuleActionDeny, Tag: "no-subs", Methods: []string{methodSubscribeCosmos}}
+	require.NoError(t, deny.Compile())
+	proxy.SetRules([]*JsonRpcRule{deny}, RuleActionAllow, nil)
+	require.Eventually(t, func() bool { return len(proxy.cgDashboard.denied.Snapshot()) == 1 }, 2*time.Second, 5*time.Millisecond)
+	record := proxy.cgDashboard.denied.Snapshot()[0]
+	require.Equal(t, "rule", record.Reason)
+	require.Equal(t, "no-subs", record.RuleTag)
+	require.Equal(t, methodSubscribeCosmos, record.Method)
+	require.Equal(t, "198.51.100.7", record.SourceIP)
+	require.Equal(t, "rpc.jsonrpc", record.Section)
+}
+
+func TestWSRuleReloadAppliesRuleAuthToLiveSubscriptions(t *testing.T) {
+	proxy := newReloadTestProxy(t, newLimitingUpstream())
+	proxy.auth = &Authenticator{}
+	alice, _ := newWSCacheClient(t)
+	bob, bobPeer := newWSCacheClient(t)
+	for i, c := range []struct {
+		client *JsonRpcWsClient
+		name   string
+	}{{alice, "alice"}, {bob, "bob"}} {
+		proxy.registerConn(c.client, "192.0.2.1", c.name, time.Now())
+		proxy.conns[c.client].resolved = &Identity{Name: c.name, Method: "apikey"}
+		_, err := proxy.broker.HandleSubscription(c.client, &JsonRpcMsg{
+			Version: jsonRpcVersion, ID: i + 1, Method: methodSubscribeCosmos, Params: []any{"q"},
+		})
+		require.NoError(t, err)
+	}
+
+	onlyAlice := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{methodSubscribeCosmos},
+		Auth: &RuleAuthConfig{Identities: []string{"alice"}}}
+	require.NoError(t, onlyAlice.Compile())
+	proxy.SetRules([]*JsonRpcRule{onlyAlice}, RuleActionDeny, nil)
+
+	require.NoError(t, bobPeer.SetReadDeadline(time.Now().Add(2*time.Second)))
+	var notice JsonRpcMsg
+	require.NoError(t, bobPeer.ReadJSON(&notice))
+	require.EqualValues(t, 2, notice.ID)
+	require.NotNil(t, notice.Error)
+	require.Equal(t, 0, proxy.broker.ClientSubCount(bob))
+	require.Equal(t, 1, proxy.broker.ClientSubCount(alice))
+	require.Equal(t, "auth", proxy.cgDashboard.denied.Snapshot()[0].Reason)
+}
+
+func TestWSConnectionKeepsResolvedIdentity(t *testing.T) {
+	proxy := newReloadTestProxy(t, newLimitingUpstream())
+	identity := &Identity{Name: "alice", Method: "apikey"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.HandleConnection(w, r.WithContext(context.WithValue(r.Context(), identityCtxKey{}, identity)))
+	}))
+	t.Cleanup(server.Close)
+	peer, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	require.Eventually(t, func() bool {
+		proxy.connsMu.Lock()
+		defer proxy.connsMu.Unlock()
+		for _, info := range proxy.conns {
+			return info.resolved == identity
+		}
+		return false
+	}, 2*time.Second, 5*time.Millisecond)
 }

@@ -326,6 +326,18 @@ func (p *UpstreamPool) MakeRequest(msg *JsonRpcMsg) (*JsonRpcMsg, error) {
 }
 
 func (p *UpstreamPool) Subscribe(param string) (string, error) {
+	return p.subscribe(param, nil)
+}
+
+// wsCreatedSubscriber is a connection that reports a new subscription's id
+// before sending the subscribe; see wsSubscriptionLifecycle.subscribe.
+type wsCreatedSubscriber interface {
+	subscribeCreated(param string, created func(string)) (string, error)
+}
+
+// subscribe is Subscribe with a created hook, passed to connections that
+// support it. Callers must not assume it ran.
+func (p *UpstreamPool) subscribe(param string, created func(string)) (string, error) {
 	// Short critical section: check + pick. We do NOT hold subMux
 	// across conn.Subscribe (a network round-trip) — that would
 	// stall every other Subscribe/Unsubscribe call AND deadlock
@@ -363,7 +375,12 @@ func (p *UpstreamPool) Subscribe(param string) (string, error) {
 	p.pendingCreates[param] = pending
 	p.subMux.Unlock()
 
-	id, err := conn.Subscribe(param)
+	var id string
+	if s, ok := conn.(wsCreatedSubscriber); ok && created != nil {
+		id, err = s.subscribeCreated(param, created)
+	} else {
+		id, err = conn.Subscribe(param)
+	}
 	if err != nil {
 		if isUncertainWSUpstreamOutcome(err) {
 			settled := uncertainWSUpstreamOutcomeSettlement(err)
