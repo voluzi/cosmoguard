@@ -1,9 +1,12 @@
 package cosmoguard
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -156,8 +159,21 @@ func (p *HttpUpstreamPool) firstClosed(set []*HttpUpstream, skip *HttpUpstream) 
 	return nil
 }
 
-// RecordOutcome is called after each proxied request completes. ok=true
-// for 2xx/3xx; ok=false for 5xx or transport errors. Trips the breaker
+// upstreamStatusIsFailure reports whether a proxied response status counts
+// against the upstream's circuit breaker. Only gateway-class statuses do:
+// CometBFT's URI RPC answers ordinary, client-inducible RPC errors (e.g. an
+// unknown height) with a 500, which says nothing about the node's health.
+func upstreamStatusIsFailure(status int) bool {
+	switch status {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// RecordOutcome is called after each proxied request completes. ok=false
+// for transport errors and 502/503/504 (see upstreamStatusIsFailure),
+// ok=true otherwise. Trips the breaker
 // when ConsecutiveFailures back-to-back failures land, and drives the
 // half-open → closed / re-open transitions.
 func (u *HttpUpstream) RecordOutcome(ok bool) {
@@ -225,6 +241,19 @@ type HttpUpstreamPool struct {
 	// needing visibility into HttpProxy internals.
 	modifyResponse func(*HttpUpstream, *http.Response) error
 	errorHandler   func(*HttpUpstream, http.ResponseWriter, *http.Request, error)
+	// cors is the proxy's CORS policy. The proxy applies it to the client
+	// writer before dispatch so its own error exits carry it; the pool
+	// strips it again before an upstream attempt (modifyResponse and
+	// errorHandler re-derive it, and ReverseProxy appends rather than
+	// replaces headers) and re-applies it to the 502/503 it writes itself.
+	cors *CORSConfig
+	// transport is shared by every upstream of this pool instead of
+	// http.DefaultTransport, whose two idle connections per host are
+	// shared process-wide and whose response-header wait is unbounded.
+	transport *http.Transport
+	// responseHeaderTimeout bounds the wait for upstream response headers;
+	// 0 means no limit. See WithUpstreamResponseHeaderTimeout.
+	responseHeaderTimeout time.Duration
 
 	idx      atomic.Uint32 // round-robin cursor
 	strategy string        // weighted-round-robin | round-robin | least-conn | primary-failover
@@ -300,6 +329,7 @@ func NewHttpUpstreamPool(
 	for _, opt := range opts {
 		opt(pool)
 	}
+	pool.transport = newUpstreamTransport(http.DefaultTransport, pool.responseHeaderTimeout)
 	registerSharedMetrics()
 	initial := make([]*HttpUpstream, 0, len(nodes))
 	for _, n := range nodes {
@@ -307,6 +337,7 @@ func NewHttpUpstreamPool(
 		if err != nil {
 			return nil, err
 		}
+		u.proxy.Transport = pool.transport
 		// Optimistic ONLY when no healthcheck is configured (there's no way
 		// to confirm, so assume usable). When a healthcheck IS configured,
 		// start unhealthy so /readyz gates the pod out of the load balancer
@@ -368,6 +399,9 @@ func (p *HttpUpstreamPool) AddUpstream(n NodeConfig) error {
 	u, err := buildHttpUpstream(n, p.service, p.rewriteDirector)
 	if err != nil {
 		return err
+	}
+	if p.transport != nil {
+		u.proxy.Transport = p.transport
 	}
 	// Install the proxy hooks (CORS apply / circuit-breaker outcome /
 	// retry-aware error handling) the proxy constructor installed on
@@ -629,6 +663,54 @@ func WithUpstreamRetries(n int) HttpUpstreamPoolOption {
 	return func(p *HttpUpstreamPool) {
 		p.maxRetry = n
 	}
+}
+
+// WithUpstreamResponseHeaderTimeout bounds how long an upstream may take to
+// send response headers; 0 (the default) waits indefinitely. HttpProxy passes
+// the server's WriteTimeout: a response later than that cannot be delivered
+// to the client anyway, while a fixed default would cut legitimately slow
+// calls such as debug_traceTransaction or broadcast_tx_commit.
+func WithUpstreamResponseHeaderTimeout(d time.Duration) HttpUpstreamPoolOption {
+	return func(p *HttpUpstreamPool) {
+		p.responseHeaderTimeout = d
+	}
+}
+
+// WithUpstreamCORS gives the pool the proxy's CORS policy; see the cors field.
+func WithUpstreamCORS(c *CORSConfig) HttpUpstreamPoolOption {
+	return func(p *HttpUpstreamPool) {
+		p.cors = c
+	}
+}
+
+// upstreamIdleConnsPerHost sizes the keep-alive pool per upstream so a busy
+// proxy reuses connections instead of opening (and TIME_WAIT-ing) one per
+// request once more than two are in flight.
+const upstreamIdleConnsPerHost = 100
+
+func newUpstreamTransport(defaultTransport http.RoundTripper, responseHeaderTimeout time.Duration) *http.Transport {
+	// An embedding program may have wrapped http.DefaultTransport (e.g. for
+	// tracing); fall back to Go's documented defaults instead of panicking.
+	var t *http.Transport
+	if base, ok := defaultTransport.(*http.Transport); ok {
+		t = base.Clone()
+	} else {
+		t = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	t.MaxIdleConns = 0 // bounded per host below
+	t.MaxIdleConnsPerHost = upstreamIdleConnsPerHost
+	t.ResponseHeaderTimeout = responseHeaderTimeout
+	return t
 }
 
 // WithPoolName overrides the pool's metrics label (the `pool=...` tag on
@@ -893,6 +975,9 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer func() { recordUpstreamRequest(p.name, stats.Upstream, stats.RuleTag) }()
 	}
 	current := p.upstreamsSnapshot()
+	if len(current) > 0 {
+		p.stripCORS(w.Header())
+	}
 	// Fast path — single upstream, no retry/load logic.
 	if len(current) == 1 {
 		u := current[0]
@@ -919,6 +1004,7 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Drained pool (no upstreams left). Surface 503 so
 			// the LB ahead of us can fail over instead of having
 			// the proxy panic on a nil dereference.
+			p.applyCORS(w, r)
 			http.Error(w, "no upstream available", http.StatusServiceUnavailable)
 			return
 		}
@@ -931,12 +1017,54 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(current) == 0 {
+		p.applyCORS(w, r)
+		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
+		return
+	}
+
+	// The transport closes the request body after a failed attempt, so a
+	// body (GET with a JSON payload) is buffered once and replayed per
+	// attempt. It is bounded by server.maxRequestBody unless that is 0.
+	var body []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			p.applyCORS(w, r)
+			var maxBytes *http.MaxBytesError
+			if errors.As(err, &maxBytes) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "error reading request body", http.StatusBadRequest)
+			return
+		}
+	}
+
 	tried := make(map[*HttpUpstream]struct{}, attempts)
 	state := &retryState{}
 	rCtx := context.WithValue(r.Context(), retryStateKey, state)
+	// The header timeout is the server's write timeout: once it has passed
+	// no attempt can still reach the client, so the whole loop shares that
+	// budget instead of spending it again on every retry.
+	var deadline time.Time
+	if p.responseHeaderTimeout > 0 {
+		deadline = time.Now().Add(p.responseHeaderTimeout)
+		var cancel context.CancelFunc
+		rCtx, cancel = context.WithDeadline(rCtx, deadline)
+		defer cancel()
+	}
 	rWithCtx := r.WithContext(rCtx)
 
 	for i := 0; i < attempts; i++ {
+		// Once the shared budget is spent (or the client left), another
+		// attempt would fail instantly and be recorded against an upstream
+		// that was never really contacted. The clock check covers the
+		// transport's header timer firing just before the context's.
+		if rCtx.Err() != nil || (!deadline.IsZero() && !time.Now().Before(deadline)) {
+			break
+		}
 		u := p.pickNotTried(tried)
 		if u == nil {
 			// No untried upstream left — exhausted.
@@ -951,6 +1079,9 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// remembers whether any byte already went to the client.
 		state.failed = false
 		rw := &retryAwareWriter{ResponseWriter: w}
+		if body != nil {
+			rWithCtx.Body = io.NopCloser(bytes.NewReader(body))
+		}
 
 		u.inFlight.Add(1)
 		u.proxy.ServeHTTP(rw, rWithCtx)
@@ -969,12 +1100,25 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}).Debug("retrying transport failure on next upstream")
 		}
 	}
+	p.applyCORS(w, r)
 	if len(tried) == 0 {
 		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
 		return
 	}
 	// Exhausted retries — surface 502.
 	w.WriteHeader(http.StatusBadGateway)
+}
+
+func (p *HttpUpstreamPool) applyCORS(w http.ResponseWriter, r *http.Request) {
+	if p.cors != nil {
+		p.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
+	}
+}
+
+func (p *HttpUpstreamPool) stripCORS(h http.Header) {
+	if p.cors != nil {
+		p.cors.StripFromResponse(h)
+	}
 }
 
 // pickNotTried returns an upstream that hasn't been tried yet. Honors
@@ -1161,6 +1305,9 @@ func (p *HttpUpstreamPool) StartHealthchecks() {
 // sees hcShutdown=true and bails, regardless of whether hcCancel was
 // nil (Shutdown-before-Start case) or not (normal teardown).
 func (p *HttpUpstreamPool) Shutdown() {
+	if p.transport != nil {
+		defer p.transport.CloseIdleConnections()
+	}
 	p.hcMu.Lock()
 	// Latch the pool shut: any future StartHealthchecks / AddUpstream
 	// will read this under hcMu and bail before touching hcCancel,

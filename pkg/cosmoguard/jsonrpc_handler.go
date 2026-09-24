@@ -656,12 +656,6 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 	h.rulesMutex.RUnlock()
 
 	for _, rule := range rulesSnap {
-		// Per-rule cache namespace: mix the rule fingerprint into the
-		// key so two cacheable rules matching the same JSON-RPC method
-		// don't share entries (different TTLs / cacheError flags would
-		// otherwise be silently ignored — whichever rule populated the
-		// cache first won).
-		hash := request.HashWithRule(rule.Fingerprint)
 		match := rule.Match(request)
 		if match {
 			if stats := RequestStatsFromCtx(r.Context()); stats != nil {
@@ -689,6 +683,12 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 				// either transport.
 				cacheable := request.ID != nil && rule.Cache != nil && rule.Cache.Enable && !hasSubscriptionMethod(request)
 				if cacheable {
+					// Per-rule cache namespace: mix the rule fingerprint into the
+					// key so two cacheable rules matching the same JSON-RPC method
+					// don't share entries (different TTLs / cacheError flags would
+					// otherwise be silently ignored — whichever rule populated the
+					// cache first won). Computed only here: it marshals params.
+					hash := request.HashWithRule(rule.Fingerprint)
 					ruleTag := ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
 					// Single round-trip lookup; ErrNotFound = miss, other
 					// errors are backend failures that we log and fall

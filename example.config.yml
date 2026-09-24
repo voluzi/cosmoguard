@@ -29,8 +29,8 @@ nodes:
       unhealthyAfter: 3
       healthyAfter: 2
     # circuitBreaker complements healthcheck: probes monitor liveness,
-    # the breaker observes actual request outcomes (5xx + transport
-    # errors). After N consecutive failures the upstream is taken out
+    # the breaker observes actual request outcomes (502/503/504 +
+    # transport errors). After N consecutive failures the upstream is taken out
     # of the picker for cooldownPeriod, then half-open allows a probe.
     circuitBreaker:
       enable: true

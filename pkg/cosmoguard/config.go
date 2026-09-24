@@ -274,8 +274,9 @@ type DiscoveryConfig struct {
 }
 
 // CircuitBreakerConfig configures consecutive-failure circuit breaking for
-// a single upstream. Failures = upstream returned 5xx OR the transport
-// itself failed (connection refused, timeout).
+// a single upstream. Failures = upstream returned 502/503/504 OR the
+// transport itself failed (connection refused, timeout). Other 5xx (e.g.
+// CometBFT's 500 for an unknown height) are client-inducible and do not count.
 type CircuitBreakerConfig struct {
 	// Enable is a *bool so YAML `enable: false` survives defaults.Set.
 	// creasty/defaults can't distinguish a zero-value `bool` from an

@@ -239,7 +239,10 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		}
 	}
 
-	var poolOpts []HttpUpstreamPoolOption
+	poolOpts := []HttpUpstreamPoolOption{WithUpstreamCORS(proxy.cors)}
+	if cfg.ServerConfig != nil {
+		poolOpts = append(poolOpts, WithUpstreamResponseHeaderTimeout(cfg.ServerConfig.WriteTimeout))
+	}
 	if cfg.UpstreamConfig != nil {
 		poolOpts = append(poolOpts,
 			WithUpstreamStrategy(cfg.UpstreamConfig.Strategy),
@@ -263,8 +266,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 	// feed the circuit breaker, a footgun that only shows up in
 	// production with autoscaled headless services.
 	modifyResponse := func(u *HttpUpstream, resp *http.Response) error {
-		ok := resp.StatusCode < 500
-		u.RecordOutcome(ok)
+		u.RecordOutcome(!upstreamStatusIsFailure(resp.StatusCode))
 		recordUpstreamVary(resp)
 		if proxy.cors != nil && proxy.cors.Enable {
 			origin := ""
@@ -513,6 +515,13 @@ func (p *HttpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// a preflight and falls through to normal proxy behavior.
 	if p.cors != nil && p.cors.HandlePreflight(w, r) {
 		return
+	}
+	// Every response cosmoguard generates itself (401/403/413/429/503,
+	// endpoint-handler errors) must carry CORS too, or a browser only sees
+	// an opaque failure. The pool swaps these for the upstream-derived
+	// copy before proxying.
+	if p.cors != nil {
+		p.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
 	}
 
 	// Cap request body up-front. Two layers:
@@ -861,8 +870,16 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 	// Normalize query keys on a copy so cache identity does not rewrite the
 	// request forwarded upstream. RequestURI retains the escaped or opaque
 	// target, including ForceQuery, using the transport's URL semantics.
+	// Credential query params are stripped before forwarding (see
+	// rewriteDirector), so they must not split the cache per API key.
 	targetURL := *req.URL
-	targetURL.RawQuery = req.URL.Query().Encode()
+	query := req.URL.Query()
+	if p.auth != nil {
+		for _, name := range p.auth.CredentialQueryParams() {
+			query.Del(name)
+		}
+	}
+	targetURL.RawQuery = query.Encode()
 	targetKind := "path"
 	if targetURL.Opaque != "" {
 		targetKind = "opaque"
@@ -1374,10 +1391,16 @@ func (p *HttpProxy) buildCachedHTTPResponse(cache *RuleCache, status int, commit
 	if age, ok := parseUpstreamAge(committed); ok {
 		upstreamAge = age
 	}
+	headers := pickCacheableHeaders(committed, cache.PreserveHeaders)
+	// Match the coalesced SharedHeaders: a cached 429 (cacheError) must
+	// replay its Retry-After.
+	if retryAfter := committed.Get("Retry-After"); retryAfter != "" {
+		headers["Retry-After"] = retryAfter
+	}
 	return CachedResponse{
 		Data:        body,
 		StatusCode:  status,
-		Headers:     pickCacheableHeaders(committed, cache.PreserveHeaders),
+		Headers:     headers,
 		StoredAt:    storedAt,
 		UpstreamAge: upstreamAge,
 	}
