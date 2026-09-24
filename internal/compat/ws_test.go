@@ -201,7 +201,7 @@ func fakeWSRefuse(t *testing.T, errJSON string, delay time.Duration) string {
 func TestCompareSubRefusals(t *testing.T) {
 	sub := evmNewHeads
 	const unauthorized = `{"code":401,"message":"unauthorized access"}`
-	// cosmoguard today rewrites an upstream subscribe error like this.
+	// cosmoguard used to rewrite an upstream subscribe error like this.
 	const rewritten = `{"code":-100,"message":"subscription failed: unauthorized access"}`
 	accepting := func() string { return fakeWSFrames(t) } // acks, then no events
 

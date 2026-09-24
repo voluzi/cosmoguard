@@ -243,15 +243,21 @@ func (b *Broker) handleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, id
 }
 
 // subscriptionErrorResponse answers a failed subscribe or unsubscribe. An
-// error the upstream itself answered with is relayed as sent (code,
-// message and data) under the client's id; cosmoguard's own failures keep
-// code -100.
+// error the upstream itself answered the same kind of request with is
+// relayed as sent (code, message and data) under the client's id;
+// cosmoguard's own failures keep code -100.
 func subscriptionErrorResponse(msg *JsonRpcMsg, err error) *JsonRpcMsg {
 	var upstream *upstreamRPCError
-	if errors.As(err, &upstream) {
+	if errors.As(err, &upstream) && isUnsubscribeMethod(upstream.method) == isUnsubscribeMethod(msg.Method) {
 		return &JsonRpcMsg{Version: jsonRpcVersion, Error: upstream.rpc.Clone(), ID: msg.ID}
 	}
 	return ErrorResponse(msg, -100, err.Error(), nil)
+}
+
+// isUnsubscribeMethod tells unsubscribe and eth_unsubscribe apart from the
+// subscribe methods.
+func isUnsubscribeMethod(method string) bool {
+	return method == methodUnsubscribeCosmos || method == methodUnsubscribeEth
 }
 
 func (b *Broker) serveSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, identity ...string) (*JsonRpcMsg, string, error) {
