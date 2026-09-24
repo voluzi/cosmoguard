@@ -179,6 +179,44 @@ A compatibility test suite recordable via `scripts/record-golden.sh`
 captures live-node responses and replays them through cosmoguard,
 asserting byte-identical relay.
 
+### Checking a live node
+
+`cmd/cosmoguard-compat` calls every read endpoint it can find on a node,
+both directly and through cosmoguard, and reports where the answers
+differ. It finds the endpoints itself: gRPC query methods through server
+reflection, the LCD routes annotated on them, every read-only CometBFT RPC
+method (URI and JSON-RPC forms, plus a batch), the read-only EVM JSON-RPC
+methods, and the NewBlock / newHeads WebSocket subscriptions. Queries are
+pinned to one height so the answers compare byte for byte, and each
+cosmoguard answer is fetched twice so cached answers are checked too. The
+status and body are compared; response headers are not.
+
+```sh
+# Build cosmoguard, start it in front of a public node, compare, stop it.
+make compat CHAIN=nibiru          # or CHAIN=allora
+make compat CHAIN=allora COMPAT_ARGS="--param topic_id=1"
+
+# Against any node and a cosmoguard you already run:
+go run ./cmd/cosmoguard-compat \
+  --node-lcd https://lcd.example.com --node-rpc https://rpc.example.com \
+  --node-grpc https://grpc.example.com \
+  --guard-lcd http://cosmoguard:11317 --guard-rpc http://cosmoguard:16657 \
+  --guard-grpc http://cosmoguard:19090 --report compat.json
+```
+
+Each endpoint is reported as `identical`, `differs` (cosmoguard answered
+differently; the run exits 1), `denied` (cosmoguard refused a request the
+node answered), `failed` (the node itself did not answer), `unstable` or
+`skipped` (a path parameter has no live value; `--param name=value`
+supplies chain-specific ones). An endpoint is `unstable` when the node
+disagrees with itself between two calls, or answers at a different height
+despite the pin. Public endpoints are often load-balanced pools of nodes
+on different versions, so a differing endpoint is compared again, up to
+three rounds, and only reported as `differs` when every round differs.
+For a definitive result, point the tool at a single node.
+
+The tool needs network access and is not part of `make test`.
+
 ## License
 
 Unless a file notes otherwise, it falls under the

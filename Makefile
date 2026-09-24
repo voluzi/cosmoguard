@@ -42,6 +42,14 @@ fuzz:
 clean:
 	rm -rf $(BUILDDIR)/ coverage.out
 
+# compat builds cosmoguard, starts it in front of a public node and checks
+# that every endpoint answers as the node does. Needs network access.
+# COMPAT_ARGS passes extra flags, e.g. COMPAT_ARGS="--param topic_id=1".
+CHAIN ?= nibiru
+compat: $(BUILDDIR)/
+	go build -o $(BUILDDIR)/cosmoguard ./cmd/cosmoguard
+	go run ./cmd/cosmoguard-compat --chain $(CHAIN) --spawn $(BUILDDIR)/cosmoguard --report $(BUILDDIR)/compat-$(CHAIN).json $(COMPAT_ARGS)
+
 # helm.package builds an OCI-ready chart tarball under $(BUILDDIR). The chart
 # version and appVersion are both the release version, so the chart defaults
 # to the image built from the same tag.
@@ -55,4 +63,4 @@ helm.package: $(BUILDDIR)/
 		--app-version $(VERSION:v%=%) \
 		-d $(BUILDDIR)
 
-.PHONY: all $(BUILD_TARGETS) test test-race test-cover fuzz clean helm.package
+.PHONY: all $(BUILD_TARGETS) test test-race test-cover fuzz clean helm.package compat
