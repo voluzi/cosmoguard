@@ -33,15 +33,3 @@ spec:
       targetPort: evm-rpc-ws
       protocol: TCP
     {{- end }}
-    {{- if .Values.config.metrics.enable }}
-    - name: metrics
-      port: {{ .Values.service.metricsPort }}
-      targetPort: metrics
-      protocol: TCP
-    {{- end }}
-    {{- if .Values.config.dashboard.enable }}
-    - name: dashboard
-      port: {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}
-      targetPort: dashboard
-      protocol: TCP
-    {{- end }}

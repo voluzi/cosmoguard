@@ -11,10 +11,10 @@ nameOverride: ""
 fullnameOverride: ""
 
 # Workload kind. Two options:
-#   Deployment   — default, ephemeral pod identities. Cache and rate-limit
+#   Deployment   — ephemeral pod identities. Cache and rate-limit
 #                  data still survives a single-pod restart via olric DMap
 #                  replication.
-#   StatefulSet  — recommended when running in cluster mode. Stable pod
+#   StatefulSet  — default; recommended in cluster mode. Stable pod
 #                  hostnames (cosmoguard-0 is always cosmoguard-0). No PVCs
 #                  are templated — cosmoguard is in-memory only by design;
 #                  replication via olric is the durability mechanism, not
@@ -246,6 +246,9 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
+  # Cosmoguard never calls the Kubernetes API (peer discovery is DNS or
+  # static), so the pod does not mount a ServiceAccount token.
+  automountToken: false
 
 podAnnotations: {}
 podLabels: {}
@@ -254,6 +257,8 @@ podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
 
 containerSecurityContext:
   allowPrivilegeEscalation: false
@@ -417,9 +422,9 @@ gateway:
 # maxUnavailable: 1 — pick whichever expresses your tolerance.
 podDisruptionBudget:
   enabled: false
-  # Exactly one of minAvailable / maxUnavailable should be set. The chart
-  # rejects setting both to avoid an ambiguous PDB. Integer or "50%".
-  minAvailable: 1
+  # Set at most one of minAvailable / maxUnavailable (integer or "50%");
+  # the chart rejects both. With neither set the PDB uses minAvailable: 1.
+  # minAvailable: 1
   # maxUnavailable: 1
 
 # Sized for the default clustered runtime (config.cache.cluster.enable: true).
@@ -458,16 +463,29 @@ networkPolicy:
   # By default the proxy listeners are NOT restricted by this policy
   # (we add nothing for them — they're the public ingress surface and
   # the controller / mesh handles auth/IP-allowlist). Add rules here
-  # to lock them down to specific namespaces / pod selectors.
+  # to lock them down to specific namespaces / pod selectors. A rule
+  # without `ports` admits every port from its sources, including the
+  # metrics, dashboard, gossip, RESP and peer-api ports, so list the
+  # proxy ports explicitly.
   proxyIngress: []
     # - from:
     #     - namespaceSelector:
     #         matchLabels:
     #           kubernetes.io/metadata.name: trusted-clients
+    #   ports:
+    #     - port: 11317
+    #     - port: 16657
+    #     - port: 19090
+  # Sources allowed to scrape the metrics port. The metrics rule is rendered
+  # whether or not proxyIngress is set; empty allows any source.
+  metricsFrom: []
+    # - namespaceSelector:
+    #     matchLabels:
+    #       kubernetes.io/metadata.name: monitoring
 
-# Horizontal Pod Autoscaler — bound on top of the Redis-shared rate
-# limiter state from Phase D so replicas don't multiply rate-limit
-# budgets. Safe to enable when `config.cache.cluster.enable: true` (the
+# Horizontal Pod Autoscaler — rate-limit state lives in olric, shared by
+# every replica, so scaling out doesn't multiply rate-limit budgets. Safe
+# to enable when `config.cache.cluster.enable: true` (the
 # default) — every replica shares the same olric-backed bucket pool,
 # so a configured `10 req/s per IP` rule stays at 10 req/s regardless
 # of replica count. Without cluster mode, each replica has its own

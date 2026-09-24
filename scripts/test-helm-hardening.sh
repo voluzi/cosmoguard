@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHART_DIR="${ROOT_DIR}/helm/cosmoguard"
+HELM_BIN="${HELM_BIN:-helm}"
+YQ_BIN="${YQ_BIN:-yq}"
+FULLNAME="hardening-test"
+failures=0
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "${tmp_dir}"' EXIT
+
+if ! command -v "${HELM_BIN}" >/dev/null 2>&1; then
+  echo "missing Helm command: ${HELM_BIN}" >&2
+  exit 2
+fi
+if ! command -v "${YQ_BIN}" >/dev/null 2>&1; then
+  echo "missing yq command: ${YQ_BIN}" >&2
+  exit 2
+fi
+
+render() {
+  local output=$1
+  shift
+  "${HELM_BIN}" template hardening-test "${CHART_DIR}" \
+    --namespace default \
+    --set-string "fullnameOverride=${FULLNAME}" \
+    --set-string cluster.existingEncryptionKeySecret=hardening-test-key \
+    "$@" >"${output}"
+}
+
+# check NAME SELECTOR PREDICATE [helm args...] renders the chart, requires
+# SELECTOR to match exactly one document, and PREDICATE to be true on it.
+check() {
+  local name=$1
+  local selector=$2
+  local predicate=$3
+  shift 3
+  local output="${tmp_dir}/${name// /-}.yaml"
+  if render "${output}" "$@" &&
+    "${YQ_BIN}" ea -e "[${selector}] | ((length == 1) and (.[0] | (${predicate})))" "${output}" >/dev/null 2>&1; then
+    printf 'ok - %s\n' "${name}"
+  else
+    printf 'not ok - %s\n' "${name}" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+for kind in Deployment StatefulSet; do
+  check "${kind}: RuntimeDefault seccomp and no service account token" \
+    'select(.kind == "'"${kind}"'")' '
+    (.spec.template.spec.securityContext.seccompProfile.type == "RuntimeDefault") and
+    (.spec.template.spec.automountServiceAccountToken == false)
+  ' --set-string "kind=${kind}"
+done
+
+check "public Service carries no operator ports" \
+  'select(.kind == "Service" and .metadata.name == "hardening-test")' '
+  [.spec.ports[].name] | ((contains(["metrics"]) or contains(["dashboard"])) | not)
+' --set service.type=LoadBalancer --set config.dashboard.enable=true
+
+check "internal ClusterIP Service carries metrics and dashboard" \
+  'select(.kind == "Service" and .metadata.name == "hardening-test-internal")' '
+  (.spec.type == "ClusterIP") and ([.spec.ports[].name] | contains(["metrics", "dashboard"]))
+' --set service.type=LoadBalancer --set config.dashboard.enable=true
+
+check "internal Service metrics port falls back to the listener port" \
+  'select(.kind == "Service" and .metadata.name == "hardening-test-internal")' '
+  [.spec.ports[] | select(.name == "metrics") | .port] | ((length == 1) and (.[0] == 9001))
+' --set service.metricsPort=null
+
+check "dashboard Ingress routes to the internal Service" \
+  'select(.kind == "Ingress")' '
+  .spec.rules[0].http.paths[0].backend.service.name == "hardening-test-internal"
+' --set config.dashboard.enable=true --set ingressDashboard.enabled=true \
+  --set 'ingressDashboard.hosts[0]=dashboard.example.com'
+
+check "dashboard HTTPRoute routes to the internal Service" \
+  'select(.kind == "HTTPRoute")' '
+  .spec.rules[0].backendRefs[0].name == "hardening-test-internal"
+' --set config.dashboard.enable=true --set gateway.enabled=true \
+  --set 'gateway.dashboard.hostnames[0]=dashboard.example.com' \
+  --set-json 'gateway.parentRefs=[{"name":"gw"}]'
+
+check "NetworkPolicy keeps the metrics rule when proxyIngress is set" \
+  'select(.kind == "NetworkPolicy")' '
+  [.spec.ingress[] | select(.ports[]?.port == 9001)] | ((length == 1) and (.[0] | has("from") | not))
+' --set networkPolicy.enabled=true \
+  --set-json 'networkPolicy.proxyIngress=[{"from":[{"podSelector":{}}]}]'
+
+check "NetworkPolicy metrics rule allows any source by default" \
+  'select(.kind == "NetworkPolicy")' '
+  [.spec.ingress[] | select(.ports[]?.port == 9001)] | ((length == 1) and (.[0] | has("from") | not))
+' --set networkPolicy.enabled=true
+
+check "NetworkPolicy metrics rule honours metricsFrom" \
+  'select(.kind == "NetworkPolicy")' '
+  [.spec.ingress[] | select(.ports[]?.port == 9001)] | ((length == 1) and
+  (.[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "monitoring"))
+' --set networkPolicy.enabled=true \
+  --set-json 'networkPolicy.metricsFrom=[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}}]'
+
+output="${tmp_dir}/servicemonitor.yaml"
+# Every selector label must be on the internal Service, which must also be
+# the Service carrying the endpoint's port name.
+servicemonitor_matches() {
+  local selector labels port
+  selector=$("${YQ_BIN}" 'select(.kind == "ServiceMonitor") | .spec.selector.matchLabels | to_entries[] | .key + "=" + .value' "$1") || return 1
+  labels=$("${YQ_BIN}" 'select(.kind == "Service" and .metadata.name == "hardening-test-internal") | .metadata.labels | to_entries[] | .key + "=" + .value' "$1") || return 1
+  port=$("${YQ_BIN}" 'select(.kind == "ServiceMonitor") | .spec.endpoints[0].port' "$1") || return 1
+  [ -n "${selector}" ] || return 1
+  grep -qx 'app.kubernetes.io/instance=hardening-test' <<<"${selector}" || return 1
+  [ -z "$(comm -23 <(sort <<<"${selector}") <(sort <<<"${labels}"))" ] || return 1
+  "${YQ_BIN}" -e 'select(.kind == "Service" and .metadata.name == "hardening-test-internal") | [.spec.ports[].name] | contains(["'"${port}"'"])' "$1" >/dev/null 2>&1
+}
+if render "${output}" --set serviceMonitor.enabled=true && servicemonitor_matches "${output}"; then
+  echo "ok - ServiceMonitor selector matches the internal Service"
+else
+  echo "not ok - ServiceMonitor selector matches the internal Service" >&2
+  failures=$((failures + 1))
+fi
+
+output="${tmp_dir}/no-operator-listeners.yaml"
+if render "${output}" --set config.metrics.enable=false --set config.dashboard.enable=false &&
+  "${YQ_BIN}" ea -e '[select(.kind == "Service" and .metadata.name == "hardening-test-internal")] | length == 0' "${output}" >/dev/null 2>&1; then
+  echo "ok - no internal Service without operator listeners"
+else
+  echo "not ok - no internal Service without operator listeners" >&2
+  failures=$((failures + 1))
+fi
+
+# A 63-char fullname must not swallow the -internal suffix, or the internal
+# Service would take the main Service's name.
+long_name="$(printf 'l%.0s' $(seq 63))"
+output="${tmp_dir}/long-fullname.yaml"
+if "${HELM_BIN}" template hardening-test "${CHART_DIR}" \
+  --namespace default \
+  --set-string "fullnameOverride=${long_name}" \
+  --set-string cluster.existingEncryptionKeySecret=hardening-test-key >"${output}" &&
+  services="$("${YQ_BIN}" 'select(.kind == "Service") | .metadata.name' "${output}" | grep -v '^---$')" &&
+  grep -Eq '^l{54}-internal$' <<<"${services}"; then
+  echo "ok - internal Service name stays distinct with a 63-char fullname"
+else
+  echo "not ok - internal Service name stays distinct with a 63-char fullname" >&2
+  failures=$((failures + 1))
+fi
+
+check "PDB accepts maxUnavailable alone" \
+  'select(.kind == "PodDisruptionBudget")' '
+  (.spec.maxUnavailable == 1) and (.spec | has("minAvailable") | not)
+' --set podDisruptionBudget.enabled=true --set podDisruptionBudget.maxUnavailable=1
+
+null_values="${tmp_dir}/pdb-null-values.yaml"
+printf 'podDisruptionBudget:\n  enabled: true\n  minAvailable: null\n  maxUnavailable: null\n' >"${null_values}"
+check "PDB treats explicit nulls as unset" \
+  'select(.kind == "PodDisruptionBudget")' '
+  (.spec.minAvailable == 1) and (.spec | has("maxUnavailable") | not)
+' -f "${null_values}"
+
+null_values_max="${tmp_dir}/pdb-null-min-values.yaml"
+printf 'podDisruptionBudget:\n  enabled: true\n  minAvailable: null\n  maxUnavailable: 1\n' >"${null_values_max}"
+check "PDB with a null minAvailable keeps maxUnavailable alone" \
+  'select(.kind == "PodDisruptionBudget")' '
+  (.spec.maxUnavailable == 1) and (.spec | has("minAvailable") | not)
+' -f "${null_values_max}"
+
+check "PDB defaults to minAvailable 1" \
+  'select(.kind == "PodDisruptionBudget")' '.spec.minAvailable == 1' --set podDisruptionBudget.enabled=true
+
+if ((failures > 0)); then
+  printf '%d hardening render regression case(s) failed\n' "${failures}" >&2
+  exit 1
+fi
+
+echo "all hardening render regression cases passed"

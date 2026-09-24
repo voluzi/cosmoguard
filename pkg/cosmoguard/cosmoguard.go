@@ -171,8 +171,9 @@ func nodeEvmWsAddrs(nodes []NodeConfig) ([]string, error) {
 //
 // On load, NewFromFile re-parses the file (no env interpolation) to detect
 // v3-shaped syntax — singular `node:` block, flat path/method/query on
-// rules — and logs a warning suggesting --migrate-config when found. The
-// detected v3 syntax keeps working forever; the warning is cosmetic.
+// rules — and logs a warning suggesting `cosmoguard migrate-config` when
+// found. The detected v3 syntax keeps working forever; the warning is
+// cosmetic.
 func NewFromFile(path string) (*CosmoGuard, error) {
 	slog.Info("loading config file", "file", path)
 	cfg, err := ReadConfigFromFile(path)

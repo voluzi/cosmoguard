@@ -1,0 +1,23 @@
+{{- if or .Values.config.metrics.enable .Values.config.dashboard.enable -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cosmoguard.internalServiceName" . }}
+  labels: {{- include "cosmoguard.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "cosmoguard.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- if .Values.config.metrics.enable }}
+    - name: metrics
+      port: {{ .Values.service.metricsPort | default .Values.config.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.config.dashboard.enable }}
+    - name: dashboard
+      port: {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }}
+      targetPort: dashboard
+      protocol: TCP
+    {{- end }}
+{{- end }}

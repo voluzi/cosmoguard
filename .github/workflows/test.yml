@@ -1,18 +1,28 @@
 name: Test
 
 on:
-  # Run on every branch push. A `branches` filter (rather than `tags-ignore`)
-  # is required to exclude tags: specifying only a tag filter would scope the
-  # push event to tags. Tags are handled by the release workflows
-  # (docker.yml, goreleaser.yml), which call this workflow as a gate via
-  # workflow_call, so a tag doesn't need a separate standalone run here.
+  # Pushes to main plus every pull request (fork PRs included). A `branches`
+  # filter (rather than `tags-ignore`) is required to exclude tags: specifying
+  # only a tag filter would scope the push event to tags. Tags are handled by
+  # the release workflows (docker.yml, goreleaser.yml, publish-chart.yml),
+  # which call this workflow as a gate via workflow_call.
   push:
     branches:
-      - "**"
+      - main
+  pull_request:
+  # Daily run so a new advisory against an idle main reaches govulncheck.
+  schedule:
+    - cron: "17 5 * * *"
   workflow_call:
 
 permissions:
   contents: read
+
+# Cancel superseded pull request runs; main (including scheduled runs) and
+# tags always complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
@@ -25,6 +35,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: vet
         run: go vet ./...
@@ -57,10 +72,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Cap each target at 10s so a regular PR run takes <1 min total.
-      # Run nightly with FUZZTIME=5m for deeper coverage.
+      # Cap each target at 10s so a regular PR run takes <1 min total; the
+      # scheduled nightly run gives each target 5m for deeper coverage.
       - name: fuzz
-        run: make fuzz FUZZTIME=10s
+        env:
+          FUZZTIME: ${{ github.event_name == 'schedule' && '5m' || '10s' }}
+        run: make fuzz FUZZTIME="$FUZZTIME"
 
   helm:
     name: helm chart renders + config loads
@@ -87,6 +104,9 @@ jobs:
 
       - name: config reload render regression matrix
         run: scripts/test-helm-config-reload.sh
+
+      - name: hardening render regression matrix
+        run: scripts/test-helm-hardening.sh
 
       - name: cluster mode renders (generated key path)
         run: |

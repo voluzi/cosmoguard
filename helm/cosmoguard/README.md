@@ -43,9 +43,11 @@ See `values.yaml` for the full reference. Highlights:
   default); without it, rate-limit budgets are per-replica and HPA
   multiplies them.
 - `serviceMonitor.enabled: true` — when prometheus-operator is in the
-  cluster, scrapes `/metrics` on the cosmoguard service.
+  cluster, scrapes `/metrics` on the `<fullname>-internal` Service.
 - `podDisruptionBudget.enabled: true` — caps voluntary disruptions so
-  the cluster keeps quorum during node drains.
+  the cluster keeps quorum during node drains. Set at most one of
+  `minAvailable` / `maxUnavailable`; with neither the PDB uses
+  `minAvailable: 1`.
 
 ## Cluster mode
 
@@ -184,6 +186,13 @@ Two mutually-exclusive routing modes are supported. Disabling all the
 options below means the cosmoguard Service is reachable only in-cluster
 (use `kubectl port-forward` for local access).
 
+The metrics and dashboard listeners are never published on the main
+Service. They live on a separate ClusterIP Service, `<fullname>-internal`,
+so `service.type: LoadBalancer` exposes only the proxy ports. With
+`networkPolicy.enabled`, the metrics port stays open even when
+`networkPolicy.proxyIngress` restricts the proxy listeners; narrow its
+sources with `networkPolicy.metricsFrom`.
+
 ### Ingress (networking.k8s.io/v1)
 
 Three separate Ingress objects, by design:
@@ -211,6 +220,25 @@ Liveness uses `/healthz`; readiness uses `/readyz`. Both live on the
 metrics port (default 9001). `/readyz` returns 503 when zero upstreams
 are healthy across the LCD + RPC pools — k8s will then stop sending
 traffic to that pod.
+
+## Upgrading to 2.0.0
+
+Chart 2.0.0 changes these defaults; the pods restart on upgrade.
+
+- Metrics and dashboard ports move from `<fullname>` to the ClusterIP
+  Service `<fullname>-internal`. The bundled ServiceMonitor, dashboard
+  Ingress and dashboard HTTPRoute follow automatically; repoint any scrape
+  job, runbook or route that used `<fullname>:9001` or `:19999`.
+- Pods no longer mount a ServiceAccount token. Set
+  `serviceAccount.automountToken: true` if a sidecar (e.g. a Vault agent)
+  needs it.
+- Pods run with `seccompProfile: RuntimeDefault`.
+- With `networkPolicy.enabled` and `networkPolicy.proxyIngress` set, the
+  metrics port is now allowed from any source unless
+  `networkPolicy.metricsFrom` narrows it.
+- `podDisruptionBudget.minAvailable` is no longer set in `values.yaml`, so
+  `maxUnavailable` can be set on its own. With neither set the PDB still
+  uses `minAvailable: 1`.
 
 ## Customizing the cosmoguard config
 

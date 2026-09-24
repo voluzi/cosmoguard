@@ -1,6 +1,6 @@
 # Configuration
 
-This is the cosmoguard v4 configuration reference. Every setting is shown with its YAML key, default, and a short description of behavior. v3-shaped configs continue to work — run `cosmoguard --migrate-config` to rewrite them in v4 form.
+This is the cosmoguard v4 configuration reference. Every setting is shown with its YAML key, default, and a short description of behavior. v3-shaped configs continue to work — run `cosmoguard migrate-config` to rewrite them in v4 form.
 
 Table of contents:
 
@@ -766,9 +766,9 @@ Empty (`VAR=""`) is treated as unset. To pass an empty value deliberately, use `
 
 ## Migration from v3
 
-Run `cosmoguard --validate --config /path/to/cosmoguard.yaml` to check that a v3 config parses cleanly under v4.
+Run `cosmoguard validate --config /path/to/cosmoguard.yaml` to check that a v3 config parses cleanly under v4.
 
-Run `cosmoguard --migrate-config --config /path/to/cosmoguard.yaml` to rewrite the file in v4 form. The original is preserved at `<path>.v3.bak`. Migration is purely cosmetic — v3 syntax keeps working forever.
+Run `cosmoguard migrate-config --config /path/to/cosmoguard.yaml` to rewrite the file in v4 form. The original is preserved at `<path>.v3.bak`. Migration is purely cosmetic — v3 syntax keeps working forever.
 
 **Behavioral changes worth a quick read:**
 
