@@ -199,8 +199,7 @@ against itself.
 
 ```sh
 # Build cosmoguard, start it in front of the node, compare, stop it.
-make compat                        # the allora-devnet preset
-make compat COMPAT_ARGS="--param topic_id=1"
+make compat COMPAT_ARGS="--node-grpc http://localhost:19090"
 
 # Against any raw node and a cosmoguard you already run:
 go run ./cmd/cosmoguard-compat \
@@ -209,6 +208,12 @@ go run ./cmd/cosmoguard-compat \
   --guard-lcd http://cosmoguard:11317 --guard-rpc http://cosmoguard:16657 \
   --guard-grpc http://cosmoguard:19090 --report compat.json
 ```
+
+The `allora-devnet` preset only works with that gRPC override: its ingress
+cannot serve gRPC yet (Traefik has no h2c backend for it), so forward the
+node's gRPC port first with
+`kubectl -n default port-forward svc/allora-devnet-fullnodes-0 19090:9090`.
+`--node-*` flags replace the preset's URLs one by one.
 
 `--spawn path/to/cosmoguard` with `--node-*` flags starts cosmoguard in
 front of another raw node, as `make compat` does for the preset.

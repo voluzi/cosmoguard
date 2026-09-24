@@ -29,7 +29,9 @@ import (
 // endpoints usually sit behind cosmoguard already, which would compare
 // cosmoguard against itself, so other chains go through the --node-* flags.
 var presets = map[string]compat.Endpoints{
-	// Temporary on-prem devnet (CometBFT 0.38).
+	// Temporary on-prem devnet (CometBFT 0.38). Its ingress cannot serve
+	// gRPC yet (no h2c backend on Traefik), so the preset is only usable
+	// with the gRPC port forwarded and --node-grpc pointing at it.
 	"allora-devnet": {
 		LCD:  "https://lcd.allora.voluzi.xyz",
 		RPC:  "https://rpc.allora.voluzi.xyz",
@@ -43,7 +45,7 @@ func main() {
 
 func run() int {
 	var (
-		chain       = flag.String("chain", "allora-devnet", "raw-node preset: "+strings.Join(presetNames(), ", ")+" (ignored when any --node-* URL is set)")
+		chain       = flag.String("chain", "allora-devnet", "raw-node preset: "+strings.Join(presetNames(), ", ")+"; --node-* flags override its URLs one by one")
 		spawnBin    = flag.String("spawn", "", "cosmoguard binary to start in front of the node (instead of guard-* flags)")
 		report      = flag.String("report", "", "write the full JSON report, including skip reasons, to this file")
 		only        = flag.String("only", "", "comma-separated protocols to run: grpc,lcd,rpc,evm,ws (default all)")
@@ -67,13 +69,11 @@ func run() int {
 	endpointFlags(&guard, "guard", "cosmoguard")
 	flag.Parse()
 
-	if node == (compat.Endpoints{}) {
-		p, ok := presets[*chain]
-		if !ok {
-			fmt.Fprintf(os.Stderr, "unknown chain %q and no --node-* URLs\n", *chain)
-			return 2
-		}
-		node = p
+	if p, ok := presets[*chain]; ok {
+		node = overlay(p, node)
+	} else if node == (compat.Endpoints{}) {
+		fmt.Fprintf(os.Stderr, "unknown chain %q and no --node-* URLs\n", *chain)
+		return 2
 	}
 	if node.LCD == "" || node.RPC == "" || node.GRPC == "" {
 		fmt.Fprintln(os.Stderr, "need --node-lcd, --node-rpc and --node-grpc (or a --chain preset)")
@@ -180,6 +180,23 @@ func endpointFlags(e *compat.Endpoints, prefix, who string) {
 	flag.StringVar(&e.GRPC, prefix+"-grpc", "", "gRPC target of "+who+" (https://host[:port] for TLS, http://host:port plaintext)")
 	flag.StringVar(&e.EVM, prefix+"-evm", "", "EVM JSON-RPC URL of "+who+" (optional)")
 	flag.StringVar(&e.EVMWS, prefix+"-evm-ws", "", "EVM WebSocket URL of "+who+" (optional)")
+}
+
+// overlay returns preset with every URL set in flags replacing its own.
+func overlay(preset, flags compat.Endpoints) compat.Endpoints {
+	pick := func(flag, preset string) string {
+		if flag != "" {
+			return flag
+		}
+		return preset
+	}
+	return compat.Endpoints{
+		LCD:   pick(flags.LCD, preset.LCD),
+		RPC:   pick(flags.RPC, preset.RPC),
+		GRPC:  pick(flags.GRPC, preset.GRPC),
+		EVM:   pick(flags.EVM, preset.EVM),
+		EVMWS: pick(flags.EVMWS, preset.EVMWS),
+	}
 }
 
 // trimSlashes drops trailing slashes, so base+path never sends "//".

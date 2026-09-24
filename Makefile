@@ -45,7 +45,8 @@ clean:
 # compat builds cosmoguard, starts it in front of a raw node (not one
 # already behind cosmoguard) and checks that every endpoint answers as the
 # node does. Needs network access to the node.
-# COMPAT_ARGS passes extra flags, e.g. COMPAT_ARGS="--param topic_id=1".
+# COMPAT_ARGS passes extra flags, e.g. COMPAT_ARGS="--node-grpc http://localhost:19090"
+# (the allora-devnet preset needs its gRPC port forwarded; see README.md).
 CHAIN ?= allora-devnet
 compat: $(BUILDDIR)/
 	go build -o $(BUILDDIR)/cosmoguard ./cmd/cosmoguard
