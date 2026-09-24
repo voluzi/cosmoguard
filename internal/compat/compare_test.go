@@ -33,6 +33,8 @@ func TestClassify(t *testing.T) {
 		{"only cosmoguard oversized", ok(`{}`), []Response{{Status: 200, Body: []byte(`{}`), Oversized: true}}, false, Differs, "cosmoguard's answer is larger than 32 MiB"},
 		{"only the node oversized", Response{Status: 200, Body: []byte(`{}`), Oversized: true}, []Response{ok(`{}`)}, false, Differs, "the node's answer is larger than 32 MiB"},
 		{"every answer oversized", Response{Status: 200, Oversized: true}, []Response{{Status: 200, Oversized: true}, {Status: 200, Oversized: true}}, false, Skipped, "every answer is larger than 32 MiB"},
+		{"node and its one comparison oversized", Response{Status: 200, Oversized: true}, []Response{{Status: 200, Oversized: true}}, false, Skipped, "every answer is larger than 32 MiB"},
+		{"node and some of cosmoguard oversized", Response{Status: 200, Oversized: true}, []Response{{Status: 200, Oversized: true}, ok(`{}`)}, false, Differs, "only 1 of cosmoguard's 2 are"},
 		{"oversized node, cosmoguard down", Response{Status: 200, Oversized: true}, []Response{{Err: errors.New("refused")}}, false, Differs, "cosmoguard: refused"},
 		{"content type", Response{Status: 200, Body: []byte("{}"), ContentType: "application/json"}, []Response{{Status: 200, Body: []byte("{}"), ContentType: "text/plain"}}, false, Differs, "Content-Type"},
 		{"both deny", Response{Status: 403, Denied: true}, []Response{{Status: 403, Denied: true}}, false, Identical, ""},

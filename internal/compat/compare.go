@@ -103,6 +103,8 @@ func classifyOversized(direct Response, proxies []Response) (Class, string, bool
 		return "", "", false
 	case direct.Oversized && over == len(proxies):
 		return Skipped, fmt.Sprintf("every answer is larger than %d MiB, so none was compared", limit), true
+	case direct.Oversized && over > 0:
+		return Differs, fmt.Sprintf("the node's answer is larger than %d MiB, but only %d of cosmoguard's %d are", limit, over, len(proxies)), true
 	case direct.Oversized:
 		return Differs, fmt.Sprintf("the node's answer is larger than %d MiB, cosmoguard's is not", limit), true
 	}
