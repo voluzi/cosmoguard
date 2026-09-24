@@ -563,11 +563,23 @@ func jsonRPCStatusRequest(id int, origin string) (*JsonRpcMsg, *http.Request) {
 // JSON-RPC over HTTP to a wildcard-CORS node is shared across origins: plain clients share one entry,
 // every browser origin shares another, and browser hits carry the node's wildcard CORS header.
 func TestJSONRPCWildcardCORSUpstreamIsSharedAcrossOrigins(t *testing.T) {
-	for name, coalesce := range map[string]bool{"coalesced": true, "non-coalesced": false} {
+	cases := map[string]struct {
+		coalesce bool
+		cors     *CORSConfig
+	}{
+		"coalesced":                    {coalesce: true},
+		"non-coalesced":                {coalesce: false},
+		"coalesced, CORS disabled":     {coalesce: true, cors: &CORSConfig{Enable: false}},
+		"non-coalesced, CORS disabled": {coalesce: false, cors: &CORSConfig{Enable: false}},
+	}
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			coalesce := tc.coalesce
 			p, hits := newRealHookCacheProxy(t, nil, jsonRPCWildcardCORSUpstream(t))
 			rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"status"}, Cache: &RuleCache{Enable: true, TTL: time.Minute, Coalesce: &coalesce}}
 			h := newJSONCacheHandler(t, rule)
+			// A deployment without a cors: block still carries a disabled CORSConfig.
+			h.cors = tc.cors
 			next := p.pool.ServeHTTP
 			call := func(id int, origin string) *httptest.ResponseRecorder {
 				request, httpRequest := jsonRPCStatusRequest(id, origin)

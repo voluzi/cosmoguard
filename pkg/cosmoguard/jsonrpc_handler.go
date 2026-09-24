@@ -1159,7 +1159,7 @@ func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *h
 // shared with a coalesced caller) to a request with an Origin. When cosmoguard owns CORS its own
 // policy applies instead.
 func (h *JsonRpcHandler) applyCachedCORS(headers http.Header, r *http.Request, res *JsonRpcMsg) {
-	if h.cors != nil || res == nil || !res.CORSWildcard || r.Header.Get("Origin") == "" {
+	if (h.cors != nil && h.cors.Enable) || res == nil || !res.CORSWildcard || r.Header.Get("Origin") == "" {
 		return
 	}
 	headers.Set("Access-Control-Allow-Origin", "*")
