@@ -15,9 +15,9 @@ import (
 
 // GoldenFixture is one captured request+response from a real Cosmos node.
 // Recorded by scripts/record-golden.sh (legacy local-node fixtures) or
-// scripts/record-golden-remote.sh (live-node fixtures captured for
-// TestK_GoldenLiveCompatibility). Replayed by the compatibility test
-// suite to assert cosmoguard preserves byte-identical behavior.
+// scripts/record-golden-remote.sh (live-node fixtures). Replayed by the
+// compatibility test suite to assert cosmoguard preserves
+// byte-identical behavior.
 //
 // Service is "lcd" / "rpc" / "evm_rpc". Empty defaults to "lcd" for
 // backwards compatibility with pre-live fixtures. BodyBase64 +

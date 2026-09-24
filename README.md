@@ -182,6 +182,70 @@ A compatibility test suite recordable via `scripts/record-golden.sh`
 captures live-node responses and replays them through cosmoguard,
 asserting byte-identical relay.
 
+### Checking a live node
+
+`cmd/cosmoguard-compat` calls every read endpoint it can find on a node,
+both directly and through cosmoguard, and reports where the answers
+differ. It finds the endpoints itself: gRPC query methods through server
+reflection (only `*.Query` / `*.QueryService` services and the SDK's
+known read-only services are called; others are listed as skipped), the LCD routes
+annotated on them, every read-only CometBFT RPC
+method (URI and JSON-RPC forms, plus a batch), a fixed set of read-only
+EVM JSON-RPC methods, and the NewBlock / newHeads WebSocket subscriptions.
+Queries that take a height are pinned to one, so their answers compare
+byte for byte; answers about the latest state or the answering node
+(status, latest block, node info, gas price and the like) are compared by
+JSON shape only, and a WebSocket event is compared as a JSON value for the
+same block. Each cosmoguard answer is fetched twice so cached answers are
+checked too. The status, body and Content-Type are compared; other
+response headers are not. A few `cross-height` probes also ask for the
+same query at two heights, so a cache that ignores the requested height
+is caught.
+
+The node side must be a raw node, not one already behind cosmoguard; a
+chain's public endpoints usually are, and comparing against them tests
+cosmoguard against itself. By default the tool expects the node on
+localhost at the standard ports, so with a Cosmopilot node forward them
+first:
+
+```sh
+kubectl port-forward svc/<chainnode> 1317 26657 9090   # add 8545 8546 for an EVM chain
+make compat
+```
+
+`make compat` builds cosmoguard, starts it in front of the node, compares
+and stops it. A chain without EVM leaves ports 8545 and 8546 closed; its
+EVM checks are reported as skipped. `--node-lcd`, `--node-rpc`,
+`--node-grpc` (`http://` for plaintext, `https://` for TLS), `--node-evm`
+and `--node-evm-ws` override each default, and an EVM URL given this way
+must be reachable. To check a cosmoguard you already run:
+
+```sh
+go run ./cmd/cosmoguard-compat \
+  --guard-lcd http://cosmoguard:11317 --guard-rpc http://cosmoguard:16657 \
+  --guard-grpc http://cosmoguard:19090 --report compat.json
+```
+
+Each endpoint is reported as `identical`, `differs` (cosmoguard answered
+differently), `denied` (cosmoguard refused a request the node answered),
+`failed` (the node itself did not answer), `unstable` or `skipped` (a path
+parameter has no live value; `--param name=value` supplies chain-specific
+ones). An endpoint is `unstable` when the node disagrees with itself
+between two calls, or answers at a different height despite the pin. A
+node behind a load balancer can do both, so a differing endpoint is
+compared again, up to three rounds, and only reported as `differs` when no
+round matched. Rounds and height retries are `--round-delay` apart (3s
+with `make compat`, whose cosmoguard caches for 2s), so each reaches the
+node rather than cosmoguard's cache; set it above your cache TTL when
+checking a running deployment.
+
+The run exits 1 when any endpoint differs, when nothing could be compared,
+or, with `make compat` (whose config allows everything), when any request
+was denied. With `make compat` the cosmoguard log is kept after a failing
+run and its path is printed.
+
+The tool needs network access and is not part of `make test`.
+
 ## License
 
 Unless a file notes otherwise, it falls under the

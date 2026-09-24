@@ -1,0 +1,98 @@
+package compat
+
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"gotest.tools/assert"
+)
+
+func ok(body string) Response { return Response{Status: 200, Body: []byte(body)} }
+
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		name     string
+		direct   Response
+		proxies  []Response
+		volatile bool
+		want     Class
+		detail   string
+	}{
+		{"identical", ok(`{"a":1}`), []Response{ok(`{"a":1}`), ok(`{"a":1}`)}, false, Identical, ""},
+		{"error answers compared too", Response{Status: 404, Body: []byte("nope")}, []Response{{Status: 404, Body: []byte("nope")}}, false, Identical, ""},
+		{"node down", Response{Err: errors.New("timeout")}, []Response{ok(`{}`)}, false, Failed, "node: timeout"},
+		{"cosmoguard down", ok(`{}`), []Response{{Err: errors.New("refused")}}, false, Differs, "cosmoguard: refused"},
+		{"node gateway error", Response{Status: 504, Body: []byte("<html>")}, []Response{ok(`{}`)}, false, Failed, "node: gateway status 504"},
+		{"cosmoguard gateway error", ok(`{}`), []Response{{Status: 504}}, false, Differs, "status node=200 cosmoguard=504"},
+		{"denied", ok(`{}`), []Response{{Status: 403, Denied: true}}, false, Denied, "refused with 403"},
+		{"node rate-limited", Response{Status: 429, Throttled: true}, []Response{ok(`{}`)}, false, Failed, "rate-limited"},
+		{"only cosmoguard oversized", ok(`{}`), []Response{{Status: 200, Body: []byte(`{}`), Oversized: true}}, false, Differs, "cosmoguard's answer is larger than 32 MiB"},
+		{"only the node oversized", Response{Status: 200, Body: []byte(`{}`), Oversized: true}, []Response{ok(`{}`)}, false, Differs, "the node's answer is larger than 32 MiB"},
+		{"every answer oversized", Response{Status: 200, Oversized: true}, []Response{{Status: 200, Oversized: true}, {Status: 200, Oversized: true}}, false, Skipped, "every answer is larger than 32 MiB"},
+		{"node and its one comparison oversized", Response{Status: 200, Oversized: true}, []Response{{Status: 200, Oversized: true}}, false, Skipped, "every answer is larger than 32 MiB"},
+		{"node and some of cosmoguard oversized", Response{Status: 200, Oversized: true}, []Response{{Status: 200, Oversized: true}, ok(`{}`)}, false, Differs, "only 1 of cosmoguard's 2 are"},
+		{"oversized node, cosmoguard down", Response{Status: 200, Oversized: true}, []Response{{Err: errors.New("refused")}}, false, Differs, "cosmoguard: refused"},
+		{"content type", Response{Status: 200, Body: []byte("{}"), ContentType: "application/json"}, []Response{{Status: 200, Body: []byte("{}"), ContentType: "text/plain"}}, false, Differs, "Content-Type"},
+		{"both deny", Response{Status: 403, Denied: true}, []Response{{Status: 403, Denied: true}}, false, Identical, ""},
+		{"status", ok(`{}`), []Response{{Status: 502}}, false, Differs, "status node=200 cosmoguard=502"},
+		{"cached answer differs", ok(`{"a":1}`), []Response{ok(`{"a":1}`), ok(`{"a":2}`)}, false, Differs, "call 2: at $.a"},
+		{"volatile same shape", ok(`{"h":"5"}`), []Response{ok(`{"h":"9"}`)}, true, Identical, ""},
+		{"volatile new key", ok(`{"h":"5"}`), []Response{ok(`{"h":"5","x":1}`)}, true, Differs, "keys on one side only: x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, detail := Classify(tc.direct, tc.proxies, tc.volatile)
+			assert.Equal(t, got, tc.want, detail)
+			if tc.detail == "" {
+				assert.Equal(t, detail, "")
+			} else {
+				assert.Assert(t, strings.Contains(detail, tc.detail), "detail %q lacks %q", detail, tc.detail)
+			}
+		})
+	}
+}
+
+func TestSameHeight(t *testing.T) {
+	assert.Assert(t, SameHeight(Response{Height: 5}, Response{}, Response{Height: 5}))
+	assert.Assert(t, !SameHeight(Response{Height: 5}, Response{Height: 6}))
+	assert.Assert(t, SameHeight(Response{}, Response{}))
+}
+
+func TestBodyDiff(t *testing.T) {
+	assert.Equal(t, BodyDiff([]byte(`{"a":[1,2]}`), []byte(`{"a":[1,3]}`)), "at $.a[1]: node=2 cosmoguard=3")
+	assert.Equal(t, BodyDiff([]byte(`{"a":1}`), []byte(`{"a":1,"b":2}`)), "at $.b: only cosmoguard has it")
+	assert.Equal(t, BodyDiff([]byte(`{"a":1,"b":2}`), []byte(`{"b":2,"a":1}`)), "same JSON value, different bytes (formatting or key order)")
+	// Large integers must not be rounded into equality.
+	assert.Assert(t, strings.HasPrefix(BodyDiff([]byte(`{"n":12345678901234567890}`), []byte(`{"n":12345678901234567891}`)), "at $.n"))
+	assert.Assert(t, strings.HasPrefix(BodyDiff([]byte("abcX"), []byte("abcY")), "bodies differ at byte 3"))
+}
+
+func TestShapeDiff(t *testing.T) {
+	assert.Equal(t, ShapeDiff([]byte(`{"a":[{"x":1}]}`), []byte(`{"a":[{"x":2},{"x":3}]}`)), "")
+	assert.Equal(t, ShapeDiff([]byte(`{"a":[]}`), []byte(`{"a":[{"x":2}]}`)), "")
+	assert.Equal(t, ShapeDiff([]byte(`{"a":"1"}`), []byte(`{"a":1}`)), "at $.a: node has string, cosmoguard number")
+	assert.Equal(t, ShapeDiff([]byte(`{"a":[{"x":1}]}`), []byte(`{"a":[{"y":1}]}`)), "at $.a[0]: keys on one side only: x, y")
+	assert.Assert(t, ShapeDiff([]byte("x"), []byte("y")) != "")
+	// Trailing data makes a body not JSON, even a stray closing bracket.
+	assert.Assert(t, ShapeDiff([]byte(`{}]`), []byte(`{}`)) != "")
+	assert.Assert(t, ShapeDiff([]byte(`{} {}`), []byte(`{}`)) != "")
+	assert.Equal(t, ShapeDiff([]byte("{}\n"), []byte(`{}`)), "")
+}
+
+func TestHTTPDoerKeepsRedirects(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("followed"))
+	}))
+	defer target.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+	r := newHTTPDoer(5*time.Second).do(t.Context(), http.MethodGet, srv.URL, nil, nil)
+	assert.NilError(t, r.Err)
+	assert.Equal(t, r.Status, http.StatusFound, "a redirect is compared, not followed")
+}

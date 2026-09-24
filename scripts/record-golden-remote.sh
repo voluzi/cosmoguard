@@ -14,8 +14,9 @@
 #         pkg/cosmoguard/testharness/testdata/golden/<chain>-live/manifest.json
 #
 # The "-live" suffix distinguishes these from the local-fake-upstream
-# fixtures record-golden.sh produces. TestK_GoldenLiveCompatibility
-# reads from the -live directory.
+# fixtures record-golden.sh produces. LoadGoldenFixtures reads either
+# layout. For a live comparison without recording, see
+# cmd/cosmoguard-compat.
 #
 # All fixtures are written with the same JSON shape as record-golden.sh
 # plus optional request.body_base64 / request.content_type for non-GET
@@ -63,10 +64,8 @@ OUT_DIR="pkg/cosmoguard/testharness/testdata/golden/${CHAIN}-live"
 mkdir -p "$OUT_DIR"
 
 # Curated endpoints — kept small and deterministic so a recording made
-# moments before a test replay is unlikely to drift. Anything
-# height-sensitive (latest block, status's block height) is recorded
-# but the replay treats `/status` specially in case the timestamp
-# changes between record and replay (see TestK_GoldenLiveCompatibility).
+# moments before a test replay is unlikely to drift. Height-sensitive
+# answers (latest block, status's block height) are recorded as they are.
 LCD_ENDPOINTS=(
   "/cosmos/base/tendermint/v1beta1/node_info"
   "/cosmos/bank/v1beta1/params"
