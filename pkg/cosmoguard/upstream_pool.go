@@ -1021,6 +1021,14 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tried := make(map[*HttpUpstream]struct{}, attempts)
 	state := &retryState{}
 	rCtx := context.WithValue(r.Context(), retryStateKey, state)
+	// The header timeout is the server's write timeout: once it has passed
+	// no attempt can still reach the client, so the whole loop shares that
+	// budget instead of spending it again on every retry.
+	if p.responseHeaderTimeout > 0 {
+		var cancel context.CancelFunc
+		rCtx, cancel = context.WithTimeout(rCtx, p.responseHeaderTimeout)
+		defer cancel()
+	}
 	rWithCtx := r.WithContext(rCtx)
 
 	for i := 0; i < attempts; i++ {

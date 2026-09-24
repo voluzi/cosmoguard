@@ -384,3 +384,37 @@ func TestHTTPPoolWithoutTransportServesAddedUpstream(t *testing.T) {
 	pool.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 }
+
+func TestHTTPRetryLoopSharesHeaderTimeout(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	release := make(chan struct{})
+	var hits atomic.Int32
+	stall := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	a := httptest.NewServer(stall)
+	b := httptest.NewServer(stall)
+	t.Cleanup(func() {
+		close(release)
+		a.Close()
+		b.Close()
+	})
+
+	p := newHardeningProxy(t,
+		[]NodeConfig{{Name: "a", LcdURL: a.URL}, {Name: "b", LcdURL: b.URL}},
+		WithServerConfig[HttpProxyOptions](&ServerConfig{WriteTimeout: timeout}),
+		WithUpstreamConfig[HttpProxyOptions](retryUpstreamConfig()))
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	p.pool.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	elapsed := time.Since(start)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Less(t, elapsed, 2*timeout-timeout/4,
+		"both stalled upstreams must share one header-timeout budget, took %s", elapsed)
+}
