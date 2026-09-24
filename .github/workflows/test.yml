@@ -4,7 +4,7 @@ on:
   # Pushes to main plus every pull request (fork PRs included). A `branches`
   # filter (rather than `tags-ignore`) is required to exclude tags: specifying
   # only a tag filter would scope the push event to tags. Tags are handled by
-  # the release workflows (docker.yml, goreleaser.yml, publish-chart.yml),
+  # the release workflows (docker.yml, goreleaser.yml),
   # which call this workflow as a gate via workflow_call.
   push:
     branches:
