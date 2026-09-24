@@ -101,3 +101,14 @@ func TestCrossHeightSkipsHeightStableAnswers(t *testing.T) {
 	res := runCrossHeight(t, node.URL, fakeCache(t, node.URL, false, 20*time.Millisecond).URL)
 	assert.Equal(t, res.Class, Skipped, res.Detail)
 }
+
+func TestCrossHeightNeedsAHeightBelow(t *testing.T) {
+	called := false
+	task := crossHeightTask("probe", 1, 0, func(context.Context, bool, int64) Response {
+		called = true
+		return ok("x")
+	})
+	res := task(t.Context())
+	assert.Equal(t, res.Class, Skipped)
+	assert.Assert(t, !called, "height 0 is not queried")
+}

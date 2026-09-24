@@ -20,7 +20,11 @@ type httpDoer struct {
 }
 
 func newHTTPDoer(timeout time.Duration) *httpDoer {
-	return &httpDoer{client: &http.Client{Timeout: timeout}}
+	return &httpDoer{client: &http.Client{
+		Timeout: timeout,
+		// A redirect is an answer to compare, not a request to follow.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 // do sends one request. A 429 is retried with backoff, so a public node's

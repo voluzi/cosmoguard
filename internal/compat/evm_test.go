@@ -70,7 +70,7 @@ func TestEvmCallsReadOnly(t *testing.T) {
 	// Every method here was checked to read state only. Adding one to
 	// evmCalls means checking it and adding it here.
 	readOnly := map[string]bool{
-		"web3_clientVersion": true, "net_version": true, "net_listening": true, "net_peerCount": true,
+		"web3_clientVersion": true, "web3_sha3": true, "eth_getUncleCountByBlockHash": true, "eth_getUncleByBlockHashAndIndex": true, "net_version": true, "net_listening": true, "net_peerCount": true,
 		"eth_chainId": true, "eth_protocolVersion": true, "eth_accounts": true, "eth_mining": true,
 		"eth_hashrate": true, "eth_coinbase": true, "eth_blockNumber": true, "eth_syncing": true,
 		"eth_gasPrice": true, "eth_maxPriorityFeePerGas": true, "eth_feeHistory": true,

@@ -78,8 +78,9 @@ func dialGRPC(target string) (*grpc.ClientConn, error) {
 }
 
 // discoverMethods lists the node's unary query methods through server
-// reflection. Tx broadcast/simulate and Msg services are left out.
-func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, error) {
+// reflection, and the services it will not call because they are not
+// known to only read. Tx broadcast/simulate is left out.
+func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, []string, error) {
 	var stream grpc.ClientStream
 	ask := func(req *rpb.ServerReflectionRequest) (*rpb.ServerReflectionResponse, error) {
 		if err := stream.SendMsg(req); err != nil {
@@ -94,7 +95,7 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 		var err error
 		stream, err = conn.NewStream(ctx, &grpc.StreamDesc{ClientStreams: true, ServerStreams: true}, method)
 		if err != nil {
-			return nil, fmt.Errorf("reflection: %w", err)
+			return nil, nil, fmt.Errorf("reflection: %w", err)
 		}
 		resp, err = ask(listReq)
 		if status.Code(err) == codes.Unimplemented {
@@ -104,15 +105,15 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 		}
 		defer func() { _ = stream.CloseSend() }()
 		if err != nil {
-			return nil, fmt.Errorf("reflection list: %w", err)
+			return nil, nil, fmt.Errorf("reflection list: %w", err)
 		}
 		if e := resp.GetErrorResponse(); e != nil {
-			return nil, fmt.Errorf("reflection list: %s", e.GetErrorMessage())
+			return nil, nil, fmt.Errorf("reflection list: %s", e.GetErrorMessage())
 		}
 		break
 	}
 	if resp == nil {
-		return nil, errors.New("the node serves no gRPC server reflection")
+		return nil, nil, errors.New("the node serves no gRPC server reflection")
 	}
 	var services []string
 	for _, s := range resp.GetListServicesResponse().GetService() {
@@ -136,10 +137,10 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 	for _, s := range services {
 		r, err := ask(&rpb.ServerReflectionRequest{MessageRequest: &rpb.ServerReflectionRequest_FileContainingSymbol{FileContainingSymbol: s}})
 		if err != nil {
-			return nil, fmt.Errorf("reflection %s: %w", s, err)
+			return nil, nil, fmt.Errorf("reflection %s: %w", s, err)
 		}
 		if err := addFiles(r); err != nil {
-			return nil, fmt.Errorf("reflection %s: %w", s, err)
+			return nil, nil, fmt.Errorf("reflection %s: %w", s, err)
 		}
 	}
 	// Servers may omit dependencies they assume the client has.
@@ -152,7 +153,7 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 				}
 				r, err := ask(&rpb.ServerReflectionRequest{MessageRequest: &rpb.ServerReflectionRequest_FileByFilename{FileByFilename: dep}})
 				if err != nil {
-					return nil, fmt.Errorf("reflection %s: %w", dep, err)
+					return nil, nil, fmt.Errorf("reflection %s: %w", dep, err)
 				}
 				if err := addFiles(r); err != nil || fdps[dep] == nil {
 					// Leave it unresolved; building the file tolerates that.
@@ -166,13 +167,18 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 	files := buildFiles(fdps)
 	types := dynamicpb.NewTypes(files)
 	var methods []Method
+	var skipped []string
 	for _, s := range services {
 		d, err := files.FindDescriptorByName(protoreflect.FullName(s))
 		if err != nil {
 			continue
 		}
 		sd, ok := d.(protoreflect.ServiceDescriptor)
-		if !ok || !queryService(s) {
+		if !ok || strings.HasPrefix(s, "grpc.reflection.") {
+			continue
+		}
+		if !queryService(s) {
+			skipped = append(skipped, s)
 			continue
 		}
 		for i := 0; i < sd.Methods().Len(); i++ {
@@ -189,11 +195,26 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 		}
 	}
 	sort.Slice(methods, func(i, j int) bool { return methods[i].FullName < methods[j].FullName })
-	return methods, nil
+	return methods, skipped, nil
 }
 
+// readOnlyServices are the Cosmos SDK services outside the *.Query
+// convention that only read. Any other service is never called, since a
+// method with no request fields would otherwise be invoked blind.
+var readOnlyServices = map[string]bool{
+	"cosmos.base.tendermint.v1beta1.Service":            true,
+	"cosmos.base.node.v1beta1.Service":                  true,
+	"cosmos.tx.v1beta1.Service":                         true, // Broadcast*/Simulate* excluded by queryMethod
+	"cosmos.base.reflection.v1beta1.ReflectionService":  true,
+	"cosmos.base.reflection.v2alpha1.ReflectionService": true,
+	"cosmos.reflection.v1.ReflectionService":            true,
+}
+
+// queryService reports a service known to only read: a module's query
+// service (named Query or QueryService, e.g. emissions.v10.QueryService)
+// or one of readOnlyServices.
 func queryService(name string) bool {
-	return !strings.HasSuffix(name, ".Msg") && !strings.HasPrefix(name, "grpc.reflection.")
+	return strings.HasSuffix(name, ".Query") || strings.HasSuffix(name, ".QueryService") || readOnlyServices[name]
 }
 
 func queryMethod(name string) bool {

@@ -69,7 +69,11 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 	}
 	height := o.Height
 	if height == 0 {
-		height = latest - 5
+		// A few blocks behind the tip, so every side has the block.
+		height = max(latest-5, 1)
+	}
+	if height < 1 {
+		return nil, fmt.Errorf("height %d: heights start at 1", height)
 	}
 	rep := &Report{Chain: chainID, Height: height}
 	logf := func(format string, args ...any) { fmt.Fprintf(o.Log, format+"\n", args...) }
@@ -100,12 +104,15 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 			defer guard.Close()
 		}
 		dctx, cancel := context.WithTimeout(ctx, max(2*time.Minute, 6*o.Timeout))
-		methods, err := discoverMethods(dctx, node)
+		methods, notRead, err := discoverMethods(dctx, node)
 		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("discover gRPC methods: %w", err)
 		}
 		logf("discovered %d query methods", len(methods))
+		for _, svc := range notRead {
+			rep.Add(Result{Protocol: ProtoGRPC, Name: svc, Class: Skipped, Detail: "not a known read-only service, so not called"})
+		}
 		for _, m := range methods {
 			if o.enabled(ProtoGRPC) {
 				tasks = append(tasks, grpcTask(node, guard, m, params, height, o))

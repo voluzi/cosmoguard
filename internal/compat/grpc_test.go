@@ -84,9 +84,12 @@ func TestBuildRequest(t *testing.T) {
 
 func TestQueryFilters(t *testing.T) {
 	assert.Assert(t, queryService("cosmos.bank.v1beta1.Query"))
+	assert.Assert(t, queryService("emissions.v10.QueryService"))
 	assert.Assert(t, queryService("cosmos.base.tendermint.v1beta1.Service"))
 	assert.Assert(t, !queryService("cosmos.bank.v1beta1.Msg"))
-	assert.Assert(t, !queryService("grpc.reflection.v1alpha.ServerReflection"))
+	// Only known read-only services are called; anything else could write.
+	assert.Assert(t, !queryService("example.admin.v1.Admin"))
+	assert.Assert(t, !queryService("example.control.v1.ControlService"))
 	assert.Assert(t, queryMethod("GetTx"))
 	assert.Assert(t, !queryMethod("BroadcastTx"))
 	assert.Assert(t, !queryMethod("Simulate"))

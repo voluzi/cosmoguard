@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"gotest.tools/assert"
@@ -99,4 +100,57 @@ func TestWsCompareSkipsEVMWithoutWebSocket(t *testing.T) {
 	o.Node.EVM, o.Guard.EVM = "", ""
 	res = wsCompare(t.Context(), o)
 	assert.Equal(t, res[1].Class, Skipped)
+}
+
+// fakeWSFrames acks a subscribe, then sends frames verbatim and holds the
+// connection open.
+func fakeWSFrames(t *testing.T, frames ...string) string {
+	t.Helper()
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, _, err := c.ReadMessage(); err != nil {
+			return
+		}
+		_ = c.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+		for _, f := range frames {
+			if c.WriteMessage(websocket.TextMessage, []byte(f)) != nil {
+				return
+			}
+		}
+		_, _, _ = c.ReadMessage()
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+func newBlockFrame(height int, events string) string {
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"result":{"query":"tm.event='NewBlock'","data":{"type":"tendermint/event/NewBlock","value":{"block":{"header":{"height":"%d"}}}},"events":%s}}`, height, events)
+}
+
+func TestCompareSubComparesEventAttributes(t *testing.T) {
+	sub := cometNewBlock
+	sub.path = ""
+	node := fakeWSFrames(t, newBlockFrame(10, `{"tm.event":["NewBlock"],"mint.amount":["5"]}`))
+	guard := fakeWSFrames(t, newBlockFrame(10, `{"tm.event":["NewBlock"]}`))
+	res := compareSub(t.Context(), sub, node, guard)
+	assert.Equal(t, res.Class, Differs, res.Detail)
+	assert.Assert(t, strings.Contains(res.Detail, "events"), res.Detail)
+}
+
+func TestCompareSubInterrupted(t *testing.T) {
+	sub := cometNewBlock
+	sub.path = ""
+	// The node delivers a block, cosmoguard not yet, when the run stops.
+	node := fakeWSFrames(t, newBlockFrame(10, `{}`))
+	guard := fakeWSFrames(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
+	res := compareSub(ctx, sub, node, guard)
+	assert.Equal(t, res.Class, Unstable, res.Detail)
+	assert.Equal(t, res.Detail, "interrupted before a verdict")
 }

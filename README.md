@@ -184,7 +184,9 @@ asserting byte-identical relay.
 `cmd/cosmoguard-compat` calls every read endpoint it can find on a node,
 both directly and through cosmoguard, and reports where the answers
 differ. It finds the endpoints itself: gRPC query methods through server
-reflection, the LCD routes annotated on them, every read-only CometBFT RPC
+reflection (only `*.Query` / `*.QueryService` services and the SDK's
+known read-only services are called; others are listed as skipped), the LCD routes
+annotated on them, every read-only CometBFT RPC
 method (URI and JSON-RPC forms, plus a batch), a fixed set of read-only
 EVM JSON-RPC methods, and the NewBlock / newHeads WebSocket subscriptions.
 Queries that take a height are pinned to one, so their answers compare

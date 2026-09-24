@@ -38,7 +38,9 @@ var cometNewBlock = wsSub{
 		if !ok {
 			return "", nil, false
 		}
-		return height, data, true
+		// The whole result: data plus the query and event attributes
+		// clients filter on.
+		return height, result, true
 	},
 }
 
@@ -91,6 +93,7 @@ type wsEvent struct {
 // its own.
 func compareSub(ctx context.Context, s wsSub, node, guard string) Result {
 	res := Result{Protocol: ProtoWS, Name: s.name}
+	run := ctx
 	ctx, cancel := context.WithTimeout(ctx, wsWindow)
 	defer cancel()
 
@@ -114,6 +117,10 @@ func compareSub(ctx context.Context, s wsSub, node, guard string) Result {
 		var ok bool
 		select {
 		case <-ctx.Done():
+			if run.Err() != nil {
+				res.Class, res.Detail = Unstable, "interrupted before a verdict"
+				return res
+			}
 			res.Class = Unstable
 			if len(seen[0]) > 0 && len(seen[1]) == 0 {
 				res.Class = Differs

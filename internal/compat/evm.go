@@ -39,6 +39,7 @@ func evmCalls(c evmChain) []evmCall {
 	return []evmCall{
 		// clientVersion, accounts and coinbase describe the answering node.
 		{method: "web3_clientVersion", volatile: true},
+		{method: "web3_sha3", params: []any{"0x68656c6c6f"}},
 		{method: "net_version"},
 		{method: "net_listening"},
 		{method: "net_peerCount", volatile: true},
@@ -60,6 +61,8 @@ func evmCalls(c evmChain) []evmCall {
 		{method: "eth_getBlockTransactionCountByHash", params: []any{c.blockHash}, skip: missing("block hash", c.blockHash)},
 		{method: "eth_getUncleCountByBlockNumber", params: []any{b}},
 		{method: "eth_getUncleByBlockNumberAndIndex", params: []any{b, "0x0"}},
+		{method: "eth_getUncleCountByBlockHash", params: []any{c.blockHash}, skip: missing("block hash", c.blockHash)},
+		{method: "eth_getUncleByBlockHashAndIndex", params: []any{c.blockHash, "0x0"}, skip: missing("block hash", c.blockHash)},
 		{method: "eth_getBlockReceipts", params: []any{b}},
 		{method: "eth_getLogs", params: []any{map[string]any{"fromBlock": b, "toBlock": b}}},
 		{method: "eth_getBalance", params: []any{c.addr, b}},

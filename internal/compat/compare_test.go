@@ -2,8 +2,11 @@ package compat
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"gotest.tools/assert"
 )
@@ -73,4 +76,18 @@ func TestShapeDiff(t *testing.T) {
 	assert.Assert(t, ShapeDiff([]byte(`{}]`), []byte(`{}`)) != "")
 	assert.Assert(t, ShapeDiff([]byte(`{} {}`), []byte(`{}`)) != "")
 	assert.Equal(t, ShapeDiff([]byte("{}\n"), []byte(`{}`)), "")
+}
+
+func TestHTTPDoerKeepsRedirects(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("followed"))
+	}))
+	defer target.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+	r := newHTTPDoer(5*time.Second).do(t.Context(), http.MethodGet, srv.URL, nil, nil)
+	assert.NilError(t, r.Err)
+	assert.Equal(t, r.Status, http.StatusFound, "a redirect is compared, not followed")
 }

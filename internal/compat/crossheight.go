@@ -28,6 +28,10 @@ func crossHeightTask(name string, height int64, delay time.Duration, send func(c
 	return func(ctx context.Context) Result {
 		res := Result{Protocol: ProtoCrossHeight, Name: name}
 		below := height - 1
+		if below < 1 {
+			res.Class, res.Detail = Skipped, fmt.Sprintf("no height below %d", height)
+			return res
+		}
 		atPin, atBelow := send(ctx, false, height), send(ctx, false, below)
 		if atPin.Err == nil && atBelow.Err == nil {
 			if c, _ := Classify(atPin, []Response{atBelow}, false); c == Identical {
