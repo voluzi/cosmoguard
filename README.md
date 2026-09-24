@@ -82,6 +82,9 @@ docker run -it --name cosmoguard \
   --config /etc/cosmoguard/cosmoguard.yaml
 ```
 
+Image tags: `X.Y.Z` for each release, `latest` for the newest stable
+release, and `edge` for the current `main` branch (unreleased, may break).
+
 ### Helm (k8s)
 
 Each release publishes the chart as `oci://ghcr.io/voluzi/helm/cosmoguard`,
