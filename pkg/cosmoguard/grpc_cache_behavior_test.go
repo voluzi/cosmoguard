@@ -28,6 +28,7 @@ type grpcCacheTestStream struct {
 	request  []byte
 	mu       sync.Mutex
 	header   metadata.MD
+	trailer  metadata.MD
 	response []byte
 }
 
@@ -45,8 +46,19 @@ func (s *grpcCacheTestStream) SetHeader(md metadata.MD) error {
 }
 
 func (s *grpcCacheTestStream) SendHeader(md metadata.MD) error { return s.SetHeader(md) }
-func (s *grpcCacheTestStream) SetTrailer(metadata.MD)          {}
 func (s *grpcCacheTestStream) Context() context.Context        { return s.ctx }
+
+func (s *grpcCacheTestStream) SetTrailer(md metadata.MD) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.trailer = metadata.Join(s.trailer, md)
+}
+
+func (s *grpcCacheTestStream) metadata() (header, trailer metadata.MD) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.header.Copy(), s.trailer.Copy()
+}
 
 func (s *grpcCacheTestStream) SendMsg(msg any) error {
 	frame, ok := msg.(*rawFrame)
@@ -188,6 +200,9 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 		invokes.Add(1)
 		startedOnce.Do(func() { close(upstreamStarted) })
 		<-releaseUpstream
+		if err := stream.SetHeader(metadata.Pairs("x-cosmos-block-height", "7")); err != nil {
+			return err
+		}
 		return stream.SendMsg(&rawFrame{Payload: payload})
 	})
 	p, _ := newGRPCCacheTestProxy(t, conn, &RuleCache{Enable: true, TTL: time.Minute})
@@ -227,6 +242,8 @@ func TestGRPCCacheConcurrentMissesCoalesceOneUpstreamInvoke(t *testing.T) {
 		cacheState, response := stream.result()
 		require.Equal(t, cacheMiss, cacheState)
 		require.Equal(t, payload, response)
+		header, _ := stream.metadata()
+		require.Equal(t, []string{"7"}, header.Get("x-cosmos-block-height"))
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc/credentials"
@@ -202,7 +203,7 @@ func upstreamGRPCTarget(n NodeConfig) (target string, creds credentials.Transpor
 		}
 		return host, insecure.NewCredentials(), nil
 	}
-	target = fmt.Sprintf("%s:%d", n.Host, n.GrpcPort)
+	target = net.JoinHostPort(n.Host, strconv.Itoa(n.GrpcPort))
 	if n.TLS {
 		return target, credentials.NewTLS(&tls.Config{ServerName: n.Host}), nil
 	}

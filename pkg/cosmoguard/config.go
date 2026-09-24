@@ -726,6 +726,12 @@ type GrpcConfig struct {
 	// Empty list disables canonicalization (the keyMode silently
 	// degrades to "raw" for methods not in any protoset).
 	Protosets []string `yaml:"protosets,omitempty"`
+	// MaxRecvMsgSize caps a request message accepted from clients, and
+	// MaxSendMsgSize caps a response message relayed from the upstream.
+	// Defaults match the Cosmos SDK node's own gRPC server (10 MiB in,
+	// math.MaxInt32 out) so the proxy never rejects what the node serves.
+	MaxRecvMsgSize int `yaml:"maxRecvMsgSize,omitempty" default:"10485760"`
+	MaxSendMsgSize int `yaml:"maxSendMsgSize,omitempty" default:"2147483647"`
 }
 
 type MetricsConfig struct {
@@ -1110,6 +1116,9 @@ func PrepareConfig(cfg *Config) error {
 	if err := validateCacheBackend(&cfg.Cache); err != nil {
 		return err
 	}
+	if err := validateGrpcLimits(&cfg.GRPC); err != nil {
+		return err
+	}
 	// Publish the trusted-proxies CIDR list so GetSourceIP /
 	// rate-limit / audit code can honor forwarded headers ONLY when
 	// the immediate peer is on the allowlist. Empty list → secure-
@@ -1387,6 +1396,16 @@ func validateServerLimits(s *ServerConfig) error {
 		if limit.value != nil && *limit.value < 0 {
 			return fmt.Errorf("server.websocketLimits.%s must be >= 0 (0 disables the limit); got %d", limit.name, *limit.value)
 		}
+	}
+	return nil
+}
+
+func validateGrpcLimits(g *GrpcConfig) error {
+	if g.MaxRecvMsgSize <= 0 {
+		return fmt.Errorf("grpc.maxRecvMsgSize must be > 0; got %d", g.MaxRecvMsgSize)
+	}
+	if g.MaxSendMsgSize <= 0 {
+		return fmt.Errorf("grpc.maxSendMsgSize must be > 0; got %d", g.MaxSendMsgSize)
 	}
 	return nil
 }

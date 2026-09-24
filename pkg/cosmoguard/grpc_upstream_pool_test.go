@@ -173,7 +173,7 @@ func TestBuildGrpcUpstream_NormalizesUnslashedHealthcheckPath(t *testing.T) {
 			HealthyAfter:   1,
 		},
 	}
-	u, err := buildGrpcUpstream(node)
+	u, err := buildGrpcUpstream(node, 0)
 	if err != nil {
 		t.Fatalf("buildGrpcUpstream: %v", err)
 	}

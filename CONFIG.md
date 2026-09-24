@@ -494,6 +494,8 @@ rpc:
 
 grpc:
   default: deny
+  maxRecvMsgSize: 10485760           # bytes; largest request message accepted from clients
+  maxSendMsgSize: 2147483647         # bytes; largest response message relayed to clients
   rules: [ ... ]                     # gRPC rules
 
 evm:                                 # only when enableEvm: true
@@ -589,7 +591,7 @@ Both `coalesce` and `staleWhileRevalidate` are per-rule overrides of the global 
 - **`keyMetadata` (response-affecting request metadata)** — applies to HTTP-family and gRPC rules. HTTP-family rules default to `x-cosmos-block-height` and `grpc-metadata-x-cosmos-block-height`; gRPC defaults to `x-cosmos-block-height`. A non-empty list replaces the protocol default, so include the defaults explicitly when adding custom dimensions. `keyMetadata: []` opts out. HTTP names are case-insensitive, and all values participate in their received order with value boundaries preserved. `Host` uses the request authority. `X-Forwarded-Host` also uses a non-empty request authority, but retains the inbound header when the authority is empty; `X-Forwarded-Proto` uses `http` or `https` according to the inbound transport. These derived values match what CosmoGuard sends upstream and ignore overwritten request headers. The two HTTP height aliases remain independent dimensions because gateways can interpret them differently. JSON-RPC message caches and WebSocket caches do not use this setting.
 
 Scope and caveats:
-- Coalescing applies to HTTP-family rules (LCD, RPC-HTTP, EVM-RPC-HTTP), gRPC rules, and JSON-RPC **single** requests over HTTP or WebSocket. gRPC responses also carry `x-cosmoguard-cache` response metadata (`hit`/`miss`/`stale`).
+- Coalescing applies to HTTP-family rules (LCD, RPC-HTTP, EVM-RPC-HTTP), gRPC rules, and JSON-RPC **single** requests over HTTP or WebSocket. gRPC responses also carry `x-cosmoguard-cache` response metadata (`hit`/`miss`/`stale`) alongside the upstream's own response metadata and trailers (such as `x-cosmos-block-height`), which are cached with the payload.
 - Serve-stale SWR applies to HTTP-family rules, gRPC, and JSON-RPC single requests over HTTP. WebSocket single requests coalesce stale revalidation but wait for the refreshed response instead of serving stale data.
 - HTTP responses carrying `Cache-Control: must-revalidate` or `proxy-revalidate` are never served stale, even when SWR is enabled.
 - **JSON-RPC batch** items are freshness-aware (a stale entry is revalidated as part of the aggregated batch call) but are not individually coalesced or served stale — a batch already collapses its misses into a single upstream call, so there is nothing to coalesce.
@@ -704,6 +706,8 @@ startup or reload.
 | `cache.ttl` | `5s` | Per-rule TTL. |
 | `cache.keyMode` | `raw` | `raw` hashes payload bytes verbatim; `method-only` excludes payload (parameter-less queries only); `canonical` decodes payload against operator-supplied protoset descriptors and re-encodes deterministically before hashing — cache hits across clients with different serialization (field order, default-vs-absent). |
 | `cache.keyMetadata` | `x-cosmos-block-height` | Metadata keys folded into the cache key; see [Cache features](#cache-features). |
+
+`grpc.maxRecvMsgSize` and `grpc.maxSendMsgSize` default to the Cosmos SDK node's own gRPC limits (10 MiB in, 2 GiB − 1 out), so the proxy relays every message the node serves. Unset or `0` keeps the default, negative values are rejected, and changing them requires a process restart. The gRPC listener also caps each client connection at 1000 concurrent streams (further streams queue) and pings idle clients every 2 minutes.
 
 For `keyMode: canonical`, set `grpc.protosets:` at the top level. Each path is a binary `FileDescriptorSet` produced by `protoc --descriptor_set_out=foo.protoset -I path/to/protos path/to/protos/**/*.proto`. Methods absent from the loaded protosets silently degrade to `raw`.
 

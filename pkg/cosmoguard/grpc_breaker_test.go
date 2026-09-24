@@ -60,6 +60,7 @@ func TestRecordOutcomeErr_ClientErrorsDoNotTrip(t *testing.T) {
 	clientCaused := []codes.Code{
 		codes.Canceled, codes.DeadlineExceeded, codes.InvalidArgument,
 		codes.NotFound, codes.PermissionDenied, codes.Unauthenticated,
+		codes.ResourceExhausted,
 	}
 	for _, code := range clientCaused {
 		u := &GrpcUpstream{cbConfig: enabledBreaker(3, time.Minute)}
@@ -81,9 +82,9 @@ func TestRecordOutcomeErr_ClientErrorsDoNotTrip(t *testing.T) {
 	}
 }
 
-// TestRecordOutcomeErr_ApplicationRejectionCountsAsSuccess mirrors the HTTP
-// breaker's `<500` handling: an application-level gRPC status (the upstream
-// responded, it just rejected the request) must reset consecFails and close
+// TestRecordOutcomeErr_ApplicationRejectionCountsAsSuccess: an
+// application-level gRPC status (the upstream responded, it just rejected
+// the request) must reset consecFails and close
 // a half-open breaker, not merely leave it untouched.
 func TestRecordOutcomeErr_ApplicationRejectionCountsAsSuccess(t *testing.T) {
 	// Resets consecFails so it takes ConsecutiveFailures fresh failures to trip.
