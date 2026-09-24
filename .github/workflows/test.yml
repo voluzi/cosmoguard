@@ -92,10 +92,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Fuzzing runs on Go 1.27+ rather than go.mod's toolchain: before 1.27
+      # Fuzzing runs on a Go 1.27 toolchain rather than go.mod's: before 1.27
       # the fuzz coordinator can report a spurious "context deadline exceeded"
       # failure when -fuzztime expires (go.dev/issue/75804, fixed in 1.27.0
-      # and not backported). Return to go-version-file once go.mod is >= 1.27.
+      # and not backported). Reproduce any crasher found here on go.mod's
+      # toolchain before filing it. Return to go-version-file once go.mod is
+      # >= 1.27.
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
