@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,13 +19,26 @@ import (
 const migrationInterval = 2 * time.Second
 
 type Broker struct {
-	IdGen          *util.UniqueID
-	pool           *UpstreamPool
-	admission      *wsAdmissionController
-	log            *Entry
-	sm             *SubscriptionManager
-	upstreamSubMux sync.Mutex
-	stopMigrate    chan struct{}
+	IdGen     *util.UniqueID
+	pool      *UpstreamPool
+	admission *wsAdmissionController
+	log       *Entry
+	sm        *SubscriptionManager
+	// paramLocks serialises subscription changes per subscription param,
+	// including the upstream round trips, so a slow upstream only stalls
+	// callers of that param.
+	paramLocksMu sync.Mutex
+	paramLocks   map[string]*brokerParamLock
+	// membershipMu serialises client joins and leaves, which never wait on
+	// the network, so a disconnect releases admission without waiting for a
+	// param lock. It also guards requests, the subscribe request behind each
+	// membership, kept so a rule reload can re-evaluate it.
+	membershipMu sync.Mutex
+	requests     map[brokerMembership]*JsonRpcMsg
+	// pending holds a new membership's events until the proxy has written
+	// the subscribe acknowledgement, so no event reaches the client first.
+	pending     map[brokerMembership][]heldNotification
+	stopMigrate chan struct{}
 	// migrateDone is closed by migrateLoop when it exits, so Stop()
 	// can wait for it before tearing down the pool. Without the
 	// join, runMigration could be mid-pool.MigrateUnhealthy while
@@ -128,10 +142,7 @@ func (b *Broker) migrateLoop() {
 }
 
 func (b *Broker) runMigration() {
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
-
-	for _, m := range b.pool.MigrateUnhealthy() {
+	b.pool.migrateUnhealthy(b.lockParam, func(m SubscriptionMigration) {
 		if !b.sm.Migrate(m.OldID, m.NewID) {
 			b.log.WithFields(Fields{
 				"oldID": m.OldID,
@@ -139,6 +150,37 @@ func (b *Broker) runMigration() {
 				"param": m.Param,
 			}).Warn("migration: subscription manager unaware of oldID")
 		}
+	})
+}
+
+type brokerParamLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockParam locks param and returns its unlock function.
+func (b *Broker) lockParam(param string) func() {
+	b.paramLocksMu.Lock()
+	if b.paramLocks == nil {
+		b.paramLocks = make(map[string]*brokerParamLock)
+	}
+	l := b.paramLocks[param]
+	if l == nil {
+		l = &brokerParamLock{}
+		b.paramLocks[param] = l
+	}
+	l.refs++
+	b.paramLocksMu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		b.paramLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(b.paramLocks, param)
+		}
+		b.paramLocksMu.Unlock()
 	}
 }
 
@@ -179,55 +221,76 @@ func (b *Broker) HandleRequest(msg *JsonRpcMsg) (*JsonRpcMsg, error) {
 	return res.CloneWithID(msg.ID), nil
 }
 
+// HandleSubscription is handleSubscription for callers that do not write the
+// response to the client: held events are released before it returns. A
+// caller that writes an acknowledgement must use handleSubscription.
 func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, identity ...string) (*JsonRpcMsg, error) {
+	res, delivered, err := b.handleSubscription(client, msg, identity...)
+	delivered()
+	return res, err
+}
+
+// handleSubscription serves a subscription method. The caller must call
+// delivered once the response is written: a new subscription's events are
+// held until then.
+func (b *Broker) handleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, identity ...string) (*JsonRpcMsg, func(), error) {
+	delivered := func() {}
+	res, id, err := b.serveSubscription(client, msg, identity...)
+	if id != "" {
+		delivered = func() { b.releasePending(client, id) }
+	}
+	return res, delivered, err
+}
+
+func (b *Broker) serveSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, identity ...string) (*JsonRpcMsg, string, error) {
 	b.log.WithField("client", client).Debug("handling subscription")
 	client.SetOnDisconnectCallback(b.onClientDisconnect)
 	if client.IsClosed() {
-		return nil, ErrClosed
+		return nil, "", ErrClosed
 	}
 
 	switch msg.Method {
 	case methodSubscribeCosmos:
-		_, err := b.addSubscription(client, msg, identity...)
+		id, err := b.addSubscription(client, msg, identity...)
 		if err != nil {
 			if data := wsResourceExhaustedData(err); data != nil {
-				return ErrorResponse(msg, -32005, "WebSocket resource exhausted", data), nil
+				return ErrorResponse(msg, -32005, "WebSocket resource exhausted", data), "", nil
 			}
-			return ErrorResponse(msg, -100, err.Error(), nil), nil
+			return ErrorResponse(msg, -100, err.Error(), nil), "", nil
 		}
-		return EmptyResult(msg), nil
+		return EmptyResult(msg), id, nil
 
 	case methodUnsubscribeCosmos:
 		if err := b.removeSubscription(client, msg); err != nil {
-			return ErrorResponse(msg, -100, err.Error(), nil), nil
+			return ErrorResponse(msg, -100, err.Error(), nil), "", nil
 		}
-		return EmptyResult(msg), nil
+		return EmptyResult(msg), "", nil
 
 	case methodUnsubscribeAllCosmos:
 		if err := b.removeAllSubscriptions(client); err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return EmptyResult(msg), nil
+		return EmptyResult(msg), "", nil
 
 	case methodSubscribeEth:
 		id, err := b.addSubscription(client, msg, identity...)
 		if err != nil {
 			if data := wsResourceExhaustedData(err); data != nil {
-				return ErrorResponse(msg, -32005, "WebSocket resource exhausted", data), nil
+				return ErrorResponse(msg, -32005, "WebSocket resource exhausted", data), "", nil
 			}
-			return ErrorResponse(msg, -100, err.Error(), nil), nil
+			return ErrorResponse(msg, -100, err.Error(), nil), "", nil
 		}
-		return WithResult(msg, id), nil
+		return WithResult(msg, id), id, nil
 
 	case methodUnsubscribeEth:
 		if err := b.removeSubscription(client, msg); err != nil {
-			return ErrorResponse(msg, -100, err.Error(), nil), nil
+			return ErrorResponse(msg, -100, err.Error(), nil), "", nil
 		}
-		return WithResult(msg, true), nil
+		return WithResult(msg, true), "", nil
 
 	default:
 		// This should never happen
-		return nil, fmt.Errorf("unsupported method on subscriptions")
+		return nil, "", fmt.Errorf("unsupported method on subscriptions")
 	}
 }
 
@@ -237,16 +300,15 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 		return "", err
 	}
 
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
+	defer b.lockParam(param)()
 	if client.IsClosed() {
 		return "", ErrClosed
 	}
 
 	id, exists := b.sm.GetSubscriptionID(param)
 	if exists && b.sm.ClientSubscribed(id, client) {
-		if msg.Method == methodSubscribeCosmos && msg.ID != nil {
-			b.sm.SubscribeClient(id, client, msg.ID)
+		if msg.Method == methodSubscribeCosmos && msg.ID != nil && !b.joinClient(client, id, msg.ID, nil, false) {
+			return "", ErrClosed
 		}
 		return id, nil
 	}
@@ -263,15 +325,34 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 			b.admission.releaseSubscription(client)
 		}
 	}()
+	// Eth does not send the ID on subscription notifications. Lets do the same
+	var clientSubID interface{}
+	if msg.Method != methodSubscribeEth {
+		clientSubID = msg.ID
+	}
+	joined := false
 	if !exists {
 		b.log.WithField("client", client).Debug("upstream subscription does not exist")
 
-		// Subscribe in upstream
-		id, err = b.pool.Subscribe(param)
+		// Register before the subscribe goes out: the upstream may push an
+		// event right behind its acknowledgement.
+		created := ""
+		id, err = b.pool.subscribe(param, func(handle string) {
+			created = handle
+			b.sm.AddSubscription(param, handle)
+			joined = b.joinClient(client, handle, clientSubID, msg, true)
+		})
+		if created != "" && (err != nil || id != created) {
+			b.leaveClient(client, created, false)
+			b.sm.RemoveSubscription(created)
+			joined = false
+		}
 		if err != nil {
 			return "", err
 		}
-		b.sm.AddSubscription(param, id)
+		if id != created {
+			b.sm.AddSubscription(param, id)
+		}
 
 		b.log.WithFields(map[string]interface{}{
 			"id":    id,
@@ -279,16 +360,14 @@ func (b *Broker) addSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, ident
 		}).Info("subscribed upstream")
 	}
 
-	if msg.Method == methodSubscribeEth {
-		// Eth does not send the ID on subscription notifications. Lets do the same
-		b.sm.SubscribeClient(id, client, nil)
-	} else {
-		b.sm.SubscribeClient(id, client, msg.ID)
-	}
-	if client.IsClosed() {
-		emptySubscriptions := b.detachClientSubscriptionsLocked(client)
+	if !joined && !b.joinClient(client, id, clientSubID, msg, true) {
+		// Release admission before the upstream cleanup can wait on I/O.
 		admitted = false
-		return "", errors.Join(ErrClosed, b.removeEmptySubscriptionsLocked(emptySubscriptions))
+		b.admission.releaseSubscription(client)
+		if b.sm.SubscriptionEmpty(id) {
+			return "", errors.Join(ErrClosed, b.removeEmptySubscriptionLocked(id))
+		}
+		return "", ErrClosed
 	}
 	admitted = false
 
@@ -307,8 +386,13 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		return err
 	}
 
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
+	param := subParam
+	if isEthSubscriptionID(subParam) {
+		if param, _ = b.sm.GetSubscriptionParam(subParam); param == "" {
+			return fmt.Errorf("subscription does not exist")
+		}
+	}
+	defer b.lockParam(param)()
 
 	var subID string
 	if isEthSubscriptionID(subParam) {
@@ -321,12 +405,10 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		subID = id
 	}
 
-	if !b.sm.ClientSubscribed(subID, client) {
+	clientSubID, _, ok := b.leaveClient(client, subID, true)
+	if !ok {
 		return fmt.Errorf("subscription does not exist")
 	}
-
-	clientSubID := b.sm.GetSubscriptionClients(subID)[client]
-	b.sm.UnsubscribeClient(subID, client)
 	b.log.WithFields(map[string]interface{}{
 		"id":     subID,
 		"client": client,
@@ -337,16 +419,17 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 		// from the canonical subID after a migration.
 		upstreamID, _ := b.sm.UpstreamID(subID)
 		if err = b.pool.Unsubscribe(upstreamID); err != nil {
-			if !isUncertainWSUpstreamOutcome(err) && !client.IsClosed() {
-				b.sm.SubscribeClient(subID, client, clientSubID)
+			if !isUncertainWSUpstreamOutcome(err) && b.joinClient(client, subID, clientSubID, nil, false) {
 				return err
 			}
+			b.forgetRequest(client, subID)
 			b.admission.releaseSubscription(client)
 			b.abandonEmptySubscription(subID, upstreamID, err)
 			return err
 		}
 		param, _ := b.sm.GetSubscriptionParam(subID)
 		b.sm.RemoveSubscription(subID)
+		b.forgetRequest(client, subID)
 		b.admission.releaseSubscription(client)
 
 		b.log.WithFields(map[string]interface{}{
@@ -354,6 +437,7 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 			"param": param,
 		}).Warn("unsubscribed upstream")
 	} else {
+		b.forgetRequest(client, subID)
 		b.admission.releaseSubscription(client)
 	}
 
@@ -363,46 +447,243 @@ func (b *Broker) removeSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg) er
 func (b *Broker) removeAllSubscriptions(client *JsonRpcWsClient) error {
 	b.log.WithField("client", client).Debug("unsubscribing client from all subscriptions")
 
-	b.upstreamSubMux.Lock()
-	defer b.upstreamSubMux.Unlock()
-
-	emptySubscriptions := b.detachClientSubscriptionsLocked(client)
-	return b.removeEmptySubscriptionsLocked(emptySubscriptions)
-}
-
-func (b *Broker) detachClientSubscriptionsLocked(client *JsonRpcWsClient) []string {
+	// Admission belongs to downstream membership, so all memberships are
+	// released before any upstream cleanup can wait on network I/O.
+	// Listing under membershipMu means a concurrent joinClient either lands
+	// in the list or sees the client closed.
+	b.membershipMu.Lock()
+	subscriptionIDs := b.sm.GetSubscriptions(client)
+	b.membershipMu.Unlock()
 	var emptySubscriptions []string
-	for _, subscriptionID := range b.sm.GetSubscriptions(client) {
-		b.log.WithField("ID", subscriptionID).Debug("unsubscribing client")
-		b.sm.UnsubscribeClient(subscriptionID, client)
-		b.admission.releaseSubscription(client)
-		if b.sm.SubscriptionEmpty(subscriptionID) {
+	for _, subscriptionID := range subscriptionIDs {
+		if b.detachClient(client, subscriptionID) {
 			emptySubscriptions = append(emptySubscriptions, subscriptionID)
 		}
 	}
-	return emptySubscriptions
-}
 
-func (b *Broker) removeEmptySubscriptionsLocked(emptySubscriptions []string) error {
-	// Admission belongs to downstream membership, so all memberships must be
-	// released before any upstream cleanup can wait on network I/O.
 	var errs []error
 	for _, subscriptionID := range emptySubscriptions {
-		b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
-		upstreamID, _ := b.sm.UpstreamID(subscriptionID)
-		if err := b.pool.Unsubscribe(upstreamID); err != nil {
-			b.abandonEmptySubscription(subscriptionID, upstreamID, err)
-			errs = append(errs, fmt.Errorf("subscription %s: %w", subscriptionID, err))
+		param, ok := b.sm.GetSubscriptionParam(subscriptionID)
+		if !ok {
 			continue
 		}
-		param, _ := b.sm.GetSubscriptionParam(subscriptionID)
-		b.sm.RemoveSubscription(subscriptionID)
-		b.log.WithFields(map[string]interface{}{
-			"ID":    subscriptionID,
-			"param": param,
-		}).Warn("unsubscribed upstream")
+		unlock := b.lockParam(param)
+		// Another client may have joined since the detach.
+		if id, _ := b.sm.GetSubscriptionID(param); id == subscriptionID && b.sm.SubscriptionEmpty(subscriptionID) {
+			if err := b.removeEmptySubscriptionLocked(subscriptionID); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		unlock()
 	}
 	return errors.Join(errs...)
+}
+
+type brokerMembership struct {
+	client *JsonRpcWsClient
+	id     string
+}
+
+type heldNotification struct {
+	msg  *JsonRpcMsg
+	cost uint64
+}
+
+// joinClient adds client to subscription id unless the client has closed;
+// once it has, its disconnect cleanup may already have run. The caller holds
+// the param lock. A nil request keeps the one already recorded. With
+// awaitAck the membership's events are held until releasePending.
+func (b *Broker) joinClient(client *JsonRpcWsClient, id string, clientSubID interface{}, request *JsonRpcMsg, awaitAck bool) bool {
+	b.membershipMu.Lock()
+	defer b.membershipMu.Unlock()
+	if client.IsClosed() {
+		return false
+	}
+	b.sm.SubscribeClient(id, client, clientSubID)
+	key := brokerMembership{client: client, id: id}
+	if request != nil {
+		if b.requests == nil {
+			b.requests = make(map[brokerMembership]*JsonRpcMsg)
+		}
+		b.requests[key] = request
+	}
+	if awaitAck {
+		if b.pending == nil {
+			b.pending = make(map[brokerMembership][]heldNotification)
+		}
+		b.pending[key] = nil
+	}
+	return true
+}
+
+// leaveClient removes client from subscription id and returns what joinClient
+// needs to restore it. Admission is left to the caller. keepRequest leaves
+// the subscribe request recorded while the caller's outcome is open, so a
+// concurrent reload still sees it; forgetRequest drops it.
+func (b *Broker) leaveClient(client *JsonRpcWsClient, id string, keepRequest bool) (interface{}, *JsonRpcMsg, bool) {
+	b.membershipMu.Lock()
+	defer b.membershipMu.Unlock()
+	return b.leaveClientLocked(client, id, keepRequest)
+}
+
+func (b *Broker) leaveClientLocked(client *JsonRpcWsClient, id string, keepRequest bool) (interface{}, *JsonRpcMsg, bool) {
+	clientSubID, ok := b.sm.GetSubscriptionClients(id)[client]
+	if !ok {
+		return nil, nil, false
+	}
+	key := brokerMembership{client: client, id: id}
+	request := b.requests[key]
+	if !keepRequest {
+		delete(b.requests, key)
+	}
+	delete(b.pending, key)
+	b.sm.UnsubscribeClient(id, client)
+	return clientSubID, request, true
+}
+
+func (b *Broker) forgetRequest(client *JsonRpcWsClient, id string) {
+	b.membershipMu.Lock()
+	defer b.membershipMu.Unlock()
+	delete(b.requests, brokerMembership{client: client, id: id})
+}
+
+// releasePending delivers the events held for a new membership.
+func (b *Broker) releasePending(client *JsonRpcWsClient, id string) {
+	b.membershipMu.Lock()
+	defer b.membershipMu.Unlock()
+	key := brokerMembership{client: client, id: id}
+	held, ok := b.pending[key]
+	if !ok {
+		return
+	}
+	delete(b.pending, key)
+	for _, notification := range held {
+		if err := client.enqueueNotification(notification.msg, notification.cost); err != nil {
+			if !errors.Is(err, ErrClosed) {
+				b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
+			}
+			return
+		}
+	}
+}
+
+// detachClient removes client from subscription id, releases its admission
+// and reports whether the subscription is left without clients.
+func (b *Broker) detachClient(client *JsonRpcWsClient, id string) bool {
+	if _, _, ok := b.leaveClient(client, id, false); !ok {
+		return false
+	}
+	b.log.WithField("ID", id).Debug("unsubscribing client")
+	b.admission.releaseSubscription(client)
+	return b.sm.SubscriptionEmpty(id)
+}
+
+// revocationCheck returns nil while a live subscription's request is still
+// allowed, otherwise a function that records its revocation.
+type revocationCheck func(*JsonRpcWsClient, *JsonRpcMsg) (revoked func())
+
+// revokeDenied ends every client membership that check rejects and tells
+// the client.
+func (b *Broker) revokeDenied(check revocationCheck) {
+	b.membershipMu.Lock()
+	requests := maps.Clone(b.requests)
+	b.membershipMu.Unlock()
+	for membership, request := range requests {
+		if check(membership.client, request) != nil {
+			if revoked := b.revoke(membership.client, membership.id, check); revoked != nil {
+				revoked()
+			}
+		}
+	}
+}
+
+func (b *Broker) revoke(client *JsonRpcWsClient, id string, check revocationCheck) func() {
+	// A closing client's own cleanup removes its memberships.
+	if client.IsClosed() {
+		return nil
+	}
+	param, ok := b.sm.GetSubscriptionParam(id)
+	if !ok {
+		return nil
+	}
+	unlock := b.lockParam(param)
+	key := brokerMembership{client: client, id: id}
+	// A later reload may have allowed it again while this one waited.
+	b.membershipMu.Lock()
+	request := b.requests[key]
+	b.membershipMu.Unlock()
+	if request == nil {
+		unlock()
+		return nil
+	}
+	revoked := check(client, request)
+	if revoked == nil {
+		unlock()
+		return nil
+	}
+
+	b.membershipMu.Lock()
+	_, awaitingAck := b.pending[key]
+	clientSubID, _, ok := b.leaveClientLocked(client, id, false)
+	// CometBFT's own cancellation notice, sent under the subscribe id.
+	notice := &JsonRpcMsg{
+		Version: jsonRpcVersion,
+		ID:      clientSubID,
+		Error: &JsonRpcError{
+			Code:    -32000,
+			Message: "Server error",
+			Data:    "subscription was canceled (reason: denied by policy)",
+		},
+	}
+	// A subscribe sent as a notification has no id to answer (§4.1).
+	notify := request.Method != methodSubscribeEth && clientSubID != nil
+	if ok && awaitingAck && notify {
+		// The acknowledgement is not written yet; send the notice after it.
+		b.pending[key] = []heldNotification{{msg: notice, cost: wsNotificationSharedCost(notice)}}
+	}
+	b.membershipMu.Unlock()
+	if !ok {
+		unlock()
+		return nil
+	}
+	b.admission.releaseSubscription(client)
+	if b.sm.SubscriptionEmpty(id) {
+		if err := b.removeEmptySubscriptionLocked(id); err != nil {
+			b.log.WithError(err).Warn("error removing revoked subscription upstream")
+		}
+	}
+	unlock()
+
+	b.log.WithFields(Fields{"ID": id, "client": client}).Warn("subscription revoked by rule reload")
+	if request.Method == methodSubscribeEth {
+		// eth_subscribe has no server-side cancellation message; closing
+		// the socket is what the client library notices.
+		_ = client.Close()
+		return revoked
+	}
+	if awaitingAck || !notify {
+		return revoked
+	}
+	if err := client.enqueueNotification(notice, wsNotificationSharedCost(notice)); err != nil && !errors.Is(err, ErrClosed) {
+		b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
+	}
+	return revoked
+}
+
+func (b *Broker) removeEmptySubscriptionLocked(subscriptionID string) error {
+	b.log.WithField("ID", subscriptionID).Debug("unsubscribing upstream")
+	upstreamID, _ := b.sm.UpstreamID(subscriptionID)
+	if err := b.pool.Unsubscribe(upstreamID); err != nil {
+		b.abandonEmptySubscription(subscriptionID, upstreamID, err)
+		return fmt.Errorf("subscription %s: %w", subscriptionID, err)
+	}
+	param, _ := b.sm.GetSubscriptionParam(subscriptionID)
+	b.sm.RemoveSubscription(subscriptionID)
+	b.log.WithFields(map[string]interface{}{
+		"ID":    subscriptionID,
+		"param": param,
+	}).Warn("unsubscribed upstream")
+	return nil
 }
 
 func (b *Broker) abandonEmptySubscription(id, upstreamID string, err error) {
@@ -447,22 +728,49 @@ func (b *Broker) onSubscriptionMessage(msg *JsonRpcMsg) {
 		}
 	}
 
+	// Held events are decided under membershipMu, so they cannot interleave
+	// with their release; the rest are enqueued after it. releasePending
+	// enqueues under the lock, so a later direct enqueue follows it.
+	type readyNotification struct {
+		client *JsonRpcWsClient
+		heldNotification
+	}
+	sharedCost := wsNotificationSharedCost(msg)
+	b.membershipMu.Lock()
 	clients := b.sm.GetSubscriptionClients(msgID)
+	ready := make([]readyNotification, 0, len(clients))
+	for client, id := range clients {
+		notification := heldNotification{msg: msg.CloneWithID(id), cost: wsNotificationCostWithID(sharedCost, id)}
+		key := brokerMembership{client: client, id: msgID}
+		held, ok := b.pending[key]
+		if !ok {
+			ready = append(ready, readyNotification{client: client, heldNotification: notification})
+			continue
+		}
+		// The client's own queue limits, applied while its events wait.
+		heldBytes := notification.cost
+		for _, h := range held {
+			heldBytes = addWSNotificationCost(heldBytes, h.cost)
+		}
+		if len(held) >= wsNotificationQueueMessages || (len(held) > 0 && heldBytes > wsNotificationQueueBytes) {
+			client.closeForNotificationFailure()
+			continue
+		}
+		b.pending[key] = append(held, notification)
+	}
+	b.membershipMu.Unlock()
+
 	if len(clients) == 0 {
 		b.log.WithField("ID", msg.ID).Warn("no subscribers for message")
 		return
 	}
-
 	b.log.WithFields(map[string]interface{}{
 		"ID":      msgID,
 		"clients": len(clients),
 	}).Info("broadcasting message to subscribers")
-
-	sharedCost := wsNotificationSharedCost(msg)
-	for client, id := range clients {
-		cost := wsNotificationCostWithID(sharedCost, id)
-		if err := client.enqueueNotification(msg.CloneWithID(id), cost); err != nil && !errors.Is(err, ErrClosed) {
-			b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
+	for _, r := range ready {
+		if err := r.client.enqueueNotification(r.msg, r.cost); err != nil && !errors.Is(err, ErrClosed) {
+			b.log.WithError(err).WithField("client", r.client).Warn("dropping slow websocket subscriber")
 		}
 	}
 }

@@ -59,9 +59,9 @@ type JsonRpcWebSocketProxy struct {
 	// path is the WS handshake path ("/websocket", "/"). Stored so the
 	// request-log entries carry the same path the client connected on.
 	path string
-	// auth is the shared Authenticator. Currently retained for symmetry
-	// with the HTTP / gRPC sides — per-rule WS auth enforcement (using
-	// JsonRpcRule.Auth) is queued for a follow-up.
+	// auth is the shared Authenticator. handleRequest applies per-rule
+	// auth (JsonRpcRule.Auth) to each frame, and a rule reload re-applies
+	// it to live subscriptions.
 	auth *Authenticator
 	// cgRequestLog captures per-frame + connect/close metadata for the
 	// dashboard's Live-traffic feed. nil-safe.
@@ -98,6 +98,9 @@ type wsConnInfo struct {
 	sourceIP    string
 	identity    string
 	connectedAt time.Time
+	// resolved is the identity per-rule auth is checked against when a
+	// reload re-applies the rules to live subscriptions.
+	resolved *Identity
 }
 
 // SetRequestLog wires the Live-traffic request log. Nil-safe.
@@ -193,6 +196,81 @@ func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction Rul
 	p.rules = rules
 	p.defaultAction = defaultAction
 	p.limiters = limiters
+	// Upstream unsubscribes are network I/O; keep them off the reload path.
+	if p.broker != nil {
+		go p.revokeDenied()
+	}
+}
+
+func (p *JsonRpcWebSocketProxy) revokeDenied() {
+	p.broker.revokeDenied(p.revocationCheck)
+}
+
+// recheckSubscription covers a reload that landed while request was being
+// subscribed: its revocation scan ran before the membership existed.
+func (p *JsonRpcWebSocketProxy) recheckSubscription(client *JsonRpcWsClient, request *JsonRpcMsg) {
+	if (request.Method == methodSubscribeCosmos || request.Method == methodSubscribeEth) && p.revocationCheck(client, request) != nil {
+		go p.revokeDenied()
+	}
+}
+
+// subscriptionDenial applies the current rules and per-rule auth to a live
+// subscription's subscribe request the way handleRequest does, returning
+// the deny reason and the deciding rule, or "" when it is still allowed.
+// Rate limits are not re-applied: they meter requests, and a live
+// subscription makes none.
+func (p *JsonRpcWebSocketProxy) subscriptionDenial(client *JsonRpcWsClient, request *JsonRpcMsg) (string, *JsonRpcRule) {
+	p.rulesMutex.RLock()
+	rules, defaultAction := p.rules, p.defaultAction
+	p.rulesMutex.RUnlock()
+	p.connsMu.Lock()
+	var identity *Identity
+	if info := p.conns[client]; info != nil {
+		identity = info.resolved
+	}
+	p.connsMu.Unlock()
+	for _, rule := range rules {
+		if !rule.Match(request) {
+			continue
+		}
+		if p.auth != nil {
+			if ok, _ := p.auth.Authorize(rule.Auth, identity); !ok {
+				return "auth", rule
+			}
+		}
+		if rule.Action != RuleActionAllow {
+			return "rule", rule
+		}
+		return "", rule
+	}
+	if defaultAction != RuleActionAllow {
+		return "default", nil
+	}
+	if p.auth != nil {
+		if ok, _ := p.auth.Authorize(nil, identity); !ok {
+			return "auth", nil
+		}
+	}
+	return "", nil
+}
+
+// revocationCheck is the broker's revocationCheck: a denied subscription
+// is recorded in the dashboard's denials once revoked.
+func (p *JsonRpcWebSocketProxy) revocationCheck(client *JsonRpcWsClient, request *JsonRpcMsg) func() {
+	reason, rule := p.subscriptionDenial(client, request)
+	if reason == "" {
+		return nil
+	}
+	record := DenyRecord{Section: p.section, Reason: reason, Method: request.Method}
+	if rule != nil {
+		record.RuleTag = ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
+	}
+	p.connsMu.Lock()
+	if info := p.conns[client]; info != nil {
+		record.SourceIP = info.sourceIP
+	}
+	p.connsMu.Unlock()
+	return func() { p.cgDashboard.RecordDeny(record) }
 }
 
 // policyVerdict runs the matched rule's per-rule auth + rate-limit
@@ -289,7 +367,7 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 		idObj = id
 	}
 	connectedAt := time.Now()
-	p.registerConn(client, source, identity, connectedAt)
+	p.registerConn(client, source, idObj, connectedAt)
 	p.recordLifecycle("CONNECT", source, identity, http.StatusSwitchingProtocols, 0)
 	defer func() {
 		p.deregisterConn(client)
@@ -346,15 +424,23 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 
 		if err := p.handleRequest(client, req, source, idObj); err != nil {
 			p.log.Errorf("error handling request: %v", err)
-			continue
+			var writeErr *wsWriteError
+			if errors.As(err, &writeErr) || errors.Is(err, ErrClosed) {
+				client.Close()
+				break
+			}
 		}
 	}
 }
 
 // registerConn adds a freshly-upgraded client to the live registry.
-func (p *JsonRpcWebSocketProxy) registerConn(c *JsonRpcWsClient, sourceIP, identity string, at time.Time) {
+func (p *JsonRpcWebSocketProxy) registerConn(c *JsonRpcWsClient, sourceIP string, identity *Identity, at time.Time) {
+	info := &wsConnInfo{sourceIP: sourceIP, connectedAt: at, resolved: identity}
+	if identity != nil {
+		info.identity = identity.Name
+	}
 	p.connsMu.Lock()
-	p.conns[c] = &wsConnInfo{sourceIP: sourceIP, identity: identity, connectedAt: at}
+	p.conns[c] = info
 	p.connsMu.Unlock()
 }
 
@@ -570,21 +656,19 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				var err error
 				storeResponse := cacheable
 				if hasSubscriptionMethod(request) {
-					res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
-					if err != nil {
-						return err
-					}
+					var delivered func()
+					res, delivered, err = p.broker.handleSubscription(client, request, websocketAdmissionIdentity(identity))
+					// Deferred calls run after the acknowledgement is written.
+					defer delivered()
+					defer p.recheckSubscription(client, request)
 				} else if cacheable && resolveCoalesce(rule.Cache, cfgCoalesce(p.cacheConfig)) {
 					res, err = p.coalescedWSRequest(context.Background(), hash, request, rule.Cache, ruleID)
-					if err != nil {
-						return err
-					}
 					storeResponse = false
 				} else {
 					res, err = p.broker.HandleRequest(request)
-					if err != nil {
-						return err
-					}
+				}
+				if err != nil {
+					return p.replyForwardError(client, request, err)
 				}
 
 				// Notifications (no id) get no response frame, even though
@@ -685,15 +769,16 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 		var res *JsonRpcMsg
 		var err error
 		if hasSubscriptionMethod(request) {
-			res, err = p.broker.HandleSubscription(client, request, websocketAdmissionIdentity(identity))
-			if err != nil {
-				return err
-			}
+			var delivered func()
+			res, delivered, err = p.broker.handleSubscription(client, request, websocketAdmissionIdentity(identity))
+			// Deferred calls run after the acknowledgement is written.
+			defer delivered()
+			defer p.recheckSubscription(client, request)
 		} else {
 			res, err = p.broker.HandleRequest(request)
-			if err != nil {
-				return err
-			}
+		}
+		if err != nil {
+			return p.replyForwardError(client, request, err)
 		}
 
 		// Notification (no id) → no response frame even on default-allow
@@ -722,6 +807,17 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 	p.recordOutcome(request, source, cacheMiss, string(defaultActionSnap), nil, startTime,
 		fmt.Sprintf("request %s", defaultActionSnap))
 	return nil
+}
+
+// replyForwardError answers a call the upstream could not serve, so the
+// client is not left waiting on an id that will never be answered. The
+// cause is only logged: it can name internal upstream addresses.
+func (p *JsonRpcWebSocketProxy) replyForwardError(client *JsonRpcWsClient, request *JsonRpcMsg, err error) error {
+	p.log.WithError(err).WithField("method", request.Method).Warn("websocket upstream forwarding failed")
+	if request.ID == nil {
+		return nil
+	}
+	return client.SendMsg(ErrorResponse(request, -32603, "upstream error", nil))
 }
 
 func websocketAdmissionIdentity(identity *Identity) string {

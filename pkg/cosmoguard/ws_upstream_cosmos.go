@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,6 +24,7 @@ type UpstreamConnManagerCosmos struct {
 	lifecycle      *wsSubscriptionLifecycle
 	requestIDs     wsInternalRequestIDs
 	requestTimeout time.Duration
+	pingPeriod     time.Duration
 
 	respMap map[wsResponseKey]chan *JsonRpcMsg
 	respMux sync.Mutex
@@ -210,6 +212,7 @@ func (u *UpstreamConnManagerCosmos) connect() error {
 		// in ws_upstream.go for the size rationale.
 		conn.SetReadLimit(upstreamWSReadLimit)
 		client := NewJsonRpcWsClient(conn)
+		startUpstreamKeepalive(conn, client, u.pingPeriod)
 		if u.beforeInstall != nil {
 			u.beforeInstall(client)
 		}
@@ -274,7 +277,13 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(client *JsonRpcWsClient, m
 	}
 
 	// Otherwise let's check if it's a cosmos subscription notification.
+	// A subscribe acknowledgement that outlived its request carries the
+	// same id but an empty result; it is not an event.
 	handle, ok := u.subscriptionLifecycle().route(client, msgID)
+	if ok && msg.Error == nil && isEmptyJSONObject(msg.Result) {
+		u.log.WithField("ID", msgID).Warn("dropped late subscribe acknowledgement from upstream")
+		return
+	}
 	if ok {
 		u.log.WithFields(map[string]interface{}{
 			"ID": handle,
@@ -368,9 +377,13 @@ func (u *UpstreamConnManagerCosmos) HasSubscription(param string) bool {
 }
 
 func (u *UpstreamConnManagerCosmos) Subscribe(param string) (string, error) {
+	return u.subscribeCreated(param, nil)
+}
+
+func (u *UpstreamConnManagerCosmos) subscribeCreated(param string, created func(string)) (string, error) {
 	u.initState()
 	id := u.IdGen.ID()
-	return u.subscriptionLifecycle().subscribe(param, id, u.curClient(), u)
+	return u.subscriptionLifecycle().subscribe(param, id, u.curClient(), u, created)
 }
 
 func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) error {
@@ -381,7 +394,7 @@ func (u *UpstreamConnManagerCosmos) subscribeWithIDOnClient(cli *JsonRpcWsClient
 		}
 		return u.subscriptionLifecycle().resubmitRecord(cli, record, u)
 	}
-	_, err := u.subscriptionLifecycle().subscribe(param, id, cli, u)
+	_, err := u.subscriptionLifecycle().subscribe(param, id, cli, u, nil)
 	return err
 }
 
@@ -451,8 +464,13 @@ func (u *UpstreamConnManagerCosmos) unsubscribeOn(binding wsSubscriptionBinding,
 	return validateCosmosUnsubscribeResponse(response)
 }
 
-func (u *UpstreamConnManagerCosmos) stableHandle(provisional, _ string) string {
+func (u *UpstreamConnManagerCosmos) stableHandle(provisional string) string {
 	return provisional
+}
+
+// knownWireID: Cosmos notifications carry the subscribe request's id.
+func (u *UpstreamConnManagerCosmos) knownWireID(id string) (string, bool) {
+	return id, true
 }
 
 func (u *UpstreamConnManagerCosmos) releaseHandle(handle string) {
@@ -490,4 +508,10 @@ func (u *UpstreamConnManagerCosmos) Stop() {
 
 func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
 	return u.subscriptionLifecycle().resubmit(cli, u)
+}
+
+func isEmptyJSONObject(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' &&
+		len(bytes.TrimSpace(trimmed[1:len(trimmed)-1])) == 0
 }

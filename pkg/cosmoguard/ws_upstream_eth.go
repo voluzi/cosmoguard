@@ -24,9 +24,13 @@ type UpstreamConnManagerEth struct {
 	lifecycle      *wsSubscriptionLifecycle
 	requestIDs     wsInternalRequestIDs
 	requestTimeout time.Duration
+	pingPeriod     time.Duration
 
 	respMap map[wsResponseKey]chan *JsonRpcMsg
-	respMux sync.Mutex
+	// respHooks run on the reader goroutine before a response is handed to
+	// its waiter, so they finish before the next upstream frame is read.
+	respHooks map[wsResponseKey]func(*JsonRpcMsg)
+	respMux   sync.Mutex
 
 	onSubscriptionMessage func(msg *JsonRpcMsg)
 
@@ -165,6 +169,7 @@ func (u *UpstreamConnManagerEth) connect() error {
 		// in ws_upstream.go for the size rationale.
 		conn.SetReadLimit(upstreamWSReadLimit)
 		client := NewJsonRpcWsClient(conn)
+		startUpstreamKeepalive(conn, client, u.pingPeriod)
 		if u.beforeInstall != nil {
 			u.beforeInstall(client)
 		}
@@ -243,12 +248,17 @@ func (u *UpstreamConnManagerEth) onUpstreamMessage(client *JsonRpcWsClient, msg 
 		u.respMux.Lock()
 		key := wsResponseKey{client: client, id: msgID}
 		wc, ok := u.respMap[key]
+		hook := u.respHooks[key]
 		if ok {
 			delete(u.respMap, key)
+			delete(u.respHooks, key)
 		}
 		u.respMux.Unlock()
 		if ok {
 			u.log.WithField("ID", msgID).Debug("got response for request")
+			if hook != nil {
+				hook(msg)
+			}
 			wc <- msg
 			close(wc)
 			return
@@ -334,9 +344,13 @@ func (u *UpstreamConnManagerEth) HasSubscription(subID string) bool {
 }
 
 func (u *UpstreamConnManagerEth) Subscribe(query string) (string, error) {
+	return u.subscribeCreated(query, nil)
+}
+
+func (u *UpstreamConnManagerEth) subscribeCreated(param string, created func(string)) (string, error) {
 	u.initState()
 	id := u.IdGen.ID()
-	return u.subscriptionLifecycle().subscribe(query, id, u.curClient(), u)
+	return u.subscriptionLifecycle().subscribe(param, id, u.curClient(), u, created)
 }
 
 func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, id, param string, resubmit bool) (string, error) {
@@ -347,7 +361,7 @@ func (u *UpstreamConnManagerEth) subscribeWithIDOnClient(cli *JsonRpcWsClient, i
 		}
 		return record.handle, u.subscriptionLifecycle().resubmitRecord(cli, record, u)
 	}
-	return u.subscriptionLifecycle().subscribe(param, id, cli, u)
+	return u.subscriptionLifecycle().subscribe(param, id, cli, u, nil)
 }
 
 func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param string, _ bool) (string, error) {
@@ -356,10 +370,27 @@ func (u *UpstreamConnManagerEth) subscribeOn(cli *JsonRpcWsClient, id, param str
 		Version: jsonRpcVersion,
 		ID:      requestID,
 		Method:  methodSubscribeEth,
-		Params:  []interface{}{param},
+		Params:  ethSubscribeParams(param),
 	}
 
+	// An event can follow the acknowledgement immediately; bind its id
+	// before the reader moves on to it.
+	hookKey := wsResponseKey{client: cli, id: requestID}
+	u.respMux.Lock()
+	if u.respHooks == nil {
+		u.respHooks = make(map[wsResponseKey]func(*JsonRpcMsg))
+	}
+	u.respHooks[hookKey] = func(resp *JsonRpcMsg) {
+		var subID string
+		if resp.Error == nil && json.Unmarshal(resp.Result, &subID) == nil && subID != "" {
+			u.subscriptionLifecycle().bindEarly(cli, param, subID)
+		}
+	}
+	u.respMux.Unlock()
 	resp, err := u.makeRequestWithIDOnClient(cli, requestID, msg)
+	u.respMux.Lock()
+	delete(u.respHooks, hookKey)
+	u.respMux.Unlock()
 	if err != nil {
 		return "", err
 	}
@@ -414,7 +445,13 @@ func (u *UpstreamConnManagerEth) unsubscribeOn(binding wsSubscriptionBinding, _ 
 
 const evmLogicalHandleDomain = "cg:"
 
-func (u *UpstreamConnManagerEth) stableHandle(provisional, _ string) string {
+// knownWireID: the upstream picks eth subscription ids; subscribeOn binds
+// the id when the acknowledgement is read instead.
+func (u *UpstreamConnManagerEth) knownWireID(string) (string, bool) {
+	return "", false
+}
+
+func (u *UpstreamConnManagerEth) stableHandle(provisional string) string {
 	return "0x" + hex.EncodeToString([]byte(evmLogicalHandleDomain+provisional))
 }
 
