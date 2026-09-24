@@ -119,3 +119,31 @@ jobs:
             $TAGS \
             "${image}:${VERSION}-amd64" \
             "${image}:${VERSION}-arm64"
+  # Publish the chart only once the multi-arch image exists, so its default
+  # image (appVersion, stamped from the same tag) can always be pulled.
+  chart:
+    name: Publish Helm Chart
+    needs:
+      - version
+      - merge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package chart
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: make helm.package VERSION="$VERSION"
+
+      - name: Push chart
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | helm registry login -u "$GITHUB_REPOSITORY_OWNER" --password-stdin ghcr.io
+          helm push build/cosmoguard-*.tgz "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/helm"
+          helm registry logout ghcr.io

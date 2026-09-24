@@ -1,14 +1,9 @@
+# Retired chart/vX.Y.Z tags still exist on the remote; never read them as the
+# release version.
 VERSION ?= $(shell git describe --tags --exclude 'chart/*' --abbrev=0)
 COMMIT ?= $(shell git rev-parse HEAD)
 BUILD_TARGETS := build install
 
-# Most recent chart/vX.Y.Z tag — drives the helm chart version. Kept on its
-# own tag stream so chart and binary can release independently.
-HELM_CHART_LATEST_TAG ?= $(shell git describe --tags --match 'chart/*' --abbrev=0 2>/dev/null)
-HELM_CHART_VERSION = $(HELM_CHART_LATEST_TAG:chart/v%=%)
-# Newest stable (non-prerelease) vX.Y.Z tag — drives the chart appVersion,
-# so a chart tagged next to an rc never defaults to the rc image.
-HELM_APP_VERSION ?= $(shell git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$$' | head -n1)
 
 BUILDDIR ?= $(CURDIR)/build
 
@@ -47,17 +42,17 @@ fuzz:
 clean:
 	rm -rf $(BUILDDIR)/ coverage.out
 
-# helm.package builds an OCI-ready chart tarball under $(BUILDDIR). The
-# version comes from the most recent chart/vX.Y.Z tag; appVersion from the
-# newest stable cosmoguard release tag.
+# helm.package builds an OCI-ready chart tarball under $(BUILDDIR). The chart
+# version and appVersion are both the release version, so the chart defaults
+# to the image built from the same tag.
 $(BUILDDIR)/:
 	mkdir -p $(BUILDDIR)/
 
 helm.package: $(BUILDDIR)/
-	@test -n "$(HELM_APP_VERSION)" || { echo "no stable vX.Y.Z tag found for the chart appVersion" >&2; exit 1; }
+	@test -n "$(VERSION)" || { echo "no release tag found; pass VERSION=X.Y.Z" >&2; exit 1; }
 	helm package helm/cosmoguard \
-		--version $(HELM_CHART_VERSION:v%=%) \
-		--app-version $(HELM_APP_VERSION:v%=%) \
+		--version $(VERSION:v%=%) \
+		--app-version $(VERSION:v%=%) \
 		-d $(BUILDDIR)
 
 .PHONY: all $(BUILD_TARGETS) test test-race test-cover fuzz clean helm.package

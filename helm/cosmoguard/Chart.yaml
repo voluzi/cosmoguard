@@ -2,10 +2,11 @@ apiVersion: v2
 name: cosmoguard
 description: Cosmos node firewall + cache + auth gateway
 type: application
-# The chart publish workflow refuses a chart/vX.Y.Z tag unless `version`
-# equals that tag and `appVersion` equals the newest stable vX.Y.Z tag.
-version: 2.0.0
-appVersion: 4.0.3
+# Placeholders: a vX.Y.Z release tag stamps both version and appVersion with
+# X.Y.Z when it packages the chart (make helm.package). An install from this
+# directory defaults to the `latest` image unless image.tag is set.
+version: 0.0.0-dev
+appVersion: latest
 kubeVersion: ">=1.24.0"
 home: https://github.com/voluzi/cosmoguard
 sources:

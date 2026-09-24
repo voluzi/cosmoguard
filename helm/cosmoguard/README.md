@@ -221,9 +221,14 @@ metrics port (default 9001). `/readyz` returns 503 when zero upstreams
 are healthy across the LCD + RPC pools — k8s will then stop sending
 traffic to that pod.
 
-## Upgrading to 2.0.0
+## Upgrading from chart 1.x
 
-Chart 2.0.0 changes these defaults; the pods restart on upgrade.
+The chart is now versioned with cosmoguard itself: chart X.Y.Z deploys
+cosmoguard X.Y.Z by default. Release candidates publish X.Y.Z-rc.N charts,
+which Helm only selects with an explicit `--version` (or `--devel`).
+
+The first such release also changes these defaults; the pods restart on
+upgrade.
 
 - Metrics and dashboard ports move from `<fullname>` to the ClusterIP
   Service `<fullname>-internal`. The bundled ServiceMonitor, dashboard

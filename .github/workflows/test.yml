@@ -4,7 +4,7 @@ on:
   # Pushes to main plus every pull request (fork PRs included). A `branches`
   # filter (rather than `tags-ignore`) is required to exclude tags: specifying
   # only a tag filter would scope the push event to tags. Tags are handled by
-  # the release workflows (docker.yml, goreleaser.yml, publish-chart.yml),
+  # the release workflows (docker.yml, goreleaser.yml),
   # which call this workflow as a gate via workflow_call.
   push:
     branches:
@@ -25,6 +25,31 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  # The release workflows gate on this workflow, so a tag that is not strict
+  # SemVer (vX.Y.Z or vX.Y.Z-<prerelease>, as helm package requires) fails
+  # here before any image, binary or chart is published.
+  release-tag:
+    name: release tag is SemVer
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          re="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${id}(\\.${id})*)?$"
+          if ! [[ "$TAG" =~ $re ]]; then
+            echo "::error::tag ${TAG} is not vX.Y.Z or vX.Y.Z-<prerelease>"
+            exit 1
+          fi
+          # The version also becomes the app.kubernetes.io/version label.
+          version="${TAG#v}"
+          if (( ${#version} > 63 )) || ! [[ "$version" =~ [0-9A-Za-z]$ ]]; then
+            echo "::error::version ${version} is not a valid Kubernetes label value (max 63 chars, must end alphanumeric)"
+            exit 1
+          fi
+
   test:
     name: go test (race + cover)
     runs-on: ubuntu-latest
