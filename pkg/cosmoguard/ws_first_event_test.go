@@ -95,7 +95,7 @@ func TestBrokerHoldsJoinedClientEventsUntilAcknowledged(t *testing.T) {
 	require.NoError(t, err)
 	id, _ := broker.sm.GetSubscriptionID("q")
 
-	res, delivered, err := broker.handleSubscription(joiner, &JsonRpcMsg{Version: jsonRpcVersion, ID: 2, Method: methodSubscribeCosmos, Params: []any{"q"}})
+	_, _, err = broker.handleSubscription(joiner, &JsonRpcMsg{Version: jsonRpcVersion, ID: 2, Method: methodSubscribeCosmos, Params: []any{"q"}})
 	require.NoError(t, err)
 	broker.onSubscriptionMessage(&JsonRpcMsg{Version: jsonRpcVersion, ID: id, Result: []byte(`{"query":"q"}`)})
 	require.NoError(t, joinerPeer.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
@@ -103,7 +103,7 @@ func TestBrokerHoldsJoinedClientEventsUntilAcknowledged(t *testing.T) {
 	require.Error(t, err, "event reached the joining client before its acknowledgement")
 
 	joiner2, joiner2Peer := newWSCacheClient(t)
-	res, delivered, err = broker.handleSubscription(joiner2, &JsonRpcMsg{Version: jsonRpcVersion, ID: 3, Method: methodSubscribeCosmos, Params: []any{"q"}})
+	res, delivered, err := broker.handleSubscription(joiner2, &JsonRpcMsg{Version: jsonRpcVersion, ID: 3, Method: methodSubscribeCosmos, Params: []any{"q"}})
 	require.NoError(t, err)
 	broker.onSubscriptionMessage(&JsonRpcMsg{Version: jsonRpcVersion, ID: id, Result: []byte(`{"query":"q"}`)})
 	require.NoError(t, joiner2.SendMsg(res))

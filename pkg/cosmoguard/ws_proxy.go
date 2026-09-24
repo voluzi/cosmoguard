@@ -197,7 +197,9 @@ func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction Rul
 	p.defaultAction = defaultAction
 	p.limiters = limiters
 	// Upstream unsubscribes are network I/O; keep them off the reload path.
-	go p.revokeDenied()
+	if p.broker != nil {
+		go p.revokeDenied()
+	}
 }
 
 func (p *JsonRpcWebSocketProxy) revokeDenied() {
