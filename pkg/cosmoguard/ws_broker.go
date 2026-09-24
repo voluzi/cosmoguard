@@ -635,7 +635,9 @@ func (b *Broker) revoke(client *JsonRpcWsClient, id string, check revocationChec
 			Data:    "subscription was canceled (reason: denied by policy)",
 		},
 	}
-	if ok && awaitingAck && request.Method != methodSubscribeEth {
+	// A subscribe sent as a notification has no id to answer (§4.1).
+	notify := request.Method != methodSubscribeEth && clientSubID != nil
+	if ok && awaitingAck && notify {
 		// The acknowledgement is not written yet; send the notice after it.
 		b.pending[key] = []heldNotification{{msg: notice, cost: wsNotificationSharedCost(notice)}}
 	}
@@ -659,7 +661,7 @@ func (b *Broker) revoke(client *JsonRpcWsClient, id string, check revocationChec
 		_ = client.Close()
 		return revoked
 	}
-	if awaitingAck {
+	if awaitingAck || !notify {
 		return revoked
 	}
 	if err := client.enqueueNotification(notice, wsNotificationSharedCost(notice)); err != nil && !errors.Is(err, ErrClosed) {
