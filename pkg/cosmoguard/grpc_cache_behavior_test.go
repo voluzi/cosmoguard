@@ -655,6 +655,7 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		defer cancel()
 		ctx := lateTimerCtx{Context: base, deadline: time.Now().Add(-time.Millisecond)}
 		_, err := p.grpcFetchAndStore(ctx, grpcCacheTestMethod, []byte("req"), key, rule, true)
+		require.NoError(t, base.Err(), "the context timer fired, so this did not exercise the Err()==nil window")
 		require.Error(t, err)
 		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
 		require.True(t, up.cbOpen.Load(), "an expired proxy deadline must trip the breaker even before ctx.Err() is set")
