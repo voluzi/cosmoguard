@@ -114,8 +114,9 @@ func cacheableByVary(upstream http.Header, policy cacheKeyVaryPolicy) bool {
 type upstreamVaryCaptureContextKey struct{}
 
 type upstreamVaryCapture struct {
-	values   []string
-	observed bool
+	values      []string
+	allowOrigin []string
+	observed    bool
 }
 
 func withUpstreamVaryCapture(r *http.Request) (*http.Request, *upstreamVaryCapture) {
@@ -134,6 +135,7 @@ func recordUpstreamVary(resp *http.Response) {
 		return
 	}
 	capture.values = append(capture.values[:0], resp.Header.Values("Vary")...)
+	capture.allowOrigin = append(capture.allowOrigin[:0], resp.Header.Values("Access-Control-Allow-Origin")...)
 	capture.observed = true
 }
 
@@ -149,7 +151,51 @@ func cacheAdmissionHeaders(committed http.Header, capture *upstreamVaryCapture) 
 	for _, value := range capture.values {
 		headers.Add("Vary", value)
 	}
+	headers.Del("Access-Control-Allow-Origin")
+	for _, value := range capture.allowOrigin {
+		headers.Add("Access-Control-Allow-Origin", value)
+	}
 	return headers
+}
+
+// httpCacheableByVary is the HTTP cache admission rule for upstream Vary. Accept-Encoding is part of
+// the key. Origin is not: a CometBFT or Cosmos SDK node with CORS enabled sends `Vary: Origin` on
+// every response yet answers every origin identically, with `Access-Control-Allow-Origin: *` when
+// the request carries an Origin and no CORS headers when it does not. Such responses are shared by
+// all origins; the key only separates requests with and without an Origin (see originPresenceKey).
+// A response whose CORS answer depends on the origin stays uncached.
+func httpCacheableByVary(upstream http.Header, requestHasOrigin bool) bool {
+	for _, vary := range upstream.Values("Vary") {
+		for _, field := range strings.Split(vary, ",") {
+			switch f := strings.ToLower(strings.TrimSpace(field)); f {
+			case "", "accept-encoding":
+			case "origin":
+				if !sameResponseForEveryOrigin(upstream, requestHasOrigin) {
+					return false
+				}
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sameResponseForEveryOrigin(upstream http.Header, requestHasOrigin bool) bool {
+	allowOrigin := upstream.Values("Access-Control-Allow-Origin")
+	if !requestHasOrigin {
+		return len(allowOrigin) == 0
+	}
+	return len(allowOrigin) == 1 && strings.TrimSpace(allowOrigin[0]) == "*"
+}
+
+// originPresenceKey is the cache-key part for the Origin header: only whether the request carries
+// one, matching how CORS middleware (and CORSConfig.ApplyToResponse) treats an empty Origin.
+func originPresenceKey(header http.Header) string {
+	if header.Get("Origin") == "" {
+		return "no-origin"
+	}
+	return "origin"
 }
 
 // pickCacheableHeaders returns a flat map of header-name → value containing
@@ -184,6 +230,15 @@ func pickCacheableHeaders(upstream http.Header, extra []string) map[string]strin
 			continue
 		}
 		out[c] = strings.Join(vals, ", ")
+	}
+	// A wildcard Access-Control-Allow-Origin is the same answer for every origin (a node with CORS
+	// enabled; see httpCacheableByVary), so it is stored with the response it belongs to. An
+	// origin-specific value is never stored: replaying it would hand one origin's grant to another.
+	if allowOrigin := upstream.Values("Access-Control-Allow-Origin"); len(allowOrigin) == 1 && strings.TrimSpace(allowOrigin[0]) == "*" {
+		out["Access-Control-Allow-Origin"] = "*"
+		if expose := upstream.Values("Access-Control-Expose-Headers"); len(expose) > 0 {
+			out["Access-Control-Expose-Headers"] = strings.Join(expose, ", ")
+		}
 	}
 	return out
 }

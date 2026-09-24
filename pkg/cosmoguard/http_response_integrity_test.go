@@ -32,7 +32,7 @@ func TestHTTPResponseIntegrityAdmission(t *testing.T) {
 		{http.StatusInternalServerError, true, false},
 	} {
 		t.Run(http.StatusText(tc.status)+"/cacheError="+map[bool]string{false: "false", true: "true"}[tc.cacheError], func(t *testing.T) {
-			require.Equal(t, tc.want, p.shouldStore(tc.status, nil, &RuleCache{CacheError: tc.cacheError}))
+			require.Equal(t, tc.want, p.shouldStore(tc.status, nil, &RuleCache{CacheError: tc.cacheError}, false))
 		})
 	}
 }

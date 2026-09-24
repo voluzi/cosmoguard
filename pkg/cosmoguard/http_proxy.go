@@ -892,8 +892,8 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 	// We key on the FULL set of acceptable codings (not a gzip/br/identity
 	// bucket) so a client accepting e.g. `gzip, zstd` never shares an entry
 	// with a gzip-only client — the upstream might return zstd, which the
-	// gzip-only client couldn't accept. Responses that Vary on anything
-	// besides Accept-Encoding are refused caching (see cacheableByVary).
+	// gzip-only client couldn't accept. Whether the request carries an Origin
+	// is folded in too, but not its value: see httpCacheableByVary.
 	// Join ALL Accept-Encoding header lines — a client may legally send more
 	// than one, and the reverse proxy forwards them all upstream; Header.Get
 	// would see only the first and could mis-key.
@@ -902,6 +902,7 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 			req.Method + "\x00" + req.Host + "\x00" +
 			targetKind + "\x00" + canonical + "\x00" +
 			acceptEncodingKey(strings.Join(req.Header.Values("Accept-Encoding"), ",")) + "\x00" +
+			originPresenceKey(req.Header) + "\x00" +
 			httpCacheKeyMetaPart(req, keyMetadata) + "\x00" +
 			string(b),
 	), nil
@@ -1315,7 +1316,7 @@ func (p *HttpProxy) cacheMissStreaming(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	committed := ww.GetCommittedHeaders()
-	if status <= 0 || !p.shouldStore(status, cacheAdmissionHeaders(committed, varyCapture), cache) {
+	if status <= 0 || !p.shouldStore(status, cacheAdmissionHeaders(committed, varyCapture), cache, r.Header.Get("Origin") != "") {
 		return
 	}
 	cardinalityKey := r.Method + " " + p.redactedRequestURI(r)
@@ -1358,7 +1359,7 @@ func (p *HttpProxy) fetchAndStore(r *http.Request, requestHash string, cache *Ru
 		"cache-error":   cache.CacheError,
 	}).Debug("got response from upstream")
 
-	if !p.shouldStore(status, cacheAdmissionHeaders(committed, varyCapture), cache) {
+	if !p.shouldStore(status, cacheAdmissionHeaders(committed, varyCapture), cache, r.Header.Get("Origin") != "") {
 		return out, nil
 	}
 	out.Shareable = true
@@ -1452,7 +1453,7 @@ func (p *HttpProxy) persistCachedHTTPResponse(requestHash string, cached CachedR
 // shouldStore reports whether an upstream response is cacheable: never cache
 // incomplete representations or 5xx; cache non-200 statuses only when
 // cacheError is set; honor upstream Cache-Control and Vary restrictions.
-func (p *HttpProxy) shouldStore(status int, committed http.Header, cache *RuleCache) bool {
+func (p *HttpProxy) shouldStore(status int, committed http.Header, cache *RuleCache, requestHasOrigin bool) bool {
 	if !reusableCachedHTTPStatus(status) {
 		return false
 	}
@@ -1465,7 +1466,7 @@ func (p *HttpProxy) shouldStore(status int, committed http.Header, cache *RuleCa
 	if !cacheableByUpstream(committed) {
 		return false
 	}
-	return cacheableByVary(committed, httpCacheKeyVary)
+	return httpCacheableByVary(committed, requestHasOrigin)
 }
 
 func reusableCachedHTTPStatus(status int) bool {

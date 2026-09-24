@@ -434,3 +434,109 @@ func mustMarshalJSONRPC(t *testing.T, response *JsonRpcMsg) []byte {
 	require.NoError(t, err)
 	return body
 }
+
+// cometBFTWildcardCORS mimics a CometBFT or Cosmos SDK node with cors_allowed_origins = ["*"]: it
+// sends `Vary: Origin` on every response and `Access-Control-Allow-Origin: *` when the request
+// carries an Origin, while the body is the same for every client.
+func cometBFTWildcardCORS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "Origin")
+	if r.Header.Get("Origin") != "" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+	_, _ = w.Write([]byte("status"))
+}
+
+// Many clients from many origins must be served from the cache: curl-like clients share one entry
+// and all browsers share another, whatever their origin, with the node's CORS header replayed.
+func TestHTTPWildcardCORSUpstreamIsSharedAcrossOrigins(t *testing.T) {
+	for name, coalesce := range map[string]bool{"coalesced": true, "streaming": false} {
+		t.Run(name, func(t *testing.T) {
+			p, hits := newRealHookCacheProxy(t, nil, cometBFTWildcardCORS)
+			rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute, Coalesce: &coalesce})
+			waitStored := func(origin string) {
+				req := httptest.NewRequest(http.MethodGet, "/status", nil)
+				if origin != "" {
+					req.Header.Set("Origin", origin)
+				}
+				key, err := p.getRequestHash(req, rule.Fingerprint, rule.Cache.EffectiveHTTPKeyMetadata())
+				require.NoError(t, err)
+				require.Eventually(t, func() bool {
+					stored, err := p.cache.Has(t.Context(), key)
+					return err == nil && stored
+				}, time.Second, time.Millisecond)
+			}
+
+			first, _ := cacheRequest(p, rule, nil)
+			require.Empty(t, first.Header().Get("Access-Control-Allow-Origin"))
+			waitStored("")
+			for range 3 {
+				response, _ := cacheRequest(p, rule, nil)
+				require.Equal(t, "status", response.Body.String())
+				require.Empty(t, response.Header().Get("Access-Control-Allow-Origin"))
+			}
+			require.Equal(t, int32(1), hits.Load(), "clients without an Origin share one entry")
+
+			origins := []string{"https://a.example", "https://b.example", "https://c.example", "https://d.example"}
+			_, _ = cacheRequest(p, rule, http.Header{"Origin": {origins[0]}})
+			waitStored(origins[0])
+			for _, origin := range origins {
+				response, _ := cacheRequest(p, rule, http.Header{"Origin": {origin}})
+				require.Equal(t, "status", response.Body.String())
+				require.Equal(t, "*", response.Header().Get("Access-Control-Allow-Origin"), origin)
+			}
+			require.Equal(t, int32(2), hits.Load(), "every origin shares one entry")
+		})
+	}
+}
+
+// An upstream that answers each origin differently (echoing it back) is not shared across origins.
+func TestHTTPOriginSpecificCORSUpstreamIsNotShared(t *testing.T) {
+	p, hits := newRealHookCacheProxy(t, nil, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		_, _ = w.Write([]byte("status"))
+	})
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute})
+
+	a, _ := cacheRequest(p, rule, http.Header{"Origin": {"https://a.example"}})
+	b, _ := cacheRequest(p, rule, http.Header{"Origin": {"https://b.example"}})
+	require.Equal(t, "https://a.example", a.Header().Get("Access-Control-Allow-Origin"))
+	require.Equal(t, "https://b.example", b.Header().Get("Access-Control-Allow-Origin"))
+	require.Equal(t, int32(2), hits.Load())
+}
+
+// When cosmoguard owns CORS it replaces the node's headers on cache hits with its own policy.
+func TestHTTPWildcardCORSUpstreamBehindCosmoguardCORS(t *testing.T) {
+	p, hits := newRealHookCacheProxy(t, compiledTestCORS(t), cometBFTWildcardCORS)
+	rule := cacheRule(t, &RuleCache{Enable: true, TTL: time.Minute})
+
+	a, _ := cacheRequest(p, rule, http.Header{"Origin": {"https://a.example"}})
+	require.Eventually(t, func() bool {
+		b, _ := cacheRequest(p, rule, http.Header{"Origin": {"https://b.example"}})
+		return b.Header().Get(cacheStateHeader) == cacheHit && b.Header().Get("Access-Control-Allow-Origin") == "https://b.example"
+	}, time.Second, 5*time.Millisecond)
+	require.Equal(t, "https://a.example", a.Header().Get("Access-Control-Allow-Origin"))
+	require.Equal(t, int32(1), hits.Load())
+}
+
+func TestHTTPCacheableByVary(t *testing.T) {
+	wildcard := http.Header{"Vary": {"Origin"}, "Access-Control-Allow-Origin": {"*"}}
+	require.True(t, httpCacheableByVary(wildcard, true))
+	require.False(t, httpCacheableByVary(wildcard, false), "a wildcard answer to a request without an Origin is unexpected")
+	require.True(t, httpCacheableByVary(http.Header{"Vary": {"Origin"}}, false))
+	require.False(t, httpCacheableByVary(http.Header{"Vary": {"Origin"}}, true), "no CORS answer to an origin may be origin-specific")
+	require.False(t, httpCacheableByVary(http.Header{"Vary": {"Origin"}, "Access-Control-Allow-Origin": {"https://a.example"}}, true))
+	require.True(t, httpCacheableByVary(http.Header{"Vary": {"Accept-Encoding, Origin"}}, false))
+	require.False(t, httpCacheableByVary(http.Header{"Vary": {"Origin, X-Tenant"}}, false))
+	require.False(t, httpCacheableByVary(http.Header{"Vary": {"*"}}, false))
+}
+
+func TestPickCacheableHeadersStoresOnlyAWildcardACAO(t *testing.T) {
+	wildcard := pickCacheableHeaders(http.Header{"Access-Control-Allow-Origin": {"*"}, "Access-Control-Expose-Headers": {"X-Custom"}}, nil)
+	require.Equal(t, "*", wildcard["Access-Control-Allow-Origin"])
+	require.Equal(t, "X-Custom", wildcard["Access-Control-Expose-Headers"])
+
+	specific := pickCacheableHeaders(http.Header{"Access-Control-Allow-Origin": {"https://a.example"}, "Access-Control-Expose-Headers": {"X-Custom"}}, nil)
+	require.NotContains(t, specific, "Access-Control-Allow-Origin")
+	require.NotContains(t, specific, "Access-Control-Expose-Headers")
+}
