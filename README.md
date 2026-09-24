@@ -83,13 +83,14 @@ docker run -it --name cosmoguard \
 
 ### Helm (k8s)
 
-The repo ships a Helm chart at `helm/cosmoguard/`:
+Each release publishes the chart as `oci://ghcr.io/voluzi/helm/cosmoguard`,
+versioned with cosmoguard itself (chart X.Y.Z deploys image X.Y.Z):
 
 ```bash
 kubectl create secret generic cosmoguard-cluster-key \
   --from-literal=encryptionKey="$(head -c32 /dev/urandom | base64)"
 
-helm upgrade --install cosmoguard ./helm/cosmoguard \
+helm upgrade --install cosmoguard oci://ghcr.io/voluzi/helm/cosmoguard \
   --set config.nodes[0].host=cosmos-node.default.svc \
   --set cluster.existingEncryptionKeySecret=cosmoguard-cluster-key
 ```
@@ -97,6 +98,10 @@ helm upgrade --install cosmoguard ./helm/cosmoguard \
 Create the shared key Secret once; do not regenerate it on each deploy. The
 Secret and Helm release must use the same namespace (both commands above use
 `default`).
+
+Installing from a checkout (`./helm/cosmoguard`) deploys the floating
+`latest` image, because the chart's version fields are only stamped at
+release; pin `image.tag` for anything but local testing.
 
 See `helm/cosmoguard/README.md` for cluster-mode + HPA setup.
 

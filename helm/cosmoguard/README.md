@@ -224,7 +224,8 @@ traffic to that pod.
 ## Upgrading from chart 1.x
 
 The chart is now versioned with cosmoguard itself: chart X.Y.Z deploys
-cosmoguard X.Y.Z by default. The first such release also changes these
+cosmoguard X.Y.Z by default. Release candidates publish X.Y.Z-rc.N charts,
+which Helm only selects with an explicit `--version` (or `--devel`). The first such release also changes these
 defaults; the pods restart on upgrade.
 
 - Metrics and dashboard ports move from `<fullname>` to the ClusterIP

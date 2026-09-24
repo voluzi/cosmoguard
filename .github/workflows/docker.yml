@@ -26,6 +26,12 @@ jobs:
         run: |
           TAG_REF="${GITHUB_REF#refs/tags/}"
           VERSION_WITHOUT_V="${TAG_REF#v}"
+          # The image and the chart both take this version; refuse a tag
+          # that is not X.Y.Z[-pre] before any of them is published.
+          if ! [[ "$VERSION_WITHOUT_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::tag ${TAG_REF} is not vX.Y.Z or vX.Y.Z-<prerelease>"
+            exit 1
+          fi
           echo "version=$VERSION_WITHOUT_V" >> "$GITHUB_OUTPUT"
   build:
     name: Build and Push Cosmoguard Images

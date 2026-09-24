@@ -1,3 +1,5 @@
+# Retired chart/vX.Y.Z tags still exist on the remote; never read them as the
+# release version.
 VERSION ?= $(shell git describe --tags --exclude 'chart/*' --abbrev=0)
 COMMIT ?= $(shell git rev-parse HEAD)
 BUILD_TARGETS := build install
@@ -47,6 +49,7 @@ $(BUILDDIR)/:
 	mkdir -p $(BUILDDIR)/
 
 helm.package: $(BUILDDIR)/
+	@test -n "$(VERSION)" || { echo "no release tag found; pass VERSION=X.Y.Z" >&2; exit 1; }
 	helm package helm/cosmoguard \
 		--version $(VERSION:v%=%) \
 		--app-version $(VERSION:v%=%) \
