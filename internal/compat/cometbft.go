@@ -57,7 +57,7 @@ func cometCalls(height int64, blockHash, txHash string) []rpcCall {
 		{method: "dump_consensus_state", volatile: true},
 		{method: "genesis_chunked", params: []rpcParam{num("chunk", "0")}},
 		// blockchain also reports the answering node's tip (last_height).
-		{method: "blockchain", params: []rpcParam{num("minHeight", strconv.FormatInt(height-2, 10)), num("maxHeight", h)}, volatile: true},
+		{method: "blockchain", params: []rpcParam{num("minHeight", strconv.FormatInt(max(height-2, 1), 10)), num("maxHeight", h)}, volatile: true},
 		{method: "block", params: []rpcParam{num("height", h)}},
 		{method: "block_results", params: []rpcParam{num("height", h)}},
 		{method: "commit", params: []rpcParam{num("height", h)}},

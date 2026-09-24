@@ -118,6 +118,9 @@ func TestCometCallEncoding(t *testing.T) {
 	assert.DeepEqual(t, byName["block_by_hash"].body(1)["params"], map[string]any{"hash": "q80="})
 	assert.Equal(t, byName["tx"].skip, "no live tx hash")
 	assert.Equal(t, byName["block_by_hash"].skip, "")
+	// minHeight never goes below 1 at a low pinned height.
+	assert.DeepEqual(t, cometCalls(2, "", "")[9].params[0].uri, "1")
+	assert.Equal(t, cometCalls(2, "", "")[9].method, "blockchain")
 	for _, c := range calls {
 		assert.Assert(t, c.method != "broadcast_tx_sync" && c.method != "genesis", c.method)
 	}
@@ -143,6 +146,12 @@ func statusServer(t *testing.T) *grpc.ClientConn {
 			return status.Error(codes.ResourceExhausted, "grpc: received message larger than max (5 vs. 4)")
 		case "not-found":
 			return status.Error(codes.NotFound, "nope")
+		case "detail-a", "detail-b":
+			st, err := status.New(codes.InvalidArgument, "bad").WithDetails(&descriptorpb.FieldOptions{Deprecated: proto.Bool(md.Get("want")[0] == "detail-a")})
+			if err != nil {
+				return err
+			}
+			return st.Err()
 		}
 		<-stream.Context().Done()
 		return stream.Context().Err()
@@ -269,4 +278,19 @@ func TestScalarValue(t *testing.T) {
 	v, err = scalarValue(fields.ByName("key"), "x")
 	assert.NilError(t, err)
 	assert.Assert(t, !v.IsValid(), "bytes fields are not filled from parameters")
+}
+
+func TestInvokeComparesStatusDetails(t *testing.T) {
+	conn := statusServer(t)
+	call := func(want string) Response {
+		ctx := metadata.AppendToOutgoingContext(t.Context(), "want", want)
+		return invoke(ctx, conn, "/x.Query/M", []byte{}, 7)
+	}
+	a1, a2, b := call("detail-a"), call("detail-a"), call("detail-b")
+	assert.NilError(t, a1.Err)
+	c, detail := Classify(a1, []Response{a2}, false)
+	assert.Equal(t, c, Identical, detail)
+	// Same code and message, different grpc-status-details-bin.
+	c, _ = Classify(a1, []Response{b}, false)
+	assert.Equal(t, c, Differs, "status details are part of the answer")
 }

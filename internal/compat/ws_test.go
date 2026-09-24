@@ -3,6 +3,7 @@ package compat
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -51,22 +52,22 @@ func TestCompareSub(t *testing.T) {
 
 	t.Run("same block, same payload", func(t *testing.T) {
 		// The sides start at different heights; the common one is compared.
-		res := compareSub(ctx, sub, fakeWS(t, false, "P", 10, 11, 12), fakeWS(t, false, "P", 11, 12))
+		res := compareSub(ctx, sub, fakeWS(t, false, "P", 10, 11, 12), fakeWS(t, false, "P", 11, 12), 5*time.Second)
 		assert.Equal(t, res.Class, Identical, res.Detail)
 		assert.Equal(t, res.Detail, "block 11")
 	})
 	t.Run("same block, different payload", func(t *testing.T) {
-		res := compareSub(ctx, sub, fakeWS(t, false, "P", 10), fakeWS(t, false, "Q", 10))
+		res := compareSub(ctx, sub, fakeWS(t, false, "P", 10), fakeWS(t, false, "Q", 10), 5*time.Second)
 		assert.Equal(t, res.Class, Differs)
 		assert.Assert(t, strings.Contains(res.Detail, "proposer_address"), res.Detail)
 	})
 	t.Run("node refuses", func(t *testing.T) {
-		res := compareSub(ctx, sub, fakeWS(t, true, "P"), fakeWS(t, false, "P", 10))
+		res := compareSub(ctx, sub, fakeWS(t, true, "P"), fakeWS(t, false, "P", 10), 5*time.Second)
 		assert.Equal(t, res.Class, Failed)
 		assert.Assert(t, strings.Contains(res.Detail, "unauthorized access"), res.Detail)
 	})
 	t.Run("cosmoguard refuses", func(t *testing.T) {
-		res := compareSub(ctx, sub, fakeWS(t, false, "P", 10), fakeWS(t, true, "P"))
+		res := compareSub(ctx, sub, fakeWS(t, false, "P", 10), fakeWS(t, true, "P"), 5*time.Second)
 		assert.Equal(t, res.Class, Differs)
 		assert.Assert(t, strings.Contains(res.Detail, "cosmoguard refused"), res.Detail)
 	})
@@ -137,7 +138,7 @@ func TestCompareSubComparesEventAttributes(t *testing.T) {
 	sub.path = ""
 	node := fakeWSFrames(t, newBlockFrame(10, `{"tm.event":["NewBlock"],"mint.amount":["5"]}`))
 	guard := fakeWSFrames(t, newBlockFrame(10, `{"tm.event":["NewBlock"]}`))
-	res := compareSub(t.Context(), sub, node, guard)
+	res := compareSub(t.Context(), sub, node, guard, 5*time.Second)
 	assert.Equal(t, res.Class, Differs, res.Detail)
 	assert.Assert(t, strings.Contains(res.Detail, "events"), res.Detail)
 }
@@ -150,7 +151,28 @@ func TestCompareSubInterrupted(t *testing.T) {
 	guard := fakeWSFrames(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
-	res := compareSub(ctx, sub, node, guard)
+	res := compareSub(ctx, sub, node, guard, 5*time.Second)
 	assert.Equal(t, res.Class, Unstable, res.Detail)
 	assert.Equal(t, res.Detail, "interrupted before a verdict")
+}
+
+func TestCompareSubHandshakeTimeout(t *testing.T) {
+	// A server that accepts the connection but never completes the
+	// WebSocket handshake.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NilError(t, err)
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	start := time.Now()
+	res := compareSub(t.Context(), cometNewBlock, "ws://"+l.Addr().String(), "ws://"+l.Addr().String(), 100*time.Millisecond)
+	assert.Equal(t, res.Class, Failed, res.Detail)
+	assert.Assert(t, time.Since(start) < 5*time.Second, "--timeout bounds the handshake, not the %s event window", wsWindow)
 }

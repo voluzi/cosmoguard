@@ -44,10 +44,8 @@ func Classify(direct Response, proxies []Response, volatile bool) (Class, string
 	if direct.Unrenderable != "" {
 		return Skipped, direct.Unrenderable
 	}
-	for _, r := range append([]Response{direct}, proxies...) {
-		if r.Oversized {
-			return Skipped, fmt.Sprintf("an answer is larger than %d MiB, so it was not compared", maxBody>>20)
-		}
+	if c, detail, ok := classifyOversized(direct, proxies); ok {
+		return c, detail
 	}
 	if gatewayStatus(direct.Status) {
 		// The node's own edge failed; there is no node answer to compare.
@@ -84,6 +82,31 @@ func Classify(direct Response, proxies []Response, volatile bool) (Class, string
 		}
 	}
 	return Identical, ""
+}
+
+// classifyOversized handles answers cut at maxBody. When every answer is
+// that large they cannot be compared; when only some are, the sizes
+// already differ. A cosmoguard that did not answer is left to Classify.
+func classifyOversized(direct Response, proxies []Response) (Class, string, bool) {
+	over := 0
+	for _, p := range proxies {
+		if p.Err != nil {
+			return "", "", false
+		}
+		if p.Oversized {
+			over++
+		}
+	}
+	limit := maxBody >> 20
+	switch {
+	case !direct.Oversized && over == 0:
+		return "", "", false
+	case direct.Oversized && over == len(proxies):
+		return Skipped, fmt.Sprintf("every answer is larger than %d MiB, so none was compared", limit), true
+	case direct.Oversized:
+		return Differs, fmt.Sprintf("the node's answer is larger than %d MiB, cosmoguard's is not", limit), true
+	}
+	return Differs, fmt.Sprintf("cosmoguard's answer is larger than %d MiB, the node's is not", limit), true
 }
 
 // gatewayStatus reports an HTTP status a proxy in front of a node sends

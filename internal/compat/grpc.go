@@ -379,9 +379,15 @@ func invoke(ctx context.Context, conn *grpc.ClientConn, method string, req []byt
 	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
 		return Response{Err: err}
 	}
+	// The whole status, details (grpc-status-details-bin) included, is the
+	// answer; code and message alone would miss dropped or altered details.
+	body, merr := proto.MarshalOptions{Deterministic: true}.Marshal(st.Proto())
+	if merr != nil {
+		return Response{Err: fmt.Errorf("encoding status: %w", merr)}
+	}
 	return Response{
 		Status: int(st.Code()),
-		Body:   []byte(st.Message()),
+		Body:   body,
 		Height: h,
 		// cosmoguard refuses with Unauthenticated; PermissionDenied is
 		// kept for other gateways.

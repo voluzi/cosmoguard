@@ -62,9 +62,9 @@ var evmNewHeads = wsSub{
 }
 
 func wsCompare(ctx context.Context, o Options) []Result {
-	results := []Result{compareSub(ctx, cometNewBlock, wsURL(o.Node.RPC), wsURL(o.Guard.RPC))}
+	results := []Result{compareSub(ctx, cometNewBlock, wsURL(o.Node.RPC), wsURL(o.Guard.RPC), o.Timeout)}
 	if o.Node.EVMWS != "" && o.Guard.EVMWS != "" {
-		results = append(results, compareSub(ctx, evmNewHeads, wsURL(o.Node.EVMWS), wsURL(o.Guard.EVMWS)))
+		results = append(results, compareSub(ctx, evmNewHeads, wsURL(o.Node.EVMWS), wsURL(o.Guard.EVMWS), o.Timeout))
 	} else {
 		results = append(results, Result{Protocol: ProtoWS, Name: evmNewHeads.name, Class: Skipped, Detail: noEVM})
 	}
@@ -90,19 +90,20 @@ type wsEvent struct {
 
 // compareSub subscribes on both sides and compares the first block both
 // deliver. Subscription ids are not compared, since cosmoguard may assign
-// its own.
-func compareSub(ctx context.Context, s wsSub, node, guard string) Result {
+// its own. timeout bounds each handshake; wsWindow bounds the wait for a
+// common block.
+func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.Duration) Result {
 	res := Result{Protocol: ProtoWS, Name: s.name}
 	run := ctx
 	ctx, cancel := context.WithTimeout(ctx, wsWindow)
 	defer cancel()
 
-	nodeCh, err := subscribe(ctx, node+s.path, s)
+	nodeCh, err := subscribe(ctx, node+s.path, s, timeout)
 	if err != nil {
 		res.Class, res.Detail = Failed, "node: "+err.Error()
 		return res
 	}
-	guardCh, err := subscribe(ctx, guard+s.path, s)
+	guardCh, err := subscribe(ctx, guard+s.path, s, timeout)
 	if err != nil {
 		res.Class, res.Detail = Differs, "cosmoguard: "+err.Error()
 		if ctx.Err() != nil {
@@ -174,8 +175,10 @@ func compareSub(ctx context.Context, s wsSub, node, guard string) Result {
 
 // subscribe dials url, sends the subscription and streams its events
 // until ctx ends or the connection closes.
-func subscribe(ctx context.Context, url string, s wsSub) (<-chan wsEvent, error) {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
+func subscribe(ctx context.Context, url string, s wsSub, timeout time.Duration) (<-chan wsEvent, error) {
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, _, err := websocket.DefaultDialer.DialContext(dctx, url, nil)
 	if err != nil {
 		return nil, err
 	}
