@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -110,6 +111,37 @@ func withoutOverrides(env []string) []string {
 	return out
 }
 
+// writeSpawnConfig renders spawnConfig for node on ports (LCD, RPC, gRPC,
+// EVM RPC, EVM WS, metrics).
+func writeSpawnConfig(w io.Writer, node compat.Endpoints, ports []int) error {
+	data := struct {
+		Node                                   compat.Endpoints
+		EVM                                    bool
+		EVMWSUpstream                          string
+		CacheTTL                               time.Duration
+		LCD, RPC, GRPC, EVMRPC, EVMWS, Metrics int
+	}{node, node.EVM != "", httpScheme(node.EVMWS), spawnCacheTTL, ports[0], ports[1], ports[2], ports[3], ports[4], ports[5]}
+	if data.EVMWSUpstream == "" {
+		// cosmoguard always proxies EVM WebSocket with EVM on; point it at
+		// the node's host so it never falls back to a local default port.
+		data.EVMWSUpstream = node.EVM
+	}
+	return spawnConfig.Execute(w, data)
+}
+
+// httpScheme rewrites a ws:// or wss:// URL to http:// or https://.
+// cosmoguard takes its WebSocket upstreams as HTTP URLs and switches the
+// scheme itself; the tool's own dialer keeps ws(s).
+func httpScheme(url string) string {
+	switch {
+	case strings.HasPrefix(url, "ws://"):
+		return "http://" + strings.TrimPrefix(url, "ws://")
+	case strings.HasPrefix(url, "wss://"):
+		return "https://" + strings.TrimPrefix(url, "wss://")
+	}
+	return url
+}
+
 const (
 	spawnCacheTTL   = 2 * time.Second
 	spawnRoundDelay = spawnCacheTTL + time.Second
@@ -138,19 +170,7 @@ func spawn(ctx context.Context, bin string, node compat.Endpoints) (*spawned, co
 	if err != nil {
 		return nil, compat.Endpoints{}, err
 	}
-	data := struct {
-		Node                                   compat.Endpoints
-		EVM                                    bool
-		EVMWSUpstream                          string
-		CacheTTL                               time.Duration
-		LCD, RPC, GRPC, EVMRPC, EVMWS, Metrics int
-	}{node, node.EVM != "", node.EVMWS, spawnCacheTTL, ports[0], ports[1], ports[2], ports[3], ports[4], ports[5]}
-	if data.EVMWSUpstream == "" {
-		// cosmoguard always proxies EVM WebSocket with EVM on; point it at
-		// the node's host so it never falls back to a local default port.
-		data.EVMWSUpstream = node.EVM
-	}
-
+	metrics := ports[5]
 	dir, err := os.MkdirTemp("", "cosmoguard-compat-")
 	if err != nil {
 		return nil, compat.Endpoints{}, err
@@ -165,7 +185,7 @@ func spawn(ctx context.Context, bin string, node compat.Endpoints) (*spawned, co
 	if err != nil {
 		return fail(err)
 	}
-	err = spawnConfig.Execute(f, data)
+	err = writeSpawnConfig(f, node, ports)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -190,15 +210,15 @@ func spawn(ctx context.Context, bin string, node compat.Endpoints) (*spawned, co
 	}()
 
 	guard := compat.Endpoints{
-		LCD:  fmt.Sprintf("http://127.0.0.1:%d", data.LCD),
-		RPC:  fmt.Sprintf("http://127.0.0.1:%d", data.RPC),
-		GRPC: fmt.Sprintf("http://127.0.0.1:%d", data.GRPC),
+		LCD:  fmt.Sprintf("http://127.0.0.1:%d", ports[0]),
+		RPC:  fmt.Sprintf("http://127.0.0.1:%d", ports[1]),
+		GRPC: fmt.Sprintf("http://127.0.0.1:%d", ports[2]),
 	}
-	if data.EVM {
-		guard.EVM = fmt.Sprintf("http://127.0.0.1:%d", data.EVMRPC)
-		guard.EVMWS = fmt.Sprintf("http://127.0.0.1:%d", data.EVMWS)
+	if node.EVM != "" {
+		guard.EVM = fmt.Sprintf("http://127.0.0.1:%d", ports[3])
+		guard.EVMWS = fmt.Sprintf("http://127.0.0.1:%d", ports[4])
 	}
-	if err := waitReady(ctx, fmt.Sprintf("http://127.0.0.1:%d/readyz", data.Metrics), s); err != nil {
+	if err := waitReady(ctx, fmt.Sprintf("http://127.0.0.1:%d/readyz", metrics), s); err != nil {
 		s.stop()
 		logText, _ := os.ReadFile(s.logPath)
 		return fail(fmt.Errorf("%w; cosmoguard log:\n%s", err, logText))

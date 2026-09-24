@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"gotest.tools/assert"
 
 	"github.com/voluzi/cosmoguard/internal/compat"
+	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
 )
 
 func TestOverlay(t *testing.T) {
@@ -97,4 +102,42 @@ func TestReachable(t *testing.T) {
 	l.Close()
 	err = reachable("ws://" + addr)
 	assert.Assert(t, errors.Is(err, syscall.ECONNREFUSED), "a closed port is refused: %v", err)
+}
+
+// TestSpawnConfigAcceptsWebSocketUpstreams renders the spawn config for an
+// EVM node given ws:// or wss:// WebSocket URLs, and builds a cosmoguard
+// from it: cosmoguard takes WebSocket upstreams as http(s) URLs only.
+func TestSpawnConfigAcceptsWebSocketUpstreams(t *testing.T) {
+	for _, ws := range []string{"ws://localhost:8546", "wss://evm-ws.example.com", ""} {
+		t.Run(ws, func(t *testing.T) {
+			node := compat.Endpoints{
+				LCD: "http://localhost:1317", RPC: "http://localhost:26657", GRPC: "http://localhost:9090",
+				EVM: "https://evm.example.com", EVMWS: ws,
+			}
+			ports, err := freePorts(6)
+			assert.NilError(t, err)
+			path := filepath.Join(t.TempDir(), "cosmoguard.yaml")
+			f, err := os.Create(path)
+			assert.NilError(t, err)
+			assert.NilError(t, writeSpawnConfig(f, node, ports))
+			assert.NilError(t, f.Close())
+
+			cfg, err := cosmoguard.ReadConfigFromFile(path)
+			assert.NilError(t, err)
+			for _, n := range cfg.Nodes {
+				assert.Assert(t, strings.HasPrefix(n.EvmRpcWsURL, "http://") || strings.HasPrefix(n.EvmRpcWsURL, "https://"), n.EvmRpcWsURL)
+			}
+			cg, err := cosmoguard.New(cfg)
+			assert.NilError(t, err, "cosmoguard must accept the rendered config")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = cg.Shutdown(ctx)
+		})
+	}
+}
+
+func TestHTTPScheme(t *testing.T) {
+	assert.Equal(t, httpScheme("ws://h:8546"), "http://h:8546")
+	assert.Equal(t, httpScheme("wss://h"), "https://h")
+	assert.Equal(t, httpScheme("https://h"), "https://h")
 }
