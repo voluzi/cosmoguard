@@ -452,3 +452,41 @@ func TestHTTPEmptyRetryPoolRejectsBeforeReadingBody(t *testing.T) {
 	require.Equal(t, []string{"https://a.example"}, rec.Header().Values("Access-Control-Allow-Origin"))
 	require.False(t, read.Load(), "an empty pool must not buffer the request body")
 }
+
+func TestHTTPRetryStopsAfterSharedTimeoutWithoutBlamingOthers(t *testing.T) {
+	release := make(chan struct{})
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	var healthyHits atomic.Int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		healthyHits.Add(1)
+	}))
+	t.Cleanup(func() {
+		close(release)
+		stalled.Close()
+		healthy.Close()
+	})
+	breaker := &CircuitBreakerConfig{ConsecutiveFailures: 1, CooldownPeriod: time.Minute}
+	p := newHardeningProxy(t,
+		[]NodeConfig{
+			{Name: "stalled", LcdURL: stalled.URL, CircuitBreaker: breaker},
+			{Name: "healthy", LcdURL: healthy.URL, CircuitBreaker: breaker},
+		},
+		WithServerConfig[HttpProxyOptions](&ServerConfig{WriteTimeout: 150 * time.Millisecond}),
+		WithUpstreamConfig[HttpProxyOptions](&UpstreamConfig{Strategy: "primary-failover", Retries: RetryConfig{Max: 2}}))
+
+	rec := httptest.NewRecorder()
+	p.pool.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	for _, u := range p.pool.Upstreams() {
+		if u.Name == "healthy" {
+			require.False(t, u.cbOpen.Load(), "an upstream never contacted must not be charged a failure")
+		}
+	}
+	require.Zero(t, healthyHits.Load())
+}
