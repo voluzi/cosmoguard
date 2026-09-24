@@ -125,6 +125,22 @@ else
   failures=$((failures + 1))
 fi
 
+# A 63-char fullname must not swallow the -internal suffix, or the internal
+# Service would take the main Service's name.
+long_name="$(printf 'l%.0s' $(seq 63))"
+output="${tmp_dir}/long-fullname.yaml"
+if "${HELM_BIN}" template hardening-test "${CHART_DIR}" \
+  --namespace default \
+  --set-string "fullnameOverride=${long_name}" \
+  --set-string cluster.existingEncryptionKeySecret=hardening-test-key >"${output}" &&
+  services="$("${YQ_BIN}" 'select(.kind == "Service") | .metadata.name' "${output}" | grep -v '^---$')" &&
+  grep -Eq '^l{54}-internal$' <<<"${services}"; then
+  echo "ok - internal Service name stays distinct with a 63-char fullname"
+else
+  echo "not ok - internal Service name stays distinct with a 63-char fullname" >&2
+  failures=$((failures + 1))
+fi
+
 check "PDB accepts maxUnavailable alone" \
   'select(.kind == "PodDisruptionBudget")' '
   (.spec.maxUnavailable == 1) and (.spec | has("minAvailable") | not)

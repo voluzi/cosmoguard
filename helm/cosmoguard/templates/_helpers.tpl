@@ -128,9 +128,11 @@ peerService.nameOverride for existing NetworkPolicy selectors.
 {{/*
 ClusterIP Service for the operator listeners (metrics, dashboard). Kept
 off the main Service so service.type: LoadBalancer never publishes them.
+The base is cut to 54 chars first so the suffix survives and the name
+never collides with a 63-char fullname.
 */}}
 {{- define "cosmoguard.internalServiceName" -}}
-{{- printf "%s-internal" (include "cosmoguard.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-internal" (include "cosmoguard.fullname" . | trunc 54 | trimSuffix "-") -}}
 {{- end -}}
 
 {{/*
