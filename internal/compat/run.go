@@ -25,7 +25,6 @@ type Endpoints struct {
 
 // Options configure a run.
 type Options struct {
-	Chain string
 	Node  Endpoints
 	Guard Endpoints
 	// Height pins every query; 0 means the node's latest height minus 5.
@@ -57,19 +56,22 @@ const (
 
 type task func(ctx context.Context) Result
 
+// noEVM explains why EVM comparisons were skipped.
+const noEVM = "no EVM endpoint"
+
 // Run discovers endpoints on the node, calls each one directly and through
 // cosmoguard, and returns the verdicts.
 func Run(ctx context.Context, o Options) (*Report, error) {
 	h := newHTTPDoer(o.Timeout)
+	chainID, latest, err := nodeStatus(ctx, h, o.Node.RPC)
+	if err != nil {
+		return nil, fmt.Errorf("node status: %w", err)
+	}
 	height := o.Height
 	if height == 0 {
-		latest, err := latestHeight(ctx, h, o.Node.RPC)
-		if err != nil {
-			return nil, fmt.Errorf("node status: %w", err)
-		}
 		height = latest - 5
 	}
-	rep := &Report{Chain: o.Chain, Height: height}
+	rep := &Report{Chain: chainID, Height: height}
 	logf := func(format string, args ...any) { fmt.Fprintf(o.Log, format+"\n", args...) }
 	logf("pinned height %d", height)
 
@@ -118,8 +120,12 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 	if o.enabled(ProtoRPC) {
 		tasks = append(tasks, cometTasks(ctx, h, o, params, height)...)
 	}
-	if o.enabled(ProtoEVM) && o.Node.EVM != "" && o.Guard.EVM != "" {
-		tasks = append(tasks, evmTasks(ctx, h, o, height)...)
+	if o.enabled(ProtoEVM) {
+		if o.Node.EVM != "" && o.Guard.EVM != "" {
+			tasks = append(tasks, evmTasks(ctx, h, o, height)...)
+		} else {
+			rep.Add(Result{Protocol: ProtoEVM, Name: "all methods", Class: Skipped, Detail: noEVM})
+		}
 	}
 
 	tasks = append(tasks, crossHeightTasks(h, o, height, node, guard)...)

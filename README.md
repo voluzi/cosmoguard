@@ -193,33 +193,33 @@ byte for byte; answers about the latest state or the answering node
 JSON shape only, and a WebSocket event is compared as a JSON value for the
 same block. Each cosmoguard answer is fetched twice so cached answers are
 checked too. The status, body and Content-Type are compared; other
-response headers are not. A few `cross-height` probes also ask for the same query at two
-heights, so a cache that ignores the requested height is caught.
+response headers are not. A few `cross-height` probes also ask for the
+same query at two heights, so a cache that ignores the requested height
+is caught.
 
-The node side must be a raw node. A chain's public endpoints usually sit
-behind cosmoguard already, and comparing against them tests cosmoguard
-against itself.
+The node side must be a raw node, not one already behind cosmoguard; a
+chain's public endpoints usually are, and comparing against them tests
+cosmoguard against itself. By default the tool expects the node on
+localhost at the standard ports, so with a Cosmopilot node forward them
+first:
 
 ```sh
-# Build cosmoguard, start it in front of the node, compare, stop it.
-make compat COMPAT_ARGS="--node-grpc http://localhost:19090"
+kubectl port-forward svc/<chainnode> 1317 26657 9090   # add 8545 8546 for an EVM chain
+make compat
+```
 
-# Against any raw node and a cosmoguard you already run:
+`make compat` builds cosmoguard, starts it in front of the node, compares
+and stops it. A chain without EVM leaves ports 8545 and 8546 closed; its
+EVM checks are reported as skipped. `--node-lcd`, `--node-rpc`,
+`--node-grpc` (`http://` for plaintext, `https://` for TLS), `--node-evm`
+and `--node-evm-ws` override each default, and an EVM URL given this way
+must be reachable. To check a cosmoguard you already run:
+
+```sh
 go run ./cmd/cosmoguard-compat \
-  --node-lcd https://lcd.example.com --node-rpc https://rpc.example.com \
-  --node-grpc https://grpc.example.com \
   --guard-lcd http://cosmoguard:11317 --guard-rpc http://cosmoguard:16657 \
   --guard-grpc http://cosmoguard:19090 --report compat.json
 ```
-
-The `allora-devnet` preset only works with that gRPC override: its ingress
-cannot serve gRPC yet (Traefik has no h2c backend for it), so forward the
-node's gRPC port first with
-`kubectl -n default port-forward svc/allora-devnet-fullnodes-0 19090:9090`.
-`--node-*` flags replace the preset's URLs one by one.
-
-`--spawn path/to/cosmoguard` with `--node-*` flags starts cosmoguard in
-front of another raw node, as `make compat` does for the preset.
 
 Each endpoint is reported as `identical`, `differs` (cosmoguard answered
 differently), `denied` (cosmoguard refused a request the node answered),

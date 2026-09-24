@@ -61,11 +61,10 @@ var evmNewHeads = wsSub{
 
 func wsCompare(ctx context.Context, o Options) []Result {
 	results := []Result{compareSub(ctx, cometNewBlock, wsURL(o.Node.RPC), wsURL(o.Guard.RPC))}
-	switch {
-	case o.Node.EVMWS != "" && o.Guard.EVMWS != "":
+	if o.Node.EVMWS != "" && o.Guard.EVMWS != "" {
 		results = append(results, compareSub(ctx, evmNewHeads, wsURL(o.Node.EVMWS), wsURL(o.Guard.EVMWS)))
-	case o.Node.EVM != "":
-		results = append(results, Result{Protocol: ProtoWS, Name: evmNewHeads.name, Class: Skipped, Detail: "no EVM WebSocket URL for both sides"})
+	} else {
+		results = append(results, Result{Protocol: ProtoWS, Name: evmNewHeads.name, Class: Skipped, Detail: noEVM})
 	}
 	return results
 }

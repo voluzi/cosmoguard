@@ -6,7 +6,7 @@
 //
 // It is a local test tool and is not shipped in releases:
 //
-//	make compat                      # the allora-devnet preset
+//	make compat        # a node port-forwarded to localhost's standard ports
 //	go run ./cmd/cosmoguard-compat --node-lcd https://... --guard-lcd http://... (etc.)
 package main
 
@@ -15,9 +15,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	neturl "net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -25,18 +26,14 @@ import (
 	"github.com/voluzi/cosmoguard/internal/compat"
 )
 
-// presets are raw nodes, with no cosmoguard in front. A chain's public
-// endpoints usually sit behind cosmoguard already, which would compare
-// cosmoguard against itself, so other chains go through the --node-* flags.
-var presets = map[string]compat.Endpoints{
-	// Temporary on-prem devnet (CometBFT 0.38). Its ingress cannot serve
-	// gRPC yet (no h2c backend on Traefik), so the preset is only usable
-	// with the gRPC port forwarded and --node-grpc pointing at it.
-	"allora-devnet": {
-		LCD:  "https://lcd.allora.voluzi.xyz",
-		RPC:  "https://rpc.allora.voluzi.xyz",
-		GRPC: "https://grpc.allora.voluzi.xyz",
-	},
+// defaultNode is a raw node reached through a port-forward on its standard
+// ports, e.g. kubectl port-forward svc/<node> 1317 26657 9090 8545 8546.
+var defaultNode = compat.Endpoints{
+	LCD:   "http://localhost:1317",
+	RPC:   "http://localhost:26657",
+	GRPC:  "http://localhost:9090",
+	EVM:   "http://localhost:8545",
+	EVMWS: "ws://localhost:8546",
 }
 
 func main() {
@@ -45,7 +42,6 @@ func main() {
 
 func run() int {
 	var (
-		chain       = flag.String("chain", "allora-devnet", "raw-node preset: "+strings.Join(presetNames(), ", ")+"; --node-* flags override its URLs one by one")
 		spawnBin    = flag.String("spawn", "", "cosmoguard binary to start in front of the node (instead of guard-* flags)")
 		report      = flag.String("report", "", "write the full JSON report, including skip reasons, to this file")
 		only        = flag.String("only", "", "comma-separated protocols to run: grpc,lcd,rpc,evm,ws (default all)")
@@ -69,13 +65,8 @@ func run() int {
 	endpointFlags(&guard, "guard", "cosmoguard")
 	flag.Parse()
 
-	if p, ok := presets[*chain]; ok {
-		node = overlay(p, node)
-	} else if node == (compat.Endpoints{}) {
-		fmt.Fprintf(os.Stderr, "unknown chain %q and no --node-* URLs\n", *chain)
-		return 2
-	}
-	node, guard = trimSlashes(node), trimSlashes(guard)
+	explicit := node
+	node, guard = trimSlashes(overlay(defaultNode, node)), trimSlashes(guard)
 
 	protocols := map[string]bool{}
 	for _, p := range strings.Split(*only, ",") {
@@ -96,9 +87,21 @@ func run() int {
 
 	enabled := func(p string) bool { return len(protocols) == 0 || protocols[p] }
 	if missing := requiredURLs(node, enabled, true); len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "need %s (or a --chain preset)\n", strings.Join(missing, ", "))
+		fmt.Fprintf(os.Stderr, "need %s\n", strings.Join(missing, ", "))
 		return 2
 	}
+
+	// A chain without EVM leaves the default EVM ports closed.
+	var err error
+	if node.EVM, err = resolveEVM(node.EVM, explicit.EVM != "", reachable(node.EVM)); err != nil {
+		fmt.Fprintf(os.Stderr, "--node-evm: %v\n", err)
+		return 2
+	}
+	if node.EVMWS, err = resolveEVM(node.EVMWS, explicit.EVMWS != "", reachable(node.EVMWS)); err != nil {
+		fmt.Fprintf(os.Stderr, "--node-evm-ws: %v\n", err)
+		return 2
+	}
+
 	if missing := requiredURLs(guard, enabled, false); *spawnBin == "" && len(missing) > 0 {
 		fmt.Fprintf(os.Stderr, "need --spawn or %s\n", strings.Join(missing, ", "))
 		return 2
@@ -106,7 +109,7 @@ func run() int {
 
 	var spawned *spawned
 	if *spawnBin != "" {
-		s, g, err := spawn(ctx, *spawnBin, *chain, node)
+		s, g, err := spawn(ctx, *spawnBin, node)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "starting cosmoguard: %v\n", err)
 			return 2
@@ -116,7 +119,7 @@ func run() int {
 			*roundDelay = spawnRoundDelay
 		}
 	}
-	code := compare(ctx, *chain, node, guard, *height, *concurrency, *timeout, *roundDelay, protocols, *report, params, spawned != nil)
+	code := compare(ctx, node, guard, *height, *concurrency, *timeout, *roundDelay, protocols, *report, params, spawned != nil)
 	if spawned != nil {
 		spawned.stop()
 		if log := spawned.cleanup(code != 0); log != "" {
@@ -129,7 +132,7 @@ func run() int {
 // compare runs the comparison and returns the exit code: 1 when cosmoguard
 // answered differently, refused a request under the allow-all spawn config,
 // or nothing could be compared.
-func compare(ctx context.Context, chain string, node, guard compat.Endpoints, height int64, concurrency int,
+func compare(ctx context.Context, node, guard compat.Endpoints, height int64, concurrency int,
 	timeout, roundDelay time.Duration, protocols map[string]bool, report string, params compat.Params, spawned bool) int {
 	if guard.EVM == "" {
 		node.EVM = ""
@@ -139,7 +142,6 @@ func compare(ctx context.Context, chain string, node, guard compat.Endpoints, he
 	}
 
 	rep, err := compat.Run(ctx, compat.Options{
-		Chain:       chain,
 		Node:        node,
 		Guard:       guard,
 		Height:      height,
@@ -180,11 +182,17 @@ func compare(ctx context.Context, chain string, node, guard compat.Endpoints, he
 }
 
 func endpointFlags(e *compat.Endpoints, prefix, who string) {
-	flag.StringVar(&e.LCD, prefix+"-lcd", "", "LCD base URL of "+who)
-	flag.StringVar(&e.RPC, prefix+"-rpc", "", "CometBFT RPC base URL of "+who)
-	flag.StringVar(&e.GRPC, prefix+"-grpc", "", "gRPC target of "+who+" (https://host[:port] for TLS, http://host:port plaintext)")
-	flag.StringVar(&e.EVM, prefix+"-evm", "", "EVM JSON-RPC URL of "+who+" (optional)")
-	flag.StringVar(&e.EVMWS, prefix+"-evm-ws", "", "EVM WebSocket URL of "+who+" (optional)")
+	def := func(v string) string {
+		if prefix == "node" {
+			return " (default " + v + ")"
+		}
+		return ""
+	}
+	flag.StringVar(&e.LCD, prefix+"-lcd", "", "LCD base URL of "+who+def(defaultNode.LCD))
+	flag.StringVar(&e.RPC, prefix+"-rpc", "", "CometBFT RPC base URL of "+who+def(defaultNode.RPC))
+	flag.StringVar(&e.GRPC, prefix+"-grpc", "", "gRPC target of "+who+" (https://host[:port] for TLS, http://host:port plaintext)"+def(defaultNode.GRPC))
+	flag.StringVar(&e.EVM, prefix+"-evm", "", "EVM JSON-RPC URL of "+who+def(defaultNode.EVM))
+	flag.StringVar(&e.EVMWS, prefix+"-evm-ws", "", "EVM WebSocket URL of "+who+def(defaultNode.EVMWS))
 }
 
 // requiredURLs lists the flags a run of the enabled protocols needs. The
@@ -207,20 +215,57 @@ func requiredURLs(e compat.Endpoints, enabled func(string) bool, isNode bool) []
 	return missing
 }
 
-// overlay returns preset with every URL set in flags replacing its own.
-func overlay(preset, flags compat.Endpoints) compat.Endpoints {
-	pick := func(flag, preset string) string {
+// resolveEVM decides whether an EVM endpoint is compared, given whether it
+// was set explicitly and whether it could be reached. A default endpoint
+// that refuses the connection belongs to a chain without EVM and is
+// dropped (""); an explicit one that cannot be reached is an error.
+// Other failures are left for the comparison to report.
+func resolveEVM(url string, explicit bool, reachErr error) (string, error) {
+	switch {
+	case reachErr == nil:
+		return url, nil
+	case explicit:
+		return "", fmt.Errorf("%s is unreachable: %w", url, reachErr)
+	case errors.Is(reachErr, syscall.ECONNREFUSED):
+		return "", nil
+	}
+	return url, nil
+}
+
+// reachable opens and closes a TCP connection to url's host.
+func reachable(url string) error {
+	u, err := neturl.Parse(url)
+	if err != nil {
+		return err
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if u.Scheme == "https" || u.Scheme == "wss" {
+			port = "443"
+		}
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(u.Hostname(), port), 5*time.Second)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+// overlay returns defaults with every URL set in flags replacing its own.
+func overlay(defaults, flags compat.Endpoints) compat.Endpoints {
+	pick := func(flag, def string) string {
 		if flag != "" {
 			return flag
 		}
-		return preset
+		return def
 	}
 	return compat.Endpoints{
-		LCD:   pick(flags.LCD, preset.LCD),
-		RPC:   pick(flags.RPC, preset.RPC),
-		GRPC:  pick(flags.GRPC, preset.GRPC),
-		EVM:   pick(flags.EVM, preset.EVM),
-		EVMWS: pick(flags.EVMWS, preset.EVMWS),
+		LCD:   pick(flags.LCD, defaults.LCD),
+		RPC:   pick(flags.RPC, defaults.RPC),
+		GRPC:  pick(flags.GRPC, defaults.GRPC),
+		EVM:   pick(flags.EVM, defaults.EVM),
+		EVMWS: pick(flags.EVMWS, defaults.EVMWS),
 	}
 }
 
@@ -228,13 +273,4 @@ func overlay(preset, flags compat.Endpoints) compat.Endpoints {
 func trimSlashes(e compat.Endpoints) compat.Endpoints {
 	t := func(s string) string { return strings.TrimRight(s, "/") }
 	return compat.Endpoints{LCD: t(e.LCD), RPC: t(e.RPC), GRPC: t(e.GRPC), EVM: t(e.EVM), EVMWS: t(e.EVMWS)}
-}
-
-func presetNames() []string {
-	names := make([]string, 0, len(presets))
-	for n := range presets {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return names
 }

@@ -43,14 +43,12 @@ clean:
 	rm -rf $(BUILDDIR)/ coverage.out
 
 # compat builds cosmoguard, starts it in front of a raw node (not one
-# already behind cosmoguard) and checks that every endpoint answers as the
-# node does. Needs network access to the node.
-# COMPAT_ARGS passes extra flags, e.g. COMPAT_ARGS="--node-grpc http://localhost:19090"
-# (the allora-devnet preset needs its gRPC port forwarded; see README.md).
-CHAIN ?= allora-devnet
+# already behind cosmoguard) port-forwarded to localhost's standard ports,
+# and checks that every endpoint answers as the node does. See README.md.
+# COMPAT_ARGS passes extra flags, e.g. COMPAT_ARGS="--node-rpc http://localhost:36657".
 compat: $(BUILDDIR)/
 	go build -o $(BUILDDIR)/cosmoguard ./cmd/cosmoguard
-	go run ./cmd/cosmoguard-compat --chain $(CHAIN) --spawn $(BUILDDIR)/cosmoguard --report $(BUILDDIR)/compat-$(CHAIN).json $(COMPAT_ARGS)
+	go run ./cmd/cosmoguard-compat --spawn $(BUILDDIR)/cosmoguard --report $(BUILDDIR)/compat.json $(COMPAT_ARGS)
 
 # helm.package builds an OCI-ready chart tarball under $(BUILDDIR). The chart
 # version and appVersion are both the release version, so the chart defaults

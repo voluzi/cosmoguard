@@ -93,4 +93,10 @@ func TestWsCompareSkipsEVMWithoutWebSocket(t *testing.T) {
 	assert.Equal(t, len(res), 2)
 	assert.Equal(t, res[1].Class, Skipped)
 	assert.Equal(t, res[1].Name, evmNewHeads.name)
+	assert.Equal(t, res[1].Detail, noEVM)
+
+	// A chain without EVM reports the subscription as skipped too.
+	o.Node.EVM, o.Guard.EVM = "", ""
+	res = wsCompare(t.Context(), o)
+	assert.Equal(t, res[1].Class, Skipped)
 }

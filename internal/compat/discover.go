@@ -10,19 +10,23 @@ import (
 	"strings"
 )
 
-// latestHeight returns the node's latest block height.
-func latestHeight(ctx context.Context, h *httpDoer, rpc string) (int64, error) {
+// nodeStatus returns the node's chain id and latest block height.
+func nodeStatus(ctx context.Context, h *httpDoer, rpc string) (string, int64, error) {
 	var st struct {
 		Result struct {
+			NodeInfo struct {
+				Network string `json:"network"`
+			} `json:"node_info"`
 			SyncInfo struct {
 				LatestBlockHeight string `json:"latest_block_height"`
 			} `json:"sync_info"`
 		} `json:"result"`
 	}
 	if err := h.getJSON(ctx, rpc+"/status", nil, &st); err != nil {
-		return 0, err
+		return "", 0, err
 	}
-	return strconv.ParseInt(st.Result.SyncInfo.LatestBlockHeight, 10, 64)
+	height, err := strconv.ParseInt(st.Result.SyncInfo.LatestBlockHeight, 10, 64)
+	return st.Result.NodeInfo.Network, height, err
 }
 
 // discoverParams reads live values for request fields from the node at

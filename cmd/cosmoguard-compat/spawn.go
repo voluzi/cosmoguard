@@ -29,7 +29,7 @@ enableEvm: {{.EVM}}
 evmRpcPort: {{.EVMRPC}}
 evmRpcWsPort: {{.EVMWS}}
 nodes:
-  - name: {{.Chain}}
+  - name: node
     lcdURL: {{.Node.LCD}}
     rpcURL: {{.Node.RPC}}
     grpcURL: {{.Node.GRPC}}
@@ -133,19 +133,18 @@ func (s *spawned) exited() bool {
 
 // spawn starts the cosmoguard binary in front of node and returns the
 // endpoints it serves once it reports ready.
-func spawn(ctx context.Context, bin, chain string, node compat.Endpoints) (*spawned, compat.Endpoints, error) {
+func spawn(ctx context.Context, bin string, node compat.Endpoints) (*spawned, compat.Endpoints, error) {
 	ports, err := freePorts(6)
 	if err != nil {
 		return nil, compat.Endpoints{}, err
 	}
 	data := struct {
-		Chain                                  string
 		Node                                   compat.Endpoints
 		EVM                                    bool
 		EVMWSUpstream                          string
 		CacheTTL                               time.Duration
 		LCD, RPC, GRPC, EVMRPC, EVMWS, Metrics int
-	}{chain, node, node.EVM != "", node.EVMWS, spawnCacheTTL, ports[0], ports[1], ports[2], ports[3], ports[4], ports[5]}
+	}{node, node.EVM != "", node.EVMWS, spawnCacheTTL, ports[0], ports[1], ports[2], ports[3], ports[4], ports[5]}
 	if data.EVMWSUpstream == "" {
 		// cosmoguard always proxies EVM WebSocket with EVM on; point it at
 		// the node's host so it never falls back to a local default port.

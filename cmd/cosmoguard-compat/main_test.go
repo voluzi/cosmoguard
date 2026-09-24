@@ -1,6 +1,10 @@
 package main
 
 import (
+	"errors"
+	"net"
+	"os"
+	"syscall"
 	"testing"
 
 	"gotest.tools/assert"
@@ -9,8 +13,8 @@ import (
 )
 
 func TestOverlay(t *testing.T) {
-	preset := compat.Endpoints{LCD: "https://lcd", RPC: "https://rpc", GRPC: "https://grpc"}
-	got := overlay(preset, compat.Endpoints{GRPC: "http://localhost:19090"})
+	defaults := compat.Endpoints{LCD: "https://lcd", RPC: "https://rpc", GRPC: "https://grpc"}
+	got := overlay(defaults, compat.Endpoints{GRPC: "http://localhost:19090"})
 	assert.DeepEqual(t, got, compat.Endpoints{LCD: "https://lcd", RPC: "https://rpc", GRPC: "http://localhost:19090"})
 }
 
@@ -46,4 +50,51 @@ func TestRequiredURLs(t *testing.T) {
 func TestWithoutOverrides(t *testing.T) {
 	got := withoutOverrides([]string{"PATH=/bin", "COSMOGUARD_NODE_RPC_URL=http://x", "HOME=/h"})
 	assert.DeepEqual(t, got, []string{"PATH=/bin", "HOME=/h"})
+}
+
+func TestDefaultNode(t *testing.T) {
+	// Without flags the node is a port-forward on the standard ports.
+	assert.DeepEqual(t, overlay(defaultNode, compat.Endpoints{}), compat.Endpoints{
+		LCD:   "http://localhost:1317",
+		RPC:   "http://localhost:26657",
+		GRPC:  "http://localhost:9090",
+		EVM:   "http://localhost:8545",
+		EVMWS: "ws://localhost:8546",
+	})
+	// Each --node-* flag replaces only its own default.
+	got := overlay(defaultNode, compat.Endpoints{RPC: "http://localhost:36657"})
+	assert.Equal(t, got.RPC, "http://localhost:36657")
+	assert.Equal(t, got.LCD, defaultNode.LCD)
+	assert.Equal(t, got.GRPC, defaultNode.GRPC)
+}
+
+func TestResolveEVM(t *testing.T) {
+	refused := &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	timeout := errors.New("i/o timeout")
+	const url = "http://localhost:8545"
+
+	got, err := resolveEVM(url, false, nil)
+	assert.NilError(t, err)
+	assert.Equal(t, got, url, "a reachable default is compared")
+
+	got, err = resolveEVM(url, false, refused)
+	assert.NilError(t, err, "a chain without EVM is not a failure")
+	assert.Equal(t, got, "", "a refused default is skipped")
+
+	_, err = resolveEVM(url, true, refused)
+	assert.ErrorContains(t, err, "unreachable", "an explicit endpoint must be reachable")
+
+	got, err = resolveEVM(url, false, timeout)
+	assert.NilError(t, err)
+	assert.Equal(t, got, url, "only a refusal means no EVM; other failures are reported by the comparison")
+}
+
+func TestReachable(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NilError(t, err)
+	addr := l.Addr().String()
+	assert.NilError(t, reachable("http://"+addr))
+	l.Close()
+	err = reachable("ws://" + addr)
+	assert.Assert(t, errors.Is(err, syscall.ECONNREFUSED), "a closed port is refused: %v", err)
 }
