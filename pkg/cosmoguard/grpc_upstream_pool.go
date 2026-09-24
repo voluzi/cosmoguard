@@ -163,8 +163,8 @@ func grpcNeutral(err error) bool {
 // grpcClientCaused reports whether a gRPC error is an application-level
 // rejection (invalid arguments, not-found, permission/auth, ...) rather
 // than an upstream health problem. The upstream received the request and
-// responded — mirroring the HTTP breaker's `<500` handling, that counts
-// as a successful breaker outcome, not a failure or a no-op. Otherwise a
+// responded, so that counts as a successful breaker outcome, not a
+// failure or a no-op. Otherwise a
 // client hammering a cacheable method with requests the node legitimately
 // rejects (InvalidArgument/NotFound) would leave a healthy upstream's
 // consecutive-failure count un-reset, or a half-open probe answered with
