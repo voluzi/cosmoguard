@@ -14,7 +14,7 @@ Service ({{ .Values.service.type }}): {{ $fullName }}
 
 Service (ClusterIP, operator-only): {{ include "cosmoguard.internalServiceName" . }}
 {{- if .Values.config.metrics.enable }}
-  metrics  → port {{ .Values.service.metricsPort }} (/metrics, /healthz, /readyz)
+  metrics  → port {{ .Values.service.metricsPort | default .Values.config.metrics.port }} (/metrics, /healthz, /readyz)
 {{- end }}
 {{- if .Values.config.dashboard.enable }}
   dashboard → port {{ .Values.service.dashboardPort | default .Values.config.dashboard.port }} (operator-only, no built-in auth)
