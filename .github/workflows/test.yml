@@ -43,6 +43,12 @@ jobs:
             echo "::error::tag ${TAG} is not vX.Y.Z or vX.Y.Z-<prerelease>"
             exit 1
           fi
+          # The version also becomes the app.kubernetes.io/version label.
+          version="${TAG#v}"
+          if (( ${#version} > 63 )) || ! [[ "$version" =~ [0-9A-Za-z]$ ]]; then
+            echo "::error::version ${version} is not a valid Kubernetes label value (max 63 chars, must end alphanumeric)"
+            exit 1
+          fi
 
   test:
     name: go test (race + cover)
