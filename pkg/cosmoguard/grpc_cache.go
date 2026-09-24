@@ -335,8 +335,10 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 	// caller noise. Without this a wedged node keeps getting re-selected for
 	// every coalesced miss/refresh. The deadline is read from the clock, not
 	// fetchCtx.Err(): the upstream's reset can arrive after the deadline has
-	// passed but before the context's timer has fired and set Err().
-	if invokeErr != nil && proxyDeadline && deadlinePassed(fetchCtx) {
+	// passed but before the context's timer has fired and set Err(). Only a
+	// non-answer (Canceled/DeadlineExceeded) is forced; any other status is
+	// something the upstream sent, so the normal classification applies.
+	if invokeErr != nil && proxyDeadline && grpcNeutral(invokeErr) && deadlinePassed(fetchCtx) {
 		upstream.RecordOutcome(false)
 	} else {
 		upstream.RecordOutcomeErr(invokeErr)
