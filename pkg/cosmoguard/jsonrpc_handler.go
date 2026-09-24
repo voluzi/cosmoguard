@@ -688,7 +688,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 					// don't share entries (different TTLs / cacheError flags would
 					// otherwise be silently ignored — whichever rule populated the
 					// cache first won). Computed only here: it marshals params.
-					hash := request.HashWithRule(rule.Fingerprint)
+					hash := jsonRPCHTTPCacheKey(request, rule.Fingerprint, r)
 					ruleTag := ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
 					// Single round-trip lookup; ErrNotFound = miss, other
 					// errors are backend failures that we log and fall
@@ -864,9 +864,11 @@ func (h *JsonRpcHandler) getSingleUpstreamResponse(w http.ResponseWriter, r *htt
 	// requires. Mirror the HTTP path's cacheableByUpstream gate.
 	committed := ww.GetCommittedHeaders()
 	admission := cacheAdmissionHeaders(committed, varyCapture)
-	if !cacheableByUpstream(admission) || !cacheableByVary(admission, jsonRPCCacheKeyVary) {
+	hasOrigin := r.Header.Get("Origin") != ""
+	if !cacheableByUpstream(admission) || !jsonRPCCacheableByVary(admission, hasOrigin) {
 		return
 	}
+	res.CORSWildcard = wildcardCORSAnswer(admission, hasOrigin)
 
 	// Stamp StoredAt and store under a physical TTL extended by the stale
 	// window so this entry can be served stale-while-revalidate later.
@@ -1047,9 +1049,11 @@ func (h *JsonRpcHandler) fetchSingle(r *http.Request, next func(http.ResponseWri
 	// without the revalidation its Cache-Control demands. Mirror the HTTP
 	// path's cacheableByUpstream gate.
 	admission := cacheAdmissionHeaders(committed, varyCapture)
-	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) || !cacheableByUpstream(admission) || !cacheableByVary(admission, jsonRPCCacheKeyVary) {
+	hasOrigin := r.Header.Get("Origin") != ""
+	if (res.Error != nil && !cache.CacheError) || (res.IsEmptyResult() && !cache.CacheEmptyResult) || !cacheableByUpstream(admission) || !jsonRPCCacheableByVary(admission, hasOrigin) {
 		return out, nil
 	}
+	res.CORSWildcard = wildcardCORSAnswer(admission, hasOrigin)
 	out.Shareable = true
 	if age, ok := parseUpstreamAge(out.Headers); ok && out.SharedHeaders != nil {
 		// Coalesced non-owner waiters only receive SharedHeaders (which carries
@@ -1136,6 +1140,9 @@ func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *h
 			w.Header().Set("Content-Type", "application/json")
 		}
 	}
+	if !ownsRawResponse {
+		h.applyCachedCORS(w.Header(), r, res.Message)
+	}
 	if h.cors != nil {
 		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
 	}
@@ -1148,6 +1155,17 @@ func (h *JsonRpcHandler) writeBufferedSingleResponse(w http.ResponseWriter, r *h
 	_, _ = w.Write(body)
 }
 
+// applyCachedCORS replays the node's wildcard CORS answer on a response served from the cache (or
+// shared with a coalesced caller) to a request with an Origin. When cosmoguard owns CORS its own
+// policy applies instead.
+func (h *JsonRpcHandler) applyCachedCORS(headers http.Header, r *http.Request, res *JsonRpcMsg) {
+	if h.cors != nil || res == nil || !res.CORSWildcard || r.Header.Get("Origin") == "" {
+		return
+	}
+	headers.Set("Access-Control-Allow-Origin", "*")
+	addVary(headers, "Origin")
+}
+
 func (h *JsonRpcHandler) writeSingleResponse(w http.ResponseWriter, r *http.Request, res *JsonRpcMsg) {
 	b, err := res.Marshal()
 	if err != nil {
@@ -1158,6 +1176,7 @@ func (h *JsonRpcHandler) writeSingleResponse(w http.ResponseWriter, r *http.Requ
 
 	// set the proper content type before writing
 	w.Header().Set("Content-Type", "application/json")
+	h.applyCachedCORS(w.Header(), r, res)
 	if h.cors != nil {
 		h.cors.ApplyToResponse(w.Header(), r.Header.Get("Origin"))
 	}
@@ -1290,7 +1309,7 @@ RequestsLoop:
 					}
 
 					// Per-rule cache namespace; see HashWithRule.
-					hash := req.HashWithRule(rule.Fingerprint)
+					hash := jsonRPCHTTPCacheKey(req, rule.Fingerprint, r)
 					ruleTag := ruleTagOrFingerprint(rule.Tag, rule.Fingerprint)
 					// Single round-trip lookup; ErrNotFound = miss
 					// (fall through to upstream), other errors are
@@ -1415,7 +1434,7 @@ RequestsLoop:
 			// Correlate by id (Set) — per JSON-RPC 2.0 batch responses
 			// match by id, not position; notifications get none.
 			responses.Set(pendingRequests, upstreamResponses)
-			if err = responses.StoreInCache(h.cache, nowOrDefault(h.now).UTC(), h.cacheConfig, upstreamHeaders, func(ruleTag, method string) {
+			if err = responses.StoreInCache(h.cache, nowOrDefault(h.now).UTC(), h.cacheConfig, upstreamHeaders, r.Header.Get("Origin") != "", func(ruleTag, method string) {
 				h.cgDashboard.RecordCardinality(h.section, ruleTag, method)
 			}); err != nil {
 				h.log.Errorf("error caching responses: %v", err)

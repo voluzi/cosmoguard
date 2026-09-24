@@ -79,6 +79,12 @@ type JsonRpcMsg struct {
 	// classifyFreshness): those entries have no stale window, so the
 	// backend TTL still evicts them correctly.
 	StoredAt time.Time `json:"-" msgpack:"stored_at,omitempty"`
+
+	// CORSWildcard records that the upstream answered this browser request with
+	// `Access-Control-Allow-Origin: *`, the same answer for every origin (a node
+	// with CORS enabled). Cache hits for requests with an Origin replay it; see
+	// jsonRPCHTTPCacheKey. Cache-only, like StoredAt.
+	CORSWildcard bool `json:"-" msgpack:"cors_wildcard,omitempty"`
 }
 
 // jsonRpcMsgOverheadBytes is a flat per-entry allowance covering the
@@ -221,27 +227,29 @@ func (j *JsonRpcMsg) IsEmptyResult() bool {
 
 func (j *JsonRpcMsg) Clone() *JsonRpcMsg {
 	return &JsonRpcMsg{
-		Version:    j.Version,
-		ID:         j.ID,
-		Method:     j.Method,
-		Params:     j.Params,
-		Result:     j.Result,
-		Error:      j.Error.Clone(),
-		WireSuffix: j.WireSuffix,
-		StoredAt:   j.StoredAt,
+		Version:      j.Version,
+		ID:           j.ID,
+		Method:       j.Method,
+		Params:       j.Params,
+		Result:       j.Result,
+		Error:        j.Error.Clone(),
+		WireSuffix:   j.WireSuffix,
+		StoredAt:     j.StoredAt,
+		CORSWildcard: j.CORSWildcard,
 	}
 }
 
 func (j *JsonRpcMsg) CloneWithID(id interface{}) *JsonRpcMsg {
 	return &JsonRpcMsg{
-		Version:    j.Version,
-		ID:         id,
-		Method:     j.Method,
-		Params:     j.Params,
-		Result:     j.Result,
-		Error:      j.Error.Clone(),
-		WireSuffix: j.WireSuffix,
-		StoredAt:   j.StoredAt,
+		Version:      j.Version,
+		ID:           id,
+		Method:       j.Method,
+		Params:       j.Params,
+		Result:       j.Result,
+		Error:        j.Error.Clone(),
+		WireSuffix:   j.WireSuffix,
+		StoredAt:     j.StoredAt,
+		CORSWildcard: j.CORSWildcard,
 	}
 }
 
@@ -969,15 +977,16 @@ func (l *JsonRpcResponses) Deny(request *JsonRpcMsg) {
 // caller can bump the per-rule cache-cardinality counter (the WS / HTTP
 // single-request paths do this inline; batch fans out through here).
 // onWrite receives the rule tag and the original JSON-RPC method.
-func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], now time.Time, global *CacheGlobalConfig, upstreamHeaders http.Header, onWrite func(ruleTag, method string)) error {
+func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], now time.Time, global *CacheGlobalConfig, upstreamHeaders http.Header, requestHasOrigin bool, onWrite func(ruleTag, method string)) error {
 	// A batch shares one HTTP response, so its Cache-Control governs every
 	// message in it. Anti-cache directives (no-store/no-cache/private/zero
 	// max-age) forbid storage: entries here are written under a stale-extended
 	// TTL for single-path / WS serve-stale, so a stored no-cache reply would be
 	// served stale without the revalidation it requires. Mirror the HTTP path.
-	if !cacheableByUpstream(upstreamHeaders) || !cacheableByVary(upstreamHeaders, jsonRPCCacheKeyVary) {
+	if !cacheableByUpstream(upstreamHeaders) || !jsonRPCCacheableByVary(upstreamHeaders, requestHasOrigin) {
 		return nil
 	}
+	corsWildcard := wildcardCORSAnswer(upstreamHeaders, requestHasOrigin)
 	for _, r := range *l {
 		if r.Response != nil && r.Cache != nil && r.Cache.Enable {
 			if r.Response.Error != nil && !r.Cache.CacheError {
@@ -993,6 +1002,7 @@ func (l *JsonRpcResponses) StoreInCache(cache cache.Cache[uint64, *JsonRpcMsg], 
 			// while it revalidates. When SWR is off the physical TTL is just
 			// the logical TTL.
 			r.Response.StoredAt = now
+			r.Response.CORSWildcard = corsWildcard
 			stale := upstreamHTTPStaleWindow(upstreamHeaders, resolveStaleWindow(r.Cache, cfgStaleWindow(global)))
 			ttl := physicalTTL(effectiveTTL(r.Cache, global), stale)
 			if err := cache.Set(context.Background(), r.CacheKey, r.Response, ttl); err != nil {

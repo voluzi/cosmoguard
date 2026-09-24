@@ -931,7 +931,10 @@ func TestJSONRPCStaleResponseCarriesCacheHeader(t *testing.T) {
 	base := time.Unix(2_000_000, 0)
 	h.now = func() time.Time { return base }
 	request := &JsonRpcMsg{Version: "2.0", ID: 1, Method: "status"}
-	hash := request.HashWithRule(rule.Fingerprint)
+	rec := httptest.NewRecorder()
+	req, _ := jsonRequestContext()
+	req.Header.Set("Origin", "https://app.example")
+	hash := jsonRPCHTTPCacheKey(request, rule.Fingerprint, req)
 	require.NoError(t, h.cache.Set(context.Background(), hash, &JsonRpcMsg{
 		Version:  "2.0",
 		ID:       1,
@@ -939,9 +942,6 @@ func TestJSONRPCStaleResponseCarriesCacheHeader(t *testing.T) {
 		StoredAt: base.Add(-6 * time.Second),
 	}, time.Hour))
 
-	rec := httptest.NewRecorder()
-	req, _ := jsonRequestContext()
-	req.Header.Set("Origin", "https://app.example")
 	h.handleHttpSingle(request, rec, req, func(http.ResponseWriter, *http.Request) {}, time.Now())
 
 	require.Equal(t, cacheStale, rec.Header().Get(cacheStateHeader))

@@ -165,10 +165,44 @@ func cacheAdmissionHeaders(committed http.Header, capture *upstreamVaryCapture) 
 // all origins; the key only separates requests with and without an Origin (see originPresenceKey).
 // A response whose CORS answer depends on the origin stays uncached.
 func httpCacheableByVary(upstream http.Header, requestHasOrigin bool) bool {
+	return cacheableByVaryAllowingOrigin(upstream, requestHasOrigin, true)
+}
+
+// jsonRPCCacheableByVary is httpCacheableByVary for JSON-RPC entries, which are re-marshalled on
+// every hit and therefore cannot follow an upstream content-coding: Accept-Encoding stays refused.
+func jsonRPCCacheableByVary(upstream http.Header, requestHasOrigin bool) bool {
+	return cacheableByVaryAllowingOrigin(upstream, requestHasOrigin, false)
+}
+
+// wildcardCORSAnswer reports whether the upstream granted this browser request the wildcard CORS
+// answer that is identical for every origin.
+func wildcardCORSAnswer(upstream http.Header, requestHasOrigin bool) bool {
+	return requestHasOrigin && sameResponseForEveryOrigin(upstream, true)
+}
+
+// jsonRPCOriginBucket separates JSON-RPC cache entries for requests with an Origin from those
+// without one, mirroring originPresenceKey on the HTTP path. The bucket without an Origin keeps the
+// plain HashWithRule key that the WebSocket path also uses, so WS and plain HTTP clients still share.
+const jsonRPCOriginBucket uint64 = 0x9e3779b97f4a7c15
+
+// jsonRPCHTTPCacheKey is the cache key for a JSON-RPC request received over HTTP.
+func jsonRPCHTTPCacheKey(msg *JsonRpcMsg, ruleFingerprint uint64, r *http.Request) uint64 {
+	hash := msg.HashWithRule(ruleFingerprint)
+	if r.Header.Get("Origin") != "" {
+		hash ^= jsonRPCOriginBucket
+	}
+	return hash
+}
+
+func cacheableByVaryAllowingOrigin(upstream http.Header, requestHasOrigin, acceptEncodingKeyed bool) bool {
 	for _, vary := range upstream.Values("Vary") {
 		for _, field := range strings.Split(vary, ",") {
 			switch f := strings.ToLower(strings.TrimSpace(field)); f {
-			case "", "accept-encoding":
+			case "":
+			case "accept-encoding":
+				if !acceptEncodingKeyed {
+					return false
+				}
 			case "origin":
 				if !sameResponseForEveryOrigin(upstream, requestHasOrigin) {
 					return false

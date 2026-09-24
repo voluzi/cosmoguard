@@ -280,7 +280,7 @@ func TestJSONRPCNonCoalescedCORSAddedVaryStoresAndHitsThroughRealHook(t *testing
 	first := httptest.NewRecorder()
 	h.handleHttpSingle(firstRequest, first, firstHTTP, next, time.Now())
 
-	hash := firstRequest.HashWithRule(rule.Fingerprint)
+	hash := jsonRPCHTTPCacheKey(firstRequest, rule.Fingerprint, firstHTTP)
 	require.Eventually(t, func() bool {
 		_, err := h.cache.Get(t.Context(), hash)
 		return err == nil
@@ -539,4 +539,183 @@ func TestPickCacheableHeadersStoresOnlyAWildcardACAO(t *testing.T) {
 	specific := pickCacheableHeaders(http.Header{"Access-Control-Allow-Origin": {"https://a.example"}, "Access-Control-Expose-Headers": {"X-Custom"}}, nil)
 	require.NotContains(t, specific, "Access-Control-Allow-Origin")
 	require.NotContains(t, specific, "Access-Control-Expose-Headers")
+}
+
+// jsonRPCWildcardCORSUpstream answers JSON-RPC like a CometBFT node with cors_allowed_origins = ["*"].
+func jsonRPCWildcardCORSUpstream(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Origin")
+		if r.Header.Get("Origin") != "" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		writeJSONRPCUpstreamResult(t, w, r)
+	}
+}
+
+func jsonRPCStatusRequest(id int, origin string) (*JsonRpcMsg, *http.Request) {
+	httpRequest := jsonTenantRequest("", id)
+	if origin != "" {
+		httpRequest.Header.Set("Origin", origin)
+	}
+	return &JsonRpcMsg{Version: "2.0", ID: id, Method: "status"}, httpRequest
+}
+
+// JSON-RPC over HTTP to a wildcard-CORS node is shared across origins: plain clients share one entry,
+// every browser origin shares another, and browser hits carry the node's wildcard CORS header.
+func TestJSONRPCWildcardCORSUpstreamIsSharedAcrossOrigins(t *testing.T) {
+	for name, coalesce := range map[string]bool{"coalesced": true, "non-coalesced": false} {
+		t.Run(name, func(t *testing.T) {
+			p, hits := newRealHookCacheProxy(t, nil, jsonRPCWildcardCORSUpstream(t))
+			rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"status"}, Cache: &RuleCache{Enable: true, TTL: time.Minute, Coalesce: &coalesce}}
+			h := newJSONCacheHandler(t, rule)
+			next := p.pool.ServeHTTP
+			call := func(id int, origin string) *httptest.ResponseRecorder {
+				request, httpRequest := jsonRPCStatusRequest(id, origin)
+				response := httptest.NewRecorder()
+				h.handleHttpSingle(request, response, httpRequest, next, time.Now())
+				require.JSONEq(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":"ok"}`, id), response.Body.String())
+				return response
+			}
+			waitStored := func(origin string) {
+				request, httpRequest := jsonRPCStatusRequest(1, origin)
+				key := jsonRPCHTTPCacheKey(request, rule.Fingerprint, httpRequest)
+				require.Eventually(t, func() bool {
+					_, err := h.cache.Get(t.Context(), key)
+					return err == nil
+				}, time.Second, time.Millisecond)
+			}
+
+			call(1, "")
+			waitStored("")
+			for id := 2; id <= 4; id++ {
+				response := call(id, "")
+				require.Equal(t, cacheHit, response.Header().Get(cacheStateHeader))
+				require.Empty(t, response.Header().Get("Access-Control-Allow-Origin"))
+			}
+			require.Equal(t, int32(1), hits.Load(), "clients without an Origin share one entry")
+
+			call(5, "https://a.example")
+			waitStored("https://a.example")
+			for id, origin := range []string{"https://a.example", "https://b.example", "https://c.example"} {
+				response := call(10+id, origin)
+				require.Equal(t, cacheHit, response.Header().Get(cacheStateHeader), origin)
+				require.Equal(t, "*", response.Header().Get("Access-Control-Allow-Origin"), origin)
+			}
+			require.Equal(t, int32(2), hits.Load(), "every origin shares one entry")
+		})
+	}
+}
+
+// A JSON-RPC upstream that answers each origin differently is not shared across origins.
+func TestJSONRPCOriginSpecificCORSUpstreamIsNotShared(t *testing.T) {
+	p, hits := newRealHookCacheProxy(t, nil, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		writeJSONRPCUpstreamResult(t, w, r)
+	})
+	off := false
+	rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"status"}, Cache: &RuleCache{Enable: true, TTL: time.Minute, Coalesce: &off}}
+	h := newJSONCacheHandler(t, rule)
+	for id, origin := range []string{"https://a.example", "https://b.example"} {
+		request, httpRequest := jsonRPCStatusRequest(id+1, origin)
+		response := httptest.NewRecorder()
+		h.handleHttpSingle(request, response, httpRequest, p.pool.ServeHTTP, time.Now())
+		require.Equal(t, origin, response.Header().Get("Access-Control-Allow-Origin"))
+	}
+	require.Equal(t, int32(2), hits.Load())
+}
+
+// A batch from a browser stores wildcard-CORS entries that later single browser requests hit.
+func TestJSONRPCBatchWildcardCORSEntryServesBrowserSingles(t *testing.T) {
+	p, hits := newRealHookCacheProxy(t, nil, jsonRPCWildcardCORSUpstream(t))
+	rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"status"}, Cache: &RuleCache{Enable: true, TTL: time.Minute}}
+	h := newJSONCacheHandler(t, rule)
+	_, batchHTTP := jsonRPCStatusRequest(1, "https://a.example")
+	h.handleHttpBatch(JsonRpcMsgs{{Version: "2.0", ID: 1, Method: "status"}}, httptest.NewRecorder(), batchHTTP, p.pool.ServeHTTP, time.Now())
+	require.Equal(t, int32(1), hits.Load())
+
+	request, httpRequest := jsonRPCStatusRequest(2, "https://b.example")
+	response := httptest.NewRecorder()
+	h.handleHttpSingle(request, response, httpRequest, p.pool.ServeHTTP, time.Now())
+	require.Equal(t, cacheHit, response.Header().Get(cacheStateHeader))
+	require.Equal(t, "*", response.Header().Get("Access-Control-Allow-Origin"))
+	require.Equal(t, int32(1), hits.Load())
+}
+
+// The bucket without an Origin keeps the plain key the WebSocket path uses, so an entry primed over
+// WebSocket serves plain HTTP clients, and never browsers, which have no CORS answer for it.
+func TestJSONRPCWebSocketEntryServesOnlyRequestsWithoutOrigin(t *testing.T) {
+	rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"status"}, Cache: &RuleCache{Enable: true, TTL: time.Minute}}
+	h := newJSONCacheHandler(t, rule)
+	request, plain := jsonRPCStatusRequest(1, "")
+	require.NoError(t, h.cache.Set(t.Context(), request.HashWithRule(rule.Fingerprint), &JsonRpcMsg{Version: "2.0", ID: 1, Result: []byte(`"ws"`), StoredAt: time.Now()}, time.Minute))
+	require.Equal(t, request.HashWithRule(rule.Fingerprint), jsonRPCHTTPCacheKey(request, rule.Fingerprint, plain))
+
+	_, browser := jsonRPCStatusRequest(1, "https://a.example")
+	require.NotEqual(t, request.HashWithRule(rule.Fingerprint), jsonRPCHTTPCacheKey(request, rule.Fingerprint, browser))
+}
+
+func TestJSONRPCCacheableByVary(t *testing.T) {
+	require.True(t, jsonRPCCacheableByVary(http.Header{"Vary": {"Origin"}, "Access-Control-Allow-Origin": {"*"}}, true))
+	require.True(t, jsonRPCCacheableByVary(http.Header{"Vary": {"Origin"}}, false))
+	require.False(t, jsonRPCCacheableByVary(http.Header{"Vary": {"Origin"}, "Access-Control-Allow-Origin": {"https://a.example"}}, true))
+	require.False(t, jsonRPCCacheableByVary(http.Header{"Vary": {"Accept-Encoding"}}, false), "JSON-RPC entries are re-marshalled")
+	require.False(t, jsonRPCCacheableByVary(http.Header{"Vary": {"Origin, X-Tenant"}}, false))
+}
+
+// Browser callers coalesced onto one upstream fetch all receive the wildcard CORS answer.
+func TestJSONRPCCoalescedBrowserWaitersGetWildcardCORS(t *testing.T) {
+	release := make(chan struct{})
+	p, hits := newRealHookCacheProxy(t, nil, func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		jsonRPCWildcardCORSUpstream(t)(w, r)
+	})
+	rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"status"}, Cache: &RuleCache{Enable: true, TTL: time.Minute}}
+	h := newJSONCacheHandler(t, rule)
+
+	origins := []string{"https://a.example", "https://b.example", "https://c.example"}
+	responses := make([]*httptest.ResponseRecorder, len(origins))
+	var wg sync.WaitGroup
+	for i, origin := range origins {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			request, httpRequest := jsonRPCStatusRequest(i+1, origin)
+			responses[i] = httptest.NewRecorder()
+			h.handleHttpSingle(request, responses[i], httpRequest, p.pool.ServeHTTP, time.Now())
+		}()
+	}
+	require.Eventually(t, func() bool { return hits.Load() == 1 }, time.Second, time.Millisecond)
+	time.Sleep(50 * time.Millisecond) // let the other callers join the in-flight fetch
+	close(release)
+	wg.Wait()
+
+	require.Equal(t, int32(1), hits.Load())
+	for i, response := range responses {
+		require.Equal(t, "*", response.Header().Get("Access-Control-Allow-Origin"), origins[i])
+	}
+}
+
+// When cosmoguard owns CORS its policy decides: an origin it does not allow gets no wildcard from
+// the cached node answer.
+func TestJSONRPCWildcardCORSEntryDefersToCosmoguardCORS(t *testing.T) {
+	p, _ := newRealHookCacheProxy(t, nil, jsonRPCWildcardCORSUpstream(t))
+	off := false
+	rule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"status"}, Cache: &RuleCache{Enable: true, TTL: time.Minute, Coalesce: &off}}
+	h := newJSONCacheHandler(t, rule)
+	h.cors = compiledTestCORS(t)
+
+	first, firstHTTP := jsonRPCStatusRequest(1, "https://a.example")
+	h.handleHttpSingle(first, httptest.NewRecorder(), firstHTTP, p.pool.ServeHTTP, time.Now())
+	key := jsonRPCHTTPCacheKey(first, rule.Fingerprint, firstHTTP)
+	require.Eventually(t, func() bool {
+		_, err := h.cache.Get(t.Context(), key)
+		return err == nil
+	}, time.Second, time.Millisecond)
+
+	request, httpRequest := jsonRPCStatusRequest(2, "https://not-allowed.example")
+	response := httptest.NewRecorder()
+	h.handleHttpSingle(request, response, httpRequest, p.pool.ServeHTTP, time.Now())
+	require.Equal(t, cacheHit, response.Header().Get(cacheStateHeader))
+	require.Empty(t, response.Header().Get("Access-Control-Allow-Origin"))
 }
