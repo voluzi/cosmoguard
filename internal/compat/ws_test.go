@@ -176,3 +176,68 @@ func TestCompareSubHandshakeTimeout(t *testing.T) {
 	assert.Equal(t, res.Class, Failed, res.Detail)
 	assert.Assert(t, time.Since(start) < 5*time.Second, "--timeout bounds the handshake, not the %s event window", wsWindow)
 }
+
+// fakeWSRefuse answers a subscribe with errJSON after delay, then closes,
+// as public edges do.
+func fakeWSRefuse(t *testing.T, errJSON string, delay time.Duration) string {
+	t.Helper()
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, _, err := c.ReadMessage(); err != nil {
+			return
+		}
+		time.Sleep(delay)
+		_ = c.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","id":1,"error":`+errJSON+`}`))
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+func TestCompareSubRefusals(t *testing.T) {
+	sub := evmNewHeads
+	const unauthorized = `{"code":401,"message":"unauthorized access"}`
+	// cosmoguard today rewrites an upstream subscribe error like this.
+	const rewritten = `{"code":-100,"message":"subscription failed: unauthorized access"}`
+	accepting := func() string { return fakeWSFrames(t) } // acks, then no events
+
+	// Each case runs with either side answering first, so the verdict
+	// cannot depend on arrival order.
+	for _, nodeFirst := range []bool{true, false} {
+		nodeDelay, guardDelay := time.Duration(0), 50*time.Millisecond
+		if !nodeFirst {
+			nodeDelay, guardDelay = guardDelay, nodeDelay
+		}
+		t.Run(fmt.Sprintf("nodeFirst=%v", nodeFirst), func(t *testing.T) {
+			res := compareSub(t.Context(), sub, fakeWSRefuse(t, unauthorized, nodeDelay), fakeWSRefuse(t, unauthorized, guardDelay), 5*time.Second)
+			assert.Equal(t, res.Class, Identical, res.Detail)
+			assert.Assert(t, strings.Contains(res.Detail, "both refused"), res.Detail)
+
+			res = compareSub(t.Context(), sub, fakeWSRefuse(t, unauthorized, nodeDelay), fakeWSRefuse(t, rewritten, guardDelay), 5*time.Second)
+			assert.Equal(t, res.Class, Differs, res.Detail)
+			assert.Assert(t, strings.Contains(res.Detail, "code node=401 cosmoguard=-100"), res.Detail)
+			assert.Assert(t, strings.Contains(res.Detail, "message node="), res.Detail)
+			assert.Assert(t, !strings.Contains(res.Detail, "data node="), "equal fields are not listed: %s", res.Detail)
+		})
+	}
+	t.Run("only the node refuses", func(t *testing.T) {
+		res := compareSub(t.Context(), sub, fakeWSRefuse(t, unauthorized, 50*time.Millisecond), accepting(), 5*time.Second)
+		assert.Equal(t, res.Class, Failed, res.Detail)
+	})
+	t.Run("only cosmoguard refuses", func(t *testing.T) {
+		res := compareSub(t.Context(), sub, accepting(), fakeWSRefuse(t, unauthorized, 50*time.Millisecond), 5*time.Second)
+		assert.Equal(t, res.Class, Differs, res.Detail)
+		assert.Assert(t, strings.Contains(res.Detail, "cosmoguard refused"), res.Detail)
+	})
+}
+
+func TestErrorDiff(t *testing.T) {
+	a := map[string]any{"code": 1, "message": "m", "data": map[string]any{"x": 1}}
+	b := map[string]any{"code": 1, "message": "m", "data": map[string]any{"x": 2}}
+	assert.Equal(t, errorDiff(a, a), "")
+	assert.Assert(t, strings.HasPrefix(errorDiff(a, b), "data node="), errorDiff(a, b))
+}

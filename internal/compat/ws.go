@@ -84,8 +84,11 @@ func wsURL(base string) string {
 type wsEvent struct {
 	key     string
 	payload any
-	// err is set when the server answered the subscribe with an error.
-	err string
+	// refusal is the JSON-RPC error object the server answered the
+	// subscribe with.
+	refusal map[string]any
+	// ack marks the server's acceptance of the subscribe.
+	ack bool
 }
 
 // compareSub subscribes on both sides and compares the first block both
@@ -112,7 +115,17 @@ func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.D
 		return res
 	}
 	seen := [2]map[string]any{{}, {}}
+	// A side has answered the subscribe once it acked, sent an event or
+	// refused. After a refusal the other side's answer is awaited, so the
+	// verdict does not depend on which arrives first.
+	var refused [2]map[string]any
+	var accepted [2]bool
+	chans := [2]<-chan wsEvent{nodeCh, guardCh}
 	for {
+		if class, detail, done := refusalVerdict(refused, accepted); done {
+			res.Class, res.Detail = class, detail
+			return res
+		}
 		var ev wsEvent
 		var side int
 		var ok bool
@@ -122,39 +135,47 @@ func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.D
 				res.Class, res.Detail = Unstable, "interrupted before a verdict"
 				return res
 			}
-			res.Class = Unstable
-			if len(seen[0]) > 0 && len(seen[1]) == 0 {
-				res.Class = Differs
+			switch {
+			case refused[0] != nil:
+				res.Class, res.Detail = Failed, "node refused the subscription: "+short(refused[0])
+			case refused[1] != nil:
+				res.Class, res.Detail = Failed, fmt.Sprintf("the node did not answer the subscribe within %s; cosmoguard refused it: %s", wsWindow, short(refused[1]))
+			default:
+				res.Class = Unstable
+				if len(seen[0]) > 0 && len(seen[1]) == 0 {
+					res.Class = Differs
+				}
+				res.Detail = fmt.Sprintf("no block delivered by both within %s (node %d events, cosmoguard %d)", wsWindow, len(seen[0]), len(seen[1]))
 			}
-			res.Detail = fmt.Sprintf("no block delivered by both within %s (node %d events, cosmoguard %d)", wsWindow, len(seen[0]), len(seen[1]))
 			return res
-		case ev, ok = <-nodeCh:
+		case ev, ok = <-chans[0]:
 			side = 0
-		case ev, ok = <-guardCh:
+		case ev, ok = <-chans[1]:
 			side = 1
 		}
-		if !ok && ctx.Err() != nil {
-			// The window closed the connections; report the timeout
-			// on the next turn rather than a closed subscription.
-			if side == 0 {
-				nodeCh = nil
-			} else {
-				guardCh = nil
-			}
+		if !ok && (ctx.Err() != nil || refused[side] != nil) {
+			// The window closed the connections, or the server closed
+			// after refusing; the verdict comes from what was seen.
+			chans[side] = nil
 			continue
 		}
-		if !ok || ev.err != "" {
-			why := "closed the subscription"
-			if ev.err != "" {
-				why = "refused the subscription: " + ev.err
-			}
+		if !ok {
 			if side == 0 {
-				res.Class, res.Detail = Failed, "node "+why
+				res.Class, res.Detail = Failed, "node closed the subscription"
 			} else {
-				res.Class, res.Detail = Differs, "cosmoguard "+why
+				res.Class, res.Detail = Differs, "cosmoguard closed the subscription"
 			}
 			return res
 		}
+		switch {
+		case ev.refusal != nil:
+			refused[side] = ev.refusal
+			continue
+		case ev.ack:
+			accepted[side] = true
+			continue
+		}
+		accepted[side] = true
 		seen[side][ev.key] = ev.payload
 		other, both := seen[1-side][ev.key]
 		if !both {
@@ -171,6 +192,37 @@ func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.D
 		res.Class, res.Detail = Identical, "block "+ev.key
 		return res
 	}
+}
+
+// refusalVerdict decides a subscription once a refusal and the other
+// side's answer are both known: both refusing compares the JSON-RPC error
+// objects, only the node refusing means the node failed, only cosmoguard
+// refusing is a difference.
+func refusalVerdict(refused [2]map[string]any, accepted [2]bool) (Class, string, bool) {
+	switch {
+	case refused[0] != nil && refused[1] != nil:
+		if d := errorDiff(refused[0], refused[1]); d != "" {
+			return Differs, "both refused the subscription, with different errors: " + d, true
+		}
+		return Identical, "both refused the subscription: " + short(refused[0]), true
+	case refused[0] != nil && accepted[1]:
+		return Failed, "node refused the subscription: " + short(refused[0]), true
+	case refused[1] != nil && accepted[0]:
+		return Differs, "cosmoguard refused the subscription the node accepted: " + short(refused[1]), true
+	}
+	return "", "", false
+}
+
+// errorDiff lists the JSON-RPC error fields (code, message, data) that
+// differ between the node's and cosmoguard's error objects.
+func errorDiff(node, guard map[string]any) string {
+	var diffs []string
+	for _, k := range []string{"code", "message", "data"} {
+		if jsonDiff("$", node[k], guard[k]) != "" {
+			diffs = append(diffs, fmt.Sprintf("%s node=%s cosmoguard=%s", k, short(node[k]), short(guard[k])))
+		}
+	}
+	return strings.Join(diffs, "; ")
 }
 
 // subscribe dials url, sends the subscription and streams its events
@@ -205,9 +257,15 @@ func subscribe(ctx context.Context, url string, s wsSub, timeout time.Duration) 
 			frame, _ := v.(map[string]any)
 			ev := wsEvent{}
 			if e, isErr := frame["error"].(map[string]any); isErr {
-				ev.err = fmt.Sprint(e["message"])
+				ev.refusal = e
 			} else if ev.key, ev.payload, ok = s.event(frame); !ok {
-				continue
+				// The subscribe's own answer is an ack; anything else is
+				// ignored.
+				_, hasResult := frame["result"]
+				if !hasResult || fmt.Sprint(frame["id"]) != fmt.Sprint(s.subscribe["id"]) {
+					continue
+				}
+				ev.ack = true
 			}
 			select {
 			case ch <- ev:
