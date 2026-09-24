@@ -418,3 +418,37 @@ func TestHTTPRetryLoopSharesHeaderTimeout(t *testing.T) {
 	require.Less(t, elapsed, 2*timeout-timeout/4,
 		"both stalled upstreams must share one header-timeout budget, took %s", elapsed)
 }
+
+func TestNewUpstreamTransportToleratesWrappedDefault(t *testing.T) {
+	transport := newUpstreamTransport(wrappedRoundTripper{http.DefaultTransport}, time.Second)
+	require.Equal(t, upstreamIdleConnsPerHost, transport.MaxIdleConnsPerHost)
+	require.Equal(t, time.Second, transport.ResponseHeaderTimeout)
+	require.NotNil(t, transport.DialContext)
+}
+
+type wrappedRoundTripper struct{ http.RoundTripper }
+
+type unreadableBody struct{ read *atomic.Bool }
+
+func (b unreadableBody) Read([]byte) (int, error) {
+	b.read.Store(true)
+	return 0, io.EOF
+}
+
+func (unreadableBody) Close() error { return nil }
+
+func TestHTTPEmptyRetryPoolRejectsBeforeReadingBody(t *testing.T) {
+	pool := newTestHTTPPool("round-robin", 2)
+	pool.cors = compiledTestCORS(t)
+	var read atomic.Bool
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.Body = unreadableBody{&read}
+	req.Header.Set("Origin", "https://a.example")
+	rec := httptest.NewRecorder()
+
+	pool.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, []string{"https://a.example"}, rec.Header().Values("Access-Control-Allow-Origin"))
+	require.False(t, read.Load(), "an empty pool must not buffer the request body")
+}

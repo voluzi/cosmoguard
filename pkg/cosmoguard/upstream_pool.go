@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -328,7 +329,7 @@ func NewHttpUpstreamPool(
 	for _, opt := range opts {
 		opt(pool)
 	}
-	pool.transport = newUpstreamTransport(pool.responseHeaderTimeout)
+	pool.transport = newUpstreamTransport(http.DefaultTransport, pool.responseHeaderTimeout)
 	registerSharedMetrics()
 	initial := make([]*HttpUpstream, 0, len(nodes))
 	for _, n := range nodes {
@@ -687,8 +688,25 @@ func WithUpstreamCORS(c *CORSConfig) HttpUpstreamPoolOption {
 // request once more than two are in flight.
 const upstreamIdleConnsPerHost = 100
 
-func newUpstreamTransport(responseHeaderTimeout time.Duration) *http.Transport {
-	t := http.DefaultTransport.(*http.Transport).Clone()
+func newUpstreamTransport(defaultTransport http.RoundTripper, responseHeaderTimeout time.Duration) *http.Transport {
+	// An embedding program may have wrapped http.DefaultTransport (e.g. for
+	// tracing); fall back to Go's documented defaults instead of panicking.
+	var t *http.Transport
+	if base, ok := defaultTransport.(*http.Transport); ok {
+		t = base.Clone()
+	} else {
+		t = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
 	t.MaxIdleConns = 0 // bounded per host below
 	t.MaxIdleConnsPerHost = upstreamIdleConnsPerHost
 	t.ResponseHeaderTimeout = responseHeaderTimeout
@@ -996,6 +1014,12 @@ func (p *HttpUpstreamPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		u.inFlight.Add(1)
 		defer u.inFlight.Add(-1)
 		u.proxy.ServeHTTP(w, r)
+		return
+	}
+
+	if len(current) == 0 {
+		p.applyCORS(w, r)
+		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
 		return
 	}
 
