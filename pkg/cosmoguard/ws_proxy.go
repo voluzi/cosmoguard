@@ -59,9 +59,9 @@ type JsonRpcWebSocketProxy struct {
 	// path is the WS handshake path ("/websocket", "/"). Stored so the
 	// request-log entries carry the same path the client connected on.
 	path string
-	// auth is the shared Authenticator. Currently retained for symmetry
-	// with the HTTP / gRPC sides — per-rule WS auth enforcement (using
-	// JsonRpcRule.Auth) is queued for a follow-up.
+	// auth is the shared Authenticator. handleRequest applies per-rule
+	// auth (JsonRpcRule.Auth) to each frame, and a rule reload re-applies
+	// it to live subscriptions.
 	auth *Authenticator
 	// cgRequestLog captures per-frame + connect/close metadata for the
 	// dashboard's Live-traffic feed. nil-safe.
@@ -201,20 +201,15 @@ func (p *JsonRpcWebSocketProxy) SetRules(rules []*JsonRpcRule, defaultAction Rul
 }
 
 func (p *JsonRpcWebSocketProxy) revokeDenied() {
-	p.broker.revokeDenied(p.subscriptionAllowed, p.recordRevocation)
+	p.broker.revokeDenied(p.revocationCheck)
 }
 
 // recheckSubscription covers a reload that landed while request was being
 // subscribed: its revocation scan ran before the membership existed.
 func (p *JsonRpcWebSocketProxy) recheckSubscription(client *JsonRpcWsClient, request *JsonRpcMsg) {
-	if (request.Method == methodSubscribeCosmos || request.Method == methodSubscribeEth) && !p.subscriptionAllowed(client, request) {
+	if (request.Method == methodSubscribeCosmos || request.Method == methodSubscribeEth) && p.revocationCheck(client, request) != nil {
 		go p.revokeDenied()
 	}
-}
-
-func (p *JsonRpcWebSocketProxy) subscriptionAllowed(client *JsonRpcWsClient, request *JsonRpcMsg) bool {
-	reason, _ := p.subscriptionDenial(client, request)
-	return reason == ""
 }
 
 // subscriptionDenial applies the current rules and per-rule auth to a live
@@ -257,11 +252,12 @@ func (p *JsonRpcWebSocketProxy) subscriptionDenial(client *JsonRpcWsClient, requ
 	return "", nil
 }
 
-// recordRevocation shows a reload revocation in the dashboard's denials.
-func (p *JsonRpcWebSocketProxy) recordRevocation(client *JsonRpcWsClient, request *JsonRpcMsg) {
+// revocationCheck is the broker's revocationCheck: a denied subscription
+// is recorded in the dashboard's denials once revoked.
+func (p *JsonRpcWebSocketProxy) revocationCheck(client *JsonRpcWsClient, request *JsonRpcMsg) func() {
 	reason, rule := p.subscriptionDenial(client, request)
 	if reason == "" {
-		return
+		return nil
 	}
 	record := DenyRecord{Section: p.section, Reason: reason, Method: request.Method}
 	if rule != nil {
@@ -272,7 +268,7 @@ func (p *JsonRpcWebSocketProxy) recordRevocation(client *JsonRpcWsClient, reques
 		record.SourceIP = info.sourceIP
 	}
 	p.connsMu.Unlock()
-	p.cgDashboard.RecordDeny(record)
+	return func() { p.cgDashboard.RecordDeny(record) }
 }
 
 // policyVerdict runs the matched rule's per-rule auth + rate-limit
@@ -369,10 +365,7 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 		idObj = id
 	}
 	connectedAt := time.Now()
-	p.registerConn(client, source, identity, connectedAt)
-	p.connsMu.Lock()
-	p.conns[client].resolved = idObj
-	p.connsMu.Unlock()
+	p.registerConn(client, source, idObj, connectedAt)
 	p.recordLifecycle("CONNECT", source, identity, http.StatusSwitchingProtocols, 0)
 	defer func() {
 		p.deregisterConn(client)
@@ -439,9 +432,13 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 }
 
 // registerConn adds a freshly-upgraded client to the live registry.
-func (p *JsonRpcWebSocketProxy) registerConn(c *JsonRpcWsClient, sourceIP, identity string, at time.Time) {
+func (p *JsonRpcWebSocketProxy) registerConn(c *JsonRpcWsClient, sourceIP string, identity *Identity, at time.Time) {
+	info := &wsConnInfo{sourceIP: sourceIP, connectedAt: at, resolved: identity}
+	if identity != nil {
+		info.identity = identity.Name
+	}
 	p.connsMu.Lock()
-	p.conns[c] = &wsConnInfo{sourceIP: sourceIP, identity: identity, connectedAt: at}
+	p.conns[c] = info
 	p.connsMu.Unlock()
 }
 

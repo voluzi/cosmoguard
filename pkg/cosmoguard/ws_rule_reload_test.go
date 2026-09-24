@@ -131,7 +131,7 @@ func TestBrokerRevokeRechecksCurrentRules(t *testing.T) {
 	require.NoError(t, err)
 
 	// Denied when scanned, allowed again by the time revoke holds the lock.
-	broker.revoke(client, id, func(*JsonRpcWsClient, *JsonRpcMsg) bool { return true })
+	broker.revoke(client, id, func(*JsonRpcWsClient, *JsonRpcMsg) func() { return nil })
 	require.Equal(t, 1, broker.ClientSubCount(client))
 	require.Zero(t, upstream.unsubscribeCalls.Load())
 }
@@ -234,7 +234,7 @@ func TestWSRuleReloadDuringFailedUnsubscribeRevokesIt(t *testing.T) {
 func TestWSRuleReloadRevocationIsRecordedAsDenial(t *testing.T) {
 	proxy := newReloadTestProxy(t, newLimitingUpstream())
 	client, _ := newWSCacheClient(t)
-	proxy.registerConn(client, "198.51.100.7", "", time.Now())
+	proxy.registerConn(client, "198.51.100.7", nil, time.Now())
 	_, err := proxy.broker.HandleSubscription(client, &JsonRpcMsg{
 		Version: jsonRpcVersion, ID: 1, Method: methodSubscribeCosmos, Params: []any{"q"},
 	})
@@ -261,8 +261,7 @@ func TestWSRuleReloadAppliesRuleAuthToLiveSubscriptions(t *testing.T) {
 		client *JsonRpcWsClient
 		name   string
 	}{{alice, "alice"}, {bob, "bob"}} {
-		proxy.registerConn(c.client, "192.0.2.1", c.name, time.Now())
-		proxy.conns[c.client].resolved = &Identity{Name: c.name, Method: "apikey"}
+		proxy.registerConn(c.client, "192.0.2.1", &Identity{Name: c.name, Method: "apikey"}, time.Now())
 		_, err := proxy.broker.HandleSubscription(c.client, &JsonRpcMsg{
 			Version: jsonRpcVersion, ID: i + 1, Method: methodSubscribeCosmos, Params: []any{"q"},
 		})
@@ -302,4 +301,39 @@ func TestWSConnectionKeepsResolvedIdentity(t *testing.T) {
 		}
 		return false
 	}, 2*time.Second, 5*time.Millisecond)
+}
+
+// A revocation that lands while the subscribe acknowledgement is unwritten
+// sends its cancellation after the acknowledgement.
+func TestWSRevocationNoticeFollowsAcknowledgement(t *testing.T) {
+	proxy := newReloadTestProxy(t, newLimitingUpstream())
+	client, peer := newWSCacheClient(t)
+	res, delivered, err := proxy.broker.handleSubscription(client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 3, Method: methodSubscribeCosmos, Params: []any{"q"},
+	})
+	require.NoError(t, err)
+	proxy.SetRules(nil, RuleActionDeny, nil)
+	require.Eventually(t, func() bool { return proxy.broker.ClientSubCount(client) == 0 }, 2*time.Second, 5*time.Millisecond)
+	require.NoError(t, client.SendMsg(res))
+	delivered()
+
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(2*time.Second)))
+	var ack, notice JsonRpcMsg
+	require.NoError(t, peer.ReadJSON(&ack))
+	require.Nil(t, ack.Error, "acknowledgement must come first")
+	require.NoError(t, peer.ReadJSON(&notice))
+	require.NotNil(t, notice.Error)
+	require.EqualValues(t, 3, notice.ID)
+}
+
+func TestWSRevocationSkipsClosingClient(t *testing.T) {
+	proxy := newReloadTestProxy(t, newLimitingUpstream())
+	client := NewJsonRpcWsClient(nil)
+	id, err := proxy.broker.addSubscription(client, &JsonRpcMsg{
+		Version: jsonRpcVersion, ID: 1, Method: methodSubscribeCosmos, Params: []any{"q"},
+	})
+	require.NoError(t, err)
+	client.closed.Store(true)
+	require.Nil(t, proxy.broker.revoke(client, id, func(*JsonRpcWsClient, *JsonRpcMsg) func() { return func() {} }))
+	require.Equal(t, 1, proxy.broker.ClientSubCount(client))
 }

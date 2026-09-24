@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/http"
@@ -276,7 +277,13 @@ func (u *UpstreamConnManagerCosmos) onUpstreamMessage(client *JsonRpcWsClient, m
 	}
 
 	// Otherwise let's check if it's a cosmos subscription notification.
+	// A subscribe acknowledgement that outlived its request carries the
+	// same id but an empty result; it is not an event.
 	handle, ok := u.subscriptionLifecycle().route(client, msgID)
+	if ok && msg.Error == nil && isEmptyJSONObject(msg.Result) {
+		u.log.WithField("ID", msgID).Warn("dropped late subscribe acknowledgement from upstream")
+		return
+	}
 	if ok {
 		u.log.WithFields(map[string]interface{}{
 			"ID": handle,
@@ -501,4 +508,10 @@ func (u *UpstreamConnManagerCosmos) Stop() {
 
 func (u *UpstreamConnManagerCosmos) reSubmitSubscriptionsOnClient(cli *JsonRpcWsClient) error {
 	return u.subscriptionLifecycle().resubmit(cli, u)
+}
+
+func isEmptyJSONObject(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' &&
+		len(bytes.TrimSpace(trimmed[1:len(trimmed)-1])) == 0
 }

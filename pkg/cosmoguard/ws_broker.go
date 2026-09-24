@@ -221,8 +221,9 @@ func (b *Broker) HandleRequest(msg *JsonRpcMsg) (*JsonRpcMsg, error) {
 	return res.CloneWithID(msg.ID), nil
 }
 
-// HandleSubscription is handleSubscription for callers that deliver the
-// response before anything else reaches the client.
+// HandleSubscription is handleSubscription for callers that do not write the
+// response to the client: held events are released before it returns. A
+// caller that writes an acknowledgement must use handleSubscription.
 func (b *Broker) HandleSubscription(client *JsonRpcWsClient, msg *JsonRpcMsg, identity ...string) (*JsonRpcMsg, error) {
 	res, delivered, err := b.handleSubscription(client, msg, identity...)
 	delivered()
@@ -522,6 +523,10 @@ func (b *Broker) joinClient(client *JsonRpcWsClient, id string, clientSubID inte
 func (b *Broker) leaveClient(client *JsonRpcWsClient, id string, keepRequest bool) (interface{}, *JsonRpcMsg, bool) {
 	b.membershipMu.Lock()
 	defer b.membershipMu.Unlock()
+	return b.leaveClientLocked(client, id, keepRequest)
+}
+
+func (b *Broker) leaveClientLocked(client *JsonRpcWsClient, id string, keepRequest bool) (interface{}, *JsonRpcMsg, bool) {
 	clientSubID, ok := b.sm.GetSubscriptionClients(id)[client]
 	if !ok {
 		return nil, nil, false
@@ -573,37 +578,71 @@ func (b *Broker) detachClient(client *JsonRpcWsClient, id string) bool {
 	return b.sm.SubscriptionEmpty(id)
 }
 
-// revokeDenied ends every client membership whose subscribe request allowed
-// rejects, tells the client, and reports it through revoked.
-func (b *Broker) revokeDenied(allowed func(*JsonRpcWsClient, *JsonRpcMsg) bool, revoked func(*JsonRpcWsClient, *JsonRpcMsg)) {
+// revocationCheck returns nil while a live subscription's request is still
+// allowed, otherwise a function that records its revocation.
+type revocationCheck func(*JsonRpcWsClient, *JsonRpcMsg) (revoked func())
+
+// revokeDenied ends every client membership that check rejects and tells
+// the client.
+func (b *Broker) revokeDenied(check revocationCheck) {
 	b.membershipMu.Lock()
 	requests := maps.Clone(b.requests)
 	b.membershipMu.Unlock()
 	for membership, request := range requests {
-		if !allowed(membership.client, request) && b.revoke(membership.client, membership.id, allowed) {
-			revoked(membership.client, request)
+		if check(membership.client, request) != nil {
+			if revoked := b.revoke(membership.client, membership.id, check); revoked != nil {
+				revoked()
+			}
 		}
 	}
 }
 
-func (b *Broker) revoke(client *JsonRpcWsClient, id string, allowed func(*JsonRpcWsClient, *JsonRpcMsg) bool) bool {
+func (b *Broker) revoke(client *JsonRpcWsClient, id string, check revocationCheck) func() {
+	// A closing client's own cleanup removes its memberships.
+	if client.IsClosed() {
+		return nil
+	}
 	param, ok := b.sm.GetSubscriptionParam(id)
 	if !ok {
-		return false
+		return nil
 	}
 	unlock := b.lockParam(param)
+	key := brokerMembership{client: client, id: id}
 	// A later reload may have allowed it again while this one waited.
 	b.membershipMu.Lock()
-	request := b.requests[brokerMembership{client: client, id: id}]
+	request := b.requests[key]
 	b.membershipMu.Unlock()
-	if request == nil || allowed(client, request) {
+	if request == nil {
 		unlock()
-		return false
+		return nil
 	}
-	clientSubID, _, ok := b.leaveClient(client, id, false)
+	revoked := check(client, request)
+	if revoked == nil {
+		unlock()
+		return nil
+	}
+
+	b.membershipMu.Lock()
+	_, awaitingAck := b.pending[key]
+	clientSubID, _, ok := b.leaveClientLocked(client, id, false)
+	// CometBFT's own cancellation notice, sent under the subscribe id.
+	notice := &JsonRpcMsg{
+		Version: jsonRpcVersion,
+		ID:      clientSubID,
+		Error: &JsonRpcError{
+			Code:    -32000,
+			Message: "Server error",
+			Data:    "subscription was canceled (reason: denied by policy)",
+		},
+	}
+	if ok && awaitingAck && request.Method != methodSubscribeEth {
+		// The acknowledgement is not written yet; send the notice after it.
+		b.pending[key] = []heldNotification{{msg: notice, cost: wsNotificationSharedCost(notice)}}
+	}
+	b.membershipMu.Unlock()
 	if !ok {
 		unlock()
-		return false
+		return nil
 	}
 	b.admission.releaseSubscription(client)
 	if b.sm.SubscriptionEmpty(id) {
@@ -618,22 +657,15 @@ func (b *Broker) revoke(client *JsonRpcWsClient, id string, allowed func(*JsonRp
 		// eth_subscribe has no server-side cancellation message; closing
 		// the socket is what the client library notices.
 		_ = client.Close()
-		return true
+		return revoked
 	}
-	// CometBFT's own cancellation notice, sent under the subscribe id.
-	notice := &JsonRpcMsg{
-		Version: jsonRpcVersion,
-		ID:      clientSubID,
-		Error: &JsonRpcError{
-			Code:    -32000,
-			Message: "Server error",
-			Data:    "subscription was canceled (reason: denied by policy)",
-		},
+	if awaitingAck {
+		return revoked
 	}
 	if err := client.enqueueNotification(notice, wsNotificationSharedCost(notice)); err != nil && !errors.Is(err, ErrClosed) {
 		b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
 	}
-	return true
+	return revoked
 }
 
 func (b *Broker) removeEmptySubscriptionLocked(subscriptionID string) error {
@@ -694,35 +726,49 @@ func (b *Broker) onSubscriptionMessage(msg *JsonRpcMsg) {
 		}
 	}
 
-	// Under membershipMu so a membership's held events and its release
-	// cannot interleave.
+	// Held events are decided under membershipMu, so they cannot interleave
+	// with their release; the rest are enqueued after it. releasePending
+	// enqueues under the lock, so a later direct enqueue follows it.
+	type readyNotification struct {
+		client *JsonRpcWsClient
+		heldNotification
+	}
+	sharedCost := wsNotificationSharedCost(msg)
 	b.membershipMu.Lock()
-	defer b.membershipMu.Unlock()
 	clients := b.sm.GetSubscriptionClients(msgID)
+	ready := make([]readyNotification, 0, len(clients))
+	for client, id := range clients {
+		notification := heldNotification{msg: msg.CloneWithID(id), cost: wsNotificationCostWithID(sharedCost, id)}
+		key := brokerMembership{client: client, id: msgID}
+		held, ok := b.pending[key]
+		if !ok {
+			ready = append(ready, readyNotification{client: client, heldNotification: notification})
+			continue
+		}
+		// The client's own queue limits, applied while its events wait.
+		heldBytes := notification.cost
+		for _, h := range held {
+			heldBytes = addWSNotificationCost(heldBytes, h.cost)
+		}
+		if len(held) >= wsNotificationQueueMessages || (len(held) > 0 && heldBytes > wsNotificationQueueBytes) {
+			client.closeForNotificationFailure()
+			continue
+		}
+		b.pending[key] = append(held, notification)
+	}
+	b.membershipMu.Unlock()
+
 	if len(clients) == 0 {
 		b.log.WithField("ID", msg.ID).Warn("no subscribers for message")
 		return
 	}
-
 	b.log.WithFields(map[string]interface{}{
 		"ID":      msgID,
 		"clients": len(clients),
 	}).Info("broadcasting message to subscribers")
-
-	sharedCost := wsNotificationSharedCost(msg)
-	for client, id := range clients {
-		cost := wsNotificationCostWithID(sharedCost, id)
-		key := brokerMembership{client: client, id: msgID}
-		if held, ok := b.pending[key]; ok {
-			if len(held) >= wsNotificationQueueMessages {
-				client.closeForNotificationFailure()
-				continue
-			}
-			b.pending[key] = append(held, heldNotification{msg: msg.CloneWithID(id), cost: cost})
-			continue
-		}
-		if err := client.enqueueNotification(msg.CloneWithID(id), cost); err != nil && !errors.Is(err, ErrClosed) {
-			b.log.WithError(err).WithField("client", client).Warn("dropping slow websocket subscriber")
+	for _, r := range ready {
+		if err := r.client.enqueueNotification(r.msg, r.cost); err != nil && !errors.Is(err, ErrClosed) {
+			b.log.WithError(err).WithField("client", r.client).Warn("dropping slow websocket subscriber")
 		}
 	}
 }
