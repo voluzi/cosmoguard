@@ -96,12 +96,13 @@ func discoverMethods(ctx context.Context, conn *grpc.ClientConn) ([]Method, erro
 		if err != nil {
 			return nil, fmt.Errorf("reflection: %w", err)
 		}
-		defer func() { _ = stream.CloseSend() }()
 		resp, err = ask(listReq)
 		if status.Code(err) == codes.Unimplemented {
+			_ = stream.CloseSend()
 			resp = nil
 			continue
 		}
+		defer func() { _ = stream.CloseSend() }()
 		if err != nil {
 			return nil, fmt.Errorf("reflection list: %w", err)
 		}

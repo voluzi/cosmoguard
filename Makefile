@@ -42,10 +42,11 @@ fuzz:
 clean:
 	rm -rf $(BUILDDIR)/ coverage.out
 
-# compat builds cosmoguard, starts it in front of a public node and checks
-# that every endpoint answers as the node does. Needs network access.
+# compat builds cosmoguard, starts it in front of a raw node (not one
+# already behind cosmoguard) and checks that every endpoint answers as the
+# node does. Needs network access to the node.
 # COMPAT_ARGS passes extra flags, e.g. COMPAT_ARGS="--param topic_id=1".
-CHAIN ?= nibiru
+CHAIN ?= allora-devnet
 compat: $(BUILDDIR)/
 	go build -o $(BUILDDIR)/cosmoguard ./cmd/cosmoguard
 	go run ./cmd/cosmoguard-compat --chain $(CHAIN) --spawn $(BUILDDIR)/cosmoguard --report $(BUILDDIR)/compat-$(CHAIN).json $(COMPAT_ARGS)

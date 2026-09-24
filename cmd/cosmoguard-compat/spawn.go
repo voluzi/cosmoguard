@@ -54,6 +54,9 @@ lcd:
 rpc:
   default: allow
   webSocketEnabled: true
+  # One upstream subscription is compared; do not hold the default 40
+  # sockets open on the node.
+  webSocketConnections: 1
   rules:
     - action: allow
       match:
@@ -89,10 +92,7 @@ evm:
           enable: true
   ws:
     default: allow
-{{- if not .Node.EVMWS}}
-    # No EVM WebSocket to compare; keep the proxy's upstream pool minimal.
     webSocketConnections: 1
-{{- end}}
 {{- end}}
 `))
 

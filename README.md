@@ -189,14 +189,20 @@ method (URI and JSON-RPC forms, plus a batch), the read-only EVM JSON-RPC
 methods, and the NewBlock / newHeads WebSocket subscriptions. Queries are
 pinned to one height so the answers compare byte for byte, and each
 cosmoguard answer is fetched twice so cached answers are checked too. The
-status and body are compared; response headers are not.
+status, body and Content-Type are compared; other response headers are
+not. A few `cross-height` probes also ask for the same query at two
+heights, so a cache that ignores the requested height is caught.
+
+The node side must be a raw node. A chain's public endpoints usually sit
+behind cosmoguard already, and comparing against them tests cosmoguard
+against itself.
 
 ```sh
-# Build cosmoguard, start it in front of a public node, compare, stop it.
-make compat CHAIN=nibiru          # or CHAIN=allora
-make compat CHAIN=allora COMPAT_ARGS="--param topic_id=1"
+# Build cosmoguard, start it in front of the node, compare, stop it.
+make compat                        # the allora-devnet preset
+make compat COMPAT_ARGS="--param topic_id=1"
 
-# Against any node and a cosmoguard you already run:
+# Against any raw node and a cosmoguard you already run:
 go run ./cmd/cosmoguard-compat \
   --node-lcd https://lcd.example.com --node-rpc https://rpc.example.com \
   --node-grpc https://grpc.example.com \
@@ -204,19 +210,21 @@ go run ./cmd/cosmoguard-compat \
   --guard-grpc http://cosmoguard:19090 --report compat.json
 ```
 
+`--spawn path/to/cosmoguard` with `--node-*` flags starts cosmoguard in
+front of another raw node, as `make compat` does for the preset.
+
 Each endpoint is reported as `identical`, `differs` (cosmoguard answered
 differently), `denied` (cosmoguard refused a request the node answered),
 `failed` (the node itself did not answer), `unstable` or `skipped` (a path
 parameter has no live value; `--param name=value` supplies chain-specific
 ones). An endpoint is `unstable` when the node disagrees with itself
-between two calls, or answers at a different height despite the pin.
-Public endpoints are often load-balanced pools of nodes on different
-versions, so a differing endpoint is compared again, up to three rounds,
-and only reported as `differs` when every round differs. Rounds are
-`--round-delay` apart (3s with `make compat`, whose cosmoguard caches for
-2s), so each round reaches the node rather than cosmoguard's cache; set it
-above your cache TTL when checking a running deployment. For a definitive
-result, point the tool at a single node.
+between two calls, or answers at a different height despite the pin. A
+node behind a load balancer can do both, so a differing endpoint is
+compared again, up to three rounds, and only reported as `differs` when no
+round matched. Rounds and height retries are `--round-delay` apart (3s
+with `make compat`, whose cosmoguard caches for 2s), so each reaches the
+node rather than cosmoguard's cache; set it above your cache TTL when
+checking a running deployment.
 
 The run exits 1 when any endpoint differs, when nothing could be compared,
 or, with `make compat` (whose config allows everything), when any request

@@ -91,6 +91,50 @@ func TestSettle(t *testing.T) {
 		assert.Equal(t, c, Differs)
 		assert.Assert(t, strings.Contains(detail, "cosmoguard does not"), detail)
 	})
+	t.Run("cosmoguard losing the pin differs even when its cache hit states no height", func(t *testing.T) {
+		fetch, _ := scripted([4]Response{at(a, 5), at(b, 9), at(a, 5), at(b, 0)})
+		c, detail := settle(ctx, comparison{fetch: fetch, pinned: 5})
+		assert.Equal(t, c, Differs, detail)
+	})
+	t.Run("height retries wait out the delay", func(t *testing.T) {
+		fetch, calls := scripted([4]Response{at(a, 5), at(a, 6), at(a, 5), at(a, 6)}, [4]Response{at(a, 6), at(a, 6), at(a, 6), at(a, 6)})
+		start := time.Now()
+		c, _ := settle(ctx, comparison{fetch: fetch, delay: 30 * time.Millisecond})
+		assert.Equal(t, c, Identical)
+		assert.Equal(t, *calls, 2)
+		assert.Assert(t, time.Since(start) >= 30*time.Millisecond, "the retry must outlast cosmoguard's cache")
+	})
+	t.Run("a failed round keeps an earlier difference", func(t *testing.T) {
+		failed := Response{Status: 504}
+		fetch, _ := scripted([4]Response{a, b, a, b}, [4]Response{failed, a, failed, a}, [4]Response{failed, a, failed, a})
+		c, detail := settle(ctx, cmp(fetch))
+		assert.Equal(t, c, Differs, detail)
+		assert.Assert(t, strings.Contains(detail, "cosmoguard"), detail)
+	})
+	t.Run("interrupted during a round has no verdict", func(t *testing.T) {
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		calls := 0
+		fetch := func() (Response, Response, Response, Response) {
+			calls++
+			if calls == rounds {
+				cancel() // the calls in flight fail as the run is interrupted
+				return a, Response{Err: context.Canceled}, a, Response{Err: context.Canceled}
+			}
+			return a, b, a, b
+		}
+		c, detail := settle(cctx, comparison{fetch: fetch})
+		assert.Equal(t, c, Unstable)
+		assert.Equal(t, detail, "interrupted before a verdict")
+	})
+	t.Run("interrupted between rounds has no verdict", func(t *testing.T) {
+		cctx, cancel := context.WithCancel(ctx)
+		fetch, _ := scripted([4]Response{a, b, a, b})
+		go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+		c, detail := settle(cctx, comparison{fetch: fetch, delay: time.Second})
+		assert.Equal(t, c, Unstable)
+		assert.Equal(t, detail, "interrupted before a verdict")
+	})
 	t.Run("drift that settles is compared", func(t *testing.T) {
 		fetch, _ := scripted([4]Response{at(a, 5), at(a, 6), at(a, 5), at(a, 6)}, [4]Response{at(a, 6), at(a, 6), at(a, 6), at(a, 6)})
 		c, _ := settle(ctx, cmp(fetch))
@@ -103,9 +147,27 @@ func TestSettle(t *testing.T) {
 	})
 }
 
+func TestRunTasksInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	rep := &Report{}
+	started := 0
+	var tasks []task
+	for range 5 {
+		tasks = append(tasks, func(context.Context) Result {
+			started++
+			cancel()
+			return Result{Protocol: ProtoRPC, Name: "x", Class: Differs}
+		})
+	}
+	runTasks(ctx, tasks, Options{Concurrency: 1, Timeout: time.Second}, rep)
+	assert.Equal(t, started, 1, "no endpoint starts after an interrupt")
+	assert.Equal(t, rep.Count(Differs), 0, "an interrupted comparison records no difference")
+}
+
 func TestRunTasksBudget(t *testing.T) {
 	rep := &Report{}
-	o := Options{Concurrency: 2, Timeout: time.Millisecond}
+	o := Options{Concurrency: 2, Timeout: 20 * time.Millisecond}
 	slow := func(ctx context.Context) Result {
 		<-ctx.Done()
 		return Result{Protocol: ProtoRPC, Name: "slow", Class: Differs, Detail: "cosmoguard: context deadline exceeded"}

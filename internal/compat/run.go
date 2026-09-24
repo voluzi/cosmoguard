@@ -82,14 +82,14 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 	}
 
 	var tasks []task
+	var node, guard *grpc.ClientConn
 	if o.enabled(ProtoGRPC) || o.enabled(ProtoLCD) {
-		node, err := dialGRPC(o.Node.GRPC)
-		if err != nil {
+		var err error
+		if node, err = dialGRPC(o.Node.GRPC); err != nil {
 			return nil, fmt.Errorf("dial node gRPC: %w", err)
 		}
 		defer node.Close()
-		guard, err := dialGRPC(o.Guard.GRPC)
-		if err != nil {
+		if guard, err = dialGRPC(o.Guard.GRPC); err != nil {
 			return nil, fmt.Errorf("dial cosmoguard gRPC: %w", err)
 		}
 		defer guard.Close()
@@ -118,6 +118,8 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 		tasks = append(tasks, evmTasks(ctx, h, o, height)...)
 	}
 
+	tasks = append(tasks, crossHeightTasks(h, o, height, node, guard)...)
+
 	logf("running %d comparisons with concurrency %d", len(tasks), o.Concurrency)
 	runTasks(ctx, tasks, o, rep)
 
@@ -141,14 +143,23 @@ func runTasks(ctx context.Context, tasks []task, o Options, rep *Report) {
 	var wg sync.WaitGroup
 	budget := taskBudget(o)
 	for _, t := range tasks {
-		sem <- struct{}{}
+		select {
+		case <-ctx.Done():
+			// Interrupted: record nothing for the endpoints not started.
+			wg.Wait()
+			return
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
 		go func() {
 			defer func() { <-sem; wg.Done() }()
 			tctx, cancel := context.WithTimeout(ctx, budget)
 			defer cancel()
 			res := t(tctx)
-			if ctx.Err() == nil && tctx.Err() != nil {
+			switch {
+			case ctx.Err() != nil && res.Class != Identical && res.Class != Skipped:
+				res.Class, res.Detail = Unstable, "interrupted before a verdict"
+			case ctx.Err() == nil && tctx.Err() != nil:
 				// Calls cut off by the budget would read as cosmoguard
 				// failures; there is no verdict.
 				res.Class, res.Detail = Unstable, fmt.Sprintf("no verdict within %s", budget)
@@ -225,41 +236,58 @@ type comparison struct {
 }
 
 // settle compares an endpoint over up to rounds rounds and returns the
-// verdict. It differs only when every round differs; a later match makes
-// it unstable, keeping the first difference in the detail.
+// verdict. It differs only when no round matched; a later match makes it
+// unstable, keeping the first difference in the detail. A round in which
+// the node failed is inconclusive and does not erase an earlier
+// difference. An interrupted comparison has no verdict.
 func settle(ctx context.Context, c comparison) (Class, string) {
 	var first string
 	for round := 1; ; round++ {
-		class, detail := settleRound(c)
-		if class != Differs {
-			if first != "" && class == Identical {
-				return Unstable, fmt.Sprintf("matched in round %d after differing: %s", round, first)
+		class, detail := settleRound(ctx, c)
+		if ctx.Err() != nil {
+			return Unstable, "interrupted before a verdict"
+		}
+		switch {
+		case class == Differs:
+			if first == "" {
+				first = detail
 			}
+		case class == Failed && first != "":
+			// The node did not answer this round; keep the difference.
+		case class == Identical && first != "":
+			return Unstable, fmt.Sprintf("matched in round %d after differing: %s", round, first)
+		default:
 			return class, detail
 		}
-		if first == "" {
-			first = detail
-		}
 		if round == rounds {
-			return Differs, detail
+			return Differs, first
 		}
-		select {
-		case <-ctx.Done():
-			return Differs, detail
-		case <-time.After(c.delay):
+		if !sleep(ctx, c.delay) {
+			return Unstable, "interrupted before a verdict"
 		}
 	}
 }
 
+// sleep waits d, reporting false if ctx ends first.
+func sleep(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
 // settleRound compares one round. Answers at the wrong height are fetched
-// again: a pinned query should never drift, but some public nodes ignore
-// the pin. With a pin, any answer stating another height is wrong (a
-// cosmoguard cache hit may state none); without one, the answers must
-// agree. If the node keeps honouring the pin while cosmoguard keeps
-// answering at another height, cosmoguard lost the pin. When the node's
-// own two answers disagree, cosmoguard cannot be judged against it, so the
-// endpoint is reported as unstable.
-func settleRound(c comparison) (Class, string) {
+// again after the round delay, so the retry reaches upstream rather than
+// replaying cosmoguard's cache: a pinned query should never drift, but
+// some public nodes ignore the pin. With a pin, any answer stating another
+// height is wrong (a cosmoguard cache hit may state none); without one,
+// the answers must agree. If the node keeps honouring the pin while every
+// cosmoguard answer that states a height states another one, cosmoguard
+// lost the pin. When the node's own two answers disagree, cosmoguard
+// cannot be judged against it, so the endpoint is reported as unstable.
+func settleRound(ctx context.Context, c comparison) (Class, string) {
 	render := c.render
 	if render == nil {
 		render = func(r Response) Response { return r }
@@ -272,11 +300,13 @@ func settleRound(c comparison) (Class, string) {
 		}
 		if !c.volatile && drift {
 			if attempt < heightRetries {
+				if !sleep(ctx, c.delay) {
+					return Unstable, "interrupted before a verdict"
+				}
 				continue
 			}
 			detail := fmt.Sprintf("answered at heights node=%d,%d cosmoguard=%d,%d", d1.Height, d2.Height, g1.Height, g2.Height)
-			if c.pinned != 0 && d1.Height == c.pinned && d2.Height == c.pinned &&
-				offPin(g1, c.pinned) && offPin(g2, c.pinned) {
+			if c.pinned != 0 && d1.Height == c.pinned && d2.Height == c.pinned && lostPin(c.pinned, g1, g2) {
 				return Differs, fmt.Sprintf("the node honours the pinned height %d, cosmoguard does not: %s", c.pinned, detail)
 			}
 			return Unstable, detail + " despite the pin"
@@ -295,6 +325,23 @@ func settleRound(c comparison) (Class, string) {
 		}
 		return Classify(d1, []Response{g1, g2}, c.volatile)
 	}
+}
+
+// lostPin reports cosmoguard answers of which at least one states a height
+// and every one that does states one other than pinned. A cache hit may
+// state no height at all.
+func lostPin(pinned int64, rs ...Response) bool {
+	stated := false
+	for _, r := range rs {
+		if r.Height == 0 {
+			continue
+		}
+		stated = true
+		if r.Height == pinned {
+			return false
+		}
+	}
+	return stated
 }
 
 // offPin reports an answer that states a height other than the pinned one.

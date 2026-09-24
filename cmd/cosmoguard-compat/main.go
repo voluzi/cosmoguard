@@ -6,8 +6,8 @@
 //
 // It is a local test tool and is not shipped in releases:
 //
-//	make compat CHAIN=nibiru
-//	go run ./cmd/cosmoguard-compat --chain allora --guard-lcd http://... (etc.)
+//	make compat                      # the allora-devnet preset
+//	go run ./cmd/cosmoguard-compat --node-lcd https://... --guard-lcd http://... (etc.)
 package main
 
 import (
@@ -25,20 +25,15 @@ import (
 	"github.com/voluzi/cosmoguard/internal/compat"
 )
 
-// presets are public endpoints of chains cosmoguard is run in front of.
+// presets are raw nodes, with no cosmoguard in front. A chain's public
+// endpoints usually sit behind cosmoguard already, which would compare
+// cosmoguard against itself, so other chains go through the --node-* flags.
 var presets = map[string]compat.Endpoints{
-	"nibiru": {
-		LCD:  "https://lcd.nibiru.fi",
-		RPC:  "https://rpc.nibiru.fi",
-		GRPC: "https://grpc.nibiru.fi",
-		EVM:  "https://evm-rpc.nibiru.fi",
-		// evm-rpc-ws.nibiru.fi refuses eth_subscribe without
-		// credentials, so EVM subscriptions need --node-evm-ws.
-	},
-	"allora": {
-		LCD:  "https://allora-api.mainnet.allora.network",
-		RPC:  "https://allora-rpc.mainnet.allora.network",
-		GRPC: "https://allora-grpc.mainnet.allora.network",
+	// Temporary on-prem devnet (CometBFT 0.38).
+	"allora-devnet": {
+		LCD:  "https://lcd.allora.voluzi.xyz",
+		RPC:  "https://rpc.allora.voluzi.xyz",
+		GRPC: "https://grpc.allora.voluzi.xyz",
 	},
 }
 
@@ -48,7 +43,7 @@ func main() {
 
 func run() int {
 	var (
-		chain       = flag.String("chain", "nibiru", "node preset: "+strings.Join(presetNames(), ", ")+" (ignored when any --node-* URL is set)")
+		chain       = flag.String("chain", "allora-devnet", "raw-node preset: "+strings.Join(presetNames(), ", ")+" (ignored when any --node-* URL is set)")
 		spawnBin    = flag.String("spawn", "", "cosmoguard binary to start in front of the node (instead of guard-* flags)")
 		report      = flag.String("report", "", "write the full JSON report, including skip reasons, to this file")
 		only        = flag.String("only", "", "comma-separated protocols to run: grpc,lcd,rpc,evm,ws (default all)")
@@ -84,6 +79,21 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "need --node-lcd, --node-rpc and --node-grpc (or a --chain preset)")
 		return 2
 	}
+	node, guard = trimSlashes(node), trimSlashes(guard)
+
+	protocols := map[string]bool{}
+	for _, p := range strings.Split(*only, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		switch p {
+		case compat.ProtoGRPC, compat.ProtoLCD, compat.ProtoRPC, compat.ProtoEVM, compat.ProtoWS:
+			protocols[p] = true
+		default:
+			fmt.Fprintf(os.Stderr, "unknown protocol %q in --only\n", p)
+			return 2
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -100,7 +110,7 @@ func run() int {
 			*roundDelay = spawnRoundDelay
 		}
 	}
-	code := compare(ctx, *chain, node, guard, *height, *concurrency, *timeout, *roundDelay, *only, *report, params, spawned != nil)
+	code := compare(ctx, *chain, node, guard, *height, *concurrency, *timeout, *roundDelay, protocols, *report, params, spawned != nil)
 	if spawned != nil {
 		spawned.stop()
 		if log := spawned.cleanup(code != 0); log != "" {
@@ -114,27 +124,13 @@ func run() int {
 // answered differently, refused a request under the allow-all spawn config,
 // or nothing could be compared.
 func compare(ctx context.Context, chain string, node, guard compat.Endpoints, height int64, concurrency int,
-	timeout, roundDelay time.Duration, only, report string, params compat.Params, spawned bool) int {
+	timeout, roundDelay time.Duration, protocols map[string]bool, report string, params compat.Params, spawned bool) int {
 	if guard.LCD == "" || guard.RPC == "" || guard.GRPC == "" {
 		fmt.Fprintln(os.Stderr, "need --spawn or --guard-lcd, --guard-rpc and --guard-grpc")
 		return 2
 	}
 	if guard.EVM == "" {
 		node.EVM, node.EVMWS = "", ""
-	}
-
-	protocols := map[string]bool{}
-	for _, p := range strings.Split(only, ",") {
-		if p = strings.TrimSpace(p); p == "" {
-			continue
-		}
-		switch p {
-		case compat.ProtoGRPC, compat.ProtoLCD, compat.ProtoRPC, compat.ProtoEVM, compat.ProtoWS:
-			protocols[p] = true
-		default:
-			fmt.Fprintf(os.Stderr, "unknown protocol %q in --only\n", p)
-			return 2
-		}
 	}
 
 	rep, err := compat.Run(ctx, compat.Options{
@@ -184,6 +180,12 @@ func endpointFlags(e *compat.Endpoints, prefix, who string) {
 	flag.StringVar(&e.GRPC, prefix+"-grpc", "", "gRPC target of "+who+" (https://host[:port] for TLS, http://host:port plaintext)")
 	flag.StringVar(&e.EVM, prefix+"-evm", "", "EVM JSON-RPC URL of "+who+" (optional)")
 	flag.StringVar(&e.EVMWS, prefix+"-evm-ws", "", "EVM WebSocket URL of "+who+" (optional)")
+}
+
+// trimSlashes drops trailing slashes, so base+path never sends "//".
+func trimSlashes(e compat.Endpoints) compat.Endpoints {
+	t := func(s string) string { return strings.TrimRight(s, "/") }
+	return compat.Endpoints{LCD: t(e.LCD), RPC: t(e.RPC), GRPC: t(e.GRPC), EVM: t(e.EVM), EVMWS: t(e.EVMWS)}
 }
 
 func presetNames() []string {

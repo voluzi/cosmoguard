@@ -98,13 +98,13 @@ func (r *Report) WriteSummary(w io.Writer) {
 		counts[res.Protocol][res.Class]++
 	}
 	fmt.Fprintf(w, "chain %s, pinned height %d\n\n", r.Chain, r.Height)
-	fmt.Fprintf(w, "%-8s", "")
+	fmt.Fprintf(w, "%-13s", "")
 	for _, c := range classOrder {
 		fmt.Fprintf(w, "%10s", c)
 	}
 	fmt.Fprintln(w)
 	for _, p := range protocols {
-		fmt.Fprintf(w, "%-8s", p)
+		fmt.Fprintf(w, "%-13s", p)
 		for _, c := range classOrder {
 			fmt.Fprintf(w, "%10d", counts[p][c])
 		}
