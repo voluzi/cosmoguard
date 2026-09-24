@@ -25,6 +25,9 @@ type rpcCall struct {
 	method   string
 	params   []rpcParam
 	volatile bool
+	// mask lists dotted JSON paths set aside before comparing, for values
+	// that describe the answering node rather than the pinned query.
+	mask []string
 	// skip says why the call cannot be built (a live value is missing).
 	skip string
 }
@@ -56,8 +59,9 @@ func cometCalls(height int64, blockHash, txHash string) []rpcCall {
 		{method: "consensus_state", volatile: true},
 		{method: "dump_consensus_state", volatile: true},
 		{method: "genesis_chunked", params: []rpcParam{num("chunk", "0")}},
-		// blockchain also reports the answering node's tip (last_height).
-		{method: "blockchain", params: []rpcParam{num("minHeight", strconv.FormatInt(max(height-2, 1), 10)), num("maxHeight", h)}, volatile: true},
+		// blockchain also reports the answering node's tip (last_height);
+		// the pinned block_metas are compared in full.
+		{method: "blockchain", params: []rpcParam{num("minHeight", strconv.FormatInt(max(height-2, 1), 10)), num("maxHeight", h)}, mask: []string{"result.last_height"}},
 		{method: "block", params: []rpcParam{num("height", h)}},
 		{method: "block_results", params: []rpcParam{num("height", h)}},
 		{method: "commit", params: []rpcParam{num("height", h)}},
@@ -111,10 +115,10 @@ func cometTasks(ctx context.Context, h *httpDoer, o Options, p Params, height in
 	var tasks []task
 	for _, c := range calls {
 		tasks = append(tasks,
-			httpPairTask(ProtoRPC, "GET /"+c.method, c.skip, c.volatile, func(ctx context.Context, base string) Response {
+			httpPairTask(ProtoRPC, "GET /"+c.method, c.skip, c.volatile, maskFields(c.mask), func(ctx context.Context, base string) Response {
 				return h.do(ctx, http.MethodGet, base+c.uri(), nil, nil)
 			}, o.Node.RPC, o.Guard.RPC, o.RoundDelay),
-			httpPairTask(ProtoRPC, "POST "+c.method, c.skip, c.volatile, func(ctx context.Context, base string) Response {
+			httpPairTask(ProtoRPC, "POST "+c.method, c.skip, c.volatile, maskFields(c.mask), func(ctx context.Context, base string) Response {
 				b, _ := json.Marshal(c.body(1))
 				return post(ctx, base, b)
 			}, o.Node.RPC, o.Guard.RPC, o.RoundDelay),
@@ -129,7 +133,7 @@ func cometTasks(ctx context.Context, h *httpDoer, o Options, p Params, height in
 			batch = append(batch, c.body(i+1))
 		}
 	}
-	tasks = append(tasks, httpPairTask(ProtoRPC, "POST batch(block,validators,abci_query)", "", false, func(ctx context.Context, base string) Response {
+	tasks = append(tasks, httpPairTask(ProtoRPC, "POST batch(block,validators,abci_query)", "", false, nil, func(ctx context.Context, base string) Response {
 		b, _ := json.Marshal(batch)
 		return post(ctx, base, b)
 	}, o.Node.RPC, o.Guard.RPC, o.RoundDelay))
@@ -138,7 +142,7 @@ func cometTasks(ctx context.Context, h *httpDoer, o Options, p Params, height in
 
 // httpPairTask compares node and cosmoguard answers (see settle) to the
 // request built by send.
-func httpPairTask(proto, name, skip string, volatile bool, send func(context.Context, string) Response, node, guard string, delay time.Duration) task {
+func httpPairTask(proto, name, skip string, volatile bool, render func(Response) Response, send func(context.Context, string) Response, node, guard string, delay time.Duration) task {
 	return func(ctx context.Context) Result {
 		res := Result{Protocol: proto, Name: name}
 		if skip != "" {
@@ -150,8 +154,38 @@ func httpPairTask(proto, name, skip string, volatile bool, send func(context.Con
 				return send(ctx, node), send(ctx, guard), send(ctx, node), send(ctx, guard)
 			},
 			volatile: volatile,
+			render:   render,
 			delay:    delay,
 		})
 		return res
+	}
+}
+
+// maskFields returns a render that nulls the given dotted JSON paths and
+// re-encodes the body, so both sides compare as JSON values without them.
+// No paths means no render.
+func maskFields(paths []string) func(Response) Response {
+	if len(paths) == 0 {
+		return nil
+	}
+	return func(r Response) Response {
+		v, ok := decodeJSON(r.Body)
+		if r.Err != nil || !ok {
+			return r
+		}
+		for _, p := range paths {
+			segs := strings.Split(p, ".")
+			m, _ := v.(map[string]any)
+			for _, s := range segs[:len(segs)-1] {
+				m, _ = m[s].(map[string]any)
+			}
+			if _, has := m[segs[len(segs)-1]]; has {
+				m[segs[len(segs)-1]] = nil
+			}
+		}
+		if b, err := json.Marshal(v); err == nil {
+			r.Body = b
+		}
+		return r
 	}
 }

@@ -10,8 +10,8 @@ import (
 )
 
 // wsWindow bounds how long a subscription comparison waits for both sides
-// to deliver an event for the same block.
-const wsWindow = 45 * time.Second
+// to deliver an event for the same block. Tests shorten it.
+var wsWindow = 45 * time.Second
 
 // wsSub describes one subscription and how to read the block key and the
 // comparable payload out of its event frames.
@@ -120,6 +120,10 @@ func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.D
 	// verdict does not depend on which arrives first.
 	var refused [2]map[string]any
 	var accepted [2]bool
+	// A matching block is only a verdict once both sides also returned
+	// the subscribe's own response (its id is not compared).
+	var acked [2]bool
+	var matched string
 	chans := [2]<-chan wsEvent{nodeCh, guardCh}
 	for {
 		if class, detail, done := refusalVerdict(refused, accepted); done {
@@ -136,6 +140,10 @@ func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.D
 				return res
 			}
 			switch {
+			case matched != "" && !acked[0]:
+				res.Class, res.Detail = Failed, "the node never acknowledged the subscribe"
+			case matched != "":
+				res.Class, res.Detail = Differs, "cosmoguard delivered "+matched+" but never acknowledged the subscribe"
 			case refused[0] != nil:
 				res.Class, res.Detail = Failed, "node refused the subscription: "+short(refused[0])
 			case refused[1] != nil:
@@ -172,7 +180,11 @@ func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.D
 			refused[side] = ev.refusal
 			continue
 		case ev.ack:
-			accepted[side] = true
+			accepted[side], acked[side] = true, true
+			if matched != "" && acked[0] && acked[1] {
+				res.Class, res.Detail = Identical, matched
+				return res
+			}
 			continue
 		}
 		accepted[side] = true
@@ -189,8 +201,11 @@ func compareSub(ctx context.Context, s wsSub, node, guard string, timeout time.D
 			res.Class, res.Detail = Differs, "block "+ev.key+": "+d
 			return res
 		}
-		res.Class, res.Detail = Identical, "block "+ev.key
-		return res
+		matched = "block " + ev.key
+		if acked[0] && acked[1] {
+			res.Class, res.Detail = Identical, matched
+			return res
+		}
 	}
 }
 

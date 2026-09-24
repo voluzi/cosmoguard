@@ -198,3 +198,11 @@ func TestReport(t *testing.T) {
 	r.WriteSummary(&sb)
 	assert.Assert(t, !strings.Contains(sb.String(), "<html>"), "summary entries stay on one line")
 }
+
+func TestCheckHeight(t *testing.T) {
+	assert.NilError(t, checkHeight(5, 10))
+	assert.NilError(t, checkHeight(10, 10))
+	assert.ErrorContains(t, checkHeight(11, 10), "above the node's latest block")
+	assert.ErrorContains(t, checkHeight(0, 10), "heights start at 1")
+	assert.ErrorContains(t, checkHeight(1, 0), "no block yet")
+}

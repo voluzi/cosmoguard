@@ -139,11 +139,11 @@ func evmTasks(ctx context.Context, h *httpDoer, o Options, height int64) []task 
 		if c.params == nil {
 			body["params"] = []any{}
 		}
-		tasks = append(tasks, httpPairTask(ProtoEVM, c.name(), c.skip, c.volatile, post(body), o.Node.EVM, o.Guard.EVM, o.RoundDelay))
+		tasks = append(tasks, httpPairTask(ProtoEVM, c.name(), c.skip, c.volatile, nil, post(body), o.Node.EVM, o.Guard.EVM, o.RoundDelay))
 		if c.method == "eth_chainId" || c.method == "eth_getBalance" || (c.method == "eth_getBlockByNumber" && c.params[1] == false) {
 			batch = append(batch, body)
 		}
 	}
-	tasks = append(tasks, httpPairTask(ProtoEVM, "batch(eth_chainId,eth_getBlockByNumber,eth_getBalance)", "", false, post(batch), o.Node.EVM, o.Guard.EVM, o.RoundDelay))
+	tasks = append(tasks, httpPairTask(ProtoEVM, "batch(eth_chainId,eth_getBlockByNumber,eth_getBalance)", "", false, nil, post(batch), o.Node.EVM, o.Guard.EVM, o.RoundDelay))
 	return tasks
 }

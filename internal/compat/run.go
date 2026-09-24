@@ -56,6 +56,21 @@ const (
 
 type task func(ctx context.Context) Result
 
+// checkHeight rejects a pinned height the node cannot serve: below 1, or
+// above its latest block (including a node with no block yet), where both
+// sides would only return matching errors.
+func checkHeight(height, latest int64) error {
+	switch {
+	case latest < 1:
+		return fmt.Errorf("the node has no block yet (latest height %d)", latest)
+	case height < 1:
+		return fmt.Errorf("height %d: heights start at 1", height)
+	case height > latest:
+		return fmt.Errorf("height %d is above the node's latest block %d", height, latest)
+	}
+	return nil
+}
+
 // noEVM explains why EVM comparisons were skipped.
 const noEVM = "no EVM endpoint"
 
@@ -72,8 +87,8 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 		// A few blocks behind the tip, so every side has the block.
 		height = max(latest-5, 1)
 	}
-	if height < 1 {
-		return nil, fmt.Errorf("height %d: heights start at 1", height)
+	if err := checkHeight(height, latest); err != nil {
+		return nil, err
 	}
 	rep := &Report{Chain: chainID, Height: height}
 	logf := func(format string, args ...any) { fmt.Fprintf(o.Log, format+"\n", args...) }

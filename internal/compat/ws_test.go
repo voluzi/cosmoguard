@@ -241,3 +241,48 @@ func TestErrorDiff(t *testing.T) {
 	assert.Equal(t, errorDiff(a, a), "")
 	assert.Assert(t, strings.HasPrefix(errorDiff(a, b), "data node="), errorDiff(a, b))
 }
+
+func TestCompareSubRequiresAcknowledgements(t *testing.T) {
+	defer func(w time.Duration) { wsWindow = w }(wsWindow)
+	wsWindow = 500 * time.Millisecond
+	sub := cometNewBlock
+	sub.path = ""
+	block := newBlockFrame(10, `{}`)
+
+	// Events but no subscribe response from cosmoguard.
+	res := compareSub(t.Context(), sub, fakeWSFrames(t, block), fakeWSNoAck(t, block), 5*time.Second)
+	assert.Equal(t, res.Class, Differs, res.Detail)
+	assert.Assert(t, strings.Contains(res.Detail, "never acknowledged"), res.Detail)
+
+	// Or from the node.
+	res = compareSub(t.Context(), sub, fakeWSNoAck(t, block), fakeWSFrames(t, block), 5*time.Second)
+	assert.Equal(t, res.Class, Failed, res.Detail)
+
+	// Both acknowledged: identical.
+	res = compareSub(t.Context(), sub, fakeWSFrames(t, block), fakeWSFrames(t, block), 5*time.Second)
+	assert.Equal(t, res.Class, Identical, res.Detail)
+}
+
+// fakeWSNoAck sends frames without first answering the subscribe.
+func fakeWSNoAck(t *testing.T, frames ...string) string {
+	t.Helper()
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, _, err := c.ReadMessage(); err != nil {
+			return
+		}
+		for _, f := range frames {
+			if c.WriteMessage(websocket.TextMessage, []byte(f)) != nil {
+				return
+			}
+		}
+		_, _, _ = c.ReadMessage()
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}

@@ -141,3 +141,43 @@ func TestHTTPScheme(t *testing.T) {
 	assert.Equal(t, httpScheme("wss://h"), "https://h")
 	assert.Equal(t, httpScheme("https://h"), "https://h")
 }
+
+func TestResolveNodeEVMFollowsSelectedProtocols(t *testing.T) {
+	probed := map[string]bool{}
+	unreachable := func(url string) error {
+		probed[url] = true
+		return errors.New("unreachable")
+	}
+	explicit := compat.Endpoints{EVM: "http://evm:8545", EVMWS: "ws://evm:8546"}
+	node := overlay(defaultNode, explicit)
+	only := func(ps ...string) func(string) bool {
+		return func(p string) bool {
+			for _, q := range ps {
+				if p == q {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	// An RPC-only run neither probes nor fails on explicit EVM URLs.
+	got, err := resolveNodeEVM(node, explicit, only(compat.ProtoRPC), unreachable)
+	assert.NilError(t, err)
+	assert.Equal(t, len(probed), 0, "no EVM port is probed")
+	assert.Equal(t, got.EVM, "")
+	assert.Equal(t, got.EVMWS, "")
+
+	// Selecting EVM checks the explicit EVM URL, which must be reachable.
+	_, err = resolveNodeEVM(node, explicit, only(compat.ProtoEVM), unreachable)
+	assert.ErrorContains(t, err, "--node-evm:")
+	assert.Assert(t, probed["http://evm:8545"] && !probed["ws://evm:8546"])
+}
+
+func TestCompareReturns130WhenInterruptedDuringSetup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	node := compat.Endpoints{LCD: "http://127.0.0.1:1", RPC: "http://127.0.0.1:1", GRPC: "http://127.0.0.1:1"}
+	code := compare(ctx, node, node, 0, 1, time.Second, 0, map[string]bool{}, "", compat.Params{}, false)
+	assert.Equal(t, code, 130)
+}

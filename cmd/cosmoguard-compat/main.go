@@ -91,14 +91,9 @@ func run() int {
 		return 2
 	}
 
-	// A chain without EVM leaves the default EVM ports closed.
-	var err error
-	if node.EVM, err = resolveEVM(node.EVM, explicit.EVM != "", reachable(node.EVM)); err != nil {
-		fmt.Fprintf(os.Stderr, "--node-evm: %v\n", err)
-		return 2
-	}
-	if node.EVMWS, err = resolveEVM(node.EVMWS, explicit.EVMWS != "", reachable(node.EVMWS)); err != nil {
-		fmt.Fprintf(os.Stderr, "--node-evm-ws: %v\n", err)
+	node, err := resolveNodeEVM(node, explicit, enabled, reachable)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -153,6 +148,9 @@ func compare(ctx context.Context, node, guard compat.Endpoints, height int64, co
 		Log:         os.Stderr,
 	})
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return 130 // interrupted during setup
+		}
 		fmt.Fprintf(os.Stderr, "compat: %v\n", err)
 		return 2
 	}
@@ -213,6 +211,25 @@ func requiredURLs(e compat.Endpoints, enabled func(string) bool, isNode bool) []
 	need(e.RPC, "rpc", isNode || enabled(compat.ProtoRPC) || enabled(compat.ProtoWS))
 	need(e.GRPC, "grpc", enabled(compat.ProtoGRPC) || (isNode && enabled(compat.ProtoLCD)))
 	return missing
+}
+
+// resolveNodeEVM settles the node's EVM URLs. A chain without EVM leaves
+// the default EVM ports closed. A port is only probed when a selected
+// protocol uses it; the EVM URL also serves newHeads, as the spawned
+// cosmoguard proxies EVM WebSocket only with EVM on.
+func resolveNodeEVM(node, explicit compat.Endpoints, enabled func(string) bool, reach func(string) error) (compat.Endpoints, error) {
+	var err error
+	if !enabled(compat.ProtoEVM) && !enabled(compat.ProtoWS) {
+		node.EVM = ""
+	} else if node.EVM, err = resolveEVM(node.EVM, explicit.EVM != "", reach(node.EVM)); err != nil {
+		return node, fmt.Errorf("--node-evm: %w", err)
+	}
+	if !enabled(compat.ProtoWS) {
+		node.EVMWS = ""
+	} else if node.EVMWS, err = resolveEVM(node.EVMWS, explicit.EVMWS != "", reach(node.EVMWS)); err != nil {
+		return node, fmt.Errorf("--node-evm-ws: %w", err)
+	}
+	return node, nil
 }
 
 // resolveEVM decides whether an EVM endpoint is compared, given whether it
