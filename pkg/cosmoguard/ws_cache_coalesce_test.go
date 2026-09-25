@@ -15,8 +15,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
-	cachepkg "github.com/voluzi/cosmoguard/pkg/cache"
-	"github.com/voluzi/cosmoguard/pkg/util"
+	cachepkg "github.com/voluzi/cosmoguard/v5/pkg/cache"
+	"github.com/voluzi/cosmoguard/v5/pkg/util"
 )
 
 type wsCacheUpstream struct {

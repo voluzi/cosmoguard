@@ -7,7 +7,7 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
 )
 
 // TestH_RequestID_Generated: an incoming request with no X-Request-Id

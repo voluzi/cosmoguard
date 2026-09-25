@@ -8,8 +8,8 @@ import (
 	"gotest.tools/assert"
 	"gotest.tools/poll"
 
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
 )
 
 // TestB5_CrossRuleNoPoisoning is the cache-poisoning regression test from

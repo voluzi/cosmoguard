@@ -18,7 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	cosmoguardcache "github.com/voluzi/cosmoguard/pkg/cache"
+	cosmoguardcache "github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
 
 const grpcCacheTestMethod = "/cosmoguard.test.Cache/Query"

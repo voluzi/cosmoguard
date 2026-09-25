@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/voluzi/cosmoguard/pkg/util"
+	"github.com/voluzi/cosmoguard/v5/pkg/util"
 	"gotest.tools/assert"
 )
 

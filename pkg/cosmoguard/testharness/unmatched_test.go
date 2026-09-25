@@ -9,8 +9,8 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
 )
 
 // TestDashboard_Unmatched: requests that don't match any rule are

@@ -23,7 +23,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	cosmoguardcache "github.com/voluzi/cosmoguard/pkg/cache"
+	cosmoguardcache "github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
 
 // grpcRateLimitKey derives the bucket key for a gRPC rate-limit

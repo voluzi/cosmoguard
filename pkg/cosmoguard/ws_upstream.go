@@ -9,7 +9,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/voluzi/cosmoguard/pkg/util"
+	"github.com/voluzi/cosmoguard/v5/pkg/util"
 )
 
 const (
