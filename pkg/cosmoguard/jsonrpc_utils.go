@@ -14,7 +14,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/segmentio/fasthash/fnv1a"
 
-	"github.com/voluzi/cosmoguard/pkg/cache"
+	"github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
 
 var (

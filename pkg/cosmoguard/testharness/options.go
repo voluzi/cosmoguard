@@ -5,7 +5,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
 )
 
 // boolPtr returns a pointer to b, for the *bool config fields

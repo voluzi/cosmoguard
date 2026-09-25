@@ -14,7 +14,7 @@ import (
 	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/voluzi/cosmoguard/pkg/cache"
+	"github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
 
 type JsonRpcHandler struct {

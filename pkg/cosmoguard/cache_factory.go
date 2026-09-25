@@ -3,7 +3,7 @@ package cosmoguard
 import (
 	"github.com/olric-data/olric"
 
-	"github.com/voluzi/cosmoguard/pkg/cache"
+	"github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
 
 // newResponseCache builds the response cache for a proxy / handler:

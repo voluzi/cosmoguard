@@ -12,7 +12,7 @@ all: install
 $(BUILD_TARGETS):
 	CGO_ENABLED=0 go $@ \
 		-mod=readonly \
-		-ldflags="-s -w -X github.com/voluzi/cosmoguard/pkg/cosmoguard.Version=$(VERSION) -X github.com/voluzi/cosmoguard/pkg/cosmoguard.CommitHash=$(COMMIT)" \
+		-ldflags="-s -w -X github.com/voluzi/cosmoguard/v5/pkg/cosmoguard.Version=$(VERSION) -X github.com/voluzi/cosmoguard/v5/pkg/cosmoguard.CommitHash=$(COMMIT)" \
 		./cmd/cosmoguard
 
 mod:

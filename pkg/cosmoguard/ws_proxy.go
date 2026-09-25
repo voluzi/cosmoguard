@@ -12,7 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/voluzi/cosmoguard/pkg/cache"
+	"github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
 
 const (

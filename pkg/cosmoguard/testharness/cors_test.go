@@ -7,8 +7,8 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
 )
 
 // TestJ_CORS_PreflightAllowed: an OPTIONS preflight from an allowed

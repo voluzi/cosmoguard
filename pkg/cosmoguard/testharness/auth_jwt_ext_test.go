@@ -18,8 +18,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
 )
 
 // TestI_JWT_ValidToken: a request bearing a valid HMAC-signed JWT

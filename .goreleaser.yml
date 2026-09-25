@@ -22,8 +22,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.Version=v{{ .Version }}
-      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.CommitHash={{ .Commit }}
+      - -X github.com/voluzi/cosmoguard/v5/pkg/cosmoguard.Version=v{{ .Version }}
+      - -X github.com/voluzi/cosmoguard/v5/pkg/cosmoguard.CommitHash={{ .Commit }}
 
   - id: linux
     main: ./cmd/cosmoguard
@@ -42,8 +42,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.Version=v{{ .Version }}
-      - -X github.com/voluzi/cosmoguard/pkg/cosmoguard.CommitHash={{ .Commit }}
+      - -X github.com/voluzi/cosmoguard/v5/pkg/cosmoguard.Version=v{{ .Version }}
+      - -X github.com/voluzi/cosmoguard/v5/pkg/cosmoguard.CommitHash={{ .Commit }}
 
 release:
   # Mark tags with a pre-release suffix (-rc, -beta, -alpha, …) as

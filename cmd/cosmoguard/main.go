@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
 )
 
 const (

@@ -17,7 +17,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"github.com/voluzi/cosmoguard/pkg/util"
+	"github.com/voluzi/cosmoguard/v5/pkg/util"
 )
 
 // spannedServerStream lets us replace the gRPC server stream's context

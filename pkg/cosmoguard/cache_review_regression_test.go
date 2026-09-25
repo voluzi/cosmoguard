@@ -17,7 +17,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	cachepkg "github.com/voluzi/cosmoguard/pkg/cache"
+	cachepkg "github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
 
 func TestFreshnessDurationAdditionSaturates(t *testing.T) {

@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/voluzi/cosmoguard/internal/compat"
+	"github.com/voluzi/cosmoguard/v5/internal/compat"
 )
 
 // defaultNode is a raw node reached through a port-forward on its standard

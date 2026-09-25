@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/voluzi/cosmoguard/pkg/util"
+	"github.com/voluzi/cosmoguard/v5/pkg/util"
 )
 
 // TestOnUpstreamMessage_DuplicateResponseNoPanic asserts that a second

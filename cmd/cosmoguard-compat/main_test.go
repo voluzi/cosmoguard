@@ -13,8 +13,8 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/internal/compat"
-	"github.com/voluzi/cosmoguard/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v5/internal/compat"
+	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
 )
 
 func TestOverlay(t *testing.T) {

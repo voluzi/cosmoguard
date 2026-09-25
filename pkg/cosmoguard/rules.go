@@ -15,7 +15,7 @@ import (
 	"github.com/gobwas/glob"
 	"golang.org/x/net/http/httpguts"
 
-	"github.com/voluzi/cosmoguard/pkg/util"
+	"github.com/voluzi/cosmoguard/v5/pkg/util"
 )
 
 // fingerprint helpers — write small primitives into the running hash with

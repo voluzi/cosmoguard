@@ -14,7 +14,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/voluzi/cosmoguard/internal/compat"
+	"github.com/voluzi/cosmoguard/v5/internal/compat"
 )
 
 // spawnConfig allows everything, so no rule hides a difference, and caches
