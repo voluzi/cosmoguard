@@ -175,6 +175,7 @@ func RequiresRestart(previous, next *Config) (bool, string) {
 // RestartFingerprint returns a versioned SHA-256 digest of the same declarations
 // RequiresRestart compares. cfg must be a non-nil prepared declarative config,
 // before runtime DNS expansion. No environment or runtime services are accessed.
+// Fingerprints are comparable only when produced by the same module version.
 func RestartFingerprint(cfg *Config) (string, error) {
 	if cfg == nil {
 		return "", fmt.Errorf("restart fingerprint: nil config")

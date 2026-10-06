@@ -119,6 +119,7 @@ and meaningful nil/pointer distinctions. Authentication timestamps retain their
 declared instant, offset and UTC distinction; process-local timezone caches are
 excluded. The digest's encoding is versioned; consumers
 should persist the entire string.
+Fingerprints are comparable only when produced by the same module version.
 
 These APIs do not resolve DNS, open listeners, start the cache cluster or configure
 tracing. Importing the existing package still brings its proxy/cache/telemetry

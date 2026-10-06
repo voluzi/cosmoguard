@@ -136,6 +136,19 @@ func fingerprint(t *testing.T, cfg *Config) string {
 	return value
 }
 
+func TestRestartFingerprintGolden(t *testing.T) {
+	if restartTestProcess(t) {
+		return
+	}
+	// On failure, review encoding/default changes for compatibility. Preserve the
+	// digest unless a deliberate encoding-version or module-version change
+	// warrants updating this golden.
+	const want = "v1:59ff0238c15b8e91f18976662d94fd00100a07c11da6a7750ec879128a618904"
+	if got := fingerprint(t, parseRestartConfig(t, "{}\n")); got != want {
+		t.Fatalf("minimal config fingerprint = %q; want %q", got, want)
+	}
+}
+
 func TestRestartFingerprintPolicy(t *testing.T) {
 	if restartTestProcess(t) {
 		return
