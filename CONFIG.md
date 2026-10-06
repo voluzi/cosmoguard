@@ -111,8 +111,10 @@ Pass non-nil prepared **declarative** configs, before runtime DNS expansion, to
 `RequiresRestart` and `RestartFingerprint`. Neither mutates configs or loads
 configuration. `RequiresRestart` returns `(false, "")` for a permitted hot reload;
 otherwise it returns true and the exact first rejection message used by the binary.
+Both APIs reject nil: `RequiresRestart` returns true with a reason, and
+`RestartFingerprint` returns an error.
 `RestartFingerprint` returns `v1:<64 lowercase hexadecimal SHA-256 digits>` or an
-error (including for nil). Equal fingerprints identify the same restart policy
+error. Equal fingerprints identify the same restart policy
 values; rule-only edits do not change them. Comparison and fingerprinting share the
 binary's private restart projection, including effective limits, ordered slices
 and meaningful nil/pointer distinctions. Authentication timestamps retain their

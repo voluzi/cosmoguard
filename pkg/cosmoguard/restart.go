@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"crypto/sha256"
 	stdjson "encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -132,40 +133,54 @@ func dashboardRestartProjection(cfg *DashboardConfig) restartDashboard {
 	return restartDashboard{cfg.Enable != nil && *cfg.Enable, cfg.Port, cfg.BasicAuthUser, cfg.BasicAuthPassword, cfg.ClusterHistoryRestoreEnabled()}
 }
 
-// RequiresRestart compares non-nil prepared declarative configs, before runtime
+// RequiresRestart compares prepared declarative configs, before runtime
 // DNS expansion. It does not mutate them. The reason is the first reload rejection
 // message, or empty when hot reload is permitted.
+// A nil argument is rejected with true and a non-empty reason.
 func RequiresRestart(previous, next *Config) (bool, string) {
-	old, new := restartProjection(previous), restartProjection(next)
-	if !reflect.DeepEqual(old.Cache, new.Cache) {
+	if previous == nil || next == nil {
+		return true, "restart comparison: nil config"
+	}
+	before, after := restartProjection(previous), restartProjection(next)
+	// Proxies, limiters, the cache runtime and peer API retain startup cache wiring.
+	if !reflect.DeepEqual(before.Cache, after.Cache) {
 		detail := "one or more cache.* fields changed (cluster topology, global ttl, key salt)"
-		if (old.Cache.Cluster == nil) != (new.Cache.Cluster == nil) {
+		if (before.Cache.Cluster == nil) != (after.Cache.Cluster == nil) {
 			direction := "added"
-			if old.Cache.Cluster != nil {
+			if before.Cache.Cluster != nil {
 				direction = "removed"
 			}
 			detail = fmt.Sprintf("cache.cluster block was %s (embedded ↔ networked toggle requires restart)", direction)
 		}
 		return true, "cache topology change requires a process restart: " + detail
 	}
-	if old.EnableEvm != new.EnableEvm {
-		return true, fmt.Sprintf("enableEvm change requires a process restart (running=%v, new=%v)", old.EnableEvm, new.EnableEvm)
+	// EVM handlers are absent when disabled at startup; enabling them needs construction.
+	if before.EnableEvm != after.EnableEvm {
+		return true, fmt.Sprintf("enableEvm change requires a process restart (running=%v, new=%v)", before.EnableEvm, after.EnableEvm)
 	}
 	checks := []struct {
-		old, new any
-		reason   string
+		before, after any
+		reason        string
 	}{
-		{old.Auth, new.Auth, "auth config change requires a process restart"},
-		{old.Nodes, new.Nodes, "nodes (upstream topology) change requires a process restart"},
-		{old.CORS, new.CORS, "cors config change requires a process restart"},
-		{old.Server, new.Server, "server config change (timeouts / maxRequestBody / wsReadLimit / websocketLimits / wsAllowedOrigins) requires a process restart"},
-		{old.Dashboard, new.Dashboard, "dashboard config change (enable / port / basicAuth / clusterHistoryRestore) requires a process restart"},
-		{old.Metrics, new.Metrics, "metrics config change (enable / port / webUI) requires a process restart"},
-		{old.WebSocket, new.WebSocket, "websocket config change (webSocketEnabled / webSocketConnections) requires a process restart"},
-		{old.GRPC, new.GRPC, "grpc message size change (maxRecvMsgSize / maxSendMsgSize) requires a process restart"},
+		// The authenticator, replay store and key refreshers are built once; reload cannot rotate keys.
+		{before.Auth, after.Auth, "auth config change requires a process restart"},
+		// Reload updates rules in existing upstream pools; DNS churn is handled separately.
+		{before.Nodes, after.Nodes, "nodes (upstream topology) change requires a process restart"},
+		// HTTP proxies capture the compiled CORS policy at construction.
+		{before.CORS, after.CORS, "cors config change requires a process restart"},
+		// Servers and proxies copy timeouts and limits at construction; trust lists reload separately.
+		{before.Server, after.Server, "server config change (timeouts / maxRequestBody / wsReadLimit / websocketLimits / wsAllowedOrigins) requires a process restart"},
+		// Dashboard listener/auth and history replication are installed at startup.
+		{before.Dashboard, after.Dashboard, "dashboard config change (enable / port / basicAuth / clusterHistoryRestore) requires a process restart"},
+		// The metrics listener and WebUI routes/auth are constructed at startup.
+		{before.Metrics, after.Metrics, "metrics config change (enable / port / webUI) requires a process restart"},
+		// JSON-RPC handlers build their enabled WebSocket pools and connection counts once.
+		{before.WebSocket, after.WebSocket, "websocket config change (webSocketEnabled / webSocketConnections) requires a process restart"},
+		// gRPC server and upstream pool options capture message limits at construction.
+		{before.GRPC, after.GRPC, "grpc message size change (maxRecvMsgSize / maxSendMsgSize) requires a process restart"},
 	}
 	for _, check := range checks {
-		if !reflect.DeepEqual(check.old, check.new) {
+		if !reflect.DeepEqual(check.before, check.after) {
 			return true, check.reason
 		}
 	}
@@ -173,15 +188,16 @@ func RequiresRestart(previous, next *Config) (bool, string) {
 }
 
 // RestartFingerprint returns a versioned SHA-256 digest of the same declarations
-// RequiresRestart compares. cfg must be a non-nil prepared declarative config,
+// RequiresRestart compares. cfg must be a prepared declarative config,
 // before runtime DNS expansion. No environment or runtime services are accessed.
+// A nil cfg returns an error.
 // Fingerprints are comparable only when produced by the same module version.
 // The unsalted digest covers configured API keys, JWT and client secrets,
 // dashboard passwords and cluster encryption keys; key it (for example with HMAC
 // and your own secret) before storing it somewhere less protected than those secrets.
 func RestartFingerprint(cfg *Config) (string, error) {
 	if cfg == nil {
-		return "", fmt.Errorf("restart fingerprint: nil config")
+		return "", errors.New("restart fingerprint: nil config")
 	}
 	value, err := restartEncoding(reflect.ValueOf(restartProjection(cfg)))
 	if err != nil {

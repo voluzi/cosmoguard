@@ -247,12 +247,27 @@ func TestTryReloadIgnoresDiscoveryExpansion(t *testing.T) {
 	}
 }
 
-func TestRestartFingerprintNil(t *testing.T) {
+func TestRestartAPIsRejectNil(t *testing.T) {
 	if restartTestProcess(t) {
 		return
 	}
 	if value, err := RestartFingerprint(nil); err == nil || value != "" {
 		t.Fatalf("nil config = %q, %v", value, err)
+	}
+	cfg := parseRestartConfig(t, "{}\n")
+	for _, tc := range []struct {
+		name           string
+		previous, next *Config
+	}{
+		{"previous nil", nil, cfg},
+		{"next nil", cfg, nil},
+		{"both nil", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if required, reason := RequiresRestart(tc.previous, tc.next); !required || reason == "" {
+				t.Fatalf("nil config comparison = %v, %q; want rejection with a reason", required, reason)
+			}
+		})
 	}
 }
 

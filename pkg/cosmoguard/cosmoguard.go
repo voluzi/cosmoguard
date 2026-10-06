@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"context"
 	stdjson "encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -963,13 +964,9 @@ func usesAtomicWriterDataLink(target string) bool {
 // negligible.
 func (f *CosmoGuard) tryReload() {
 	slog.Info("reloading config file", "file", f.cfgFile)
-	// PrepareConfig (inside ReadConfigFromFile) calls SetTrustedProxies,
-	// which mutates the process-global source-IP trust list as a side
-	// effect — BEFORE we know whether the reload will be accepted. If a
-	// restart-required guard below rejects the reload, that global must
-	// not retain the rejected file's trust list (it would silently change
-	// per-IP rate limits, sourceIP rule predicates, and audit source
-	// addresses). Snapshot now and restore on any non-accepted exit.
+	// ReadConfigFromFile publishes trusted proxies before we know whether the
+	// reload is accepted. Restore on rejection so source-IP predicates, rate
+	// limits and audit addresses keep using the accepted trust list.
 	prevTrusted := snapshotTrustedProxies()
 	accepted := false
 	defer func() {
@@ -995,14 +992,13 @@ func (f *CosmoGuard) tryReload() {
 	previous := *f.cfg
 	previous.Nodes = f.origNodes
 	if required, reason := RequiresRestart(&previous, newCfg); required {
-		err := fmt.Errorf("%s", reason)
+		err := errors.New(reason)
 		slog.Warn("config reload rejected", "error", err)
 		configReloadsCounter.WithLabelValues("restart_required").Inc()
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
 	}
-	// Reload accepted: keep the new trusted-proxy list PrepareConfig
-	// already published (the deferred restore is now a no-op).
+	// Keep the trusted-proxy list published by ReadConfigFromFile.
 	accepted = true
 	before := f.ruleFingerprintsLocked()
 	f.cfg = newCfg
