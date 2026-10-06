@@ -135,6 +135,10 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(cacheEvictionsCounter)
 		_ = prometheus.Register(upstreamRequestsCounter)
 		_ = prometheus.Register(configReloadsCounter)
+		// A zero baseline lets rate/increase observe the first reload outcome.
+		for _, outcome := range []string{"applied", "restart_required", "invalid"} {
+			configReloadsCounter.WithLabelValues(outcome)
+		}
 	})
 }
 

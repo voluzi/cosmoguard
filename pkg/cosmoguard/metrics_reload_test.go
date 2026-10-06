@@ -57,6 +57,11 @@ func TestConfigReloadOutcomeCounter(t *testing.T) {
 	}
 	cg.applyRulesLocked()
 	want := counts()
+	for _, outcome := range []string{"applied", "restart_required", "invalid"} {
+		if value, exists := want[outcome]; !exists || value != 0 {
+			t.Fatalf("initial reload counter{%s} = %v, exposed = %v; want exposed zero", outcome, value, exists)
+		}
+	}
 	for _, tc := range []struct {
 		name, raw, outcome string
 	}{
