@@ -34,6 +34,15 @@ Table of contents:
 | `metrics.enable` | `true` | Expose `/metrics`, `/healthz`, `/readyz` on `metrics.port`. |
 | `metrics.port` | `9001` | Metrics + health-probe port. |
 
+`/metrics` exposes `cosmoguard_config_reloads_total{outcome="..."}`, a process-wide
+counter that counts each config reload attempt once, excluding initial startup:
+
+| `outcome` | Meaning |
+|---|---|
+| `applied` | The config was accepted and its hot-reloadable settings applied. |
+| `restart_required` | A startup-captured setting changed; the previous config remains active. |
+| `invalid` | Reading, parsing or validating the file failed; the previous config remains active. |
+
 ---
 
 ## Server hardening

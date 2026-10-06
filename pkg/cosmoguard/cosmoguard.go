@@ -981,6 +981,7 @@ func (f *CosmoGuard) tryReload() {
 	newCfg, err := ReadConfigFromFile(f.cfgFile)
 	if err != nil {
 		slog.Error("config reload failed; keeping previous config", "error", err)
+		configReloadsCounter.WithLabelValues("invalid").Inc()
 		// Surface the failure on the dashboard so an operator
 		// staring at the pill can see "last reload errored" instead
 		// of the older success rendering forever.
@@ -996,6 +997,7 @@ func (f *CosmoGuard) tryReload() {
 	if required, reason := RequiresRestart(&previous, newCfg); required {
 		err := fmt.Errorf("%s", reason)
 		slog.Warn("config reload rejected", "error", err)
+		configReloadsCounter.WithLabelValues("restart_required").Inc()
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
 	}
@@ -1013,6 +1015,7 @@ func (f *CosmoGuard) tryReload() {
 	}
 	after := f.ruleFingerprintsLocked()
 	f.dashboard.RecordReload(true, "", reloadDelta(before, after))
+	configReloadsCounter.WithLabelValues("applied").Inc()
 }
 
 // ruleFingerprintsLocked returns the current per-section list of rule
