@@ -120,6 +120,9 @@ declared instant, offset and UTC distinction; process-local timezone caches are
 excluded. The digest's encoding is versioned; consumers
 should persist the entire string.
 Fingerprints are comparable only when produced by the same module version.
+The unsalted digest covers configured API keys, JWT and client secrets, dashboard
+passwords and cluster encryption keys; key it (for example with HMAC and your own
+secret) before storing it somewhere less protected than those secrets.
 
 These APIs do not resolve DNS, open listeners, start the cache cluster or configure
 tracing. Importing the existing package still brings its proxy/cache/telemetry

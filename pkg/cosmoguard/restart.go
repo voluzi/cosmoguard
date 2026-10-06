@@ -176,6 +176,9 @@ func RequiresRestart(previous, next *Config) (bool, string) {
 // RequiresRestart compares. cfg must be a non-nil prepared declarative config,
 // before runtime DNS expansion. No environment or runtime services are accessed.
 // Fingerprints are comparable only when produced by the same module version.
+// The unsalted digest covers configured API keys, JWT and client secrets,
+// dashboard passwords and cluster encryption keys; key it (for example with HMAC
+// and your own secret) before storing it somewhere less protected than those secrets.
 func RestartFingerprint(cfg *Config) (string, error) {
 	if cfg == nil {
 		return "", fmt.Errorf("restart fingerprint: nil config")
