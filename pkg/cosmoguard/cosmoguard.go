@@ -9,7 +9,6 @@ import (
 	"net/http/pprof"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -991,126 +990,11 @@ func (f *CosmoGuard) tryReload() {
 
 	f.configMutex.Lock()
 	defer f.configMutex.Unlock()
-	// Reject reloads that try to change runtime-immutable cache/cluster
-	// topology. Proxies, the rate-limiter pool, the olric runtime and the
-	// peer-API listener are all wired ONCE at startup against the original
-	// CacheGlobalConfig pointer; reloading silently here would accept the
-	// edit, show a green pill on the dashboard, and keep serving traffic
-	// from the OLD backend — exactly the "thought I changed it but nothing
-	// happened" trap. Surfacing the rejection through RecordReload puts the
-	// constraint in front of the operator instead of buried in logs.
-	if msg, ok := cacheTopologyChange(f.cfg, newCfg); !ok {
-		err := fmt.Errorf("cache topology change requires a process restart: %s", msg)
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// enableEvm is wired ONCE at startup: when it's false the EVM
-	// proxies/handlers are never constructed (left nil). Accepting a
-	// flip here would make applyRulesLocked's EVM branch dereference
-	// those nil servers and panic the watcher goroutine. Treat it as
-	// runtime-immutable, same as cache topology — reject and surface it.
-	if f.cfg.EnableEvm != newCfg.EnableEvm {
-		err := fmt.Errorf("enableEvm change requires a process restart (running=%v, new=%v)", f.cfg.EnableEvm, newCfg.EnableEvm)
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// The Authenticator (identities, methods, defaultRequire, replay
-	// store, JWKS refreshers) is built ONCE at startup and wired into
-	// every proxy/handler. A reload swaps f.cfg but does not rebuild it,
-	// so accepting auth edits here would report success while still
-	// authenticating against the OLD identities/keys — a silent key-
-	// rotation / revocation failure. Treat the global auth block as
-	// runtime-immutable and reject the change (per-rule `auth:` on
-	// individual rules still hot-reloads, since it lives in the rules).
-	if !reflect.DeepEqual(f.cfg.Auth, newCfg.Auth) {
-		err := fmt.Errorf("auth config change requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// Upstream topology (nodes:) is wired ONCE at startup: the LCD/RPC/
-	// gRPC/EVM pools are built from cfg.Nodes in New() and a reload only
-	// calls SetRules — it never rebuilds pools. Accepting a nodes: edit
-	// would report success while traffic kept flowing to the OLD upstream
-	// set. Reject as restart-required (runtime pod-IP churn for a node is
-	// handled separately by the DNS discovery reconciler, which mutates
-	// pools in place — that path is unaffected by this guard because it
-	// doesn't go through config reload).
-	if !reflect.DeepEqual(f.origNodes, newCfg.Nodes) {
-		err := fmt.Errorf("nodes (upstream topology) change requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// CORS is compiled ONCE and captured by pointer into each HTTP proxy at
-	// construction; a reload only calls SetRules, which never touches it. So
-	// accepting a cors: edit would report success while the proxies kept
-	// enforcing the OLD policy. Reject as restart-required rather than
-	// silently ignoring it. Compare only the DECLARATIVE fields — CORSConfig
-	// also carries a compiled `originCheck` closure that reflect.DeepEqual
-	// treats as never-equal, so a whole-struct compare would reject EVERY
-	// reload (even a rules-only edit) whenever CORS is enabled.
-	if corsDeclChanged(&f.cfg.CORS, &newCfg.CORS) {
-		err := fmt.Errorf("cors config change requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// Server timeouts / max-body / WS limits / WS allowed-origins are copied
-	// by value into the already-constructed http.Server + proxies at
-	// startup; a reload can't re-apply them to a live listener. Reject a
-	// change to any of those so the operator isn't fooled into thinking a
-	// timeout/body-cap edit took effect. (TrustedProxies is deliberately
-	// excluded — PrepareConfig re-publishes it via SetTrustedProxies, so it
-	// DOES hot-reload.)
-	if serverRuntimeImmutableChanged(&f.cfg.Server, &newCfg.Server) {
-		err := fmt.Errorf("server config change (timeouts / maxRequestBody / wsReadLimit / websocketLimits / wsAllowedOrigins) requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// The standalone dashboard server (enable, port, basic-auth) is
-	// installed ONCE at startup with the credentials captured in a closure;
-	// a reload does not rewire it. Only dashboard.requestLog is hot-
-	// reloadable (applied below). Reject changes to the other dashboard
-	// fields rather than reporting a success that rotates no password.
-	if dashboardRuntimeImmutableChanged(&f.cfg.Dashboard, &newCfg.Dashboard) {
-		err := fmt.Errorf("dashboard config change (enable / port / basicAuth / clusterHistoryRestore) requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// The metrics server (and its /admin WebUI routes + auth) is constructed
-	// once in New(). Now that an explicit `metrics.enable: false` survives
-	// defaulting, a reload that flips enable, changes the port, or edits the
-	// WebUI block would be accepted while the old listener keeps serving (or
-	// none exists) — reject it as restart-required.
-	if f.cfg.Metrics.IsEnabled() != newCfg.Metrics.IsEnabled() ||
-		f.cfg.Metrics.Port != newCfg.Metrics.Port ||
-		!reflect.DeepEqual(f.cfg.Metrics.WebUI, newCfg.Metrics.WebUI) {
-		err := fmt.Errorf("metrics config change (enable / port / webUI) requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	// The JSON-RPC WebSocket proxy (webSocketEnabled / webSocketConnections,
-	// for both RPC and EVM) is wired once in NewJsonRpcHandler; a reload only
-	// calls SetRules. Now that an explicit `webSocketEnabled: false` survives
-	// defaulting, toggling it (or changing the connection count) on reload
-	// would be accepted but ignored — reject as restart-required.
-	if f.cfg.RPC.WebSocketIsEnabled() != newCfg.RPC.WebSocketIsEnabled() ||
-		f.cfg.RPC.WebSocketConnections != newCfg.RPC.WebSocketConnections ||
-		f.cfg.EVM.WS.WebSocketConnections != newCfg.EVM.WS.WebSocketConnections {
-		err := fmt.Errorf("websocket config change (webSocketEnabled / webSocketConnections) requires a process restart")
-		slog.Warn("config reload rejected", "error", err)
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
-	}
-	if f.cfg.GRPC.MaxRecvMsgSize != newCfg.GRPC.MaxRecvMsgSize ||
-		f.cfg.GRPC.MaxSendMsgSize != newCfg.GRPC.MaxSendMsgSize {
-		err := fmt.Errorf("grpc message size change (maxRecvMsgSize / maxSendMsgSize) requires a process restart")
+	// Discovery expands live Nodes; restart policy compares the declarations.
+	previous := *f.cfg
+	previous.Nodes = f.origNodes
+	if required, reason := RequiresRestart(&previous, newCfg); required {
+		err := fmt.Errorf("%s", reason)
 		slog.Warn("config reload rejected", "error", err)
 		f.dashboard.RecordReload(false, err.Error(), nil)
 		return
@@ -1129,117 +1013,6 @@ func (f *CosmoGuard) tryReload() {
 	}
 	after := f.ruleFingerprintsLocked()
 	f.dashboard.RecordReload(true, "", reloadDelta(before, after))
-}
-
-// serverRuntimeImmutableChanged reports whether any ServerConfig field that
-// is captured by value at startup (and therefore can't be re-applied to a
-// running listener/proxy on reload) differs between two configs.
-// TrustedProxies is intentionally excluded — it IS hot-reloadable because
-// PrepareConfig re-publishes it via SetTrustedProxies.
-func serverRuntimeImmutableChanged(old, new *ServerConfig) bool {
-	return old.ReadHeaderTimeout != new.ReadHeaderTimeout ||
-		old.ReadTimeout != new.ReadTimeout ||
-		old.WriteTimeout != new.WriteTimeout ||
-		old.IdleTimeout != new.IdleTimeout ||
-		// Compare EFFECTIVE limits so a behaviour-neutral edit — e.g.
-		// spelling the default explicitly (`maxRequestBody: 5242880`) or as
-		// nil — isn't flagged as a change and doesn't block a rules-only
-		// reload.
-		old.EffectiveMaxRequestBody() != new.EffectiveMaxRequestBody() ||
-		old.EffectiveWSReadLimit() != new.EffectiveWSReadLimit() ||
-		old.EffectiveWebSocketLimits() != new.EffectiveWebSocketLimits() ||
-		!equalStringSet(old.WSAllowedOrigins, new.WSAllowedOrigins)
-}
-
-// equalStringSet compares two string slices treating nil and empty as
-// equal, so a behaviour-neutral edit (e.g. spelling the default WS-origin
-// policy as `wsAllowedOrigins: []` instead of omitting it) isn't rejected.
-func equalStringSet(a, b []string) bool {
-	if len(a) == 0 && len(b) == 0 {
-		return true
-	}
-	return reflect.DeepEqual(a, b)
-}
-
-// corsDeclChanged reports whether the operator-facing (declarative) CORS
-// fields differ, ignoring the compiled closure/string state so an unchanged
-// cors: block never blocks a rules-only reload.
-func corsDeclChanged(old, new *CORSConfig) bool {
-	return old.Enable != new.Enable ||
-		old.Credentials != new.Credentials ||
-		old.MaxAge != new.MaxAge ||
-		!equalStringSet(old.AllowedOrigins, new.AllowedOrigins) ||
-		!equalStringSet(old.AllowedMethods, new.AllowedMethods) ||
-		!equalStringSet(old.AllowedHeaders, new.AllowedHeaders) ||
-		!equalStringSet(old.ExposeHeaders, new.ExposeHeaders)
-}
-
-// dashboardRuntimeImmutableChanged reports whether a DashboardConfig field
-// wired once at startup (enable, port, basic-auth) differs. RequestLog is
-// excluded — it hot-reloads via requestLog.ApplyConfig.
-func dashboardRuntimeImmutableChanged(old, new *DashboardConfig) bool {
-	oldEnable, newEnable := false, false
-	if old.Enable != nil {
-		oldEnable = *old.Enable
-	}
-	if new.Enable != nil {
-		newEnable = *new.Enable
-	}
-	return oldEnable != newEnable ||
-		old.Port != new.Port ||
-		old.BasicAuthUser != new.BasicAuthUser ||
-		old.BasicAuthPassword != new.BasicAuthPassword ||
-		// clusterHistoryRestore decides at startup whether the replicator
-		// runs its DMap flush/restore; a reload swaps f.cfg but never
-		// rewires the replicator, so a live toggle would report success
-		// yet change nothing until restart. Treat it as restart-required.
-		old.ClusterHistoryRestoreEnabled() != new.ClusterHistoryRestoreEnabled()
-}
-
-// cacheTopologyChange reports whether the cache section between two configs
-// is identical for runtime purposes. Returns (description, false) when a
-// runtime-immutable field differs so tryReload can refuse the reload and
-// surface a clear reason; returns ("", true) when the cache sections match.
-//
-// The cache section is treated as a single immutable bundle because:
-//
-//   - cache.backend selects the whole rate-limiter + cache implementation;
-//     swapping it mid-flight would orphan all in-flight buckets and reroute
-//     subsequent traffic against a different distributed-state surface.
-//   - cache.cluster controls the embedded olric daemon's bind address, ports,
-//     replication factor, and discovery — all bound at startup by
-//     clusterRuntime and unchangeable without recreating the daemon.
-//   - cache.redis / redis-sentinel feed connection pools constructed once
-//     at cosmoguard.New; per-rule limiters built during reload reuse the
-//     proxies' captured *CacheGlobalConfig pointer, so a URL change here
-//     never reaches the connector.
-//   - global cache.ttl + cache.key are baked into per-rule cache compilation
-//     at startup; reload sees the live rules' already-resolved values.
-//
-// reflect.DeepEqual on the whole CacheGlobalConfig is the simplest
-// expression of "literally nothing under cache: may change" — and because
-// both old and new come through PrepareConfig + defaults.Set, defaulted
-// fields compare equal even when only one side spelled them out in YAML.
-func cacheTopologyChange(oldCfg, newCfg *Config) (string, bool) {
-	if oldCfg == nil || newCfg == nil {
-		return "", true
-	}
-	if reflect.DeepEqual(oldCfg.Cache, newCfg.Cache) {
-		return "", true
-	}
-	// Name the embedded↔networked flip specifically so the dashboard
-	// row points the operator at the right knob; other cache field
-	// differences collapse to a generic message.
-	oldCluster := oldCfg.Cache.Cluster != nil
-	newCluster := newCfg.Cache.Cluster != nil
-	if oldCluster != newCluster {
-		direction := "added"
-		if oldCluster {
-			direction = "removed"
-		}
-		return fmt.Sprintf("cache.cluster block was %s (embedded ↔ networked toggle requires restart)", direction), false
-	}
-	return "one or more cache.* fields changed (cluster topology, global ttl, key salt)", false
 }
 
 // ruleFingerprintsLocked returns the current per-section list of rule

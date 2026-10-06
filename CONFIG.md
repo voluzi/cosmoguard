@@ -75,6 +75,47 @@ By default, each enabled protocol pool has 40 upstream WebSocket connections wit
 
 **Hot-reload:** `server:` timeouts / body caps / WebSocket limits, `cors:`, and dashboard `enable`/`port`/`basicAuth` are captured at startup and now **reject** a reload that changes them (with a clear "requires a process restart" message) instead of silently accepting a change that never takes effect. `dashboard.requestLog` and `server.trustedProxies` still hot-reload.
 
+A startup-captured change rejects the **entire** reload: rules in that same file
+update stay unchanged too. Global cache, EVM enablement, authentication, upstream
+nodes, CORS, server limits/timeouts, dashboard startup settings, metrics/WebUI,
+WebSocket pool settings and gRPC message sizes require restart. Rules and section
+defaults, trusted proxies and dashboard request logging remain hot-reloadable.
+
+### Go configuration comparison API
+
+Import `github.com/voluzi/cosmoguard/v5/pkg/cosmoguard`:
+
+```go
+func ParseConfig(raw []byte, lookupEnv func(string) (string, bool)) (*Config, error)
+func RequiresRestart(previous, next *Config) (bool, string)
+func RestartFingerprint(cfg *Config) (string, error)
+```
+
+`ParseConfig` parses strict single-document YAML, applies defaults and normalization,
+validates settings and compiles rules. The supplied lookup controls both `${VAR}`
+interpolation and `COSMOGUARD_*` overrides; nil means every variable is unset. It
+returns a fresh config without publishing trusted proxies or initializing runtime
+services. The existing `ReadConfigFromFile` and `PrepareConfig` retain their process
+environment and trusted-proxy publication behavior.
+
+Pass non-nil prepared **declarative** configs, before runtime DNS expansion, to
+`RequiresRestart` and `RestartFingerprint`. Neither mutates configs or loads
+configuration. `RequiresRestart` returns `(false, "")` for a permitted hot reload;
+otherwise it returns true and the exact first rejection message used by the binary.
+`RestartFingerprint` returns `v1:<64 lowercase hexadecimal SHA-256 digits>` or an
+error (including for nil). Equal fingerprints identify the same restart policy
+values; rule-only edits do not change them. Comparison and fingerprinting share the
+binary's private restart projection, including effective limits, ordered slices
+and meaningful nil/pointer distinctions. Authentication timestamps retain their
+declared instant, offset and UTC distinction; process-local timezone caches are
+excluded. The digest's encoding is versioned; consumers
+should persist the entire string.
+
+These APIs do not resolve DNS, open listeners, start the cache cluster or configure
+tracing. Importing the existing package still brings its proxy/cache/telemetry
+dependencies and existing dependency initializers; it is not a lightweight config
+package.
+
 ---
 
 ## Upstream nodes

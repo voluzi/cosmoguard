@@ -295,14 +295,16 @@ func TestWebSocketLimitsEffectiveValues(t *testing.T) {
 
 	negative := &ServerConfig{WebSocketLimits: WebSocketLimitsConfig{MaxSubscriptionsPerClient: intPtr(-1)}}
 	assert.ErrorContains(t, validateServerLimits(negative), "maxSubscriptionsPerClient")
-	assert.Assert(t, serverRuntimeImmutableChanged(&ServerConfig{}, zero))
+	required, _ := RequiresRestart(&Config{}, &Config{Server: *zero})
+	assert.Assert(t, required)
 	explicitDefaults := &ServerConfig{WebSocketLimits: WebSocketLimitsConfig{
 		MaxSubscriptionsPerClient:             intPtr(32),
 		MaxSubscriptionsPerIdentity:           intPtr(128),
 		MaxSubscriptionsPerUpstreamConnection: intPtr(10),
 		MaxConnectionsPerIP:                   intPtr(16),
 	}}
-	assert.Assert(t, !serverRuntimeImmutableChanged(&ServerConfig{}, explicitDefaults))
+	required, _ = RequiresRestart(&Config{}, &Config{Server: *explicitDefaults})
+	assert.Assert(t, !required)
 }
 
 func TestDefaultWebSocketCapacitySupports100DistinctSubscriptions(t *testing.T) {

@@ -34,9 +34,17 @@ var trustedProxies atomic.Pointer[[]*net.IPNet]
 // but tests that spin up multiple CosmoGuards must be aware
 // (the testharness pattern uses 0.0.0.0/0 for permissiveness).
 func SetTrustedProxies(cidrs []string) error {
+	nets, err := parseTrustedProxies(cidrs)
+	if err != nil {
+		return err
+	}
+	trustedProxies.Store(nets)
+	return nil
+}
+
+func parseTrustedProxies(cidrs []string) (*[]*net.IPNet, error) {
 	if len(cidrs) == 0 {
-		trustedProxies.Store(nil)
-		return nil
+		return nil, nil
 	}
 	nets := make([]*net.IPNet, 0, len(cidrs))
 	for _, c := range cidrs {
@@ -58,12 +66,11 @@ func SetTrustedProxies(cidrs []string) error {
 		}
 		_, n, err := net.ParseCIDR(c)
 		if err != nil {
-			return fmt.Errorf("trustedProxies: invalid CIDR %q: %w", c, err)
+			return nil, fmt.Errorf("trustedProxies: invalid CIDR %q: %w", c, err)
 		}
 		nets = append(nets, n)
 	}
-	trustedProxies.Store(&nets)
-	return nil
+	return &nets, nil
 }
 
 // snapshotTrustedProxies returns the current live trusted-proxy list

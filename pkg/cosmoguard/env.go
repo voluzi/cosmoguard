@@ -28,6 +28,10 @@ import (
 // message identifies the variable name (and the user-supplied message if the
 // `:?` form was used) so config-load failures are diagnostic.
 func EnvInterpolate(s string) (string, error) {
+	return envInterpolate(s, os.LookupEnv)
+}
+
+func envInterpolate(s string, lookupEnv func(string) (string, bool)) (string, error) {
 	var b strings.Builder
 	b.Grow(len(s))
 
@@ -85,7 +89,7 @@ func EnvInterpolate(s string) (string, error) {
 		ref := s[i+2 : i+2+end]
 		i = i + 2 + end + 1
 
-		val, err := resolveVar(ref)
+		val, err := resolveVar(ref, lookupEnv)
 		if err != nil {
 			return "", err
 		}
@@ -94,7 +98,7 @@ func EnvInterpolate(s string) (string, error) {
 	return b.String(), nil
 }
 
-func resolveVar(ref string) (string, error) {
+func resolveVar(ref string, lookupEnv func(string) (string, bool)) (string, error) {
 	// Forms:
 	//   NAME            → require set
 	//   NAME:-default   → default if unset
@@ -110,7 +114,7 @@ func resolveVar(ref string) (string, error) {
 		return "", fmt.Errorf("env interpolation: empty variable name in ${%s}", ref)
 	}
 
-	v, set := os.LookupEnv(name)
+	v, set := lookupEnv(name)
 	if set && v != "" {
 		return v, nil
 	}
