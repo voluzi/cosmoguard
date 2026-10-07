@@ -22,6 +22,8 @@ func restartTestProcess(t *testing.T) bool {
 	timeout := 2 * time.Minute
 	if deadline, ok := t.Deadline(); ok {
 		timeout = time.Until(deadline)
+		// Leave time for the parent to report the child's timeout output.
+		timeout -= min(time.Second, timeout/10)
 	}
 	if timeout <= 0 {
 		t.Fatal("isolated test deadline exceeded")
@@ -39,11 +41,26 @@ func envLookup(values map[string]string) func(string) (string, bool) {
 }
 
 func TestRestartProcessDeadline(t *testing.T) {
+	if os.Getenv("TEST_COSMOGUARD_RESTART_CHILD") != "1" {
+		if deadline, ok := t.Deadline(); ok {
+			t.Setenv("TEST_COSMOGUARD_PARENT_DEADLINE", deadline.Format(time.RFC3339Nano))
+		}
+	}
 	if restartTestProcess(t) {
 		return
 	}
-	if _, ok := t.Deadline(); !ok {
+	deadline, ok := t.Deadline()
+	if !ok {
 		t.Fatal("isolated test has no deadline")
+	}
+	if raw := os.Getenv("TEST_COSMOGUARD_PARENT_DEADLINE"); raw != "" {
+		parent, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !deadline.Before(parent) {
+			t.Fatal("child deadline must precede the parent deadline")
+		}
 	}
 }
 
