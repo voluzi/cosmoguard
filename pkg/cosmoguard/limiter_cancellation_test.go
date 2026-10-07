@@ -126,11 +126,24 @@ func TestLimiterCallerContextErrorsAreNotProtocolDenials(t *testing.T) {
 			t.Run("jsonrpc", func(t *testing.T) {
 				rpcRule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"m"}, RateLimit: cfg}
 				require.NoError(t, rpcRule.Compile())
-				h := &JsonRpcHandler{log: logger, cgDashboard: newDashboardObservability()}
-				r := httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
-				ok, _, _ := h.jsonRpcPolicyVerdict(r, &JsonRpcMsg{Method: "m"}, rpcRule, nil)
-				require.False(t, ok, "a cancelled call is not forwarded")
+				hist := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "test_cancelled_jsonrpc_duration"}, []string{"method", "cache", "action", "rule_id", "upstream"})
+				h := &JsonRpcHandler{log: logger, cgDashboard: newDashboardObservability(), responseTimeHist: hist, rules: []*JsonRpcRule{rpcRule}}
+				forward := func(http.ResponseWriter, *http.Request) { t.Error("a cancelled call must not be forwarded") }
+				msg := &JsonRpcMsg{Version: "2.0", ID: float64(1), Method: "m"}
+				for name, serve := range map[string]func(http.ResponseWriter, *http.Request){
+					"single": func(w http.ResponseWriter, r *http.Request) { h.handleHttpSingle(msg, w, r, forward, time.Now()) },
+					"batch": func(w http.ResponseWriter, r *http.Request) {
+						h.handleHttpBatch(JsonRpcMsgs{msg}, w, r, forward, time.Now())
+					},
+				} {
+					rec := httptest.NewRecorder()
+					rec.Code = 0
+					serve(rec, httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx))
+					require.Zero(t, rec.Code, "%s: a cancelled client gets no response, including no 429", name)
+					require.Empty(t, rec.Body.String(), name)
+				}
 				require.Empty(t, h.cgDashboard.denied.Snapshot())
+				require.Zero(t, testutil.CollectAndCount(hist), "cancellation must not record a denial")
 				require.Empty(t, logs.String())
 			})
 		})

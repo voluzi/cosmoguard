@@ -571,9 +571,10 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, GetSourceIP(r), idName)
 		allowed, _, rlErr := allowRuleRateLimit(r.Context(), rule.RateLimit, l, key)
 		if rlErr != nil {
-			// The caller is gone: reject without logging or recording a denial.
+			// The caller is gone: code 0 tells both callers to stop
+			// without a response, a log line or a denial record.
 			if r.Context().Err() != nil {
-				return false, -32005, "request cancelled"
+				return false, 0, ""
 			}
 			logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter unavailable")
 			allowed = false
@@ -624,6 +625,9 @@ func (h *JsonRpcHandler) enforceJsonRpcRulePolicy(w http.ResponseWriter, r *http
 	ok, code, reason := h.jsonRpcPolicyVerdict(r, request, rule, limiters)
 	if ok {
 		return true
+	}
+	if code == 0 {
+		return false
 	}
 	status := http.StatusUnauthorized
 	logMsg := "request denied (auth)"
@@ -1283,6 +1287,9 @@ RequestsLoop:
 				// invoked — or served from cache — inside a batch by a
 				// caller that would be denied as a single request.
 				if vok, code, reason := h.jsonRpcPolicyVerdict(r, req, rule, limitersSnap); !vok {
+					if code == 0 {
+						return
+					}
 					denied++
 					// Notifications (no id) get NO response, even on
 					// denial, per JSON-RPC 2.0 §4.1. Emit the error only
