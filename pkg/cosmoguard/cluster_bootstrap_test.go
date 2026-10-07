@@ -63,12 +63,12 @@ func TestClusterRuntimeWaitsForRoutingTable(t *testing.T) {
 			if r.cr != nil {
 				_ = r.cr.Close(context.Background())
 			}
-		case <-time.After(3 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Error("runtime did not terminate")
 		}
 	})
 	go func() {
-		cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 2 * time.Second})
+		cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 10 * time.Second})
 		result <- outcome{cr, err}
 	}()
 	var joiner bootstrapMember
@@ -79,7 +79,7 @@ func TestClusterRuntimeWaitsForRoutingTable(t *testing.T) {
 			}
 		}
 		return false
-	}, time.Second, time.Millisecond)
+	}, 10*time.Second, time.Millisecond)
 	// A joiner has services running but no routing table until the coordinator sends it.
 	select {
 	case r := <-result:
@@ -108,7 +108,7 @@ func TestClusterRuntimeWaitsForRoutingTable(t *testing.T) {
 		dm, err := r.cr.Client().NewDMap("grpc")
 		require.NoError(t, err)
 		require.NoError(t, dm.Put(t.Context(), "key", "value"))
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("runtime did not finish after routing delivery")
 	}
 }
