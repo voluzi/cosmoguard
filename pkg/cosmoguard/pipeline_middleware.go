@@ -158,9 +158,6 @@ func MWRateLimit(
 			return next(req)
 		}
 		limiter := limiterFor(fp)
-		if limiter == nil {
-			return next(req)
-		}
 		hr := httpReqFor(req)
 		if hr == nil {
 			return next(req)
@@ -170,12 +167,12 @@ func MWRateLimit(
 			idName = req.Identity().Name
 		}
 		key := rateLimitKey(cfg.Scope, fp, hr, idName)
-		allowed, retry, err := limiter.Allow(req.Context(), key)
+		allowed, retry, err := allowRuleRateLimit(req.Context(), cfg, limiter, key)
 		if err != nil {
 			if logger != nil {
-				logLimiterBackendError(logger, err, "rate limiter error; allowing")
+				logLimiterBackendError(logger, err, "rate limiter unavailable")
 			}
-			return next(req)
+			allowed = false
 		}
 		if !allowed {
 			ra := int(math.Ceil(retry.Seconds()))

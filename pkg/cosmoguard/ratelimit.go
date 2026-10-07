@@ -85,8 +85,50 @@ type RateLimitConfig struct {
 	// Scope determines whose request rate the bucket counts.
 	Scope RateLimitScope `yaml:"scope,omitempty" default:"per-ip"`
 	// Deprecated: FailureMode is accepted and ignored, and will be removed in
-	// the next major version. Clustered backend failures use local buckets.
+	// the next major version. The per-replica limiter decides when the primary fails.
 	FailureMode string `yaml:"failureMode,omitempty"`
+
+	local RateLimiter
+}
+
+// prepare gives every compiled rule its own fallback before publication.
+func (c *RateLimitConfig) prepare() error {
+	if err := c.validate(); err != nil || c == nil {
+		return err
+	}
+	local, err := NewRateLimiter(*c, nil, "")
+	c.local = local
+	return err
+}
+
+// Reuse both shared and local buckets when an unchanged rule is reloaded.
+func reuseRuleRateLimiter(cfg *RateLimitConfig, limiter RateLimiter) {
+	if l, ok := limiter.(*boundedRateLimiter); ok && cfg.local != l.local {
+		cfg.local = l.local
+	}
+}
+
+func allowRuleRateLimit(ctx context.Context, cfg *RateLimitConfig, limiter RateLimiter, key string) (bool, time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
+	}
+	var backendErr error
+	if limiter != nil {
+		allowed, retry, err := limiter.Allow(ctx, key)
+		if err == nil {
+			return allowed, retry, nil
+		}
+		backendErr = err
+	} else {
+		backendErr = errors.New("rate limiter unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
+	}
+	if cfg.local == nil {
+		return false, 0, backendErr
+	}
+	return localLimiterDecision(ctx, cfg.local, key, "backend_error", backendErr)
 }
 
 // FailClosed is retained for source compatibility.
@@ -207,11 +249,13 @@ func (l failingRateLimiter) Close() error {
 	return nil
 }
 
-func limiterForFailedInit(cfg *RateLimitConfig, cacheCfg *CacheGlobalConfig, initErr error) RateLimiter {
-	if cacheCfg == nil || cacheCfg.Cluster == nil {
-		return nil
+func limiterForFailedInit(cfg *RateLimitConfig, initErr error) RateLimiter {
+	local := cfg.local
+	var err error
+	if local == nil {
+		local, err = NewRateLimiter(*cfg, nil, "")
+		cfg.local = local
 	}
-	local, err := NewRateLimiter(*cfg, nil, "")
 	if err != nil {
 		return failingRateLimiter{err: err}
 	}

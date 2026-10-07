@@ -294,16 +294,19 @@ func (p *JsonRpcWebSocketProxy) policyVerdict(request *JsonRpcMsg, rule *JsonRpc
 			return false, -32001, why
 		}
 	}
-	if l, found := limiters[rule.Fingerprint]; found && l != nil {
+	if rule.RateLimit != nil {
+		l := limiters[rule.Fingerprint]
 		idName := ""
 		if identity != nil {
 			idName = identity.Name
 		}
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
-		allowed, _, rlErr := l.Allow(context.Background(), key)
+		allowed, _, rlErr := allowRuleRateLimit(context.Background(), rule.RateLimit, l, key)
 		if rlErr != nil {
-			logLimiterBackendError(p.log, rlErr, "ws rate limiter error; allowing")
-		} else if !allowed {
+			logLimiterBackendError(p.log, rlErr, "ws rate limiter unavailable")
+			allowed = false
+		}
+		if !allowed {
 			p.cgDashboard.RecordDeny(DenyRecord{
 				Section: p.section, Reason: "rate_limit",
 				SourceIP: source, Method: request.Method,

@@ -125,7 +125,7 @@ func recordBackendOperationFailure(backend, outcome string) {
 
 var limiterFallbackCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "cosmoguard_rate_limit_local_fallback_total",
-	Help: "Per-replica rate limiter decisions when the clustered attempt is unavailable.",
+	Help: "Per-replica rate limiter decisions when the primary limiter is unavailable.",
 }, []string{"reason", "outcome"})
 
 var configReloadsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{

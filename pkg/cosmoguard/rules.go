@@ -195,7 +195,7 @@ func (r *HttpRule) String() string {
 // Always reinitializes state so calling Compile twice produces a clean
 // result.
 func (r *HttpRule) Compile() error {
-	if err := r.RateLimit.validate(); err != nil {
+	if err := r.RateLimit.prepare(); err != nil {
 		return fmt.Errorf("http rule (priority %d): %w", r.Priority, err)
 	}
 	if !r.Action.valid() {
@@ -428,7 +428,7 @@ func (r *JsonRpcRule) String() string {
 // on each call so a previously-compiled rule whose Params changed doesn't
 // retain stale entries.
 func (r *JsonRpcRule) Compile() error {
-	if err := r.RateLimit.validate(); err != nil {
+	if err := r.RateLimit.prepare(); err != nil {
 		return fmt.Errorf("jsonrpc rule (priority %d): %w", r.Priority, err)
 	}
 	if !r.Action.valid() {
@@ -772,7 +772,7 @@ func (r *GrpcRule) String() string {
 // Compile validates and materializes glob fields. Reinitializes on each call.
 // Also computes Fingerprint for per-rule cache-key namespacing.
 func (r *GrpcRule) Compile() error {
-	if err := r.RateLimit.validate(); err != nil {
+	if err := r.RateLimit.prepare(); err != nil {
 		return fmt.Errorf("grpc rule (priority %d): %w", r.Priority, err)
 	}
 	if !r.Action.valid() {

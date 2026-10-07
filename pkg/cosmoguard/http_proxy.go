@@ -448,6 +448,7 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		// local fallback does not outlive a backend failure after a reload.
 		if l, ok := existing[r.Fingerprint]; ok {
 			if _, failed := l.(failingRateLimiter); !failed {
+				reuseRuleRateLimiter(r.RateLimit, l)
 				newLimiters[r.Fingerprint] = l
 				continue
 			}
@@ -457,14 +458,11 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
 		if err != nil {
-			if local := limiterForFailedInit(r.RateLimit, p.cacheConfig, err); local != nil {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
-				newLimiters[r.Fingerprint] = local
-			} else {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; rule will run without limit")
-			}
+			p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
+			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)
 			continue
 		}
+		reuseRuleRateLimiter(r.RateLimit, l)
 		newLimiters[r.Fingerprint] = l
 	}
 

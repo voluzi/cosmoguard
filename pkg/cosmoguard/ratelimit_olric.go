@@ -220,7 +220,8 @@ var limiterOperations = boundedcall.New(limiterOperationCapacity, limiterOperati
 
 type boundedRateLimiter struct {
 	RateLimiter
-	local RateLimiter
+	local         RateLimiter
+	operationGate *boundedcall.Gate
 }
 
 func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
@@ -228,7 +229,7 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 		allowed bool
 		retry   time.Duration
 	}
-	res, err := boundedcall.Do(ctx, limiterOperations, func(opCtx context.Context) (decision, error) {
+	res, err := boundedcall.Do(ctx, l.operationGate, func(opCtx context.Context) (decision, error) {
 		allowed, retry, err := l.RateLimiter.Allow(opCtx, key)
 		return decision{allowed, retry}, err
 	})
@@ -249,15 +250,19 @@ func newRuleRateLimiter(cfg RateLimitConfig, cacheCfg *CacheGlobalConfig, client
 	if err != nil {
 		return nil, err
 	}
-	if client != nil && cacheCfg != nil && cacheCfg.Cluster != nil {
-		local, err := NewRateLimiter(cfg, nil, keyspace)
+	local := cfg.local
+	if local == nil {
+		local, err = NewRateLimiter(cfg, nil, keyspace)
 		if err != nil {
 			_ = limiter.Close()
 			return nil, err
 		}
-		return &boundedRateLimiter{RateLimiter: limiter, local: local}, nil
 	}
-	return limiter, nil
+	var gate *boundedcall.Gate
+	if client != nil && cacheCfg != nil && cacheCfg.Cluster != nil {
+		gate = limiterOperations
+	}
+	return &boundedRateLimiter{RateLimiter: limiter, local: local, operationGate: gate}, nil
 }
 
 func localLimiterDecision(ctx context.Context, local RateLimiter, key, reason string, backendErr error) (bool, time.Duration, error) {

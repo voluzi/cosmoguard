@@ -326,7 +326,8 @@ later shared decisions stricter. The local limiter retains its existing bounded
 bucket-storage behavior.
 
 `rateLimit.failureMode` is **deprecated and ignored**, but remains parsed and
-validated so existing configurations load and reload. It will be removed in the
+validated so existing configurations load and reload. On primary limiter failure,
+the per-replica limiter decides in every deployment mode. It will be removed in the
 next major version. Startup logs one warning naming affected rules; an accepted
 reload warns once for rules that introduce the key. The key is absent from rule
 fingerprints and the restart projection, so changing it does not alter bucket identity
@@ -340,10 +341,10 @@ is unchanged; the wait is bounded. Replay admission shares neither main pool.
 
 Non-clustered deployments add no request-path wait budgets or admission pools,
 retain the embedded limiter's 250ms contention deadline, and share the 45s
-startup default. Their limiter and cache implementations are unchanged, including
-leaving oversized responses uncached. The deprecated rate-limit key is ignored
-in every deployment mode; embedded backend errors keep the default allow policy
-and do not use the new fallback wrapper.
+startup default. Their cache implementation and healthy limiter algorithm are
+unchanged. Embedded limiter errors, failed constructors, or a missing primary
+limiter use the same per-rule local fallback; a rate-limited rule never bypasses
+its limit because the primary is unavailable.
 
 Underlying olric calls may ignore cancellation, so each slot stays occupied until
 the actual call returns. Late writes or token consumption are possible after the
@@ -791,7 +792,7 @@ With a `cache.cluster` block present, rate-limit buckets are sharded across repl
 
 `rateLimit.failureMode` is deprecated and ignored, and will be removed in the
 next major version. Existing `fail-open` and `fail-closed` values remain valid.
-Clustered backend failures use the per-replica local limiter across HTTP,
+On backend failure, the per-replica limiter decides in all modes across HTTP,
 JSON-RPC, WebSocket, and gRPC; see [cluster mode](#cluster-mode) for the bounds
 and transition behavior. Auth-method `failureMode` is unaffected.
 When `rateLimit` is set on a rule, `rate` is required and must be a finite positive number. `burst` must be non-negative; `0` uses the default capacity.

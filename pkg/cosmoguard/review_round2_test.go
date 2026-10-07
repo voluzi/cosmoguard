@@ -231,12 +231,8 @@ func TestAcceptEncodingKey_WildcardExclusion(t *testing.T) {
 func TestLimiterForFailedInit(t *testing.T) {
 	for _, mode := range []string{"", "fail-open", "fail-closed"} {
 		cfg := &RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1, FailureMode: mode}
-		limiter := limiterForFailedInit(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, errTest)
-		for _, cacheCfg := range []*CacheGlobalConfig{nil, {}} {
-			if limiterForFailedInit(cfg, cacheCfg, errTest) != nil {
-				t.Fatal("non-clustered construction failures must not introduce local fallback")
-			}
-		}
+		limiter := limiterForFailedInit(cfg, errTest)
+
 		for i := range 2 {
 			allowed, _, err := limiter.Allow(context.Background(), "key")
 			if err != nil || allowed != (i == 0) {

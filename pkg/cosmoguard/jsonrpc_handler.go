@@ -357,6 +357,7 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 		// backend is healthy again.
 		if l, ok := existing[r.Fingerprint]; ok {
 			if _, failed := l.(failingRateLimiter); !failed {
+				reuseRuleRateLimiter(r.RateLimit, l)
 				newLimiters[r.Fingerprint] = l
 				continue
 			}
@@ -364,14 +365,11 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 		keyspace := h.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := newRuleRateLimiter(*r.RateLimit, h.cacheConfig, h.olricClient, keyspace)
 		if err != nil {
-			if local := limiterForFailedInit(r.RateLimit, h.cacheConfig, err); local != nil {
-				h.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
-				newLimiters[r.Fingerprint] = local
-			} else {
-				h.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; rule will run without limit")
-			}
+			h.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
+			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)
 			continue
 		}
+		reuseRuleRateLimiter(r.RateLimit, l)
 		newLimiters[r.Fingerprint] = l
 	}
 
@@ -564,16 +562,19 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 			return false, -32001, why
 		}
 	}
-	if l, found := limiters[rule.Fingerprint]; found && l != nil {
+	if rule.RateLimit != nil {
+		l := limiters[rule.Fingerprint]
 		idName := ""
 		if id != nil {
 			idName = id.Name
 		}
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, GetSourceIP(r), idName)
-		allowed, _, rlErr := l.Allow(r.Context(), key)
+		allowed, _, rlErr := allowRuleRateLimit(r.Context(), rule.RateLimit, l, key)
 		if rlErr != nil {
-			logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter error; allowing")
-		} else if !allowed {
+			logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter unavailable")
+			allowed = false
+		}
+		if !allowed {
 			h.cgDashboard.RecordDeny(DenyRecord{
 				Section: h.section, Reason: "rate_limit",
 				SourceIP: GetSourceIP(r), Method: request.Method,

@@ -145,7 +145,7 @@ func TestLimiterWholeAttemptTimeoutUsesLocalFallback(t *testing.T) {
 			cfg := RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1, FailureMode: "fail-closed"}
 			local, err := NewRateLimiter(cfg, nil, "fallback")
 			require.NoError(t, err)
-			limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}, local: local}
+			limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}, local: local, operationGate: limiterOperations}
 			var forwarded atomic.Int32
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { forwarded.Add(1); _, _ = w.Write([]byte("ok")) }))
 			t.Cleanup(up.Close)
@@ -191,7 +191,8 @@ func TestClusterBoundsDoNotAffectLocalBackends(t *testing.T) {
 		limiter, err := newRuleRateLimiter(cfg, &CacheGlobalConfig{}, client, "local")
 		require.NoError(t, err)
 		_, bounded := limiter.(*boundedRateLimiter)
-		require.False(t, bounded)
+		require.True(t, bounded)
+		require.Nil(t, limiter.(*boundedRateLimiter).operationGate)
 		ok, _, err := limiter.Allow(t.Context(), "key")
 		require.NoError(t, err)
 		require.True(t, ok)
