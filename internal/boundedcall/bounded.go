@@ -47,6 +47,9 @@ func Do[T any](ctx context.Context, gate *Gate, fn func(context.Context) (T, err
 		return zero, err
 	}
 	expired := func(waitCtx context.Context) (T, error) {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
 		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 			if gate.observe != nil {
 				gate.observe("timeout")
@@ -73,6 +76,9 @@ func Do[T any](ctx context.Context, gate *Gate, fn func(context.Context) (T, err
 		select {
 		case gate.slots <- struct{}{}:
 		default:
+			if err := ctx.Err(); err != nil {
+				return zero, err
+			}
 			if gate.observe != nil {
 				gate.observe("rejected")
 			}
@@ -107,7 +113,7 @@ func Do[T any](ctx context.Context, gate *Gate, fn func(context.Context) (T, err
 	case <-waitCtx.Done():
 		return expired(waitCtx)
 	case res := <-done:
-		if waitCtx.Err() != nil {
+		if ctx.Err() != nil || waitCtx.Err() != nil {
 			return expired(waitCtx)
 		}
 		return res.value, res.err

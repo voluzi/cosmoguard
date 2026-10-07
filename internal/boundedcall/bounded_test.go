@@ -69,7 +69,8 @@ func TestBoundedCallCapacityAndRecovery(t *testing.T) {
 }
 
 func TestBoundedCallCancellationRetainsCapacity(t *testing.T) {
-	gate := New(1, time.Second, nil)
+	var observed atomic.Int32
+	gate := New(1, time.Second, func(string) { observed.Add(1) })
 	started, release := make(chan struct{}), make(chan struct{})
 	defer close(release)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -86,6 +87,7 @@ func TestBoundedCallCancellationRetainsCapacity(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("caller did not stop waiting")
 	}
+	require.Zero(t, observed.Load(), "caller cancellation is not a backend timeout")
 	_, err := Do(t.Context(), gate, func(context.Context) (int, error) {
 		t.Error("capacity was released before backend return")
 		return 0, nil
@@ -134,6 +136,7 @@ func TestBoundedCallWaitsForCapacityAndRecovers(t *testing.T) {
 	require.ErrorIs(t, <-done, context.Canceled)
 	_, err := Do(t.Context(), gate, func(context.Context) (int, error) { t.Error("a waiting caller must not start a worker"); return 0, nil })
 	require.ErrorIs(t, err, ErrTimeout)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Equal(t, int32(1), timeouts.Load())
 	require.Zero(t, rejected.Load())
 	unblock()
@@ -164,4 +167,31 @@ func TestBoundedCallLateAdmissionGetsFullOperationBudget(t *testing.T) {
 	deadline, err := Do(t.Context(), gate, func(opCtx context.Context) (time.Time, error) { deadline, _ := opCtx.Deadline(); return deadline, nil })
 	require.NoError(t, err)
 	require.False(t, deadline.Before((<-releasedAt).Add(time.Second)), "operation budget must start after admission")
+}
+
+func TestBoundedCallCallerDeadlineIsNotBackendTimeout(t *testing.T) {
+	for _, admission := range []bool{false, true} {
+		t.Run(map[bool]string{false: "operation", true: "admission"}[admission], func(t *testing.T) {
+			var observed atomic.Int32
+			gate := NewWaiting(1, time.Second, func(string) { observed.Add(1) })
+			started, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
+			parkedCtx, cancelParked := context.WithCancel(t.Context())
+			defer cancelParked()
+			parked := make(chan error, 1)
+			op := func(context.Context) (int, error) { close(started); <-release; return 1, nil }
+			if admission {
+				go func() { _, err := Do(parkedCtx, gate, op); parked <- err }()
+				<-started
+				cancelParked()
+				require.ErrorIs(t, <-parked, context.Canceled)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+			_, err := Do(ctx, gate, op)
+			require.Equal(t, ctx.Err(), err, "caller errors must be returned without a backend wrapper")
+			require.NotErrorIs(t, err, ErrTimeout)
+			require.Zero(t, observed.Load(), "caller deadlines are not backend timeouts")
+		})
+	}
 }

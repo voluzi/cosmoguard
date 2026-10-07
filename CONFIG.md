@@ -366,8 +366,8 @@ level, and release their slots.
 rejections. Its labels are `backend` (`l2`, `limiter`, or `replay`) and `outcome`
 (`timeout` or `rejected`) for L2 and limiter, plus replay `timeout`: five
 live combinations. Replay waits for capacity and never emits `rejected`. It does not count cache misses,
-ordinary contention denials, backend panics, or client cancellation. Timeouts
-include earlier caller deadlines. Bounded cache failures and all limiter fallback decisions log at debug
+ordinary contention denials, backend panics, or caller context cancellation/deadlines.
+Only expiry of a gate budget counts as a backend timeout. Bounded cache failures and all limiter fallback decisions log at debug
 level; other cache errors remain errors.
 JWT replay failures retain their warning for the existing security audit path.
 `cosmoguard_rate_limit_local_fallback_total` records local decisions with six
