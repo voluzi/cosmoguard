@@ -96,6 +96,16 @@ func TestGrpcCacheKey_CanonicalCollapses(t *testing.T) {
 	}
 }
 
+func TestGrpcCacheKey_CanonicalCompatibility(t *testing.T) {
+	reg := buildCanonicalTestRegistry(t)
+	// Keep canonical cache keys compatible across rolling upgrades.
+	const want = "bfb2d9520041494b"
+	got := grpcCacheKey(0xabc, "/cosmoguard.test.Svc/Echo", encodeSample(7, 9, false), "canonical", reg, "x-cosmos-block-height=100")
+	if got != want {
+		t.Fatalf("canonical cache key = %s; want %s", got, want)
+	}
+}
+
 // TestGrpcCacheKey_CanonicalUnknownMethodDegrades: a method not in the
 // registry falls back to raw — different bytes still produce different
 // keys.

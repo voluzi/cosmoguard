@@ -446,10 +446,6 @@ func grpcCacheKey(fingerprint uint64, method string, payload []byte, keyMode str
 		)
 	case "canonical":
 		payload = canonical.Canonicalize(method, payload)
-		if canonical != nil {
-			// The same bytes can mean different things under different descriptors.
-			metaPart += "\x00" + canonical.digest
-		}
 	}
 	return util.XXHash64Hex(
 		fmt.Sprintf("%x\x00%s\x00", fingerprint, method) + string(payload) + "\x00" + metaPart,

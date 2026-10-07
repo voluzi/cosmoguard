@@ -793,8 +793,8 @@ rejects the whole reload as `invalid` and preserves the previous config and
 registry. An unchanged list does not reopen files, keeping unrelated rule reloads
 independent of descriptor-file access. To load an edited bundle, change its path
 (for example, use a versioned filename). Clearing the list disables
-canonicalization. Canonical cache keys include a descriptor digest, so changed
-descriptors stop finding the old registry's cache entries.
+canonicalization. Entries cached under the previous descriptors can be served
+until their TTL expires.
 
 ```yaml
 grpc:

@@ -85,25 +85,26 @@ func TestTryReloadGRPCProtosets(t *testing.T) {
 	assertGRPCReloadCache(t, cg, explicitZero, cacheHit, "upstream-1")
 	reloadTestFile(t, cg, grpcReloadConfig(proto2, "allow"))
 	require.True(t, cg.dashboard.lastReload.Success)
-	// The absent-field payload has identical canonical bytes in both schemas;
-	// descriptor changes must still stop finding the old schema's cache entries.
-	assertGRPCReloadCache(t, cg, absent, cacheMiss, "upstream-2")
-	assertGRPCReloadCache(t, cg, explicitZero, cacheMiss, "upstream-3")
-	assertGRPCReloadCache(t, cg, explicitZero, cacheHit, "upstream-3")
+	assertGRPCReloadCache(t, cg, explicitZero, cacheMiss, "upstream-2")
+	assertGRPCReloadCache(t, cg, explicitZero, cacheHit, "upstream-2")
 
 	require.NoError(t, os.Remove(proto2))
 	reloadTestFile(t, cg, strings.Replace(grpcReloadConfig(proto2, "allow"), "/old", "/new", 1))
 	require.True(t, cg.dashboard.lastReload.Success, "an unchanged protoset list must not reopen files")
-	assertGRPCReloadCache(t, cg, absent, cacheHit, "upstream-2")
-	assertGRPCReloadCache(t, cg, explicitZero, cacheHit, "upstream-3")
+	assertGRPCReloadCache(t, cg, explicitZero, cacheHit, "upstream-2")
 
-	reloadTestFile(t, cg, grpcReloadConfig("", "allow"))
-	require.True(t, cg.dashboard.lastReload.Success)
-	assertGRPCReloadCache(t, cg, absent, cacheMiss, "upstream-4")
-	assertGRPCReloadCache(t, cg, explicitZero, cacheMiss, "upstream-5")
 	reloadTestFile(t, cg, grpcReloadConfig(proto3, "allow"))
 	require.True(t, cg.dashboard.lastReload.Success)
-	assertGRPCReloadCache(t, cg, explicitZero, cacheHit, "upstream-1")
+	absentNext, explicitZeroNext := []byte{0x10, 0x02}, []byte{0x08, 0x00, 0x10, 0x02}
+	assertGRPCReloadCache(t, cg, absentNext, cacheMiss, "upstream-3")
+	assertGRPCReloadCache(t, cg, explicitZeroNext, cacheHit, "upstream-3")
+	reloadTestFile(t, cg, grpcReloadConfig("", "allow"))
+	require.True(t, cg.dashboard.lastReload.Success)
+	assertGRPCReloadCache(t, cg, explicitZeroNext, cacheMiss, "upstream-4")
+	assertGRPCReloadCache(t, cg, absentNext, cacheHit, "upstream-3")
+	reloadTestFile(t, cg, grpcReloadConfig(proto3, "allow"))
+	require.True(t, cg.dashboard.lastReload.Success)
+	assertGRPCReloadCache(t, cg, explicitZeroNext, cacheHit, "upstream-3")
 
 	proto2 = writeReloadProtoset(t, "proto2")
 	var readers sync.WaitGroup
