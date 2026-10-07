@@ -571,6 +571,10 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, GetSourceIP(r), idName)
 		allowed, _, rlErr := allowRuleRateLimit(r.Context(), rule.RateLimit, l, key)
 		if rlErr != nil {
+			// The caller is gone: reject without logging or recording a denial.
+			if r.Context().Err() != nil {
+				return false, -32005, "request cancelled"
+			}
 			logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter unavailable")
 			allowed = false
 		}

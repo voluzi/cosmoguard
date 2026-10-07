@@ -122,6 +122,17 @@ func TestLimiterCallerContextErrorsAreNotProtocolDenials(t *testing.T) {
 				require.Empty(t, gp.cgDashboard.denied.Snapshot())
 				require.Empty(t, logs.String())
 			})
+			logs.Reset()
+			t.Run("jsonrpc", func(t *testing.T) {
+				rpcRule := &JsonRpcRule{Action: RuleActionAllow, Methods: []string{"m"}, RateLimit: cfg}
+				require.NoError(t, rpcRule.Compile())
+				h := &JsonRpcHandler{log: logger, cgDashboard: newDashboardObservability()}
+				r := httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
+				ok, _, _ := h.jsonRpcPolicyVerdict(r, &JsonRpcMsg{Method: "m"}, rpcRule, nil)
+				require.False(t, ok, "a cancelled call is not forwarded")
+				require.Empty(t, h.cgDashboard.denied.Snapshot())
+				require.Empty(t, logs.String())
+			})
 		})
 	}
 }
