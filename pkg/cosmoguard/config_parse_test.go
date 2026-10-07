@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Keep config/matcher allocation graphs out of the existing process-wide heap
@@ -18,7 +19,14 @@ func restartTestProcess(t *testing.T) bool {
 	if os.Getenv("TEST_COSMOGUARD_RESTART_CHILD") == "1" {
 		return false
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^"+regexp.QuoteMeta(t.Name())+"$")
+	timeout := 2 * time.Minute
+	if deadline, ok := t.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+	if timeout <= 0 {
+		t.Fatal("isolated test deadline exceeded")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.timeout="+timeout.String())
 	cmd.Env = append(os.Environ(), "TEST_COSMOGUARD_RESTART_CHILD=1")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("isolated test: %v\n%s", err, output)
@@ -28,6 +36,15 @@ func restartTestProcess(t *testing.T) bool {
 
 func envLookup(values map[string]string) func(string) (string, bool) {
 	return func(name string) (string, bool) { value, ok := values[name]; return value, ok }
+}
+
+func TestRestartProcessDeadline(t *testing.T) {
+	if restartTestProcess(t) {
+		return
+	}
+	if _, ok := t.Deadline(); !ok {
+		t.Fatal("isolated test has no deadline")
+	}
 }
 
 func TestParseConfigExplicitEnvironment(t *testing.T) {
