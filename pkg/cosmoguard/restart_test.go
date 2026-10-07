@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,9 @@ func restartCases() []restartCase {
 		{"rpc http rules", "", "rpc: {rules: [{paths: [/new], action: deny}]}", ""},
 		{"rpc json rules", "", "rpc: {jsonrpc: {rules: [{methods: [block], params: {height: 10, prove: true}, action: deny}]}}", ""},
 		{"grpc rules", "", "grpc: {rules: [{methods: [cosmos.bank.v1beta1.Query/Balance], action: deny}]}", ""},
+		{"jsonrpc batch limit", "", "rpc: {jsonrpc: {maxBatchSize: 1}}", ""},
+		{"jsonrpc batch disabled", "", "rpc: {jsonrpc: {maxBatchSize: 0}}", ""},
+		{"grpc protosets", "grpc: {protosets: [old.protoset]}", "grpc: {protosets: [new.protoset]}", ""},
 		{"evm rules", "enableEvm: true", "enableEvm: true\nevm: {rpc: {rules: [{methods: [eth_chainId], action: deny}], httpRules: [{paths: [/new], action: deny}]}, ws: {rules: [{methods: [eth_subscribe], action: deny}]}}", ""},
 		{"untracked listener", "", "rpcPort: 16658", ""},
 	}
@@ -188,6 +192,17 @@ func TestTryReloadMatchesRestartPolicy(t *testing.T) {
 	for _, tc := range restartCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			previousRaw, nextRaw := tc.previous, tc.next
+			if tc.name == "grpc protosets" {
+				for _, name := range []string{"old.protoset", "new.protoset"} {
+					path := filepath.Join(t.TempDir(), name)
+					// Empty bytes are a valid empty FileDescriptorSet.
+					if err := os.WriteFile(path, nil, 0600); err != nil {
+						t.Fatal(err)
+					}
+					previousRaw = strings.ReplaceAll(previousRaw, name, fmt.Sprintf("%q", path))
+					nextRaw = strings.ReplaceAll(nextRaw, name, fmt.Sprintf("%q", path))
+				}
+			}
 			if tc.name != "lcd rules" {
 				previousRaw += "\nlcd: {rules: [{paths: [/old], action: allow}]}\n"
 				nextRaw += "\nlcd: {rules: [{paths: [/new], action: deny}]}\n"

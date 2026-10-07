@@ -82,13 +82,23 @@ By default, each enabled protocol pool has 40 upstream WebSocket connections wit
 - `maxRequestBody` default raised from 1 MiB to **5 MiB** so large payloads (e.g. a wasm `MsgStoreCode` broadcast) aren't rejected with 413.
 - `wsReadLimit` default raised from 64 KiB to **1 MiB**, and an explicit `0` now means "no limit" (as documented) instead of being silently forced to 64 KiB. Large frames (e.g. a big `eth_sendRawTransaction`) are no longer dropped.
 
-**Hot-reload:** `server:` timeouts / body caps / WebSocket limits, `cors:`, and dashboard `enable`/`port`/`basicAuth` are captured at startup and now **reject** a reload that changes them (with a clear "requires a process restart" message) instead of silently accepting a change that never takes effect. `dashboard.requestLog` and `server.trustedProxies` still hot-reload.
+**Hot-reload:** Changes to `server:` timeouts / body caps / WebSocket limits, `cors:`, and dashboard `enable`/`port`/`basicAuth` **reject** a reload with a "requires a process restart" message. `dashboard.requestLog`, `server.trustedProxies`, `rpc.jsonrpc.maxBatchSize` and `grpc.protosets` hot-reload.
 
-A startup-captured change rejects the **entire** reload: rules in that same file
+A change covered by the restart policy rejects the **entire** reload: rules in that same file
 update stay unchanged too. Global cache, EVM enablement, authentication, upstream
 nodes, CORS, server limits/timeouts, dashboard startup settings, metrics/WebUI,
 WebSocket pool settings and gRPC message sizes require restart. Rules and section
-defaults, trusted proxies and dashboard request logging remain hot-reloadable.
+defaults, trusted proxies, dashboard request logging, JSON-RPC batch limits and
+gRPC protosets remain hot-reloadable.
+
+`host`, the protocol listener ports (`lcdPort`, `rpcPort`, `grpcPort`,
+`evmRpcPort`, `evmRpcWsPort`), `upstream.*` and `tracing` are captured at startup
+but are outside this restart policy. Changes to these settings alone are accepted
+on reload without being applied; restart the process to apply them.
+
+`rpc.jsonrpc.maxBatchSize` is shared by the Cosmos RPC, EVM RPC and EVM WebSocket
+handlers' HTTP batch paths. `0` disables the cap; omission restores the default
+of 100. WebSocket frames accept individual JSON-RPC requests, not batches.
 
 ### Go configuration comparison API
 
@@ -776,6 +786,15 @@ requests. Revocations appear in the dashboard's denials.
 `grpc.maxRecvMsgSize` and `grpc.maxSendMsgSize` default to the Cosmos SDK node's own gRPC limits (10 MiB in, 2 GiB − 1 out), so the proxy relays every message the node serves. Unset or `0` keeps the default, negative values are rejected, and changing them requires a process restart. The gRPC listener also caps each client connection at 1000 concurrent streams (further streams queue) and pings idle clients every 2 minutes.
 
 For `keyMode: canonical`, set `grpc.protosets:` at the top level. Each path is a binary `FileDescriptorSet` produced by `protoc --descriptor_set_out=foo.protoset -I path/to/protos path/to/protos/**/*.proto`. Methods absent from the loaded protosets silently degrade to `raw`.
+
+Changing the protoset path list hot-reloads the registry. The new files are fully
+loaded and validated before config, limits or rules are changed; a load failure
+rejects the whole reload as `invalid` and preserves the previous config and
+registry. An unchanged list does not reopen files, keeping unrelated rule reloads
+independent of descriptor-file access. To load an edited bundle, change its path
+(for example, use a versioned filename). Clearing the list disables
+canonicalization. Canonical cache keys include a descriptor digest, so changed
+descriptors stop finding the old registry's cache entries.
 
 ```yaml
 grpc:
