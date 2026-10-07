@@ -96,9 +96,9 @@ gRPC protosets remain hot-reloadable.
 but are outside this restart policy. Changes to these settings alone are accepted
 on reload without being applied; restart the process to apply them.
 
-`rpc.jsonrpc.maxBatchSize` is shared by the Cosmos RPC, EVM RPC and EVM WebSocket
-handlers' HTTP batch paths. `0` disables the cap; omission restores the default
-of 100. WebSocket frames accept individual JSON-RPC requests, not batches.
+`rpc.jsonrpc.maxBatchSize` is shared by the Cosmos RPC and EVM RPC HTTP batch
+paths. `0` disables the cap; omission restores the default of 100. WebSocket
+frames accept individual JSON-RPC requests, not batches.
 
 ### Go configuration comparison API
 

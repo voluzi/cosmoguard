@@ -27,7 +27,7 @@ func newHotReloadTestGuard(t *testing.T, raw string) *CosmoGuard {
 		jsonRpcHandler: newEnvelopeTestHandler(t), evmRpcProxy: &HttpProxy{},
 		evmJsonRpcHandler: newEnvelopeTestHandler(t), evmJsonRpcWsHandler: newEnvelopeTestHandler(t),
 	}
-	for _, handler := range []*JsonRpcHandler{cg.jsonRpcHandler, cg.evmJsonRpcHandler, cg.evmJsonRpcWsHandler} {
+	for _, handler := range []*JsonRpcHandler{cg.jsonRpcHandler, cg.evmJsonRpcHandler} {
 		handler.maxBatchSize = *cfg.RPC.JsonRpc.MaxBatchSize
 	}
 	cg.applyRulesLocked()
@@ -89,7 +89,7 @@ func TestTryReloadJSONRPCBatchLimit(t *testing.T) {
 		return fmt.Sprintf("enableEvm: true\nrpc: {jsonrpc: {default: allow%s}}\nevm: {rpc: {default: allow}, ws: {default: allow}}", limit)
 	}
 	cg := newHotReloadTestGuard(t, config(", maxBatchSize: 2"))
-	handlers := map[string]*JsonRpcHandler{"cosmos rpc": cg.jsonRpcHandler, "evm rpc": cg.evmJsonRpcHandler, "evm ws HTTP": cg.evmJsonRpcWsHandler}
+	handlers := map[string]*JsonRpcHandler{"cosmos rpc": cg.jsonRpcHandler, "evm rpc": cg.evmJsonRpcHandler}
 	for _, handler := range handlers {
 		assertReloadBatch(t, handler, 2, http.StatusOK)
 	}

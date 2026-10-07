@@ -495,7 +495,6 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 			return nil, fmt.Errorf("error resolving evm-rpc-ws backends: %w", err)
 		}
 		cosmoGuard.evmJsonRpcWsHandler, err = NewJsonRpcHandler("evm_jsonrpc_ws",
-			WithMaxBatchSize[JsonRpcHandlerOptions](*cosmoGuard.cfg.RPC.JsonRpc.MaxBatchSize),
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
@@ -1021,7 +1020,7 @@ func (f *CosmoGuard) tryReload() {
 		f.grpcProxy.canonical = registry
 		f.grpcProxy.rulesMutex.Unlock()
 	}
-	for _, handler := range []*JsonRpcHandler{f.jsonRpcHandler, f.evmJsonRpcHandler, f.evmJsonRpcWsHandler} {
+	for _, handler := range []*JsonRpcHandler{f.jsonRpcHandler, f.evmJsonRpcHandler} {
 		if handler != nil {
 			handler.setMaxBatchSize(*newCfg.RPC.JsonRpc.MaxBatchSize)
 		}
