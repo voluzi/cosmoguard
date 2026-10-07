@@ -563,6 +563,15 @@ topologySpreadConstraints: []
 # Lifecycle probes hit cosmoguard's built-in /healthz and /readyz on
 # the metrics port. /readyz reflects upstream-pool health so a node
 # without a healthy upstream stops receiving traffic.
+# Bootstrap completes before /healthz listens; leave margin over the 45s budget.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: metrics
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 30
+
 livenessProbe:
   httpGet:
     path: /healthz

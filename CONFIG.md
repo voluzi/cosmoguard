@@ -272,8 +272,8 @@ Startup waits for an initial usable olric routing table before constructing
 cache, authentication, limiter, or observability consumers. Bootstrap timeouts
 and insufficient member quorum are retried on the same daemon; permanent errors
 fail immediately. A fixed 45s budget covers initial DNS discovery, daemon start,
-and this gate together; there is no new configuration setting. The elapsed gate
-and total startup time are logged. A native DMap check already in progress can
+and this gate together; there is no new configuration setting. The first transient cause, elapsed gate
+and total startup time are logged; deadline errors retain the last cause. A native DMap check already in progress can
 finish after the caller's deadline (olric bounds that check to 10s); shutdown
 starts immediately with a 2s allowance.
 
@@ -281,8 +281,8 @@ The metrics listener and `/healthz` start only in `CosmoGuard.Run`, after
 construction and this bootstrap gate. `/readyz` then applies the existing
 upstream readiness checks; startup does not wait for all data migration to finish.
 Allow at least 60s for a startup probe on the metrics port (for example 30 failures
-at 2s intervals), and keep discovery of unready peers enabled. The default chart's
-liveness-only timing needs a matching startup allowance when used for slow joins.
+at 2s intervals), and keep discovery of unready peers enabled. The chart includes this startup probe for Deployment and StatefulSet. Deployments
+using other manifests must provide the same allowance.
 
 Clustered response-cache L2 reads, existence checks, and writes have a fixed
 100ms caller-wait budget and share 128 outstanding-operation slots per process.

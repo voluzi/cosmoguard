@@ -100,6 +100,9 @@ spec:
             gates the listener.
           */}}
           {{- if .Values.config.metrics.enable }}
+          {{- with .Values.startupProbe }}
+          startupProbe: {{- toYaml . | nindent 12 }}
+          {{- end }}
           livenessProbe: {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe: {{- toYaml .Values.readinessProbe | nindent 12 }}
           {{- end }}

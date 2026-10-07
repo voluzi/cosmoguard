@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/memberlist"
@@ -349,7 +350,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		if discovery != nil {
 			_ = discovery.Close()
 		}
-		return nil, fmt.Errorf("cluster runtime: discovery: %w", err)
+		return nil, fmt.Errorf("cluster runtime: before start: %w", err)
 	}
 	ready := make(chan struct{})
 	c.Started = func() { close(ready) }
@@ -379,12 +380,19 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = db.Shutdown(ctx)
 		cancel()
+		if discovery != nil {
+			_ = discovery.Close()
+		}
 		return nil, fmt.Errorf("cluster runtime: start: %w", err)
 	case <-ctx.Done():
+		startCause := ctx.Err()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = db.Shutdown(ctx)
 		cancel()
-		return nil, fmt.Errorf("cluster runtime: timed out after %s waiting for olric to start", opts.StartTimeout)
+		if discovery != nil {
+			_ = discovery.Close()
+		}
+		return nil, fmt.Errorf("cluster runtime: timed out after %s waiting for olric to start: %w", opts.StartTimeout, startCause)
 	}
 
 	client := db.NewEmbeddedClient()
@@ -415,16 +423,35 @@ func waitClusterBootstrap(ctx context.Context, client interface {
 	NewDMap(string, ...olric.DMapOption) (olric.DMap, error)
 }) error {
 	result := make(chan error, 1)
+	var mu sync.Mutex
+	var last error
+	deadlineError := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if last != nil {
+			return fmt.Errorf("%w (last bootstrap error: %w)", ctx.Err(), last)
+		}
+		return ctx.Err()
+	}
 	go func() {
+		logged := false
 		for {
 			if ctx.Err() != nil {
 				result <- ctx.Err()
 				return
 			}
+			// Opening this stable internal DMap leaves an empty map for the daemon's lifetime.
 			_, err := client.NewDMap("cosmoguard:bootstrap")
 			if err == nil || (!errors.Is(err, olric.ErrOperationTimeout) && !errors.Is(err, olric.ErrClusterQuorum)) {
 				result <- err
 				return
+			}
+			mu.Lock()
+			last = err
+			mu.Unlock()
+			if !logged {
+				slog.Info("waiting for olric bootstrap", "error", err)
+				logged = true
 			}
 			select {
 			case <-ctx.Done():
@@ -436,10 +463,10 @@ func waitClusterBootstrap(ctx context.Context, client interface {
 	}()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return deadlineError()
 	case err := <-result:
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return deadlineError()
 		}
 		return err
 	}

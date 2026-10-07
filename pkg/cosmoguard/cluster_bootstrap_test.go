@@ -16,7 +16,8 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// bootstrapMember mirrors olric's member metadata on the gossip/RESP wire.
+// bootstrapMember and the routing-table payload below mirror olric v0.7.4's
+// internal gossip/RESP wire format; review them when upgrading olric.
 type bootstrapMember struct {
 	Name      string
 	NameHash  uint64
@@ -153,17 +154,39 @@ func TestClusterRuntimeBootstrapDeadlineCleansUp(t *testing.T) {
 	ports := reserveLoopbackPorts(t, 2)
 	cfg := &ClusterConfig{BindAddr: "127.0.0.1", BindPort: ports[0], GossipPort: ports[1], ReplicaCount: 2, Quorum: 2, EncryptionKey: testClusterEncryptionKey,
 		Discovery: &ClusterDiscoveryConfig{Mode: "static", Static: &StaticDiscoveryConfig{}}}
-	started := time.Now()
-	cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 150 * time.Millisecond})
+	cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 2 * time.Second})
 	if cr != nil {
 		defer cr.Close(context.Background())
 	}
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Nil(t, cr)
-	require.Less(t, time.Since(started), time.Second)
+	require.ErrorIs(t, err, olric.ErrClusterQuorum)
 	for _, port := range ports {
 		l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 		require.NoError(t, err, "daemon must release its listeners")
 		require.NoError(t, l.Close())
+	}
+}
+
+func TestClusterBootstrapDeadlinePreservesCause(t *testing.T) {
+	called := make(chan struct{})
+	probe := &bootstrapProbe{open: func(n int) error {
+		if n == 2 {
+			close(called)
+		}
+		return olric.ErrClusterQuorum
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- waitClusterBootstrap(ctx, probe) }()
+	<-called
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, olric.ErrClusterQuorum)
+	case <-time.After(5 * time.Second):
+		t.Fatal("bootstrap caller did not stop")
 	}
 }
