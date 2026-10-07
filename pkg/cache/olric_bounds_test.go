@@ -16,15 +16,22 @@ type blockedCacheDMap struct {
 	olric.DMap
 	release <-chan struct{}
 	calls   atomic.Int32
+	entered chan struct{}
 }
 
 func (d *blockedCacheDMap) Get(context.Context, string) (*olric.GetResponse, error) {
-	d.calls.Add(1)
+	n := d.calls.Add(1)
+	if n == 1 && d.entered != nil {
+		d.entered <- struct{}{}
+	}
 	<-d.release
 	return nil, olric.ErrKeyNotFound
 }
 func (d *blockedCacheDMap) Put(context.Context, string, any, ...olric.PutOption) error {
-	d.calls.Add(1)
+	n := d.calls.Add(1)
+	if n == 1 && d.entered != nil {
+		d.entered <- struct{}{}
+	}
 	<-d.release
 	return nil
 }
@@ -36,7 +43,7 @@ func TestOlricCacheBoundsAllOperations(t *testing.T) {
 			var once sync.Once
 			unblock := func() { once.Do(func() { close(release) }) }
 			defer unblock()
-			dm := &blockedCacheDMap{release: release}
+			dm := &blockedCacheDMap{release: release, entered: make(chan struct{}, 1)}
 			options := defaultOptions()
 			BoundedOperations(1, 10*time.Millisecond, nil)(options)
 			c := &OlricCache[string, []byte]{dm: dm, cfg: options, namespace: "test"}
@@ -60,6 +67,11 @@ func TestOlricCacheBoundsAllOperations(t *testing.T) {
 				require.ErrorIs(t, err, context.DeadlineExceeded)
 			case <-time.After(5 * time.Second):
 				t.Fatal("cache operation did not stop waiting")
+			}
+			select {
+			case <-dm.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("backend operation did not enter")
 			}
 			_, err := c.Get(t.Context(), "other")
 			require.ErrorIs(t, err, boundedcall.ErrRejected)
