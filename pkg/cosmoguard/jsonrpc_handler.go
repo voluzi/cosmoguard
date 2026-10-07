@@ -28,7 +28,7 @@ type JsonRpcHandler struct {
 	responseTimeHist *prometheus.HistogramVec
 	batchResTimeHist *prometheus.HistogramVec
 	// maxBatchSize caps the number of requests in a single JSON-RPC batch.
-	// 0 disables the cap.
+	// 0 disables the cap. Guarded by rulesMutex.
 	maxBatchSize int
 	// cgDashboard is the optional observability sink for unmatched
 	// + deny events. nil when not wired by cosmoguard.New; all
@@ -395,6 +395,12 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 	}
 }
 
+func (h *JsonRpcHandler) setMaxBatchSize(limit int) {
+	h.rulesMutex.Lock()
+	h.maxBatchSize = limit
+	h.rulesMutex.Unlock()
+}
+
 func (h *JsonRpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request)) {
 	defer recoverHTTP(h.log, w, r)
 	// Wrap in a child span — HttpProxy.ServeHTTP started the parent
@@ -509,10 +515,13 @@ func (h *JsonRpcHandler) handleHttp(w http.ResponseWriter, r *http.Request,
 	// Reject oversized batches before any rule evaluation. Batch
 	// amplification is one of the cheapest ways to turn a single TCP
 	// connection into a flood of upstream calls.
-	if h.maxBatchSize > 0 && len(requests) > h.maxBatchSize {
+	h.rulesMutex.RLock()
+	maxBatchSize := h.maxBatchSize
+	h.rulesMutex.RUnlock()
+	if maxBatchSize > 0 && len(requests) > maxBatchSize {
 		h.log.WithFields(map[string]interface{}{
 			"batch_size":     len(requests),
-			"max_batch_size": h.maxBatchSize,
+			"max_batch_size": maxBatchSize,
 			"source":         GetSourceIP(r),
 		}).Warn("jsonrpc batch exceeds maxBatchSize")
 		WriteError(w, http.StatusRequestEntityTooLarge,
