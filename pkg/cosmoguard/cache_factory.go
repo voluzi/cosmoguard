@@ -1,10 +1,21 @@
 package cosmoguard
 
 import (
+	"time"
+
 	"github.com/olric-data/olric"
 
 	"github.com/voluzi/cosmoguard/v5/pkg/cache"
 )
+
+const l2OperationBudget = 100 * time.Millisecond
+const l2OperationCapacity = 128
+
+// Share capacity across response namespaces so saturation cannot spawn an
+// unbounded set of detached calls. Limiter admission has its own pool.
+var boundedL2Operations = cache.BoundedOperations(l2OperationCapacity, l2OperationBudget, func(outcome string) {
+	recordBackendOperationFailure("l2", outcome)
+})
 
 // newResponseCache builds the response cache for a proxy / handler:
 // an olric L2 fronted by an in-process L1, namespaced by
@@ -38,6 +49,9 @@ func newResponseCache[K comparable, V any](
 		namespace = cacheCfg.Key + name
 	}
 
+	if cacheCfg != nil && cacheCfg.Cluster != nil {
+		opts = append(opts, boundedL2Operations)
+	}
 	l2, err := cache.NewOlricCache[K, V](olricClient, namespace, opts...)
 	if err != nil {
 		return nil, err

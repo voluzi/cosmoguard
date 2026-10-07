@@ -456,7 +456,7 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		// Each rule's bucket pool gets its own keyspace under the proxy
 		// name so multiple proxies (lcd, rpc, etc.) don't share buckets.
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
 		if err != nil {
 			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
 				p.log.WithError(err).WithField("rule_priority", r.Priority).

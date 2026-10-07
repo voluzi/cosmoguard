@@ -362,7 +362,7 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 			}
 		}
 		keyspace := h.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := NewRateLimiter(*r.RateLimit, h.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, h.cacheConfig, h.olricClient, keyspace)
 		if err != nil {
 			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
 				h.log.WithError(err).WithField("rule_priority", r.Priority).

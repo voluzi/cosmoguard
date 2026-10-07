@@ -284,6 +284,34 @@ Allow at least 60s for a startup probe on the metrics port (for example 30 failu
 at 2s intervals), and keep discovery of unready peers enabled. The default chart's
 liveness-only timing needs a matching startup allowance when used for slow joins.
 
+Clustered response-cache L2 reads, existence checks, and writes have a fixed
+100ms caller-wait budget and share 128 outstanding-operation slots per process.
+L1 hits bypass this pool. At capacity, new L2 operations are rejected immediately
+without a queue. Timeout/rejection is a cache backend error: the existing proxy
+fallback serves upstream, and failed cache storage preserves the upstream result.
+This can increase upstream traffic during joins or slow peers.
+
+Clustered limiter attempts have a separate 250ms caller-wait budget and 64
+outstanding-operation slots per process, covering lock, read, write, and unlock.
+Timeout/rejection follows the rule's existing `failureMode`: fail-open admits;
+fail-closed denies. Lock contention completed within the budget still denies;
+contention that runs past the budget becomes a backend timeout and follows the
+failure mode. There are no retries or replacement local buckets. Cache saturation
+cannot consume limiter slots. These fixed bounds apply only with `cache.cluster`
+present; embedded/local caches and local limiter attempts retain their behavior.
+
+Underlying olric calls may ignore cancellation, so each slot stays occupied until
+the actual call returns. Late writes or token consumption are possible after the
+client stops waiting. The limiter's existing 2s lock lease does not guarantee
+mutual exclusion for a critical section stalled beyond that lease.
+
+`cosmoguard_backend_operation_failures_total` counts abandoned waits and capacity
+rejections. Its labels are `backend` (`l2` or `limiter`) and `outcome` (`timeout` or
+`rejected`), with only four combinations.
+It does not count cache misses, ordinary contention denials, or client cancellation.
+Timeouts include earlier caller deadlines. The existing proxy error logs and cache
+error outcomes remain in use. No new YAML settings or dependencies are required.
+
 Cross-pod replication of the dashboard observability snapshot (so a restarting pod restores its counters + metrics history from a peer) is **off by default** and opt-in via `dashboard.clusterHistoryRestore: true` — see [Dashboard restart-restore](#dashboard-restart-restore-off-by-default) below. The live cluster dashboard (peer HTTP fan-out) and Prometheus `/metrics` do **not** depend on it.
 
 ```yaml

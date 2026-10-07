@@ -329,7 +329,7 @@ func (p *GrpcProxy) SetRules(rules []*GrpcRule, defaultAction RuleAction) {
 			}
 		}
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
 		if err != nil {
 			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
 				p.log.WithError(err).WithField("rule_priority", r.Priority).

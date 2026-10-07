@@ -1,6 +1,10 @@
 package cache
 
-import "time"
+import (
+	"time"
+
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+)
 
 const (
 	defaultCacheTTL = 5 * time.Second
@@ -13,7 +17,8 @@ func defaultOptions() *Options {
 }
 
 type Options struct {
-	TTL time.Duration
+	TTL           time.Duration
+	operationGate *boundedcall.Gate
 	// MaxCostBytes caps the in-memory (L1) working set by approximate
 	// payload cost in bytes, evicting least-recently-used entries above
 	// the cap. 0 means unbounded. Each entry is charged a flat per-entry
@@ -60,4 +65,12 @@ func OnEvict(fn func()) Option {
 	return func(o *Options) {
 		o.OnEvict = fn
 	}
+}
+
+// BoundedOperations limits olric caller waiting and outstanding operations.
+// Reusing the option shares one admission pool across cache instances.
+// Memory caches ignore it; expired operations may still finish in olric.
+func BoundedOperations(capacity int, budget time.Duration, onFailure func(string)) Option {
+	gate := boundedcall.New(capacity, budget, onFailure)
+	return func(o *Options) { o.operationGate = gate }
 }

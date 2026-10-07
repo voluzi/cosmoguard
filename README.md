@@ -28,11 +28,15 @@ changed from v3; existing v3 configs continue to work — run
   preservation, configurable header allowlists. Backed by an embedded
   olric distributed cache with an in-process L1 — single binary,
   no external dependency, shared automatically across replicas when
-  cluster mode is on.
+  cluster mode is on. Clustered L2 waits are bounded at 100ms and fall
+  back upstream on timeout or saturation; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
   identity` scopes. Buckets are sharded across replicas through the
   same olric runtime in cluster mode, so configured rates stay correct
-  under HPA without an external store.
+  under HPA without an external store. Clustered attempts stop waiting
+  after 250ms or reject immediately at capacity, following the configured
+  fail-open / fail-closed policy. See [cluster behavior](CONFIG.md#cluster-mode)
+  for the fixed operation limits and metrics.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
   token introspection, and an external-validator method for
   developer-portal style credential checks. Credential headers are

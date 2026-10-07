@@ -114,6 +114,15 @@ var upstreamRequestsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Upstream fetches cosmoguard performed, by pool, upstream, and rule. Excludes cache hits and coalesced single-flight waiters; internal HTTP retries within one request collapse to a single logical fetch (so misses − this = coalesced-away calls).",
 }, []string{"pool", "upstream", "rule_id"})
 
+var backendOperationFailuresCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "cosmoguard_backend_operation_failures_total",
+	Help: "Clustered request-path backend operations abandoned on timeout or rejected at capacity.",
+}, []string{"backend", "outcome"})
+
+func recordBackendOperationFailure(backend, outcome string) {
+	backendOperationFailuresCounter.WithLabelValues(backend, outcome).Inc()
+}
+
 var configReloadsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "cosmoguard_config_reloads_total",
 	Help: "Config reload attempts by outcome: applied, restart_required, or invalid (read, parse, or validation failure).",
@@ -135,6 +144,12 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(cacheEvictionsCounter)
 		_ = prometheus.Register(upstreamRequestsCounter)
 		_ = prometheus.Register(configReloadsCounter)
+		_ = prometheus.Register(backendOperationFailuresCounter)
+		for _, backend := range []string{"l2", "limiter"} {
+			for _, outcome := range []string{"timeout", "rejected"} {
+				backendOperationFailuresCounter.WithLabelValues(backend, outcome)
+			}
+		}
 		// A zero baseline lets rate/increase observe the first reload outcome.
 		for _, outcome := range []string{"applied", "restart_required", "invalid"} {
 			configReloadsCounter.WithLabelValues(outcome)

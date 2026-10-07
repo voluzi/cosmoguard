@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/olric-data/olric"
+
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 )
 
 // OlricCache implements Cache[K, V] backed by an olric DMap. The DMap name
@@ -33,11 +35,14 @@ type OlricCache[K comparable, V any] struct {
 // assertion. *OlricCache still satisfies Cache[K, V] structurally, so
 // callers that want the interface can assign it without a cast.
 func NewOlricCache[K comparable, V any](
-	client *olric.EmbeddedClient,
+	client interface {
+		NewDMap(string, ...olric.DMapOption) (olric.DMap, error)
+	},
 	namespace string,
 	opts ...Option,
 ) (*OlricCache[K, V], error) {
-	if client == nil {
+	embedded, isEmbedded := client.(*olric.EmbeddedClient)
+	if client == nil || (isEmbedded && embedded == nil) {
 		return nil, errors.New("olric cache: client must not be nil")
 	}
 	if namespace == "" {
@@ -72,7 +77,10 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 		return err
 	}
 
-	return c.dm.Put(ctx, c.keyStr(key), payload, olric.EX(itemTTL))
+	_, err = boundedcall.Do(ctx, c.cfg.operationGate, func(opCtx context.Context) (struct{}, error) {
+		return struct{}{}, c.dm.Put(opCtx, c.keyStr(key), payload, olric.EX(itemTTL))
+	})
+	return err
 }
 
 func (c *OlricCache[K, V]) Get(ctx context.Context, key K) (V, error) {
@@ -97,7 +105,7 @@ func (c *OlricCache[K, V]) GetWithExpiry(ctx context.Context, key K) (V, int64, 
 func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, error) {
 	var zero V
 
-	resp, err := c.dm.Get(ctx, c.keyStr(key))
+	resp, err := c.get(ctx, key)
 	if err != nil {
 		if errors.Is(err, olric.ErrKeyNotFound) {
 			return zero, 0, ErrNotFound
@@ -115,7 +123,7 @@ func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, 
 }
 
 func (c *OlricCache[K, V]) Has(ctx context.Context, key K) (bool, error) {
-	_, err := c.dm.Get(ctx, c.keyStr(key))
+	_, err := c.get(ctx, key)
 	if err != nil {
 		if errors.Is(err, olric.ErrKeyNotFound) {
 			return false, nil
@@ -123,6 +131,12 @@ func (c *OlricCache[K, V]) Has(ctx context.Context, key K) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func (c *OlricCache[K, V]) get(ctx context.Context, key K) (*olric.GetResponse, error) {
+	return boundedcall.Do(ctx, c.cfg.operationGate, func(opCtx context.Context) (*olric.GetResponse, error) {
+		return c.dm.Get(opCtx, c.keyStr(key))
+	})
 }
 
 // Close is a no-op: the underlying *olric.EmbeddedClient is owned by the
