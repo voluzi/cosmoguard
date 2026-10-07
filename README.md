@@ -241,7 +241,7 @@ the leading slash is optional. Invalid patterns fail before contacting the
 node. An exclusion also skips the method's annotated LCD routes and its
 cross-height probes (including ABCI), before any comparison request is built.
 Progress and the JSON report retain the matched pattern as a `skipped` reason;
-unmatched patterns produce warnings. Exclusions do not cover unrelated parameter
+unmatched user-supplied patterns produce warnings. Exclusions do not cover unrelated parameter
 discovery requests or ordinary CometBFT/EVM JSON-RPC methods.
 
 `/eth.evm.v1.Query/Trace*` is excluded by default: an empty `TraceCall`
