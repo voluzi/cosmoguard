@@ -720,7 +720,7 @@ type GrpcConfig struct {
 	Rules   []*GrpcRule `yaml:"rules,omitempty"`
 	// Protosets is the list of binary FileDescriptorSet files
 	// (produced by `protoc --descriptor_set_out=foo.protoset`).
-	// Loaded at startup and used by gRPC rules with
+	// Loaded at startup and when this list changes on reload; used by gRPC rules with
 	// `cache.keyMode: canonical` to decode + re-encode request
 	// payloads deterministically before hashing — collapses byte-
 	// level differences in protobuf serialization across clients.

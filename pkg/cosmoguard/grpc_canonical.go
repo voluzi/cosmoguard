@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"sort"
@@ -31,6 +32,7 @@ type CanonicalRegistry struct {
 	mu      sync.RWMutex
 	methods map[string]protoreflect.MethodDescriptor // "/pkg.Svc/Method" → MethodDescriptor
 	files   *protoregistry.Files
+	digest  string // Immutable after loading; namespaces canonical cache entries.
 }
 
 // LoadCanonicalRegistry reads the listed protoset files and indexes
@@ -81,6 +83,10 @@ func (r *CanonicalRegistry) indexSet(set *descriptorpb.FileDescriptorSet) error 
 	if err != nil {
 		return fmt.Errorf("build file descriptors: %w", err)
 	}
+	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(set)
+	if err != nil {
+		return fmt.Errorf("encode file descriptors: %w", err)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
@@ -97,6 +103,7 @@ func (r *CanonicalRegistry) indexSet(set *descriptorpb.FileDescriptorSet) error 
 		return true
 	})
 	r.files = files
+	r.digest = fmt.Sprintf("%x", sha256.Sum256(raw))
 	return nil
 }
 

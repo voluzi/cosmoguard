@@ -10,6 +10,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -989,6 +990,18 @@ func (f *CosmoGuard) tryReload() {
 
 	f.configMutex.Lock()
 	defer f.configMutex.Unlock()
+	protosetsChanged := !slices.Equal(f.cfg.GRPC.Protosets, newCfg.GRPC.Protosets)
+	var registry *CanonicalRegistry
+	if protosetsChanged && len(newCfg.GRPC.Protosets) > 0 {
+		registry, err = LoadCanonicalRegistry(newCfg.GRPC.Protosets)
+		if err != nil {
+			err = fmt.Errorf("grpc canonical registry: %w", err)
+			slog.Error("config reload failed; keeping previous config", "error", err)
+			configReloadsCounter.WithLabelValues("invalid").Inc()
+			f.dashboard.RecordReload(false, err.Error(), nil)
+			return
+		}
+	}
 	// Discovery expands live Nodes; restart policy compares the declarations.
 	previous := *f.cfg
 	previous.Nodes = f.origNodes
@@ -1003,6 +1016,11 @@ func (f *CosmoGuard) tryReload() {
 	accepted = true
 	before := f.ruleFingerprintsLocked()
 	f.cfg = newCfg
+	if protosetsChanged {
+		f.grpcProxy.rulesMutex.Lock()
+		f.grpcProxy.canonical = registry
+		f.grpcProxy.rulesMutex.Unlock()
+	}
 	for _, handler := range []*JsonRpcHandler{f.jsonRpcHandler, f.evmJsonRpcHandler, f.evmJsonRpcWsHandler} {
 		if handler != nil {
 			handler.setMaxBatchSize(*newCfg.RPC.JsonRpc.MaxBatchSize)

@@ -123,7 +123,7 @@ type GrpcProxy struct {
 	// canonical holds protobuf method descriptors loaded from operator-
 	// supplied protoset files. Used by rules with cache.keyMode:
 	// canonical to decode + re-encode request payloads deterministically
-	// before hashing. nil when no protosets are configured.
+	// before hashing. nil when no protosets are configured. Guarded by rulesMutex.
 	canonical *CanonicalRegistry
 	// cgDashboard is the optional observability sink for unmatched +
 	// deny events. nil-safe.
