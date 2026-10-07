@@ -42,16 +42,18 @@ func main() {
 
 func run() int {
 	var (
-		spawnBin    = flag.String("spawn", "", "cosmoguard binary to start in front of the node (instead of guard-* flags)")
-		report      = flag.String("report", "", "write the full JSON report, including skip reasons, to this file")
-		only        = flag.String("only", "", "comma-separated protocols to run: grpc,lcd,rpc,evm,ws (default all)")
-		height      = flag.Int64("height", 0, "height to pin queries to (default: node latest - 5)")
-		concurrency = flag.Int("concurrency", 4, "comparisons in flight at once")
-		timeout     = flag.Duration("timeout", 20*time.Second, "timeout per request")
-		roundDelay  = flag.Duration("round-delay", 0, "pause between comparison rounds of a differing endpoint; set above cosmoguard's cache TTL (default with --spawn: 3s)")
-		node        compat.Endpoints
-		guard       compat.Endpoints
-		params      = compat.Params{}
+		spawnBin           = flag.String("spawn", "", "cosmoguard binary to start in front of the node (instead of guard-* flags)")
+		report             = flag.String("report", "", "write the full JSON report, including skip reasons, to this file")
+		only               = flag.String("only", "", "comma-separated protocols to run: grpc,lcd,rpc,evm,ws (default all)")
+		height             = flag.Int64("height", 0, "height to pin queries to (default: node latest - 5)")
+		concurrency        = flag.Int("concurrency", 4, "comparisons in flight at once")
+		timeout            = flag.Duration("timeout", 20*time.Second, "timeout per request")
+		roundDelay         = flag.Duration("round-delay", 0, "pause between comparison rounds of a differing endpoint; set above cosmoguard's cache TTL (default with --spawn: 3s)")
+		node               compat.Endpoints
+		guard              compat.Endpoints
+		params             = compat.Params{}
+		excludeMethods     []string
+		allowUnsafeMethods = flag.Bool("allow-unsafe-methods", false, "disable the built-in /eth.evm.v1.Query/Trace* exclusion (may crash the node)")
 	)
 	flag.Func("param", "request field value, `name=value`, for chain-specific fields discovery cannot fill (repeatable)", func(s string) error {
 		k, v, ok := strings.Cut(s, "=")
@@ -59,6 +61,13 @@ func run() int {
 			return fmt.Errorf("want name=value, got %q", s)
 		}
 		params[k] = v
+		return nil
+	})
+	flag.Func("exclude-method", "fully qualified gRPC method path or trailing * prefix (repeatable; also skips associated LCD routes)", func(p string) error {
+		if err := compat.ValidateMethodExclusions([]string{p}); err != nil {
+			return err
+		}
+		excludeMethods = append(excludeMethods, p)
 		return nil
 	})
 	endpointFlags(&node, "node", "the node")
@@ -114,7 +123,7 @@ func run() int {
 			*roundDelay = spawnRoundDelay
 		}
 	}
-	code := compare(ctx, node, guard, *height, *concurrency, *timeout, *roundDelay, protocols, *report, params, spawned != nil)
+	code := compare(ctx, node, guard, *height, *concurrency, *timeout, *roundDelay, protocols, *report, params, spawned != nil, excludeMethods, *allowUnsafeMethods)
 	if spawned != nil {
 		spawned.stop()
 		if log := spawned.cleanup(code != 0); log != "" {
@@ -128,7 +137,7 @@ func run() int {
 // answered differently, refused a request under the allow-all spawn config,
 // or nothing could be compared.
 func compare(ctx context.Context, node, guard compat.Endpoints, height int64, concurrency int,
-	timeout, roundDelay time.Duration, protocols map[string]bool, report string, params compat.Params, spawned bool) int {
+	timeout, roundDelay time.Duration, protocols map[string]bool, report string, params compat.Params, spawned bool, excludeMethods []string, allowUnsafeMethods bool) int {
 	if guard.EVM == "" {
 		node.EVM = ""
 	}
@@ -137,15 +146,17 @@ func compare(ctx context.Context, node, guard compat.Endpoints, height int64, co
 	}
 
 	rep, err := compat.Run(ctx, compat.Options{
-		Node:        node,
-		Guard:       guard,
-		Height:      height,
-		Concurrency: concurrency,
-		Timeout:     timeout,
-		Protocols:   protocols,
-		Params:      params,
-		RoundDelay:  roundDelay,
-		Log:         os.Stderr,
+		Node:               node,
+		Guard:              guard,
+		Height:             height,
+		Concurrency:        concurrency,
+		Timeout:            timeout,
+		Protocols:          protocols,
+		Params:             params,
+		RoundDelay:         roundDelay,
+		Log:                os.Stderr,
+		ExcludeMethods:     excludeMethods,
+		AllowUnsafeMethods: allowUnsafeMethods,
 	})
 	if err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {

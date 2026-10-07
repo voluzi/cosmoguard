@@ -178,6 +178,6 @@ func TestCompareReturns130WhenInterruptedDuringSetup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	node := compat.Endpoints{LCD: "http://127.0.0.1:1", RPC: "http://127.0.0.1:1", GRPC: "http://127.0.0.1:1"}
-	code := compare(ctx, node, node, 0, 1, time.Second, 0, map[string]bool{}, "", compat.Params{}, false)
+	code := compare(ctx, node, node, 0, 1, time.Second, 0, map[string]bool{}, "", compat.Params{}, false, nil, false)
 	assert.Equal(t, code, 130)
 }

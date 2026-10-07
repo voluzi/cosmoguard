@@ -184,7 +184,7 @@ asserting byte-identical relay.
 
 ### Checking a live node
 
-`cmd/cosmoguard-compat` calls every read endpoint it can find on a node,
+`cmd/cosmoguard-compat` calls the read endpoints it can find on a node,
 both directly and through cosmoguard, and reports where the answers
 differ. It finds the endpoints itself: gRPC query methods through server
 reflection (only `*.Query` / `*.QueryService` services and the SDK's
@@ -225,6 +225,26 @@ go run ./cmd/cosmoguard-compat \
   --guard-lcd http://cosmoguard:11317 --guard-rpc http://cosmoguard:16657 \
   --guard-grpc http://cosmoguard:19090 --report compat.json
 ```
+
+Use repeatable `--exclude-method` flags to omit reflected gRPC methods:
+
+```sh
+make compat COMPAT_ARGS="--exclude-method '/eth.evm.v1.Query/TraceCall' --exclude-method '/example.v1.Query/Unsafe*'"
+```
+
+Patterns are exact fully qualified paths or prefixes with one trailing `*`;
+the leading slash is optional. Invalid patterns fail before contacting the
+node. An exclusion also skips the method's annotated LCD routes and its
+cross-height probes (including ABCI), before any comparison request is built.
+Progress and the JSON report retain the matched pattern as a `skipped` reason;
+unmatched patterns produce warnings. Exclusions do not cover unrelated parameter
+discovery requests or ordinary CometBFT/EVM JSON-RPC methods.
+
+`/eth.evm.v1.Query/Trace*` is excluded by default: an empty `TraceCall`
+request can panic Nibiru 2.9.0 during decoding. This precaution does not imply
+that every trace method is affected. `--allow-unsafe-methods` disables this
+built-in exclusion and may crash the node under test; explicit
+`--exclude-method` flags still apply.
 
 Each endpoint is reported as `identical`, `differs` (cosmoguard answered
 differently), `denied` (cosmoguard refused a request the node answered),
