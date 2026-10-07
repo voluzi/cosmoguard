@@ -15,7 +15,7 @@ import (
 func TestJWTReplayBoundPreservesVerifiedIdentityAndRecovers(t *testing.T) {
 	release, unblock := boundedTestRelease(t)
 	dm := &stalledDMap{release: release, stage: "put"}
-	store := &olricReplayStore{dm: dm, operationGate: boundedcall.New(1, replayOperationBudget, func(outcome string) { recordBackendOperationFailure("replay", outcome) })}
+	store := &olricReplayStore{dm: dm, operationGate: boundedcall.NewWaiting(1, replayOperationBudget, func(outcome string) { recordBackendOperationFailure("replay", outcome) })}
 	secret := "local-test-signing-secret"
 	method, err := buildJWTMethod(AuthMethodConfig{Secret: secret}, &Authenticator{replay: store})
 	require.NoError(t, err)
@@ -45,9 +45,9 @@ func TestJWTReplayBoundPreservesVerifiedIdentityAndRecovers(t *testing.T) {
 	}
 	resolve()
 	resolve()
-	require.Equal(t, int32(1), dm.puts.Load(), "rejected calls must not reach the store")
-	require.Equal(t, beforeTimeout+1, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("replay", "timeout")))
-	require.Equal(t, beforeRejected+1, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("replay", "rejected")))
+	require.Equal(t, int32(1), dm.puts.Load(), "waiting calls must not reach the stalled store")
+	require.Equal(t, beforeTimeout+2, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("replay", "timeout")))
+	require.Equal(t, beforeRejected, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("replay", "rejected")))
 	unblock()
 	require.Eventually(t, func() bool {
 		seen, err := store.SeenOrStore(t.Context(), "recovered", time.Minute)

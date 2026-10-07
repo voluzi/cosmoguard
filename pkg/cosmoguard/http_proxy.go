@@ -444,10 +444,8 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		if r.RateLimit == nil {
 			continue
 		}
-		// Reuse the previous limiter if the rule fingerprint didn't change —
-		// UNLESS it's a failed-init sentinel, which must be rebuilt so a
-		// fail-closed rule recovers once the backend is healthy again
-		// (otherwise a transient olric error would deny that rule forever).
+		// Preserve buckets across unchanged rules; retry failed constructors so
+		// local fallback does not outlive a backend failure after a reload.
 		if l, ok := existing[r.Fingerprint]; ok {
 			if _, failed := l.(failingRateLimiter); !failed {
 				newLimiters[r.Fingerprint] = l
@@ -459,13 +457,11 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
 		if err != nil {
-			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-closed rule will DENY")
-				newLimiters[r.Fingerprint] = sentinel
+			if local := limiterForFailedInit(r.RateLimit, p.cacheConfig, err); local != nil {
+				p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
+				newLimiters[r.Fingerprint] = local
 			} else {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-open rule will run without limit")
+				p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; rule will run without limit")
 			}
 			continue
 		}

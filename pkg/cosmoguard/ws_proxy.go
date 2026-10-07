@@ -302,15 +302,6 @@ func (p *JsonRpcWebSocketProxy) policyVerdict(request *JsonRpcMsg, rule *JsonRpc
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
 		allowed, _, rlErr := l.Allow(context.Background(), key)
 		if rlErr != nil {
-			if rule.RateLimit.FailClosed() {
-				logLimiterBackendError(p.log, rlErr, "ws rate limiter error; failing closed (denying)")
-				p.cgDashboard.RecordDeny(DenyRecord{
-					Section: p.section, Reason: "rate_limit",
-					SourceIP: source, Method: request.Method,
-					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
-				})
-				return false, -32005, "rate limiter unavailable"
-			}
 			logLimiterBackendError(p.log, rlErr, "ws rate limiter error; allowing")
 		} else if !allowed {
 			p.cgDashboard.RecordDeny(DenyRecord{

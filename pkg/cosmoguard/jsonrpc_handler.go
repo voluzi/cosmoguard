@@ -353,7 +353,7 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 			continue
 		}
 		// Reuse the previous limiter unless it's a failed-init sentinel,
-		// which must be rebuilt so a fail-closed rule recovers once the
+		// which must be rebuilt so the shared limiter recovers once the
 		// backend is healthy again.
 		if l, ok := existing[r.Fingerprint]; ok {
 			if _, failed := l.(failingRateLimiter); !failed {
@@ -364,13 +364,11 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 		keyspace := h.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
 		l, err := newRuleRateLimiter(*r.RateLimit, h.cacheConfig, h.olricClient, keyspace)
 		if err != nil {
-			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
-				h.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-closed rule will DENY")
-				newLimiters[r.Fingerprint] = sentinel
+			if local := limiterForFailedInit(r.RateLimit, h.cacheConfig, err); local != nil {
+				h.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
+				newLimiters[r.Fingerprint] = local
 			} else {
-				h.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-open rule will run without limit")
+				h.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; rule will run without limit")
 			}
 			continue
 		}
@@ -574,15 +572,6 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, GetSourceIP(r), idName)
 		allowed, _, rlErr := l.Allow(r.Context(), key)
 		if rlErr != nil {
-			if rule.RateLimit.FailClosed() {
-				logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter error; failing closed (denying)")
-				h.cgDashboard.RecordDeny(DenyRecord{
-					Section: h.section, Reason: "rate_limit",
-					SourceIP: GetSourceIP(r), Method: request.Method,
-					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
-				})
-				return false, -32005, "rate limiter unavailable"
-			}
 			logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter error; allowing")
 		} else if !allowed {
 			h.cgDashboard.RecordDeny(DenyRecord{

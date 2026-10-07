@@ -69,3 +69,15 @@ func TestOlricCacheBoundsAllOperations(t *testing.T) {
 		})
 	}
 }
+
+func TestOlricCacheRejectsOversizedPayloadBeforePut(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	dm := &blockedCacheDMap{release: release}
+	options := defaultOptions()
+	BoundedOperations(1, 10*time.Millisecond, nil)(options)
+	c := &OlricCache[string, []byte]{dm: dm, cfg: options, namespace: "test"}
+	err := c.Set(t.Context(), "key", make([]byte, 256<<10+1), time.Minute)
+	require.ErrorIs(t, err, olric.ErrEntryTooLarge)
+	require.Zero(t, dm.calls.Load())
+}

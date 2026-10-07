@@ -123,6 +123,11 @@ func recordBackendOperationFailure(backend, outcome string) {
 	backendOperationFailuresCounter.WithLabelValues(backend, outcome).Inc()
 }
 
+var limiterFallbackCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "cosmoguard_rate_limit_local_fallback_total",
+	Help: "Per-replica rate limiter decisions when the clustered attempt is unavailable.",
+}, []string{"reason", "outcome"})
+
 var configReloadsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "cosmoguard_config_reloads_total",
 	Help: "Config reload attempts by outcome: applied, restart_required, or invalid (read, parse, or validation failure).",
@@ -145,6 +150,12 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(upstreamRequestsCounter)
 		_ = prometheus.Register(configReloadsCounter)
 		_ = prometheus.Register(backendOperationFailuresCounter)
+		_ = prometheus.Register(limiterFallbackCounter)
+		for _, reason := range []string{"timeout", "capacity", "backend_error"} {
+			for _, outcome := range []string{"allowed", "denied"} {
+				limiterFallbackCounter.WithLabelValues(reason, outcome)
+			}
+		}
 		for _, backend := range []string{"l2", "limiter", "replay"} {
 			for _, outcome := range []string{"timeout", "rejected"} {
 				backendOperationFailuresCounter.WithLabelValues(backend, outcome)

@@ -228,21 +228,21 @@ func TestAcceptEncodingKey_WildcardExclusion(t *testing.T) {
 	}
 }
 
-// TestLimiterForFailedInit is the codex pipeline_middleware.go:173 follow-up:
-// a fail-closed rule whose limiter can't be built gets a failing sentinel
-// (which denies), a fail-open rule gets nil (runs unlimited).
 func TestLimiterForFailedInit(t *testing.T) {
-	closed := &RateLimitConfig{FailureMode: "fail-closed"}
-	l := limiterForFailedInit(closed, errTest)
-	if l == nil {
-		t.Fatal("fail-closed rule must get a sentinel limiter")
-	}
-	if allowed, _, err := l.Allow(context.Background(), "k"); allowed || err == nil {
-		t.Fatalf("sentinel must deny with an error; allowed=%v err=%v", allowed, err)
-	}
-	open := &RateLimitConfig{} // default fail-open
-	if limiterForFailedInit(open, errTest) != nil {
-		t.Fatal("fail-open rule must get nil (runs unlimited)")
+	for _, mode := range []string{"", "fail-open", "fail-closed"} {
+		cfg := &RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1, FailureMode: mode}
+		limiter := limiterForFailedInit(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, errTest)
+		for _, cacheCfg := range []*CacheGlobalConfig{nil, {}} {
+			if limiterForFailedInit(cfg, cacheCfg, errTest) != nil {
+				t.Fatal("non-clustered construction failures must not introduce local fallback")
+			}
+		}
+		for i := range 2 {
+			allowed, _, err := limiter.Allow(context.Background(), "key")
+			if err != nil || allowed != (i == 0) {
+				t.Fatalf("mode=%q allowed=%t error=%v", mode, allowed, err)
+			}
+		}
 	}
 }
 

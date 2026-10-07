@@ -29,22 +29,25 @@ changed from v3; existing v3 configs continue to work — run
   olric distributed cache with an in-process L1 — single binary,
   no external dependency, shared automatically across replicas when
   cluster mode is on. Clustered L2 waits are bounded at 100ms and fall
-  back upstream on timeout or saturation; 2,048 slots bound outstanding
-  L2 calls. Responses still populate L1 during L2 failure, and HTTP misses
+  back upstream on timeout or saturation; 256 slots bound outstanding
+  L2 calls. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
   retain coalescing; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
   identity` scopes. Buckets are sharded across replicas through the
   same olric runtime in cluster mode, so configured rates stay correct
-  under HPA without an external store. Clustered attempts stop waiting
-  after 250ms or reject immediately at 2,048 outstanding attempts, with a
-  100ms lock-contention deadline, following the configured
-  fail-open / fail-closed policy. See [cluster behavior](CONFIG.md#cluster-mode)
-  for the fixed operation limits and metrics.
+  under HPA without an external store. Clustered attempts wait at most 1s
+  with 2,048 outstanding slots. Timeout, saturation, or backend errors use
+  one bounded local limiter per rule with the same rate, burst, and scope.
+  During fallback, the aggregate rate can reach N times the configured rate
+  across N replicas, plus a local burst around transitions.
+  `rateLimit.failureMode` is deprecated and ignored; it remains accepted and
+  validated and will be removed in the next major version.
+  See [cluster behavior](CONFIG.md#cluster-mode) for limits and metrics.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
   token introspection, and an external-validator method for
   developer-portal style credential checks. Credential headers are
   always stripped before forwarding upstream. Clustered JWT replay checks
-  use a separate 100ms budget and 512 slots; store failures retain the
+  use 512 slots and separate 100ms admission and Put budgets; store failures retain the
   verified-identity fail-open policy and warning.
 - **CORS** owned by cosmoguard, not the upstream — preflight handled
   directly; upstream's CORS headers are stripped and replaced.
@@ -70,8 +73,9 @@ changed from v3; existing v3 configs continue to work — run
 Cluster startup has a 45s default budget; `/healthz` on the metrics port starts
 answering after the bootstrap gate. The chart's startup probe allows 60s; other
 manifests must allow at least 60s. Non-clustered request paths add no wait bounds
-or pools and share the startup default; embedded tiered writes also preserve L1
-on L2 errors.
+or pools and share the startup default. Embedded tiered writes preserve their
+existing behavior: L2 errors leave L1 untouched. The deprecated rate-limit key
+is ignored in every deployment mode.
 
 ## Installation
 

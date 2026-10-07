@@ -9,7 +9,7 @@ import (
 )
 
 const l2OperationBudget = 100 * time.Millisecond
-const l2OperationCapacity = 2048
+const l2OperationCapacity = 256
 
 // Share capacity across response namespaces so saturation cannot spawn an
 // unbounded set of detached calls. Limiter admission has its own pool.

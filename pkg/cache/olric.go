@@ -11,6 +11,9 @@ import (
 	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 )
 
+// MaxBoundedOlricPayloadBytes caps payloads retained by clustered cache workers.
+const MaxBoundedOlricPayloadBytes = 256 << 10
+
 // OlricCache implements Cache[K, V] backed by an olric DMap. The DMap name
 // is the cache namespace, so two cache instances created with different
 // namespaces never collide on keys even if they live in the same olric
@@ -72,6 +75,19 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 	payload, err := marshalForOlric(value)
 	if err != nil {
 		return err
+	}
+
+	if c.cfg.operationGate != nil {
+		// Reject before a cancellation-ignoring Put can park an oversized payload.
+		if len(payload) > MaxBoundedOlricPayloadBytes {
+			return olric.ErrEntryTooLarge
+		}
+		// An encoder's spare backing capacity must not enlarge parked writes.
+		if cap(payload) > MaxBoundedOlricPayloadBytes {
+			compact := make([]byte, len(payload))
+			copy(compact, payload)
+			payload = compact
+		}
 	}
 
 	_, err = boundedcall.Do(ctx, c.cfg.operationGate, func(opCtx context.Context) (struct{}, error) {

@@ -240,12 +240,15 @@ L1 = 40% of budget,  L2 = 60% of budget   (L2 also holds replicas)
 
 The total is then split evenly across the response caches that run in the pod (one per proxy). The **caps are the primary OOM defence**. In parallel, `GOMEMLIMIT` is set to **90% of the limit** and `GOMAXPROCS` to the CPU quota — a secondary GC backstop for transient/non-cache allocations (it can only reclaim freeable memory, not the live cache set). When no cgroup limit is detectable (bare metal), each tier falls back to a fixed **128 MiB**.
 
-**The L2 (olric) cap is approximate by construction** — unlike the exact L1 byte bound. olric evicts by *sampled* LRU and cannot hold a partition below one entry, so each cache DMap has a floor of roughly `ownedPartitions × maxEntrySize`, and the aggregate L2 floor is `N_dmaps × ownedPartitions × 256 KiB`. The per-node cap is enforced by two complementary bounds — `MaxInuse` (bytes) and `MaxKeys` (count, derived from the byte budget) — so a flood of tiny entries can't exhaust heap in per-key index structures before the byte counter trips.
+**The L2 (olric) cap is approximate by construction** — unlike the exact L1 byte bound. olric evicts by *sampled* LRU and cannot hold a partition below one entry, so each cache DMap has a floor of roughly `ownedPartitions × maxEntrySize`, and the aggregate L2 floor is `N_dmaps × ownedPartitions × 1 MiB`. The per-node cap is enforced by two complementary bounds — `MaxInuse` (bytes) and `MaxKeys` (count, derived from the byte budget) — so a flood of tiny entries can't exhaust heap in per-key index structures before the byte counter trips.
 
-- **Embedded/single-pod** mode uses a reduced partition count so the floor fits the L2 budget of the smallest supported pod (~128 MiB with all proxies enabled).
-- **Clustered** mode keeps olric's default partition count (271) because the count is fixed at cluster formation and every peer must agree on it, and a lower count would hurt key distribution as the cluster scales. The trade-off: a *small* cluster (e.g. 2 nodes, `replicaCount: 2`) has a large per-node floor (each node owns nearly every partition as primary or replica), so **a small cluster on small pods can exceed the resolved L2 budget.** Size clustered pods with headroom above `N_dmaps × ownedPartitions × 256 KiB`, or run more/larger nodes.
+- **Embedded/single-pod** mode uses 16 partitions, reducing the floor to 16 MiB per DMap with the current engine table size. Eight response DMaps still have a 128 MiB aggregate floor, which can exceed a small pod's resolved L2 budget.
+- **Clustered** mode keeps olric's default partition count (271) because the count is fixed at cluster formation and every peer must agree on it, and a lower count would hurt key distribution as the cluster scales. The trade-off: a *small* cluster (e.g. 2 nodes, `replicaCount: 2`) has a large per-node floor (each node owns nearly every partition as primary or replica), so **a small cluster on small pods can exceed the resolved L2 budget.** Size clustered pods with headroom above `N_dmaps × ownedPartitions × 1 MiB`, or run more/larger nodes.
 
-Size the pod so its L2 budget clears the floor, or raise the memory limit. Entries larger than the 256 KiB fragment `tableSize` are served uncached rather than stored. Clustered deployments also divide the per-node cap by `replicaCount`, since each node holds replica copies that olric's primary-write cap doesn't govern. The L1 byte cap and `GOMEMLIMIT` are unaffected by any of this.
+Size the pod so its L2 budget clears the floor, or raise the memory limit. The sanitized olric default currently retains a 1 MiB fragment `tableSize`;
+entries above that native limit are served uncached. The clustered caller-wait
+adapter separately rejects encoded response payloads above 256 KiB before Put.
+Embedded mode retains the native size limit. Clustered deployments also divide the per-node cap by `replicaCount`, since each node holds replica copies that olric's primary-write cap doesn't govern. The L1 byte cap and `GOMEMLIMIT` are unaffected by any of this.
 
 Override any of it explicitly:
 
@@ -285,33 +288,59 @@ at 2s intervals), and keep discovery of unready peers enabled. The chart include
 using other manifests must provide the same allowance.
 
 Clustered response-cache L2 reads, existence checks, and writes have a fixed
-100ms caller-wait budget and share 2,048 outstanding-operation slots per process.
+100ms caller-wait budget and share 256 outstanding-operation slots per process.
 L1 hits bypass this pool. At capacity, new operations are rejected immediately
 without a queue. HTTP lookup timeout/rejection follows the cache-miss path,
-including coalescing and response storage. Tiered writes populate L1 even if L2
-fails, while still returning the L2 error; subsequent hot-key requests can use L1
+including coalescing and response storage. Tiered writes populate L1 on L2 timeout or capacity rejection, while still
+returning the L2 error; other L2 errors leave L1 untouched. Entries whose encoded
+payload exceeds the 256 KiB retention cap are rejected before calling olric and
+remain uncached in both tiers. Subsequent hot-key requests can use L1
 during a stall. Failed storage preserves the upstream response. Cold keys can
 increase upstream traffic during joins or slow peers.
 
-Clustered limiter attempts have a separate 250ms caller-wait budget and 2,048
-slots per process, covering lock, read, write, and unlock. Their lock-contention
-deadline is 100ms, leaving 150ms for later work. When olric returns
-`ErrLockNotAcquired` before the caller budget expires, the request is denied
-without a backend error. Olric starts that contention deadline after its initial
-Put and may ignore cancellation: a stalled lock operation or later work can
-still exceed the whole-attempt budget. Timeout/rejection follows the existing
-`failureMode`: fail-open admits; fail-closed denies. There are no retries or
-replacement local buckets. Cache saturation cannot consume limiter slots.
+Clustered limiter attempts retain v5.1.0's token-bucket algorithm and 250ms
+lock-contention deadline. A separate **1s** caller-wait budget covers the whole
+lock/read/write/unlock attempt, with **2,048** outstanding slots per process.
+At capacity, no attempt is queued: the request immediately uses a local bucket.
+The 1s budget leaves 750ms beyond the contention deadline for other work; it
+was validated with two RF2/quorum1 loopback members and bursts up to 6,000 calls.
+A completed contention timeout still denies without falling back. An attempt
+that times out or returns a backend error uses the same local bucket path.
 
-Clustered JWT replay checks have their own 100ms budget and 512 slots. Timeout
-or rejection uses the existing replay-store error policy: admit the verified
+Each rule owns one existing in-memory limiter for fallback, with the same rate,
+burst, scope, and key. It holds at most 100,000 buckets, with a 10-minute idle
+TTL and capacity eviction; eviction can reset an evicted key's burst. Cache and
+replay saturation cannot consume limiter slots. There are no retries of uncertain
+shared writes. Every subsequent request tries the shared limiter again, so normal
+operation resumes when the backend returns. A failed limiter constructor uses
+local buckets and is retried on rule reload.
+
+While falling back, limits are per replica: across N replicas a client can
+receive up to N times the configured rate. Around transitions, the client can
+also receive the local burst in addition to tokens already granted by the shared
+bucket. Late shared operations can consume tokens after a local decision, making
+later shared decisions stricter. The local limiter retains its existing bounded
+bucket-storage behavior.
+
+`rateLimit.failureMode` is **deprecated and ignored**, but remains parsed and
+validated so existing configurations load and reload. It will be removed in the
+next major version. Startup logs one warning naming affected rules; an accepted
+reload warns once for rules that introduce the key. The key is absent from rule
+fingerprints and the restart projection, so changing it does not alter bucket identity
+or require a restart. Auth-method `failureMode` settings are unchanged.
+
+Clustered JWT replay checks have 512 slots. At capacity, they wait up to
+100ms for admission without spawning a backend worker, then get a separate
+full 100ms Put budget: worst-case caller wait is 200ms. Timeout uses the existing replay-store error policy: admit the verified
 identity and log a warning that replay protection was unavailable. This policy
 is unchanged; the wait is bounded. Replay admission shares neither main pool.
 
 Non-clustered deployments add no request-path wait budgets or admission pools,
 retain the embedded limiter's 250ms contention deadline, and share the 45s
-startup default. The tiered-write improvement (populating L1 on L2 failure)
-also applies to embedded caches.
+startup default. Their limiter and cache implementations are unchanged, including
+leaving oversized responses uncached. The deprecated rate-limit key is ignored
+in every deployment mode; embedded backend errors keep the default allow policy
+and do not use the new fallback wrapper.
 
 Underlying olric calls may ignore cancellation, so each slot stays occupied until
 the actual call returns. Late writes or token consumption are possible after the
@@ -319,22 +348,33 @@ client stops waiting. Per-pod write locks can be released before timed-out Puts
 finish; an older write can overwrite a newer one, but the embedded stored-at
 timestamp still determines freshness. The limiter's existing 2s lease does not
 guarantee mutual exclusion for a critical section stalled beyond that lease.
-Bounded workers recover backend panics into errors and release their slots.
+Bounded workers recover backend panics into errors, log the stack once at error
+level, and release their slots.
 
 `cosmoguard_backend_operation_failures_total` counts abandoned waits and capacity
 rejections. Its labels are `backend` (`l2`, `limiter`, or `replay`) and `outcome`
 (`timeout` or `rejected`), with six combinations. It does not count cache misses,
 ordinary contention denials, backend panics, or client cancellation. Timeouts
-include earlier caller deadlines. Bounded cache/limiter failures log at debug
-level; other cache errors remain errors and other limiter errors remain warnings.
+include earlier caller deadlines. Bounded cache failures and all limiter fallback decisions log at debug
+level; other cache errors remain errors.
 JWT replay failures retain their warning for the existing security audit path.
+`cosmoguard_rate_limit_local_fallback_total` records local decisions with six
+combinations: `reason` (`timeout`, `capacity`, `backend_error`) and `outcome`
+(`allowed`, `denied`). Healthy bursts can also enter local fallback at capacity
+or when the attempt exceeds 1s; replay retains its existing error policy when
+either 100ms budget expires.
 No new YAML settings or dependencies are required.
 
-The pools bound concurrent operations, not memory bytes. With all 4,608 slots
-parked, a local adapter-only measurement used about 23 MiB for runtime stacks
-and heap before backend payloads. For example, 2,048 retained 256 KiB L2 write
-payloads add 512 MiB; larger encoded responses and olric copies can use more.
-There is no hard total-memory bound from admission alone.
+The three pools retain at most 2,816 backend workers: 256 L2, 2,048 limiter,
+and 512 replay. Parked L2 writes retain at most 256 KiB of encoded payload per
+slot (including spare encoder capacity), or **64 MiB** across the L2 pool.
+A local adapter-only measurement with all slots parked used about **8.7 MiB**
+of runtime stacks and heap before payloads (about 72.7 MiB with maximal L2
+payloads). These figures exclude keys, backend state, and olric/transport copies:
+olric's embedded Put can retain two additional value copies, making three
+payload copies alone up to 192 MiB. This is not a hard total-process memory cap;
+active upstream captures, per-rule local fallback buckets (up to 100,000 each),
+and the configured cache working set remain separate.
 
 Cross-pod replication of the dashboard observability snapshot (so a restarting pod restores its counters + metrics history from a peer) is **off by default** and opt-in via `dashboard.clusterHistoryRestore: true` — see [Dashboard restart-restore](#dashboard-restart-restore-off-by-default) below. The live cluster dashboard (peer HTTP fan-out) and Prometheus `/metrics` do **not** depend on it.
 
@@ -743,12 +783,16 @@ rateLimit:
   rate: 100/s                        # or "100", "30/min", "1/5s", "250/250ms"
   burst: 200                         # max bucket capacity; defaults to rate
   scope: per-ip                      # per-ip (default) | global | per-identity | compound
-  failureMode: fail-open             # fail-open (default) | fail-closed
+  failureMode: fail-open             # deprecated and ignored; removed next major
 ```
 
 With a `cache.cluster` block present, rate-limit buckets are sharded across replicas through olric so the configured rate is a true cluster-wide budget. In single-pod / embedded olric mode the rate is enforced per pod.
 
-`failureMode` controls behaviour when the limiter backend errors (e.g. olric loses quorum). `fail-open` (default) admits the request so a coordination hiccup doesn't 429 all traffic; `fail-closed` denies it so a backend outage can't silently disable rate limiting cluster-wide. Applies uniformly across HTTP, JSON-RPC, WebSocket, and gRPC.
+`rateLimit.failureMode` is deprecated and ignored, and will be removed in the
+next major version. Existing `fail-open` and `fail-closed` values remain valid.
+Clustered backend failures use the per-replica local limiter across HTTP,
+JSON-RPC, WebSocket, and gRPC; see [cluster mode](#cluster-mode) for the bounds
+and transition behavior. Auth-method `failureMode` is unaffected.
 When `rateLimit` is set on a rule, `rate` is required and must be a finite positive number. `burst` must be non-negative; `0` uses the default capacity.
 
 #### Examples

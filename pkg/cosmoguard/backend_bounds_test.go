@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -136,43 +137,50 @@ func TestHTTPL2TimeoutFallsBackAndPreservesL1(t *testing.T) {
 	unblock()
 }
 
-func TestLimiterWholeAttemptTimeoutUsesFailureMode(t *testing.T) {
+func TestLimiterWholeAttemptTimeoutUsesLocalFallback(t *testing.T) {
 	for _, stage := range []string{"lock", "get", "put", "unlock"} {
-		for _, mode := range []string{"fail-open", "fail-closed"} {
-			t.Run(stage+"/"+mode, func(t *testing.T) {
-				release, unblock := boundedTestRelease(t)
-				dm := &stalledDMap{release: release, stage: stage}
-				limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: 1, burst: 1, refillExp: time.Minute}}
-				var forwarded atomic.Int32
-				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { forwarded.Add(1); _, _ = w.Write([]byte("ok")) }))
-				t.Cleanup(up.Close)
-				p := newHardeningProxy(t, []NodeConfig{{Name: "up", LcdURL: up.URL}})
-				rule := &HttpRule{Action: RuleActionAllow, RateLimit: &RateLimitConfig{Rate: Rate{PerSecond: 1}, Burst: 1, FailureMode: mode}}
-				require.NoError(t, rule.Compile())
-				p.SetRules([]*HttpRule{rule}, RuleActionDeny)
-				p.limiters[rule.Fingerprint] = limiter
-				before := testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("limiter", "timeout"))
-				start := time.Now()
-				rec := serveBoundedTestRequest(t, p, httptest.NewRequest(http.MethodGet, "/", nil))
-				require.Less(t, time.Since(start), 5*time.Second)
-				want := http.StatusOK
-				if mode == "fail-closed" {
-					want = http.StatusTooManyRequests
+		t.Run(stage, func(t *testing.T) {
+			release, unblock := boundedTestRelease(t)
+			dm := &stalledDMap{release: release, stage: stage}
+			cfg := RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1, FailureMode: "fail-closed"}
+			local, err := NewRateLimiter(cfg, nil, "fallback")
+			require.NoError(t, err)
+			limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}, local: local}
+			var forwarded atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { forwarded.Add(1); _, _ = w.Write([]byte("ok")) }))
+			t.Cleanup(up.Close)
+			p := newHardeningProxy(t, []NodeConfig{{Name: "up", LcdURL: up.URL}})
+			rule := &HttpRule{Action: RuleActionAllow, RateLimit: &cfg}
+			require.NoError(t, rule.Compile())
+			p.SetRules([]*HttpRule{rule}, RuleActionDeny)
+			p.limiters[rule.Fingerprint] = limiter
+			before := testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("limiter", "timeout"))
+			done := make(chan int, 2)
+			for range 2 {
+				go func() {
+					rec := httptest.NewRecorder()
+					p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+					done <- rec.Code
+				}()
+			}
+			statuses := map[int]int{}
+			for range 2 {
+				select {
+				case code := <-done:
+					statuses[code]++
+				case <-time.After(5 * time.Second):
+					t.Fatal("limiter caller did not stop waiting")
 				}
-				require.Equal(t, want, rec.Code)
-				require.Equal(t, before+1, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("limiter", "timeout")))
-				if mode == "fail-closed" {
-					require.Zero(t, forwarded.Load())
-				} else {
-					require.Equal(t, int32(1), forwarded.Load())
-				}
-				unblock()
-				require.Eventually(t, func() bool { return dm.unlocks.Load() == 1 }, time.Second, time.Millisecond)
-				require.Equal(t, int32(1), dm.locks.Load())
-				require.Equal(t, int32(1), dm.gets.Load())
-				require.Equal(t, int32(1), dm.puts.Load(), "one attempt; a late write is not retried")
-			})
-		}
+			}
+			require.Equal(t, map[int]int{http.StatusOK: 1, http.StatusTooManyRequests: 1}, statuses)
+			require.Equal(t, int32(1), forwarded.Load())
+			require.Equal(t, before+2, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("limiter", "timeout")))
+			unblock()
+			require.Eventually(t, func() bool { return dm.unlocks.Load() == 2 }, 5*time.Second, time.Millisecond)
+			require.Equal(t, int32(2), dm.locks.Load())
+			require.Equal(t, int32(2), dm.gets.Load())
+			require.Equal(t, int32(2), dm.puts.Load(), "late writes are not retried")
+		})
 	}
 }
 
@@ -192,7 +200,6 @@ func TestClusterBoundsDoNotAffectLocalBackends(t *testing.T) {
 	clustered, err := newRuleRateLimiter(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), "cluster")
 	require.NoError(t, err)
 	require.IsType(t, &boundedRateLimiter{}, clustered)
-	require.Equal(t, 100*time.Millisecond, clustered.(*boundedRateLimiter).RateLimiter.(*olricRateLimiter).lockTimeout)
 	require.NoError(t, clustered.Close())
 	authCfg := &AuthConfig{Enable: true, ReplayProtection: &ReplayProtectionConfig{Enable: true}}
 	for _, networked := range []bool{false, true} {
@@ -248,26 +255,8 @@ func TestBackendCapacityIsolationAndLocalCacheBypass(t *testing.T) {
 	ok, _, err := healthy.Allow(t.Context(), "key")
 	require.NoError(t, err, "cache saturation must not consume limiter admission")
 	require.True(t, ok)
-	stalled := &stalledDMap{release: release, stage: "get"}
-	limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: stalled, locks: stalled, rate: 1, burst: 1, refillExp: time.Minute}}
-	limiterResults := make(chan error, limiterOperationCapacity)
-	for range limiterOperationCapacity {
-		go func() { _, _, err := limiter.Allow(t.Context(), "key"); limiterResults <- err }()
-	}
-	require.Eventually(t, func() bool { return stalled.gets.Load() == limiterOperationCapacity }, 5*time.Second, time.Millisecond)
-	for range limiterOperationCapacity {
-		require.ErrorIs(t, <-limiterResults, context.DeadlineExceeded)
-	}
-	before = testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("limiter", "rejected"))
-	start = time.Now()
-	_, _, err = limiter.Allow(t.Context(), "extra")
-	require.ErrorIs(t, err, boundedcall.ErrRejected)
-	require.Less(t, time.Since(start), time.Second)
-	require.Equal(t, before+1, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("limiter", "rejected")))
-	require.Equal(t, int32(limiterOperationCapacity), stalled.gets.Load())
 	unblock()
 	require.Eventually(t, func() bool { _, err := l2.Get(t.Context(), "recovered"); return err == cache.ErrNotFound }, time.Second, time.Millisecond)
-	require.Eventually(t, func() bool { ok, _, err := limiter.Allow(t.Context(), "recovered"); return err == nil && ok }, time.Second, time.Millisecond)
 }
 
 func serveBoundedTestRequest(t *testing.T, p *HttpProxy, r *http.Request) *httptest.ResponseRecorder {
@@ -332,4 +321,36 @@ func TestHTTPBoundedLookupFailureStillCoalesces(t *testing.T) {
 		}
 	}
 	require.Equal(t, int32(1), hits.Load())
+}
+
+func TestResponseCacheEntryLimits(t *testing.T) {
+	for _, clustered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clustered=%t", clustered), func(t *testing.T) {
+			cr := newEmbeddedClusterRuntimeForTest(t)
+			cfg := &CacheGlobalConfig{}
+			if clustered {
+				cfg.Cluster = &ClusterConfig{}
+			}
+			responses, err := newResponseCache[string, CachedResponse](cfg, cr.Client(), "entry-limits", CacheBudget{})
+			require.NoError(t, err)
+			defer responses.Close()
+			for _, size := range []int{256<<10 + 1, 1<<20 + 1} {
+				t.Run(fmt.Sprint(size), func(t *testing.T) {
+					key := fmt.Sprint(size)
+					response := CachedResponse{Data: make([]byte, size)}
+					err := responses.Set(t.Context(), key, response, time.Minute)
+					if clustered || size > 1<<20 {
+						require.ErrorIs(t, err, olric.ErrEntryTooLarge)
+						_, err = responses.Get(t.Context(), key)
+						require.ErrorIs(t, err, cache.ErrNotFound, "neither tier may retain a rejected response")
+					} else {
+						require.NoError(t, err, "embedded cache must preserve its native 1 MiB table limit")
+						got, err := responses.Get(t.Context(), key)
+						require.NoError(t, err)
+						require.Equal(t, response.Data, got.Data)
+					}
+				})
+			}
+		})
+	}
 }

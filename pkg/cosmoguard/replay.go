@@ -94,7 +94,7 @@ func (s *memoryReplayStore) gcLoop() {
 const replayOperationBudget = 100 * time.Millisecond
 const replayOperationCapacity = 512
 
-var replayOperations = boundedcall.New(replayOperationCapacity, replayOperationBudget, func(outcome string) {
+var replayOperations = boundedcall.NewWaiting(replayOperationCapacity, replayOperationBudget, func(outcome string) {
 	recordBackendOperationFailure("replay", outcome)
 })
 

@@ -194,6 +194,9 @@ lcd:
       rateLimit:
         rate: 10/s
         scope: per-ip          # or per-identity once auth is wired up
+        # failureMode: fail-open  # deprecated and ignored; removed next major
+        # Clustered backend failure uses local buckets with this rate/scope.
+        # Across N replicas fallback can grant N times the rate plus local bursts.
 
 # ---------------------------------------------------------------------------
 # RPC (Tendermint HTTP + WebSocket + JSON-RPC)

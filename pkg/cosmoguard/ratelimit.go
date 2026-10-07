@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,20 +84,14 @@ type RateLimitConfig struct {
 	Burst int `yaml:"burst,omitempty"`
 	// Scope determines whose request rate the bucket counts.
 	Scope RateLimitScope `yaml:"scope,omitempty" default:"per-ip"`
-	// FailureMode controls behaviour when the limiter backend errors (e.g.
-	// olric loses quorum or a partition owner is unreachable). "fail-open"
-	// (default) admits the request so a coordination hiccup doesn't 429 all
-	// traffic; "fail-closed" denies it so a backend outage can't silently
-	// disable rate limiting cluster-wide (turning it into a DoS amplifier
-	// against the protected nodes). Mirrors auth's FailureMode.
+	// Deprecated: FailureMode is accepted and ignored, and will be removed in
+	// the next major version. Clustered backend failures use local buckets.
 	FailureMode string `yaml:"failureMode,omitempty"`
 }
 
-// FailClosed reports whether a limiter backend error should deny the
-// request. Default (empty / "fail-open") admits it.
-func (c *RateLimitConfig) FailClosed() bool {
-	return c != nil && c.FailureMode == "fail-closed"
-}
+// FailClosed is retained for source compatibility.
+// Deprecated: rateLimit.failureMode is ignored.
+func (c *RateLimitConfig) FailClosed() bool { return false }
 
 // Rate carries a tokens-per-second value and the original spec string so
 // fingerprints and error messages can reference what the operator wrote.
@@ -192,34 +188,40 @@ type RateLimiter interface {
 	Close() error
 }
 
-// failingRateLimiter is stored for a FAIL-CLOSED rule whose real limiter
-// could not be constructed (e.g. an olric error at SetRules time). Its Allow
-// always errors, which drives every enforcement path's fail-closed branch to
-// DENY — otherwise the limiter would be nil and the request would run with no
-// limit at all, silently violating the operator's fail-closed intent.
-type failingRateLimiter struct{ err error }
-
-func (l failingRateLimiter) Allow(context.Context, string) (bool, time.Duration, error) {
-	return false, 0, l.err
+// A failed constructor keeps enforcing a local bucket and is retried by SetRules.
+type failingRateLimiter struct {
+	err   error
+	local RateLimiter
 }
-func (failingRateLimiter) Close() error { return nil }
 
-// limiterForFailedInit returns a sentinel failing limiter for a fail-closed
-// rule, or nil for a fail-open rule (which safely runs without a limit when
-// construction fails). Centralises the SetRules error-branch behaviour across
-// the HTTP, JSON-RPC, and gRPC proxies.
-func limiterForFailedInit(cfg *RateLimitConfig, initErr error) RateLimiter {
-	if cfg.FailClosed() {
-		return failingRateLimiter{err: fmt.Errorf("rate limiter init failed: %w", initErr)}
+func (l failingRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
+	if l.local == nil {
+		return false, 0, l.err
+	}
+	return localLimiterDecision(ctx, l.local, key, "backend_error", l.err)
+}
+func (l failingRateLimiter) Close() error {
+	if l.local != nil {
+		return l.local.Close()
 	}
 	return nil
 }
 
+func limiterForFailedInit(cfg *RateLimitConfig, cacheCfg *CacheGlobalConfig, initErr error) RateLimiter {
+	if cacheCfg == nil || cacheCfg.Cluster == nil {
+		return nil
+	}
+	local, err := NewRateLimiter(*cfg, nil, "")
+	if err != nil {
+		return failingRateLimiter{err: err}
+	}
+	return failingRateLimiter{err: initErr, local: local}
+}
+
 // NewRateLimiter returns an olric-backed token bucket when an olric
 // client is supplied — pods share one budget per key. Falls back to
-// a per-pod in-process bucket only when olricClient is nil (test
-// paths without a cluster runtime). A silent fallback in production
-// would multiply the operator's quota by replicaCount.
+// a per-pod in-process bucket when olricClient is nil. Clustered rule
+// limiters also use this bounded local implementation during backend failure.
 func NewRateLimiter(cfg RateLimitConfig, olricClient *olric.EmbeddedClient, keyspace string) (RateLimiter, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -235,11 +237,8 @@ func NewRateLimiter(cfg RateLimitConfig, olricClient *olric.EmbeddedClient, keys
 	if olricClient != nil {
 		return newOlricRateLimiter(olricClient, cfg, keyspace)
 	}
-	// Per-pod in-process fallback — only the test path that
-	// doesn't construct a cluster runtime gets here. Documented in
-	// the doc-comment above so a programmatic embedder doesn't
-	// believe their multi-replica setup is enforcing a cluster-
-	// wide quota by accident.
+	// Each local instance enforces a per-replica budget, including during
+	// clustered fallback; it cannot coordinate quotas with other replicas.
 	buckets := ttlcache.New[string, *rate.Limiter](
 		ttlcache.WithTTL[string, *rate.Limiter](memoryRateLimiterBucketTTL),
 		ttlcache.WithCapacity[string, *rate.Limiter](memoryRateLimiterMaxBuckets),
@@ -318,4 +317,62 @@ func (l *memoryRateLimiter) Close() error { return nil }
 // from grpcRateLimitKey's (`:ip:`).
 func rateLimitKey(scope RateLimitScope, ruleFingerprint uint64, r *http.Request, identity string) string {
 	return grpcRateLimitKey(scope, ruleFingerprint, GetSourceIP(r), identity)
+}
+
+func deprecatedRateLimitRules(cfg *Config) map[string]string {
+	out := make(map[string]string)
+	if cfg == nil {
+		return out
+	}
+	add := func(section string, index int, tag string, fingerprint uint64, rateLimit *RateLimitConfig) {
+		if rateLimit == nil || rateLimit.FailureMode == "" {
+			return
+		}
+		name := fmt.Sprintf("%s[%d]", section, index)
+		if tag != "" {
+			name += " (" + tag + ")"
+		}
+		key := section + ":" + strconv.FormatUint(fingerprint, 16) + ":" + tag
+		if fingerprint == 0 {
+			key = name
+		}
+		out[key] = name
+	}
+	for i, r := range cfg.LCD.Rules {
+		add("lcd", i, r.Tag, r.Fingerprint, r.RateLimit)
+	}
+	for i, r := range cfg.RPC.Rules {
+		add("rpc", i, r.Tag, r.Fingerprint, r.RateLimit)
+	}
+	for i, r := range cfg.RPC.JsonRpc.Rules {
+		add("rpc.jsonrpc", i, r.Tag, r.Fingerprint, r.RateLimit)
+	}
+	for i, r := range cfg.GRPC.Rules {
+		add("grpc", i, r.Tag, r.Fingerprint, r.RateLimit)
+	}
+	for i, r := range cfg.EVM.RPC.HttpRules {
+		add("evm.rpc.httpRules", i, r.Tag, r.Fingerprint, r.RateLimit)
+	}
+	for i, r := range cfg.EVM.RPC.Rules {
+		add("evm.rpc", i, r.Tag, r.Fingerprint, r.RateLimit)
+	}
+	for i, r := range cfg.EVM.WS.Rules {
+		add("evm.ws", i, r.Tag, r.Fingerprint, r.RateLimit)
+	}
+	return out
+}
+
+func warnDeprecatedRateLimitFailureMode(previous, next *Config) {
+	old := deprecatedRateLimitRules(previous)
+	var introduced []string
+	for key, rule := range deprecatedRateLimitRules(next) {
+		if _, exists := old[key]; !exists {
+			introduced = append(introduced, rule)
+		}
+	}
+	if len(introduced) == 0 {
+		return
+	}
+	sort.Strings(introduced)
+	slog.Warn("rateLimit.failureMode is deprecated and ignored; it will be removed in the next major version", "rules", introduced)
 }

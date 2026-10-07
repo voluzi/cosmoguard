@@ -46,31 +46,16 @@ var evictionExemptDMaps = []string{
 // for tighter eviction accuracy — cheap given the cache's short TTL.
 const olricLRUSamples = 10
 
-// embeddedPartitionCount is the olric partition count used in embedded/
-// single-pod mode. Lower than olric's default (271) because the L2 LRU has an
-// unavoidable per-DMap floor: olric can't evict a partition below one entry,
-// so the smallest achievable footprint per cache DMap is
-// ownedPartitions × maxEntrySize (= PartitionCount × olricTableSizeBytes in
-// embedded mode, where this node owns every partition). Across N cache DMaps
-// the aggregate L2 floor is N × PartitionCount × olricTableSizeBytes, which
-// must fit the smallest supported pod's L2 budget:
-//
-//	16 partitions × 256 KiB × 8 DMaps (EVM enabled) = 32 MiB
-//
-// — within the ~38 MiB L2 budget a 128 MiB pod resolves. Pods smaller than
-// that (or with more DMaps) can exceed the L2 cap by this floor; that's a
-// documented characteristic of the approximate olric bound (see CONFIG.md),
-// not something a still-lower count can fix for an arbitrarily tiny pod.
-// Cluster mode keeps olric's default because all peers must agree on the count
-// and each node then owns only PartitionCount/N_nodes partitions.
+// embeddedPartitionCount reduces the single-node per-DMap storage floor.
+// With the current 1 MiB engine table size, 16 partitions still mean a 16 MiB
+// floor per DMap; the aggregate can exceed small pods' approximate L2 budget.
+// Clustered members retain the default count because all peers must agree.
 const embeddedPartitionCount = 16
 
-// olricTableSizeBytes caps olric's per-fragment table allocation. olric's
-// default (1 MiB per (partition, dmap) fragment, allocated upfront regardless
-// of contents) puts an idle cluster well past 500 MiB. This also bounds the
-// largest storable entry: a value bigger than one table returns
-// ErrEntryTooLarge (response caches then serve uncached; the observability
-// replicator trims its blob to stay under this — see maxReplicationBlobBytes).
+// olricTableSizeBytes is the fallback table size when the engine has none.
+// config.New currently supplies a 1 MiB table size, which is preserved. Native
+// oversized entries are served uncached; clustered response-cache workers also
+// reject payloads above their smaller retention cap.
 const olricTableSizeBytes uint64 = 256 << 10 // 256 KiB
 
 // l2AssumedEntryOverheadBytes is the assumed per-key heap cost in olric
@@ -190,8 +175,8 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	// olric LRU cap (which can't evict a partition below one entry) has an
 	// effective floor of PartitionCount × maxEntrySize per DMap. olric's
 	// default of 271 partitions would floor a small pod's L2 well above its
-	// budget (271 × 256 KiB ≈ 68 MiB/DMap) and reintroduce the OOM risk this
-	// guards. A smaller count lowers that floor (~8 MiB/DMap) so MaxInuse
+	// budget (271 × 1 MiB = 271 MiB/DMap) and reintroduce the OOM risk this
+	// guards. A smaller count lowers that floor (~16 MiB/DMap) so MaxInuse
 	// actually binds at realistic budgets. Only safe to change in embedded
 	// mode — in a real cluster every peer must agree on PartitionCount, so
 	// there we keep olric's default.
@@ -310,12 +295,8 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		}
 	}
 
-	// Cap olric's per-fragment table allocation at 256 KiB. Olric's
-	// default (1 MiB per (partition, dmap) fragment, allocated upfront
-	// regardless of contents) puts an idle 271-partition × 3-dmap cluster
-	// well past 500 MiB. 256 KiB covers typical cosmoguard cache entries;
-	// oversized entries return ErrEntryTooLarge and the proxy serves
-	// them uncached.
+	// Preserve the engine's table size, supplying a fallback only when absent.
+	// Entries above the native table limit are served uncached.
 	if c.DMaps == nil {
 		c.DMaps = &config.DMaps{}
 	}
