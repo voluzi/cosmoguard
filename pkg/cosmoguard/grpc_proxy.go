@@ -476,6 +476,9 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 			key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
 			allowed, retryAfter, rlErr := allowRuleRateLimit(ctx, rule.RateLimit, l, key)
 			if rlErr != nil {
+				if ctx.Err() != nil {
+					return ctx, status.FromContextError(rlErr).Err()
+				}
 				logLimiterBackendError(p.log, rlErr, "grpc rate limiter unavailable")
 				allowed = false
 			}

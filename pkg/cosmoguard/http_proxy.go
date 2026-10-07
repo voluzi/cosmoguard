@@ -562,6 +562,10 @@ func (p *HttpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	decision := p.gateChainSnap(rulesSnap, limitersSnap, &matchedRule)(req)
 	// Middlewares enrich the context; pick up the latest copy.
 	r = req.r
+	// A cancelled rate-limit gate stops without a response, like cancelled cache waits.
+	if decision.Stop && decision.HTTPStatus == 0 && r.Context().Err() != nil {
+		return
+	}
 
 	// Endpoint handlers (JSON-RPC POST /, EVM-WS GET /websocket) run once
 	// the gate has passed — for the no-rule-matched case AND for an

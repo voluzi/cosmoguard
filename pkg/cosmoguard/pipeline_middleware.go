@@ -169,6 +169,9 @@ func MWRateLimit(
 		key := rateLimitKey(cfg.Scope, fp, hr, idName)
 		allowed, retry, err := allowRuleRateLimit(req.Context(), cfg, limiter, key)
 		if err != nil {
+			if req.Context().Err() != nil {
+				return Decision{Stop: true}
+			}
 			if logger != nil {
 				logLimiterBackendError(logger, err, "rate limiter unavailable")
 			}
