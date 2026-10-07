@@ -787,8 +787,10 @@ requests. Revocations appear in the dashboard's denials.
 
 For `keyMode: canonical`, set `grpc.protosets:` at the top level. Each path is a binary `FileDescriptorSet` produced by `protoc --descriptor_set_out=foo.protoset -I path/to/protos path/to/protos/**/*.proto`. Methods absent from the loaded protosets silently degrade to `raw`.
 
-Changing the protoset path list hot-reloads the registry. The new files are fully
-loaded and validated before config, limits or rules are changed; a load failure
+Changing the protoset path list hot-reloads the registry. Restart-policy rejection
+is checked before reading protosets and takes precedence over file errors. The
+new files are fully loaded and validated before config, limits or rules are
+changed; a load failure
 rejects the whole reload as `invalid` and preserves the previous config and
 registry. An unchanged list does not reopen files, keeping unrelated rule reloads
 independent of descriptor-file access. Protoset order is significant: reordering

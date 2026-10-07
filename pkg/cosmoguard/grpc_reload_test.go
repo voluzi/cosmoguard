@@ -167,4 +167,17 @@ func TestTryReloadInvalidGRPCProtosets(t *testing.T) {
 			require.Equal(t, restart, testutil.ToFloat64(configReloadsCounter.WithLabelValues("restart_required")))
 		})
 	}
+	t.Run("restart-required takes precedence", func(t *testing.T) {
+		next := grpcReloadConfig(missing, "deny") + "\nserver: {readTimeout: 1s}"
+		parseRestartConfig(t, next)
+		reloadTestFile(t, cg, next)
+		require.False(t, cg.dashboard.lastReload.Success)
+		require.Equal(t, "server config change (timeouts / maxRequestBody / wsReadLimit / websocketLimits / wsAllowedOrigins) requires a process restart", cg.dashboard.lastReload.Error)
+		require.Equal(t, []string{proto3}, cg.cfg.GRPC.Protosets)
+		assertGRPCReloadCache(t, cg, explicitZero, cacheHit, "upstream-1")
+		assertReloadBatch(t, cg.jsonRpcHandler, 2, http.StatusOK)
+		require.Equal(t, wantInvalid, testutil.ToFloat64(configReloadsCounter.WithLabelValues("invalid")))
+		require.Equal(t, applied, testutil.ToFloat64(configReloadsCounter.WithLabelValues("applied")))
+		require.Equal(t, restart+1, testutil.ToFloat64(configReloadsCounter.WithLabelValues("restart_required")))
+	})
 }

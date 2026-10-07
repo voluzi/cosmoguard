@@ -989,6 +989,16 @@ func (f *CosmoGuard) tryReload() {
 
 	f.configMutex.Lock()
 	defer f.configMutex.Unlock()
+	// Discovery expands live Nodes; restart policy compares the declarations.
+	previous := *f.cfg
+	previous.Nodes = f.origNodes
+	if required, reason := RequiresRestart(&previous, newCfg); required {
+		err := errors.New(reason)
+		slog.Warn("config reload rejected", "error", err)
+		configReloadsCounter.WithLabelValues("restart_required").Inc()
+		f.dashboard.RecordReload(false, err.Error(), nil)
+		return
+	}
 	protosetsChanged := !slices.Equal(f.cfg.GRPC.Protosets, newCfg.GRPC.Protosets)
 	var registry *CanonicalRegistry
 	if protosetsChanged && len(newCfg.GRPC.Protosets) > 0 {
@@ -1000,16 +1010,6 @@ func (f *CosmoGuard) tryReload() {
 			f.dashboard.RecordReload(false, err.Error(), nil)
 			return
 		}
-	}
-	// Discovery expands live Nodes; restart policy compares the declarations.
-	previous := *f.cfg
-	previous.Nodes = f.origNodes
-	if required, reason := RequiresRestart(&previous, newCfg); required {
-		err := errors.New(reason)
-		slog.Warn("config reload rejected", "error", err)
-		configReloadsCounter.WithLabelValues("restart_required").Inc()
-		f.dashboard.RecordReload(false, err.Error(), nil)
-		return
 	}
 	// Keep the trusted-proxy list published by ReadConfigFromFile.
 	accepted = true
