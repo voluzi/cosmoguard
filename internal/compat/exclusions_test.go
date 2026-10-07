@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -147,12 +148,12 @@ func TestRunMethodExclusions(t *testing.T) {
 func TestInvalidMethodExclusionsDoNotContactNode(t *testing.T) {
 	for _, pattern := range []string{"", "*", "/Query/TraceCall", "/x.Query/", "/x.Query/Tr*ace", "/x.Query/Trace**", "//x.Query/Trace", "/x.Query/Trace/Call", "/x.Query/Trace?", "/x..Query/Trace"} {
 		t.Run(pattern, func(t *testing.T) {
-			contacted := false
-			srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { contacted = true }))
+			var contacted atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { contacted.Store(true) }))
 			defer srv.Close()
 			_, err := Run(context.Background(), Options{Node: Endpoints{RPC: srv.URL}, ExcludeMethods: []string{pattern}})
 			assert.ErrorContains(t, err, "exclude-method")
-			assert.Assert(t, !contacted)
+			assert.Assert(t, !contacted.Load())
 		})
 	}
 }
