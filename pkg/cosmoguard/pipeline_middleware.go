@@ -176,7 +176,7 @@ func MWRateLimit(
 		if err != nil {
 			if cfg.FailClosed() {
 				if logger != nil {
-					logger.WithError(err).Warn("rate limiter error; failing closed (denying)")
+					logLimiterBackendError(logger, err, "rate limiter error; failing closed (denying)")
 				}
 				return Decision{
 					Stop:       true,
@@ -187,7 +187,7 @@ func MWRateLimit(
 				}
 			}
 			if logger != nil {
-				logger.WithError(err).Warn("rate limiter error; failing open")
+				logLimiterBackendError(logger, err, "rate limiter error; failing open")
 			}
 			return next(req)
 		}

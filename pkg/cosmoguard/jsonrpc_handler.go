@@ -575,7 +575,7 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 		allowed, _, rlErr := l.Allow(r.Context(), key)
 		if rlErr != nil {
 			if rule.RateLimit.FailClosed() {
-				h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; failing closed (denying)")
+				logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter error; failing closed (denying)")
 				h.cgDashboard.RecordDeny(DenyRecord{
 					Section: h.section, Reason: "rate_limit",
 					SourceIP: GetSourceIP(r), Method: request.Method,
@@ -583,7 +583,7 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 				})
 				return false, -32005, "rate limiter unavailable"
 			}
-			h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; allowing")
+			logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter error; allowing")
 		} else if !allowed {
 			h.cgDashboard.RecordDeny(DenyRecord{
 				Section: h.section, Reason: "rate_limit",
@@ -704,7 +704,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 					// through on.
 					res, err := h.cache.Get(r.Context(), hash)
 					if err != nil && !errors.Is(err, cache.ErrNotFound) {
-						h.log.Errorf("error retrieving from cache: %v", err)
+						logCacheBackendError(h.log, err, "error retrieving from cache")
 					}
 					if err == nil {
 						effTTL := effectiveTTL(rule.Cache, h.cacheConfig)
@@ -1098,6 +1098,8 @@ func (h *JsonRpcHandler) stageSingleResponse(hash uint64, response bufferedJsonR
 }
 
 func (h *JsonRpcHandler) persistPendingSingleResponse(hash uint64, pending *jsonPendingResponse, ttl time.Duration, ruleTag, method string) {
+	// A timed-out Set can leave an older Put running after this lock is
+	// released. StoredAt still bounds the freshness of a late overwrite.
 	pending.writeMu.Lock()
 	defer pending.writeMu.Unlock()
 	if current, ok := h.pendingSingles.Load(hash); !ok || current != pending {
@@ -1112,7 +1114,7 @@ func (h *JsonRpcHandler) persistSingleResponse(hash uint64, res *JsonRpcMsg, ttl
 	err := h.cache.Set(ctx, hash, res, ttl)
 	cancel()
 	if err != nil {
-		h.log.Errorf("error setting cache value: %v", err)
+		logCacheBackendError(h.log, err, "error setting cache value")
 		return
 	}
 	h.cgDashboard.RecordCardinality(h.section, ruleTag, method)
@@ -1328,7 +1330,7 @@ RequestsLoop:
 					// hit RTT for remote-partition entries.
 					res, err := h.cache.Get(r.Context(), hash)
 					if err != nil && !errors.Is(err, cache.ErrNotFound) {
-						h.log.Errorf("error loading response from cache: %v", err)
+						logCacheBackendError(h.log, err, "error loading response from cache")
 					}
 					// Only a FRESH entry is served from cache. A stale entry
 					// (past its logical TTL, still within the stale window

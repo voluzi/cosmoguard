@@ -35,14 +35,11 @@ type OlricCache[K comparable, V any] struct {
 // assertion. *OlricCache still satisfies Cache[K, V] structurally, so
 // callers that want the interface can assign it without a cast.
 func NewOlricCache[K comparable, V any](
-	client interface {
-		NewDMap(string, ...olric.DMapOption) (olric.DMap, error)
-	},
+	client *olric.EmbeddedClient,
 	namespace string,
 	opts ...Option,
 ) (*OlricCache[K, V], error) {
-	embedded, isEmbedded := client.(*olric.EmbeddedClient)
-	if client == nil || (isEmbedded && embedded == nil) {
+	if client == nil {
 		return nil, errors.New("olric cache: client must not be nil")
 	}
 	if namespace == "" {

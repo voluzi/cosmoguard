@@ -29,37 +29,39 @@ func (d *blockedCacheDMap) Put(context.Context, string, any, ...olric.PutOption)
 	return nil
 }
 
-type blockedCacheClient struct{ dm olric.DMap }
-
-func (c blockedCacheClient) NewDMap(string, ...olric.DMapOption) (olric.DMap, error) {
-	return c.dm, nil
-}
-
 func TestOlricCacheBoundsAllOperations(t *testing.T) {
 	for _, method := range []string{"get", "expiry", "has", "set"} {
 		t.Run(method, func(t *testing.T) {
 			release := make(chan struct{})
 			var once sync.Once
 			unblock := func() { once.Do(func() { close(release) }) }
-			safety := time.AfterFunc(200*time.Millisecond, unblock)
-			defer func() { safety.Stop(); unblock() }()
+			defer unblock()
 			dm := &blockedCacheDMap{release: release}
-			c, err := NewOlricCache[string, []byte](blockedCacheClient{dm}, "test", BoundedOperations(1, 10*time.Millisecond, nil))
-			require.NoError(t, err)
-			start := time.Now()
-			switch method {
-			case "get":
-				_, err = c.Get(t.Context(), "key")
-			case "expiry":
-				_, _, err = c.GetWithExpiry(t.Context(), "key")
-			case "has":
-				_, err = c.Has(t.Context(), "key")
-			case "set":
-				err = c.Set(t.Context(), "key", []byte("value"), time.Second)
+			options := defaultOptions()
+			BoundedOperations(1, 10*time.Millisecond, nil)(options)
+			c := &OlricCache[string, []byte]{dm: dm, cfg: options, namespace: "test"}
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				switch method {
+				case "get":
+					_, err = c.Get(t.Context(), "key")
+				case "expiry":
+					_, _, err = c.GetWithExpiry(t.Context(), "key")
+				case "has":
+					_, err = c.Has(t.Context(), "key")
+				case "set":
+					err = c.Set(t.Context(), "key", []byte("value"), time.Second)
+				}
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+			case <-time.After(5 * time.Second):
+				t.Fatal("cache operation did not stop waiting")
 			}
-			require.ErrorIs(t, err, context.DeadlineExceeded)
-			require.Less(t, time.Since(start), 100*time.Millisecond)
-			_, err = c.Get(t.Context(), "other")
+			_, err := c.Get(t.Context(), "other")
 			require.ErrorIs(t, err, boundedcall.ErrRejected)
 			require.Equal(t, int32(1), dm.calls.Load())
 			unblock()

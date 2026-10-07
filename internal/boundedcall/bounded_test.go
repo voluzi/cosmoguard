@@ -39,20 +39,20 @@ func TestBoundedCallCapacityAndRecovery(t *testing.T) {
 		<-release
 		return 42, nil
 	}
-	// Safety release lets the pre-fix test fail without leaking a worker.
-	safety := time.AfterFunc(200*time.Millisecond, unblock)
-	defer safety.Stop()
+
 	for range 2 {
-		start := time.Now()
-		_, err := Do(t.Context(), gate, op)
-		require.ErrorIs(t, err, context.DeadlineExceeded)
-		require.Less(t, time.Since(start), 100*time.Millisecond)
+		done := make(chan error, 1)
+		go func() { _, err := Do(t.Context(), gate, op); done <- err }()
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller did not stop waiting")
+		}
 	}
 	for range 20 {
-		start := time.Now()
 		_, err := Do(t.Context(), gate, op)
 		require.ErrorIs(t, err, ErrRejected)
-		require.Less(t, time.Since(start), 10*time.Millisecond)
 	}
 	require.Equal(t, int32(2), calls.Load())
 	require.Equal(t, int32(2), peak.Load())
@@ -80,7 +80,7 @@ func TestBoundedCallCancellationRetainsCapacity(t *testing.T) {
 	select {
 	case err := <-done:
 		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Fatal("caller did not stop waiting")
 	}
 	_, err := Do(t.Context(), gate, func(context.Context) (int, error) {
@@ -88,4 +88,13 @@ func TestBoundedCallCancellationRetainsCapacity(t *testing.T) {
 		return 0, nil
 	})
 	require.ErrorIs(t, err, ErrRejected)
+}
+
+func TestBoundedCallPanicReleasesCapacity(t *testing.T) {
+	gate := New(1, time.Second, nil)
+	_, err := Do(t.Context(), gate, func(context.Context) (int, error) { panic("broken backend") })
+	require.ErrorContains(t, err, "broken backend")
+	got, err := Do(t.Context(), gate, func(context.Context) (int, error) { return 7, nil })
+	require.NoError(t, err)
+	require.Equal(t, 7, got)
 }

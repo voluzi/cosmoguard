@@ -145,7 +145,7 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(upstreamRequestsCounter)
 		_ = prometheus.Register(configReloadsCounter)
 		_ = prometheus.Register(backendOperationFailuresCounter)
-		for _, backend := range []string{"l2", "limiter"} {
+		for _, backend := range []string{"l2", "limiter", "replay"} {
 			for _, outcome := range []string{"timeout", "rejected"} {
 				backendOperationFailuresCounter.WithLabelValues(backend, outcome)
 			}

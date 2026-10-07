@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 )
 
 // TestOlricRateLimiter_BurstAndRefill is the single-node sanity check
@@ -148,13 +149,19 @@ func newEmbeddedClusterRuntimeForTest(t *testing.T) *clusterRuntime {
 // Discovery but factored out so other cluster-mode tests can reuse it.
 func newTwoNodeClusterForTest(t *testing.T) (*clusterRuntime, *clusterRuntime) {
 	t.Helper()
+	baseline := goleak.IgnoreCurrent()
+	t.Cleanup(func() {
+		// Memberlist Shutdown leaves in-flight probes waiting for their ack timer.
+		// Wait for termination, without excluding any goroutine this helper created.
+		require.Eventually(t, func() bool { return goleak.Find(baseline) == nil }, 5*time.Second, 10*time.Millisecond, "cluster goroutines did not terminate")
+	})
 	ports := reserveLoopbackPorts(t, 4)
 	bindA, gossipA, bindB, gossipB := ports[0], ports[1], ports[2], ports[3]
 	addrA := net.JoinHostPort("127.0.0.1", strconv.Itoa(gossipA))
 	addrB := net.JoinHostPort("127.0.0.1", strconv.Itoa(gossipB))
 	peers := []string{addrA, addrB}
 
-	mk := func(bind, gossip int) *clusterRuntime {
+	mk := func(bind, gossip int, seedPeers []string) *clusterRuntime {
 		cfg := &ClusterConfig{
 			BindAddr:      "127.0.0.1",
 			BindPort:      bind,
@@ -164,7 +171,7 @@ func newTwoNodeClusterForTest(t *testing.T) (*clusterRuntime, *clusterRuntime) {
 			EncryptionKey: testClusterEncryptionKey,
 			Discovery: &ClusterDiscoveryConfig{
 				Mode:   "static",
-				Static: &StaticDiscoveryConfig{Peers: peers},
+				Static: &StaticDiscoveryConfig{Peers: seedPeers},
 			},
 		}
 		cr, err := newClusterRuntime(clusterRuntimeOptions{
@@ -180,8 +187,10 @@ func newTwoNodeClusterForTest(t *testing.T) (*clusterRuntime, *clusterRuntime) {
 		return cr
 	}
 
-	a := mk(bindA, gossipA)
-	b := mk(bindB, gossipB)
+	// Seed the first member alone so olric does not spend ten join retries
+	// contacting a second daemon that this test has not started yet.
+	a := mk(bindA, gossipA, []string{addrA})
+	b := mk(bindB, gossipB, peers)
 
 	require.Eventually(t, func() bool {
 		ma, err := a.Client().Members(context.Background())

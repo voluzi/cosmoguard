@@ -480,7 +480,7 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 			allowed, retryAfter, rlErr := l.Allow(ctx, key)
 			if rlErr != nil {
 				if rule.RateLimit.FailClosed() {
-					p.log.WithError(rlErr).Warn("grpc rate limiter error; failing closed (denying)")
+					logLimiterBackendError(p.log, rlErr, "grpc rate limiter error; failing closed (denying)")
 					p.cgDashboard.RecordDeny(DenyRecord{
 						Section: p.section, Reason: "rate_limit",
 						SourceIP: source, Method: method,
@@ -491,7 +491,7 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 				}
 				// Fail-open (default) on limiter transport error so an olric
 				// blip doesn't take down traffic.
-				p.log.WithError(rlErr).Warn("grpc rate limiter error; allowing")
+				logLimiterBackendError(p.log, rlErr, "grpc rate limiter error; allowing")
 			} else if !allowed {
 				p.cgDashboard.RecordDeny(DenyRecord{
 					Section: p.section, Reason: "rate_limit",

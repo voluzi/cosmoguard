@@ -315,7 +315,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// seen-jti set across replicas. Calling NewAuthenticator earlier
 	// would pass a nil client and silently fall back to a per-pod
 	// memory store — a JWT could then be replayed once per replica.
-	authn, err := NewAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client())
+	authn, err := newAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client(), cfg.Cache.Cluster != nil)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up authenticator: %w", err)
 	}

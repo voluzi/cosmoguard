@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/olric-data/olric"
+
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 )
 
 // ReplayStore tracks seen JWT identifiers (`jti` claim) to block
@@ -89,12 +91,20 @@ func (s *memoryReplayStore) gcLoop() {
 	}
 }
 
+const replayOperationBudget = 100 * time.Millisecond
+const replayOperationCapacity = 512
+
+var replayOperations = boundedcall.New(replayOperationCapacity, replayOperationBudget, func(outcome string) {
+	recordBackendOperationFailure("replay", outcome)
+})
+
 // olricReplayStore uses olric.Put(NX, EX): the partition owner
 // serialises concurrent inserts, making the "seen or store" check
 // atomic across the cluster.
 type olricReplayStore struct {
-	dm       olric.DMap
-	keyspace string
+	operationGate *boundedcall.Gate
+	dm            olric.DMap
+	keyspace      string
 }
 
 func (s *olricReplayStore) SeenOrStore(ctx context.Context, key string, ttl time.Duration) (bool, error) {
@@ -103,7 +113,9 @@ func (s *olricReplayStore) SeenOrStore(ctx context.Context, key string, ttl time
 	if ttl <= 0 {
 		return false, nil
 	}
-	err := s.dm.Put(ctx, key, []byte{1}, olric.NX(), olric.EX(ttl))
+	_, err := boundedcall.Do(ctx, s.operationGate, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, s.dm.Put(ctx, key, []byte{1}, olric.NX(), olric.EX(ttl))
+	})
 	if err == nil {
 		return false, nil
 	}

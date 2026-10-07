@@ -19,6 +19,7 @@ import (
 	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 	"github.com/voluzi/cosmoguard/v5/pkg/cache"
 	"github.com/voluzi/cosmoguard/v5/pkg/util"
 )
@@ -807,7 +808,8 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 			p.log.Errorf("error getting hash of request: %v", err)
 		} else {
 			// Single round-trip lookup. ErrNotFound is a miss (cold
-			// path, no logging); anything else is a backend failure
+			// path, no logging); bounded waits also use the miss/store path so
+			// L1 stays useful during an L2 stall. Other errors are backend failures
 			// that we surface as cache=error so operators alerting
 			// on hit-rate see the regression instead of having an
 			// outage masquerade as cold-cache traffic. The previous
@@ -815,7 +817,9 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 			// the olric backend (Has() = Get() internally), so
 			// remote-partition hits paid two RTTs per lookup.
 			res, lookupErr := p.cache.Get(r.Context(), hash)
-			if lookupErr != nil && !errors.Is(lookupErr, cache.ErrNotFound) {
+			if boundedcall.IsFailure(lookupErr) {
+				logCacheBackendError(p.log, lookupErr, "error getting cached value")
+			} else if lookupErr != nil && !errors.Is(lookupErr, cache.ErrNotFound) {
 				p.log.Errorf("error getting cached value: %v", lookupErr)
 				ww := WrapStatusOnly(w)
 				p.pool.ServeHTTP(ww, r)
@@ -1430,6 +1434,8 @@ func (p *HttpProxy) stageHTTPResponse(requestHash string, response bufferedUpstr
 }
 
 func (p *HttpProxy) persistPendingHTTPResponse(requestHash string, pending *httpPendingResponse, ttl time.Duration, ruleTag, cardinalityKey string) {
+	// A bounded Set can return before its Put finishes; a late older write
+	// may overwrite a newer one. StoredAt still bounds its freshness.
 	pending.writeMu.Lock()
 	defer pending.writeMu.Unlock()
 	if current, ok := p.pendingMisses.Load(requestHash); !ok || current != pending {
@@ -1444,7 +1450,7 @@ func (p *HttpProxy) persistCachedHTTPResponse(requestHash string, cached CachedR
 	setErr := p.cache.Set(writeCtx, requestHash, cached, ttl)
 	cancel()
 	if setErr != nil {
-		p.log.Errorf("error setting cache value: %v", setErr)
+		logCacheBackendError(p.log, setErr, "error setting cache value")
 		return
 	}
 	p.cgDashboard.RecordCardinality(p.section, ruleTag, cardinalityKey)

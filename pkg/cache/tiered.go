@@ -39,13 +39,10 @@ func NewTieredCache[K comparable, V any](
 }
 
 func (c *TieredCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Duration) error {
-	// L2 is the source of truth; surface its error.
-	if err := c.l2.Set(ctx, key, value, ttl); err != nil {
-		return err
-	}
-	// L1 is best-effort: on failure the next Get repopulates it.
+	// Keep hot responses available locally while L2 is unavailable.
+	err := c.l2.Set(ctx, key, value, ttl)
 	_ = c.l1.Set(ctx, key, value, ttl)
-	return nil
+	return err
 }
 
 func (c *TieredCache[K, V]) Get(ctx context.Context, key K) (V, error) {

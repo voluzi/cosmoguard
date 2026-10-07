@@ -4,10 +4,16 @@ package boundedcall
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
 var ErrRejected = errors.New("backend operation capacity exhausted")
+var ErrTimeout = errors.New("backend operation wait timed out")
+
+func IsFailure(err error) bool {
+	return errors.Is(err, ErrTimeout) || errors.Is(err, ErrRejected)
+}
 
 type Gate struct {
 	slots   chan struct{}
@@ -45,13 +51,22 @@ func Do[T any](ctx context.Context, gate *Gate, fn func(context.Context) (T, err
 	}
 	done := make(chan result, 1)
 	go func() {
-		value, err := fn(waitCtx)
-		<-gate.slots
-		done <- result{value, err}
+		var res result
+		defer func() {
+			if v := recover(); v != nil {
+				res.err = fmt.Errorf("backend operation panicked: %v", v)
+			}
+			<-gate.slots
+			done <- res
+		}()
+		res.value, res.err = fn(waitCtx)
 	}()
 	expired := func() (T, error) {
-		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) && gate.observe != nil {
-			gate.observe("timeout")
+		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+			if gate.observe != nil {
+				gate.observe("timeout")
+			}
+			return zero, fmt.Errorf("%w: %w", ErrTimeout, waitCtx.Err())
 		}
 		return zero, waitCtx.Err()
 	}

@@ -285,32 +285,56 @@ at 2s intervals), and keep discovery of unready peers enabled. The chart include
 using other manifests must provide the same allowance.
 
 Clustered response-cache L2 reads, existence checks, and writes have a fixed
-100ms caller-wait budget and share 128 outstanding-operation slots per process.
-L1 hits bypass this pool. At capacity, new L2 operations are rejected immediately
-without a queue. Timeout/rejection is a cache backend error: the existing proxy
-fallback serves upstream, and failed cache storage preserves the upstream result.
-This can increase upstream traffic during joins or slow peers.
+100ms caller-wait budget and share 2,048 outstanding-operation slots per process.
+L1 hits bypass this pool. At capacity, new operations are rejected immediately
+without a queue. HTTP lookup timeout/rejection follows the cache-miss path,
+including coalescing and response storage. Tiered writes populate L1 even if L2
+fails, while still returning the L2 error; subsequent hot-key requests can use L1
+during a stall. Failed storage preserves the upstream response. Cold keys can
+increase upstream traffic during joins or slow peers.
 
-Clustered limiter attempts have a separate 250ms caller-wait budget and 64
-outstanding-operation slots per process, covering lock, read, write, and unlock.
-Timeout/rejection follows the rule's existing `failureMode`: fail-open admits;
-fail-closed denies. Lock contention completed within the budget still denies;
-contention that runs past the budget becomes a backend timeout and follows the
-failure mode. There are no retries or replacement local buckets. Cache saturation
-cannot consume limiter slots. These fixed bounds apply only with `cache.cluster`
-present; embedded/local caches and local limiter attempts retain their behavior.
+Clustered limiter attempts have a separate 250ms caller-wait budget and 2,048
+slots per process, covering lock, read, write, and unlock. Their lock-contention
+deadline is 100ms, leaving 150ms for later work. When olric returns
+`ErrLockNotAcquired` before the caller budget expires, the request is denied
+without a backend error. Olric starts that contention deadline after its initial
+Put and may ignore cancellation: a stalled lock operation or later work can
+still exceed the whole-attempt budget. Timeout/rejection follows the existing
+`failureMode`: fail-open admits; fail-closed denies. There are no retries or
+replacement local buckets. Cache saturation cannot consume limiter slots.
+
+Clustered JWT replay checks have their own 100ms budget and 512 slots. Timeout
+or rejection uses the existing replay-store error policy: admit the verified
+identity and log a warning that replay protection was unavailable. This policy
+is unchanged; the wait is bounded. Replay admission shares neither main pool.
+
+Non-clustered deployments add no request-path wait budgets or admission pools,
+retain the embedded limiter's 250ms contention deadline, and share the 45s
+startup default. The tiered-write improvement (populating L1 on L2 failure)
+also applies to embedded caches.
 
 Underlying olric calls may ignore cancellation, so each slot stays occupied until
 the actual call returns. Late writes or token consumption are possible after the
-client stops waiting. The limiter's existing 2s lock lease does not guarantee
-mutual exclusion for a critical section stalled beyond that lease.
+client stops waiting. Per-pod write locks can be released before timed-out Puts
+finish; an older write can overwrite a newer one, but the embedded stored-at
+timestamp still determines freshness. The limiter's existing 2s lease does not
+guarantee mutual exclusion for a critical section stalled beyond that lease.
+Bounded workers recover backend panics into errors and release their slots.
 
 `cosmoguard_backend_operation_failures_total` counts abandoned waits and capacity
-rejections. Its labels are `backend` (`l2` or `limiter`) and `outcome` (`timeout` or
-`rejected`), with only four combinations.
-It does not count cache misses, ordinary contention denials, or client cancellation.
-Timeouts include earlier caller deadlines. The existing proxy error logs and cache
-error outcomes remain in use. No new YAML settings or dependencies are required.
+rejections. Its labels are `backend` (`l2`, `limiter`, or `replay`) and `outcome`
+(`timeout` or `rejected`), with six combinations. It does not count cache misses,
+ordinary contention denials, backend panics, or client cancellation. Timeouts
+include earlier caller deadlines. Bounded cache/limiter failures log at debug
+level; other cache errors remain errors and other limiter errors remain warnings.
+JWT replay failures retain their warning for the existing security audit path.
+No new YAML settings or dependencies are required.
+
+The pools bound concurrent operations, not memory bytes. With all 4,608 slots
+parked, a local adapter-only measurement used about 23 MiB for runtime stacks
+and heap before backend payloads. For example, 2,048 retained 256 KiB L2 write
+payloads add 512 MiB; larger encoded responses and olric copies can use more.
+There is no hard total-memory bound from admission alone.
 
 Cross-pod replication of the dashboard observability snapshot (so a restarting pod restores its counters + metrics history from a peer) is **off by default** and opt-in via `dashboard.clusterHistoryRestore: true` — see [Dashboard restart-restore](#dashboard-restart-restore-off-by-default) below. The live cluster dashboard (peer HTTP fan-out) and Prometheus `/metrics` do **not** depend on it.
 

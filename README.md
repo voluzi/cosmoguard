@@ -29,18 +29,23 @@ changed from v3; existing v3 configs continue to work — run
   olric distributed cache with an in-process L1 — single binary,
   no external dependency, shared automatically across replicas when
   cluster mode is on. Clustered L2 waits are bounded at 100ms and fall
-  back upstream on timeout or saturation; L1 hits bypass L2.
+  back upstream on timeout or saturation; 2,048 slots bound outstanding
+  L2 calls. Responses still populate L1 during L2 failure, and HTTP misses
+  retain coalescing; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
   identity` scopes. Buckets are sharded across replicas through the
   same olric runtime in cluster mode, so configured rates stay correct
   under HPA without an external store. Clustered attempts stop waiting
-  after 250ms or reject immediately at capacity, following the configured
+  after 250ms or reject immediately at 2,048 outstanding attempts, with a
+  100ms lock-contention deadline, following the configured
   fail-open / fail-closed policy. See [cluster behavior](CONFIG.md#cluster-mode)
   for the fixed operation limits and metrics.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
   token introspection, and an external-validator method for
   developer-portal style credential checks. Credential headers are
-  always stripped before forwarding upstream.
+  always stripped before forwarding upstream. Clustered JWT replay checks
+  use a separate 100ms budget and 512 slots; store failures retain the
+  verified-identity fail-open policy and warning.
 - **CORS** owned by cosmoguard, not the upstream — preflight handled
   directly; upstream's CORS headers are stripped and replaced.
 - **Multi-upstream nodes** with active healthchecks, weighted round-
@@ -61,6 +66,12 @@ changed from v3; existing v3 configs continue to work — run
   connection/subscription panel. In cluster mode it fans out across
   peers for a single cluster-wide view. OpenTelemetry tracing and
   Prometheus metrics round out the surface.
+
+Cluster startup has a 45s default budget; `/healthz` on the metrics port starts
+answering after the bootstrap gate. The chart's startup probe allows 60s; other
+manifests must allow at least 60s. Non-clustered request paths add no wait bounds
+or pools and share the startup default; embedded tiered writes also preserve L1
+on L2 errors.
 
 ## Installation
 
