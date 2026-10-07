@@ -429,7 +429,7 @@ podDisruptionBudget:
 
 # Sized for the default clustered runtime (config.cache.cluster.enable: true).
 # A single-replica cluster owns all of olric's partitions, so its L2 cache
-# floors at ~68 MiB/DMap (271 partitions x 256 KiB); the memory limit drives
+# floors at ~271 MiB/DMap (271 partitions x 1 MiB); the memory limit drives
 # the auto-derived L2 budget (see CacheGlobalConfig.ResolveBudget), so 1Gi
 # keeps that floor comfortably inside budget for the non-EVM DMap set. The
 # request stays modest because the idle/light-load footprint is ~10 MiB —

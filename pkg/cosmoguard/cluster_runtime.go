@@ -55,7 +55,7 @@ const embeddedPartitionCount = 16
 // olricTableSizeBytes is the fallback table size when the engine has none.
 // config.New currently supplies a 1 MiB table size, which is preserved. Native
 // oversized entries are served uncached; clustered response-cache workers also
-// reject payloads above their smaller retention cap.
+// reject payloads above the engine default table size.
 const olricTableSizeBytes uint64 = 256 << 10 // 256 KiB
 
 // l2AssumedEntryOverheadBytes is the assumed per-key heap cost in olric

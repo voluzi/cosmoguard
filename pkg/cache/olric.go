@@ -7,12 +7,20 @@ import (
 	"time"
 
 	"github.com/olric-data/olric"
+	"github.com/olric-data/olric/config"
 
 	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 )
 
-// MaxBoundedOlricPayloadBytes caps payloads retained by clustered cache workers.
-const MaxBoundedOlricPayloadBytes = 256 << 10
+// Use olric's sanitized engine default; native entry metadata can make the
+// effective value limit slightly smaller than the table size.
+var maxBoundedOlricPayloadBytes = func() int {
+	engine := config.NewEngine()
+	if err := engine.Sanitize(); err != nil {
+		panic(err)
+	}
+	return int(engine.Config["tableSize"].(uint64))
+}()
 
 // OlricCache implements Cache[K, V] backed by an olric DMap. The DMap name
 // is the cache namespace, so two cache instances created with different
@@ -79,11 +87,11 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 
 	if c.cfg.operationGate != nil {
 		// Reject before a cancellation-ignoring Put can park an oversized payload.
-		if len(payload) > MaxBoundedOlricPayloadBytes {
+		if len(payload) > maxBoundedOlricPayloadBytes {
 			return olric.ErrEntryTooLarge
 		}
 		// An encoder's spare backing capacity must not enlarge parked writes.
-		if cap(payload) > MaxBoundedOlricPayloadBytes {
+		if cap(payload) > maxBoundedOlricPayloadBytes {
 			compact := make([]byte, len(payload))
 			copy(compact, payload)
 			payload = compact

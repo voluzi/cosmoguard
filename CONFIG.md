@@ -247,7 +247,10 @@ The total is then split evenly across the response caches that run in the pod (o
 
 Size the pod so its L2 budget clears the floor, or raise the memory limit. The sanitized olric default currently retains a 1 MiB fragment `tableSize`;
 entries above that native limit are served uncached. The clustered caller-wait
-adapter separately rejects encoded response payloads above 256 KiB before Put.
+adapter derives its early rejection cap from the same sanitized engine default
+and rejects encoded payloads above 1 MiB before Put. Native key/entry framing can
+reject a slightly smaller value; successful embedded and clustered cache writes
+retain the same native entry-size boundary.
 Embedded mode retains the native size limit. Clustered deployments also divide the per-node cap by `replicaCount`, since each node holds replica copies that olric's primary-write cap doesn't govern. The L1 byte cap and `GOMEMLIMIT` are unaffected by any of this.
 
 Override any of it explicitly:
@@ -288,12 +291,12 @@ at 2s intervals), and keep discovery of unready peers enabled. The chart include
 using other manifests must provide the same allowance.
 
 Clustered response-cache L2 reads, existence checks, and writes have a fixed
-100ms caller-wait budget and share 256 outstanding-operation slots per process.
+100ms caller-wait budget and share 128 outstanding-operation slots per process.
 L1 hits bypass this pool. At capacity, new operations are rejected immediately
 without a queue. HTTP lookup timeout/rejection follows the cache-miss path,
 including coalescing and response storage. Tiered writes populate L1 on L2 timeout or capacity rejection, while still
 returning the L2 error; other L2 errors leave L1 untouched. Entries whose encoded
-payload exceeds the 256 KiB retention cap are rejected before calling olric and
+payload exceeds the 1 MiB engine table-size cap are rejected before calling olric and
 remain uncached in both tiers. Subsequent hot-key requests can use L1
 during a stall. Failed storage preserves the upstream response. Cold keys can
 increase upstream traffic during joins or slow peers.
@@ -365,16 +368,14 @@ or when the attempt exceeds 1s; replay retains its existing error policy when
 either 100ms budget expires.
 No new YAML settings or dependencies are required.
 
-The three pools retain at most 2,816 backend workers: 256 L2, 2,048 limiter,
-and 512 replay. Parked L2 writes retain at most 256 KiB of encoded payload per
-slot (including spare encoder capacity), or **64 MiB** across the L2 pool.
-A local adapter-only measurement with all slots parked used about **8.7 MiB**
-of runtime stacks and heap before payloads (about 72.7 MiB with maximal L2
-payloads). These figures exclude keys, backend state, and olric/transport copies:
-olric's embedded Put can retain two additional value copies, making three
-payload copies alone up to 192 MiB. This is not a hard total-process memory cap;
-active upstream captures, per-rule local fallback buckets (up to 100,000 each),
-and the configured cache working set remain separate.
+The three pools retain at most 2,688 backend workers: 128 L2, 2,048 limiter,
+and 512 replay. Parked L2 writes retain at most 1 MiB of encoded payload per
+slot (including spare encoder capacity), or **128 MiB** across the L2 pool.
+Runtime stacks, contexts and result channels add overhead. This is not a hard
+total-process memory cap: olric's embedded Put can retain two additional value
+copies, making three payload copies alone up to **384 MiB**, before keys,
+transport/serialization overhead, active upstream captures, the configured cache
+working set and per-rule local fallback buckets (up to 100,000 each).
 
 Cross-pod replication of the dashboard observability snapshot (so a restarting pod restores its counters + metrics history from a peer) is **off by default** and opt-in via `dashboard.clusterHistoryRestore: true` — see [Dashboard restart-restore](#dashboard-restart-restore-off-by-default) below. The live cluster dashboard (peer HTTP fan-out) and Prometheus `/metrics` do **not** depend on it.
 

@@ -326,7 +326,12 @@ func TestHTTPBoundedLookupFailureStillCoalesces(t *testing.T) {
 func TestResponseCacheEntryLimits(t *testing.T) {
 	for _, clustered := range []bool{false, true} {
 		t.Run(fmt.Sprintf("clustered=%t", clustered), func(t *testing.T) {
-			cr := newEmbeddedClusterRuntimeForTest(t)
+			var cr *clusterRuntime
+			if clustered {
+				cr, _ = newTwoNodeClusterForTest(t)
+			} else {
+				cr = newEmbeddedClusterRuntimeForTest(t)
+			}
 			cfg := &CacheGlobalConfig{}
 			if clustered {
 				cfg.Cluster = &ClusterConfig{}
@@ -334,17 +339,17 @@ func TestResponseCacheEntryLimits(t *testing.T) {
 			responses, err := newResponseCache[string, CachedResponse](cfg, cr.Client(), "entry-limits", CacheBudget{})
 			require.NoError(t, err)
 			defer responses.Close()
-			for _, size := range []int{256<<10 + 1, 1<<20 + 1} {
+			for _, size := range []int{256 << 10, 257 << 10, 1023 << 10, 1<<20 + 1} {
 				t.Run(fmt.Sprint(size), func(t *testing.T) {
 					key := fmt.Sprint(size)
 					response := CachedResponse{Data: make([]byte, size)}
 					err := responses.Set(t.Context(), key, response, time.Minute)
-					if clustered || size > 1<<20 {
+					if size > 1<<20 {
 						require.ErrorIs(t, err, olric.ErrEntryTooLarge)
 						_, err = responses.Get(t.Context(), key)
 						require.ErrorIs(t, err, cache.ErrNotFound, "neither tier may retain a rejected response")
 					} else {
-						require.NoError(t, err, "embedded cache must preserve its native 1 MiB table limit")
+						require.NoError(t, err, "both cache modes must preserve the native entry limit")
 						got, err := responses.Get(t.Context(), key)
 						require.NoError(t, err)
 						require.Equal(t, response.Data, got.Data)

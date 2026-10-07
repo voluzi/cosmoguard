@@ -29,7 +29,7 @@ changed from v3; existing v3 configs continue to work — run
   olric distributed cache with an in-process L1 — single binary,
   no external dependency, shared automatically across replicas when
   cluster mode is on. Clustered L2 waits are bounded at 100ms and fall
-  back upstream on timeout or saturation; 256 slots bound outstanding
+  back upstream on timeout or saturation; 128 slots bound outstanding
   L2 calls. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
   retain coalescing; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
