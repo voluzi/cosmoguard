@@ -344,7 +344,8 @@ retain the embedded limiter's 250ms contention deadline, and share the 45s
 startup default. Their cache implementation and healthy limiter algorithm are
 unchanged. Embedded limiter errors, failed constructors, or a missing primary
 limiter use the same per-rule local fallback; a rate-limited rule never bypasses
-its limit because the primary is unavailable.
+its limit because the primary is unavailable. Caller cancellation returns the
+context error without consuming a fallback token or counting a fallback.
 
 Underlying olric calls may ignore cancellation, so each slot stays occupied until
 the actual call returns. Late writes or token consumption are possible after the

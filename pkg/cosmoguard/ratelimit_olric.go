@@ -225,6 +225,9 @@ type boundedRateLimiter struct {
 }
 
 func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
+	}
 	type decision struct {
 		allowed bool
 		retry   time.Duration
@@ -233,6 +236,9 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 		allowed, retry, err := l.RateLimiter.Allow(opCtx, key)
 		return decision{allowed, retry}, err
 	})
+	if ctx.Err() != nil {
+		return false, 0, ctx.Err()
+	}
 	if err == nil {
 		return res.allowed, res.retry, nil
 	}
