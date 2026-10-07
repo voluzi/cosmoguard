@@ -268,6 +268,22 @@ cache:
 
 Including a `cache.cluster` block in the config turns the embedded olric daemon into a real cluster. Replicas form a memberlist gossip ring and partition the cache + rate-limiter keyspace. Single binary, single daemon, no external dependencies.
 
+Startup waits for an initial usable olric routing table before constructing
+cache, authentication, limiter, or observability consumers. Bootstrap timeouts
+and insufficient member quorum are retried on the same daemon; permanent errors
+fail immediately. A fixed 45s budget covers initial DNS discovery, daemon start,
+and this gate together; there is no new configuration setting. The elapsed gate
+and total startup time are logged. A native DMap check already in progress can
+finish after the caller's deadline (olric bounds that check to 10s); shutdown
+starts immediately with a 2s allowance.
+
+The metrics listener and `/healthz` start only in `CosmoGuard.Run`, after
+construction and this bootstrap gate. `/readyz` then applies the existing
+upstream readiness checks; startup does not wait for all data migration to finish.
+Allow at least 60s for a startup probe on the metrics port (for example 30 failures
+at 2s intervals), and keep discovery of unready peers enabled. The default chart's
+liveness-only timing needs a matching startup allowance when used for slow joins.
+
 Cross-pod replication of the dashboard observability snapshot (so a restarting pod restores its counters + metrics history from a peer) is **off by default** and opt-in via `dashboard.clusterHistoryRestore: true` — see [Dashboard restart-restore](#dashboard-restart-restore-off-by-default) below. The live cluster dashboard (peer HTTP fan-out) and Prometheus `/metrics` do **not** depend on it.
 
 ```yaml

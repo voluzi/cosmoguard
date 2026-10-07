@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
@@ -151,10 +152,8 @@ type clusterRuntimeOptions struct {
 	// LogOutput receives olric's own logs. Defaults to io.Discard because
 	// olric's default DEBUG verbosity drowns the cosmoguard log otherwise.
 	LogOutput io.Writer
-	// StartTimeout caps how long we wait for the daemon to call its Started
-	// callback. Embedded-only startup is sub-second on every machine I've
-	// measured; the 15s ceiling is for cluster-mode where peer convergence
-	// has to happen before Started fires.
+	// StartTimeout bounds discovery, daemon start and bootstrap together.
+	// The default leaves margin within the operator's 60s startup probe.
 	StartTimeout time.Duration
 	// Lookup is the DNS resolver used by the discovery plugin. nil →
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
@@ -172,8 +171,12 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		opts.LogOutput = io.Discard
 	}
 	if opts.StartTimeout == 0 {
-		opts.StartTimeout = 15 * time.Second
+		opts.StartTimeout = 45 * time.Second
 	}
+
+	startedAt := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), opts.StartTimeout)
+	defer cancel()
 
 	// The presence of a Cluster block is the operator's signal that
 	// they want networked cluster mode. Omit it for embedded loopback
@@ -268,9 +271,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		c.WriteQuorum = opts.Cluster.Quorum
 
 		// Build the discovery plugin first so we can hand olric an
-		// initial peer set. olric's discovery hook re-queries it on a
-		// timer, so this initial list is just a fast-path; the periodic
-		// DiscoverPeers calls handle steady-state churn.
+		// initial peer set. Olric re-queries discovery during join attempts;
 		//
 		// The self identifier is the memberlist gossip address (BindAddr
 		// + GossipPort), because that's the form DiscoverPeers returns
@@ -295,14 +296,13 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		}
 
 		// Pre-populate Peers with whatever the discovery plugin currently
-		// knows. Olric won't crash on an empty list (it just waits for
-		// the next periodic discovery tick), but giving it a head start
-		// shortens cluster-form time on fresh starts. A startup-time
-		// discovery failure (commonly: DNS not yet resolvable on cold
-		// boot) is soft-failed — olric's periodic retry compensates —
-		// but it MUST be logged so an operator staring at "why won't
-		// my cluster form" has a breadcrumb to follow.
-		if peers, err := discovery.DiscoverPeers(); err == nil {
+		// knows. An empty list is valid; join attempts can refresh it.
+		// Log a cold-start DNS failure so operators can diagnose failed joins.
+		initialPeers := discovery.DiscoverPeers
+		if discovery.mode == "dns" {
+			initialPeers = func() ([]string, error) { return discovery.discoverDNS(ctx) }
+		}
+		if peers, err := initialPeers(); err == nil {
 			c.Peers = peers
 		} else {
 			slog.Warn("cluster discovery: initial peer lookup failed (will retry)", "error", err, "mode", opts.Cluster.Discovery.Mode)
@@ -345,6 +345,12 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		return nil, fmt.Errorf("cluster runtime: validate: %w", err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		if discovery != nil {
+			_ = discovery.Close()
+		}
+		return nil, fmt.Errorf("cluster runtime: discovery: %w", err)
+	}
 	ready := make(chan struct{})
 	c.Started = func() { close(ready) }
 
@@ -374,19 +380,69 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		_ = db.Shutdown(ctx)
 		cancel()
 		return nil, fmt.Errorf("cluster runtime: start: %w", err)
-	case <-time.After(opts.StartTimeout):
+	case <-ctx.Done():
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = db.Shutdown(ctx)
 		cancel()
 		return nil, fmt.Errorf("cluster runtime: timed out after %s waiting for olric to start", opts.StartTimeout)
 	}
 
+	client := db.NewEmbeddedClient()
+	bootstrapAt := time.Now()
+	if err := waitClusterBootstrap(ctx, client); err != nil {
+		shutdownCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = db.Shutdown(shutdownCtx)
+		stop()
+		if discovery != nil {
+			_ = discovery.Close()
+		}
+		return nil, fmt.Errorf("cluster runtime: bootstrap after %s: %w", time.Since(startedAt), err)
+	}
+	slog.Info("olric bootstrap ready", "bootstrap_wait", time.Since(bootstrapAt), "startup_elapsed", time.Since(startedAt))
+
 	return &clusterRuntime{
 		db:         db,
-		client:     db.NewEmbeddedClient(),
+		client:     client,
 		discovery:  discovery,
 		peerAPIKey: peerAPIKey,
 	}, nil
+}
+
+// One worker retries on the same daemon. NewDMap ignores context, so the
+// caller's deadline is enforced separately; an active native check can finish
+// after shutdown (olric bounds it to 10s). The buffered result never blocks it.
+func waitClusterBootstrap(ctx context.Context, client interface {
+	NewDMap(string, ...olric.DMapOption) (olric.DMap, error)
+}) error {
+	result := make(chan error, 1)
+	go func() {
+		for {
+			if ctx.Err() != nil {
+				result <- ctx.Err()
+				return
+			}
+			_, err := client.NewDMap("cosmoguard:bootstrap")
+			if err == nil || (!errors.Is(err, olric.ErrOperationTimeout) && !errors.Is(err, olric.ErrClusterQuorum)) {
+				result <- err
+				return
+			}
+			select {
+			case <-ctx.Done():
+				result <- ctx.Err()
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-result:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
 }
 
 // Client returns the in-process client used by cache, rate-limiter, and
