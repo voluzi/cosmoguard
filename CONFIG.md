@@ -791,7 +791,9 @@ Changing the protoset path list hot-reloads the registry. The new files are full
 loaded and validated before config, limits or rules are changed; a load failure
 rejects the whole reload as `invalid` and preserves the previous config and
 registry. An unchanged list does not reopen files, keeping unrelated rule reloads
-independent of descriptor-file access. To load an edited bundle, change its path
+independent of descriptor-file access. Protoset order is significant: reordering
+the list reloads the registry, so keep the order identical across replicas.
+To load an edited bundle, change its path
 (for example, use a versioned filename). Clearing the list disables
 canonicalization. Entries cached under the previous descriptors can be served
 until their TTL expires.
