@@ -3,6 +3,7 @@ package compat
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -90,6 +91,16 @@ func TestRunMethodExclusions(t *testing.T) {
 				t.Cleanup(srv.Stop)
 				httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					count(side + r.URL.Path)
+					if r.Method == http.MethodPost {
+						var body struct {
+							Method string
+							Params struct{ Path string }
+						}
+						_ = json.NewDecoder(r.Body).Decode(&body)
+						if body.Method == "abci_query" {
+							count(side + "abci:" + body.Params.Path)
+						}
+					}
 					if r.URL.Path == "/status" {
 						fmt.Fprint(w, `{"result":{"node_info":{"network":"test"},"sync_info":{"latest_block_height":"8"}}}`)
 						return
@@ -111,6 +122,7 @@ func TestRunMethodExclusions(t *testing.T) {
 				assert.Assert(t, calls[side+"/eth.evm.v1.Query/Params"] > 0, "ordinary method must run")
 				assert.Equal(t, calls[side+crossHeightGRPC], 0)
 				assert.Equal(t, calls[side+crossHeightLCD], 0)
+				assert.Equal(t, calls[side+"abci:"+crossHeightGRPC], 0)
 				if tc.skipTrace {
 					assert.Equal(t, calls[side+"/eth.evm.v1.Query/TraceCall"], 0)
 					assert.Equal(t, calls[side+"/trace"], 0)
@@ -143,4 +155,22 @@ func TestInvalidMethodExclusionsDoNotContactNode(t *testing.T) {
 			assert.Assert(t, !contacted)
 		})
 	}
+}
+
+func TestCrossHeightExclusionProgress(t *testing.T) {
+	var progress bytes.Buffer
+	o := Options{Protocols: map[string]bool{ProtoRPC: true}, Log: &progress, ExcludeMethods: []string{crossHeightGRPC}}
+	x, err := newMethodExclusions(o)
+	assert.NilError(t, err)
+	tasks := crossHeightTasks(nil, o, 3, nil, nil, x)
+	assert.Equal(t, len(tasks), 1)
+	res := tasks[0](t.Context())
+	assert.Equal(t, res.Class, Skipped)
+	assert.Assert(t, strings.Contains(progress.String(), "skipping RPC abci_query "+crossHeightGRPC))
+	// An unselected probe is not a matched exclusion.
+	o.Protocols = map[string]bool{ProtoEVM: true}
+	x, err = newMethodExclusions(o)
+	assert.NilError(t, err)
+	assert.Equal(t, len(crossHeightTasks(nil, o, 3, nil, nil, x)), 0)
+	assert.Assert(t, !x.matched[0])
 }

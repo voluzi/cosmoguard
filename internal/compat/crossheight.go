@@ -69,9 +69,11 @@ const (
 
 func crossHeightTasks(h *httpDoer, o Options, height int64, node, guard *grpc.ClientConn, x *methodExclusions) []task {
 	var tasks []task
-	reason := x.reason(crossHeightGRPC)
 	add := func(name string, send func(context.Context, bool, int64) Response) {
-		if reason != "" {
+		if reason := x.reason(crossHeightGRPC); reason != "" {
+			if o.Log != nil {
+				fmt.Fprintf(o.Log, "skipping %s: %s\n", name, reason)
+			}
 			tasks = append(tasks, skippedTask(ProtoCrossHeight, name, reason))
 			return
 		}
