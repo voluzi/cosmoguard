@@ -175,7 +175,7 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 
 	tasks = append(tasks, crossHeightTasks(h, o, height, node, guard, x)...)
 
-	for i, p := range x.patterns {
+	for i, p := range x.patterns[:len(o.ExcludeMethods)] {
 		if !x.matched[i] {
 			logf("warning: unmatched exclusion %s", p)
 		}

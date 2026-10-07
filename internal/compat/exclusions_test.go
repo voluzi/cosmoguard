@@ -174,3 +174,19 @@ func TestCrossHeightExclusionProgress(t *testing.T) {
 	assert.Equal(t, len(crossHeightTasks(nil, o, 3, nil, nil, x)), 0)
 	assert.Assert(t, !x.matched[0])
 }
+
+func TestRunWarnsOnlyForUserExclusions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/status" {
+			fmt.Fprint(w, `{"result":{"node_info":{"network":"test"},"sync_info":{"latest_block_height":"8"}}}`)
+			return
+		}
+		fmt.Fprint(w, `{}`)
+	}))
+	defer srv.Close()
+	var progress bytes.Buffer
+	_, err := Run(t.Context(), Options{Node: Endpoints{RPC: srv.URL}, Guard: Endpoints{RPC: srv.URL}, Height: 3, Timeout: time.Second, Concurrency: 2, Protocols: map[string]bool{ProtoRPC: true}, Log: &progress, ExcludeMethods: []string{"/missing.v1.Query/Nope"}})
+	assert.NilError(t, err)
+	assert.Assert(t, strings.Contains(progress.String(), "unmatched exclusion /missing.v1.Query/Nope"))
+	assert.Assert(t, !strings.Contains(progress.String(), "unmatched exclusion "+defaultMethodExclusion), progress.String())
+}
