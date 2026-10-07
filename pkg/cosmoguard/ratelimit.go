@@ -418,5 +418,5 @@ func warnDeprecatedRateLimitFailureMode(previous, next *Config) {
 		return
 	}
 	sort.Strings(introduced)
-	slog.Warn("rateLimit.failureMode is deprecated and ignored; it will be removed in the next major version", "rules", introduced)
+	slog.Warn("rateLimit.failureMode is deprecated and ignored; the per-replica limiter decides on backend failure; it will be removed in the next major version", "rules", introduced)
 }

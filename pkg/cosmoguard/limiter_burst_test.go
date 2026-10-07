@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,7 @@ func (l *trackedLimiter) Allow(ctx context.Context, key string) (bool, time.Dura
 // runner exceeds the shared attempt budget.
 func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 	a, b := newTwoNodeClusterForTest(t)
+	cfg := RateLimitConfig{Rate: Rate{PerSecond: 5}, Burst: 5}
 	for _, tc := range []struct {
 		n        int
 		distinct bool
@@ -40,15 +42,15 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 				var limiters []RateLimiter
 				var trackers []*trackedLimiter
 				for _, cr := range []*clusterRuntime{a, b} {
-					raw, err := newOlricRateLimiter(cr.Client(), RateLimitConfig{Rate: Rate{PerSecond: 5}, Burst: 5}, keyspace)
+					raw, err := newOlricRateLimiter(cr.Client(), cfg, keyspace)
 					require.NoError(t, err)
 					tracker := &trackedLimiter{RateLimiter: raw}
 					trackers = append(trackers, tracker)
 					var limiter RateLimiter = tracker
 					if bounded {
-						local, err := NewRateLimiter(RateLimitConfig{Rate: Rate{PerSecond: 5}, Burst: 5}, nil, keyspace)
+						local, err := NewRateLimiter(cfg, nil, keyspace)
 						require.NoError(t, err)
-						limiter = &boundedRateLimiter{RateLimiter: tracker, local: local}
+						limiter = &boundedRateLimiter{RateLimiter: tracker, local: local, operationGate: limiterOperations}
 					}
 					limiters = append(limiters, limiter)
 				}
@@ -64,7 +66,7 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 						if tc.distinct {
 							key = fmt.Sprint(i)
 						}
-						ok, _, err := limiters[i%2].Allow(t.Context(), key)
+						ok, _, err := limiters[0].Allow(t.Context(), key)
 						switch {
 						case errors.Is(err, boundedcall.ErrRejected):
 							rejected.Add(1)
@@ -82,7 +84,8 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 				begin := time.Now()
 				close(start)
 				wg.Wait()
-				t.Logf("bounded=%t N=%d distinct=%t allowed=%d denied=%d timeout=%d rejected=%d other=%d duration=%s", bounded, tc.n, tc.distinct, allowed.Load(), denied.Load(), timedOut.Load(), rejected.Load(), other.Load(), time.Since(begin))
+				elapsed := time.Since(begin)
+				t.Logf("bounded=%t N=%d distinct=%t allowed=%d denied=%d timeout=%d rejected=%d other=%d duration=%s", bounded, tc.n, tc.distinct, allowed.Load(), denied.Load(), timedOut.Load(), rejected.Load(), other.Load(), elapsed)
 				require.Eventually(t, func() bool { return trackers[0].active.Load()+trackers[1].active.Load() == 0 }, 5*time.Second, time.Millisecond)
 				if bounded {
 					require.Zero(t, rejected.Load())
@@ -90,6 +93,11 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 					require.Zero(t, other.Load())
 					if tc.distinct {
 						require.Equal(t, int32(tc.n), allowed.Load())
+					} else {
+						// Native timestamps are rounded to milliseconds; include that
+						// rounding in the refill ceiling rather than another run's count.
+						nativeCeiling := int32(cfg.Burst) + int32(math.Floor(cfg.Rate.PerSecond*(elapsed+time.Millisecond).Seconds()))
+						require.LessOrEqual(t, allowed.Load(), nativeCeiling+int32(cfg.Burst), "same-key admission is bounded by native ceiling plus one local burst")
 					}
 				}
 			}

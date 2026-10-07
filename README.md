@@ -38,10 +38,12 @@ changed from v3; existing v3 configs continue to work — run
   under HPA without an external store. Clustered attempts wait at most 1s
   with 2,048 outstanding slots. Timeout, saturation, or backend errors use
   one bounded local limiter per rule with the same rate, burst, and scope.
-  During fallback, the aggregate rate can reach N times the configured rate
-  across N replicas, plus a local burst around transitions.
-  `rateLimit.failureMode` is deprecated and ignored; it remains accepted and
-  validated and will be removed in the next major version.
+  When shared and local decisions coexist, the aggregate rate can reach the
+  shared rate plus one local rate per replica, or (N + 1) times the configured
+  rate, plus local bursts around transitions. Embedded backend errors also use
+  a local decision, with no new pool or wait.
+  `rateLimit.failureMode` is deprecated and ignored; the per-replica limiter
+  decides on backend failure. The key remains accepted and validated and will be removed in the next major version.
   See [cluster behavior](CONFIG.md#cluster-mode) for limits and metrics.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
   token introspection, and an external-validator method for

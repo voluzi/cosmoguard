@@ -319,11 +319,17 @@ operation resumes when the backend returns. A failed limiter constructor uses
 local buckets and is retried on rule reload.
 
 While falling back, limits are per replica: across N replicas a client can
-receive up to N times the configured rate. Around transitions, the client can
+receive up to N times the configured rate if only local buckets are deciding.
+Under sustained saturation, shared and local decisions can coexist: the aggregate
+ceiling is the shared rate plus one local rate per replica, or (N + 1) times the
+configured rate. Around transitions, the client can
 also receive the local burst in addition to tokens already granted by the shared
 bucket. Late shared operations can consume tokens after a local decision, making
 later shared decisions stricter. The local limiter retains its existing bounded
-bucket-storage behavior.
+bucket-storage behavior. A client keeping one replica's limiter pool saturated
+(thousands of concurrent calls on one key) pushes its other rules to per-replica
+decisions; this costs at most the documented aggregate bound and does not deny a
+key merely because the pool is full.
 
 `rateLimit.failureMode` is **deprecated and ignored**, but remains parsed and
 validated so existing configurations load and reload. On primary limiter failure,
