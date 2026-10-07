@@ -53,7 +53,8 @@ const olricLRUSamples = 10
 const embeddedPartitionCount = 16
 
 // olricTableSizeBytes is the fallback table size when the engine has none.
-// config.New currently supplies a 1 MiB table size, which is preserved. Native
+// With pinned olric v0.7.4, config.New supplies a 1 MiB table size, so this
+// fallback cannot fire. Native
 // oversized entries are served uncached; clustered response-cache workers also
 // reject payloads above the engine default table size.
 const olricTableSizeBytes uint64 = 256 << 10 // 256 KiB

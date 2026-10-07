@@ -158,6 +158,9 @@ func registerSharedMetrics() {
 		}
 		for _, backend := range []string{"l2", "limiter", "replay"} {
 			for _, outcome := range []string{"timeout", "rejected"} {
+				if backend == "replay" && outcome == "rejected" {
+					continue
+				}
 				backendOperationFailuresCounter.WithLabelValues(backend, outcome)
 			}
 		}

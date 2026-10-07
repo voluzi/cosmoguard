@@ -353,11 +353,8 @@ func (r *observabilityReplicator) flush(ctx context.Context) error {
 	return nil
 }
 
-// maxReplicationBlobBytes bounds the marshalled replication payload so its
-// olric Put can't exceed the per-fragment entry cap (olricTableSizeBytes) and
-// fail with ErrEntryTooLarge — which, unlike the response caches, has no
-// uncached fallback and would drop dashboard restart-restore entirely. Left a
-// margin below the table size for olric's own per-entry framing.
+// Keep restart-restore snapshots within a conservative payload budget, with
+// room for entry framing even if the fallback table size is used.
 const maxReplicationBlobBytes = int(olricTableSizeBytes) - (16 << 10) // 240 KiB
 
 // marshalReplicationPayload marshals the payload, trimming the metrics

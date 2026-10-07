@@ -358,7 +358,8 @@ level, and release their slots.
 
 `cosmoguard_backend_operation_failures_total` counts abandoned waits and capacity
 rejections. Its labels are `backend` (`l2`, `limiter`, or `replay`) and `outcome`
-(`timeout` or `rejected`), with six combinations. It does not count cache misses,
+(`timeout` or `rejected`) for L2 and limiter, plus replay `timeout`: five
+live combinations. Replay waits for capacity and never emits `rejected`. It does not count cache misses,
 ordinary contention denials, backend panics, or client cancellation. Timeouts
 include earlier caller deadlines. Bounded cache failures and all limiter fallback decisions log at debug
 level; other cache errors remain errors.
@@ -366,7 +367,9 @@ JWT replay failures retain their warning for the existing security audit path.
 `cosmoguard_rate_limit_local_fallback_total` records local decisions with six
 combinations: `reason` (`timeout`, `capacity`, `backend_error`) and `outcome`
 (`allowed`, `denied`). Healthy bursts can also enter local fallback at capacity
-or when the attempt exceeds 1s; replay retains its existing error policy when
+or when the attempt exceeds 1s. Alert on
+`cosmoguard_rate_limit_local_fallback_total{reason="capacity"}` to detect limiter
+pool saturation. Replay retains its existing error policy when
 either 100ms budget expires.
 No new YAML settings or dependencies are required.
 
