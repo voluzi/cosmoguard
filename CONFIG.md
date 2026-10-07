@@ -34,6 +34,15 @@ Table of contents:
 | `metrics.enable` | `true` | Expose `/metrics`, `/healthz`, `/readyz` on `metrics.port`. |
 | `metrics.port` | `9001` | Metrics + health-probe port. |
 
+`/metrics` exposes `cosmoguard_config_reloads_total{outcome="..."}`, a process-wide
+counter that counts each config reload attempt once, excluding initial startup:
+
+| `outcome` | Meaning |
+|---|---|
+| `applied` | The config was accepted and its hot-reloadable settings applied. |
+| `restart_required` | A startup-captured setting changed; the previous config remains active. |
+| `invalid` | Reading, parsing or validating the file failed; the previous config remains active. |
+
 ---
 
 ## Server hardening
@@ -73,7 +82,64 @@ By default, each enabled protocol pool has 40 upstream WebSocket connections wit
 - `maxRequestBody` default raised from 1 MiB to **5 MiB** so large payloads (e.g. a wasm `MsgStoreCode` broadcast) aren't rejected with 413.
 - `wsReadLimit` default raised from 64 KiB to **1 MiB**, and an explicit `0` now means "no limit" (as documented) instead of being silently forced to 64 KiB. Large frames (e.g. a big `eth_sendRawTransaction`) are no longer dropped.
 
-**Hot-reload:** `server:` timeouts / body caps / WebSocket limits, `cors:`, and dashboard `enable`/`port`/`basicAuth` are captured at startup and now **reject** a reload that changes them (with a clear "requires a process restart" message) instead of silently accepting a change that never takes effect. `dashboard.requestLog` and `server.trustedProxies` still hot-reload.
+**Hot-reload:** Changes to `server:` timeouts / body caps / WebSocket limits, `cors:`, and dashboard `enable`/`port`/`basicAuth` **reject** a reload with a "requires a process restart" message. `dashboard.requestLog`, `server.trustedProxies`, `rpc.jsonrpc.maxBatchSize` and `grpc.protosets` hot-reload.
+
+A change covered by the restart policy rejects the **entire** reload: rules in that same file
+update stay unchanged too. Global cache, EVM enablement, authentication, upstream
+nodes, CORS, server limits/timeouts, dashboard startup settings, metrics/WebUI,
+WebSocket pool settings and gRPC message sizes require restart. Rules and section
+defaults, trusted proxies, dashboard request logging, JSON-RPC batch limits and
+gRPC protosets remain hot-reloadable.
+
+`host`, the protocol listener ports (`lcdPort`, `rpcPort`, `grpcPort`,
+`evmRpcPort`, `evmRpcWsPort`), `upstream.*` and `tracing` are captured at startup
+but are outside this restart policy. Changes to these settings alone are accepted
+on reload without being applied; restart the process to apply them.
+
+`rpc.jsonrpc.maxBatchSize` is shared by the Cosmos RPC and EVM RPC HTTP batch
+paths. `0` disables the cap; omission restores the default of 100. WebSocket
+frames accept individual JSON-RPC requests, not batches.
+
+### Go configuration comparison API
+
+Import `github.com/voluzi/cosmoguard/v5/pkg/cosmoguard`:
+
+```go
+func ParseConfig(raw []byte, lookupEnv func(string) (string, bool)) (*Config, error)
+func RequiresRestart(previous, next *Config) (bool, string)
+func RestartFingerprint(cfg *Config) (string, error)
+```
+
+`ParseConfig` parses strict single-document YAML, applies defaults and normalization,
+validates settings and compiles rules. The supplied lookup controls both `${VAR}`
+interpolation and `COSMOGUARD_*` overrides; nil means every variable is unset. It
+returns a fresh config without publishing trusted proxies or initializing runtime
+services. The existing `ReadConfigFromFile` and `PrepareConfig` retain their process
+environment and trusted-proxy publication behavior.
+
+Pass non-nil prepared **declarative** configs, before runtime DNS expansion, to
+`RequiresRestart` and `RestartFingerprint`. Neither mutates configs or loads
+configuration. `RequiresRestart` returns `(false, "")` for a permitted hot reload;
+otherwise it returns true and the exact first rejection message used by the binary.
+Both APIs reject nil: `RequiresRestart` returns true with a reason, and
+`RestartFingerprint` returns an error.
+`RestartFingerprint` returns `v1:<64 lowercase hexadecimal SHA-256 digits>` or an
+error. Equal fingerprints identify the same restart policy
+values; rule-only edits do not change them. Comparison and fingerprinting share the
+binary's private restart projection, including effective limits, ordered slices
+and meaningful nil/pointer distinctions. Authentication timestamps retain their
+declared instant, offset and UTC distinction; process-local timezone caches are
+excluded. The digest's encoding is versioned; consumers
+should persist the entire string.
+Fingerprints are comparable only when produced by the same module version.
+The unsalted digest covers configured API keys, JWT and client secrets, dashboard
+passwords and cluster encryption keys; key it (for example with HMAC and your own
+secret) before storing it somewhere less protected than those secrets.
+
+These APIs do not resolve DNS, open listeners, start the cache cluster or configure
+tracing. Importing the existing package still brings its proxy/cache/telemetry
+dependencies and existing dependency initializers; it is not a lightweight config
+package.
 
 ---
 
@@ -720,6 +786,19 @@ requests. Revocations appear in the dashboard's denials.
 `grpc.maxRecvMsgSize` and `grpc.maxSendMsgSize` default to the Cosmos SDK node's own gRPC limits (10 MiB in, 2 GiB − 1 out), so the proxy relays every message the node serves. Unset or `0` keeps the default, negative values are rejected, and changing them requires a process restart. The gRPC listener also caps each client connection at 1000 concurrent streams (further streams queue) and pings idle clients every 2 minutes.
 
 For `keyMode: canonical`, set `grpc.protosets:` at the top level. Each path is a binary `FileDescriptorSet` produced by `protoc --descriptor_set_out=foo.protoset -I path/to/protos path/to/protos/**/*.proto`. Methods absent from the loaded protosets silently degrade to `raw`.
+
+Changing the protoset path list hot-reloads the registry. Restart-policy rejection
+is checked before reading protosets and takes precedence over file errors. The
+new files are fully loaded and validated before config, limits or rules are
+changed; a load failure
+rejects the whole reload as `invalid` and preserves the previous config and
+registry. An unchanged list does not reopen files, keeping unrelated rule reloads
+independent of descriptor-file access. Protoset order is significant: reordering
+the list reloads the registry, so keep the order identical across replicas.
+To load an edited bundle, change its path
+(for example, use a versioned filename). Clearing the list disables
+canonicalization. Entries cached under the previous descriptors can be served
+until their TTL expires.
 
 ```yaml
 grpc:

@@ -2,7 +2,6 @@ package cosmoguard
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -73,52 +72,52 @@ import (
 // with env vars, the YAML must not set a non-default `node.host` —
 // validateNodeDiscovery rejects that combination because the
 // discovered IPs would silently overwrite the static value.
-func applyEnvOverrides(cfg *Config) error {
+func applyEnvOverrides(lookupEnv func(string) (string, bool), cfg *Config) error {
 	// Listener side. Port fields go through envPort (1..65535 range
 	// check) so a typo (`PORT=265570`) fails at startup with a clear
 	// error pointing at the offending env var, instead of a confusing
 	// "listen on port -65535" message from net.Listen later.
-	envStr("COSMOGUARD_HOST", &cfg.Host)
-	if err := envPort("COSMOGUARD_RPC_PORT", &cfg.RpcPort); err != nil {
+	envStr(lookupEnv, "COSMOGUARD_HOST", &cfg.Host)
+	if err := envPort(lookupEnv, "COSMOGUARD_RPC_PORT", &cfg.RpcPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_LCD_PORT", &cfg.LcdPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_LCD_PORT", &cfg.LcdPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_GRPC_PORT", &cfg.GrpcPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_GRPC_PORT", &cfg.GrpcPort); err != nil {
 		return err
 	}
-	if err := envBool("COSMOGUARD_ENABLE_EVM", &cfg.EnableEvm); err != nil {
+	if err := envBool(lookupEnv, "COSMOGUARD_ENABLE_EVM", &cfg.EnableEvm); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_EVM_RPC_PORT", &cfg.EvmRpcPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_EVM_RPC_PORT", &cfg.EvmRpcPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_EVM_RPC_WS_PORT", &cfg.EvmRpcWsPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_EVM_RPC_WS_PORT", &cfg.EvmRpcWsPort); err != nil {
 		return err
 	}
-	if err := envBoolPtr("COSMOGUARD_METRICS_ENABLE", &cfg.Metrics.Enable); err != nil {
+	if err := envBoolPtr(lookupEnv, "COSMOGUARD_METRICS_ENABLE", &cfg.Metrics.Enable); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_METRICS_PORT", &cfg.Metrics.Port); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_METRICS_PORT", &cfg.Metrics.Port); err != nil {
 		return err
 	}
 
 	// Dashboard: standalone read-only UI. Enable is *bool so the
 	// override can distinguish unset / true / false the same way
 	// YAML can (Dashboard.IsEnabled treats nil as default-enabled).
-	if err := envBoolPtr("COSMOGUARD_DASHBOARD_ENABLE", &cfg.Dashboard.Enable); err != nil {
+	if err := envBoolPtr(lookupEnv, "COSMOGUARD_DASHBOARD_ENABLE", &cfg.Dashboard.Enable); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_DASHBOARD_PORT", &cfg.Dashboard.Port); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_DASHBOARD_PORT", &cfg.Dashboard.Port); err != nil {
 		return err
 	}
-	envStr("COSMOGUARD_DASHBOARD_AUTH_USER", &cfg.Dashboard.BasicAuthUser)
-	envStr("COSMOGUARD_DASHBOARD_AUTH_PASSWORD", &cfg.Dashboard.BasicAuthPassword)
+	envStr(lookupEnv, "COSMOGUARD_DASHBOARD_AUTH_USER", &cfg.Dashboard.BasicAuthUser)
+	envStr(lookupEnv, "COSMOGUARD_DASHBOARD_AUTH_PASSWORD", &cfg.Dashboard.BasicAuthPassword)
 
 	// Cluster (cache.cluster) is global, not node-scoped, so it is applied
 	// before the node section's early return for a node-less config.
-	if err := applyClusterEnvOverrides(cfg); err != nil {
+	if err := applyClusterEnvOverrides(lookupEnv, cfg); err != nil {
 		return err
 	}
 
@@ -131,38 +130,38 @@ func applyEnvOverrides(cfg *Config) error {
 		return nil
 	}
 	n := &cfg.Nodes[0]
-	envStr("COSMOGUARD_NODE_NAME", &n.Name)
-	envStr("COSMOGUARD_NODE_HOST", &n.Host)
-	if err := envBool("COSMOGUARD_NODE_TLS", &n.TLS); err != nil {
+	envStr(lookupEnv, "COSMOGUARD_NODE_NAME", &n.Name)
+	envStr(lookupEnv, "COSMOGUARD_NODE_HOST", &n.Host)
+	if err := envBool(lookupEnv, "COSMOGUARD_NODE_TLS", &n.TLS); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_NODE_RPC_PORT", &n.RpcPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_NODE_RPC_PORT", &n.RpcPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_NODE_LCD_PORT", &n.LcdPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_NODE_LCD_PORT", &n.LcdPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_NODE_GRPC_PORT", &n.GrpcPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_NODE_GRPC_PORT", &n.GrpcPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_NODE_EVM_RPC_PORT", &n.EvmRpcPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_NODE_EVM_RPC_PORT", &n.EvmRpcPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_NODE_EVM_RPC_WS_PORT", &n.EvmRpcWsPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_NODE_EVM_RPC_WS_PORT", &n.EvmRpcWsPort); err != nil {
 		return err
 	}
-	envStr("COSMOGUARD_NODE_RPC_URL", &n.RpcURL)
-	envStr("COSMOGUARD_NODE_LCD_URL", &n.LcdURL)
-	envStr("COSMOGUARD_NODE_GRPC_URL", &n.GrpcURL)
-	envStr("COSMOGUARD_NODE_EVM_RPC_URL", &n.EvmRpcURL)
-	envStr("COSMOGUARD_NODE_EVM_RPC_WS_URL", &n.EvmRpcWsURL)
+	envStr(lookupEnv, "COSMOGUARD_NODE_RPC_URL", &n.RpcURL)
+	envStr(lookupEnv, "COSMOGUARD_NODE_LCD_URL", &n.LcdURL)
+	envStr(lookupEnv, "COSMOGUARD_NODE_GRPC_URL", &n.GrpcURL)
+	envStr(lookupEnv, "COSMOGUARD_NODE_EVM_RPC_URL", &n.EvmRpcURL)
+	envStr(lookupEnv, "COSMOGUARD_NODE_EVM_RPC_WS_URL", &n.EvmRpcWsURL)
 
 	// Discovery: any of the three vars create the Discovery block on
 	// demand. Mirror the YAML defaults (type=dns, refreshInterval=15s)
 	// so a node configured purely via env passes validateNodeDiscovery.
-	dHost, dHostSet := lookupNonEmptyEnv("COSMOGUARD_DISCOVERY_HOST")
-	dType, dTypeSet := lookupNonEmptyEnv("COSMOGUARD_DISCOVERY_TYPE")
-	dRefresh, dRefreshSet := lookupNonEmptyEnv("COSMOGUARD_DISCOVERY_REFRESH_INTERVAL")
+	dHost, dHostSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_DISCOVERY_HOST")
+	dType, dTypeSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_DISCOVERY_TYPE")
+	dRefresh, dRefreshSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_DISCOVERY_REFRESH_INTERVAL")
 	if dHostSet || dTypeSet || dRefreshSet {
 		if n.Discovery == nil {
 			n.Discovery = &DiscoveryConfig{
@@ -222,8 +221,8 @@ func applyEnvOverrides(cfg *Config) error {
 // explicit COSMOGUARD_CLUSTER_ENABLE=false suppresses cluster mode and
 // ignores the other cluster vars, so a templated deployment can toggle
 // clustering off without editing the rest of its env.
-func applyClusterEnvOverrides(cfg *Config) error {
-	enableVal, enableSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_ENABLE")
+func applyClusterEnvOverrides(lookupEnv func(string) (string, bool), cfg *Config) error {
+	enableVal, enableSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_CLUSTER_ENABLE")
 	enable := false
 	if enableSet {
 		if err := envBoolFromValue("COSMOGUARD_CLUSTER_ENABLE", enableVal, &enable); err != nil {
@@ -249,7 +248,7 @@ func applyClusterEnvOverrides(cfg *Config) error {
 	}
 	anySet := enable
 	for _, name := range clusterVars {
-		if _, ok := lookupNonEmptyEnv(name); ok {
+		if _, ok := lookupNonEmptyEnv(lookupEnv, name); ok {
 			anySet = true
 			break
 		}
@@ -268,31 +267,31 @@ func applyClusterEnvOverrides(cfg *Config) error {
 	}
 	c := cfg.Cache.Cluster
 
-	envStr("COSMOGUARD_CLUSTER_BIND_ADDR", &c.BindAddr)
-	envStr("COSMOGUARD_CLUSTER_ENCRYPTION_KEY", &c.EncryptionKey)
-	if err := envPort("COSMOGUARD_CLUSTER_BIND_PORT", &c.BindPort); err != nil {
+	envStr(lookupEnv, "COSMOGUARD_CLUSTER_BIND_ADDR", &c.BindAddr)
+	envStr(lookupEnv, "COSMOGUARD_CLUSTER_ENCRYPTION_KEY", &c.EncryptionKey)
+	if err := envPort(lookupEnv, "COSMOGUARD_CLUSTER_BIND_PORT", &c.BindPort); err != nil {
 		return err
 	}
-	if err := envPort("COSMOGUARD_CLUSTER_GOSSIP_PORT", &c.GossipPort); err != nil {
+	if err := envPort(lookupEnv, "COSMOGUARD_CLUSTER_GOSSIP_PORT", &c.GossipPort); err != nil {
 		return err
 	}
 	// PeerApiPort accepts 0: it's the documented "inherit BindPort+1" sentinel
 	// (see ClusterConfig.PeerApiPort), so an env-driven deployment must be able
 	// to express it — envPort's 1..65535 range would wrongly reject it.
-	if err := envPortAllowZero("COSMOGUARD_CLUSTER_PEER_API_PORT", &c.PeerApiPort); err != nil {
+	if err := envPortAllowZero(lookupEnv, "COSMOGUARD_CLUSTER_PEER_API_PORT", &c.PeerApiPort); err != nil {
 		return err
 	}
-	if err := envInt("COSMOGUARD_CLUSTER_REPLICA_COUNT", &c.ReplicaCount); err != nil {
+	if err := envInt(lookupEnv, "COSMOGUARD_CLUSTER_REPLICA_COUNT", &c.ReplicaCount); err != nil {
 		return err
 	}
-	if err := envInt("COSMOGUARD_CLUSTER_QUORUM", &c.Quorum); err != nil {
+	if err := envInt(lookupEnv, "COSMOGUARD_CLUSTER_QUORUM", &c.Quorum); err != nil {
 		return err
 	}
 
-	mode, modeSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_MODE")
-	dnsHost, dnsHostSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST")
-	_, dnsPortSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT")
-	_, dnsRefreshSet := lookupNonEmptyEnv("COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL")
+	mode, modeSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_CLUSTER_DISCOVERY_MODE")
+	dnsHost, dnsHostSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_CLUSTER_DISCOVERY_DNS_HOST")
+	_, dnsPortSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT")
+	_, dnsRefreshSet := lookupNonEmptyEnv(lookupEnv, "COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL")
 	if modeSet || dnsHostSet || dnsPortSet || dnsRefreshSet {
 		if c.Discovery == nil {
 			c.Discovery = &ClusterDiscoveryConfig{}
@@ -309,10 +308,10 @@ func applyClusterEnvOverrides(cfg *Config) error {
 			}
 			// DNS.Port 0 is the documented "inherit GossipPort" sentinel, so it
 			// must be expressible through env too (see DNSDiscoveryConfig.Port).
-			if err := envPortAllowZero("COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT", &c.Discovery.DNS.Port); err != nil {
+			if err := envPortAllowZero(lookupEnv, "COSMOGUARD_CLUSTER_DISCOVERY_DNS_PORT", &c.Discovery.DNS.Port); err != nil {
 				return err
 			}
-			if err := envDuration("COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL", &c.Discovery.DNS.RefreshInterval); err != nil {
+			if err := envDuration(lookupEnv, "COSMOGUARD_CLUSTER_DISCOVERY_DNS_REFRESH_INTERVAL", &c.Discovery.DNS.RefreshInterval); err != nil {
 				return err
 			}
 		}
@@ -323,8 +322,8 @@ func applyClusterEnvOverrides(cfg *Config) error {
 // envInt assigns *dst from the env var named name parsed as a plain
 // integer (used for counts like replica factor and quorum). A malformed
 // value is a startup-fatal error pointing at the offending env var.
-func envInt(name string, dst *int) error {
-	v, ok := lookupNonEmptyEnv(name)
+func envInt(lookupEnv func(string) (string, bool), name string, dst *int) error {
+	v, ok := lookupNonEmptyEnv(lookupEnv, name)
 	if !ok {
 		return nil
 	}
@@ -339,8 +338,8 @@ func envInt(name string, dst *int) error {
 // envDuration assigns *dst from the env var named name parsed as a Go
 // duration. A zero/negative or malformed value fails at startup rather
 // than degenerating into a tight refresh loop later.
-func envDuration(name string, dst *time.Duration) error {
-	v, ok := lookupNonEmptyEnv(name)
+func envDuration(lookupEnv func(string) (string, bool), name string, dst *time.Duration) error {
+	v, ok := lookupNonEmptyEnv(lookupEnv, name)
 	if !ok {
 		return nil
 	}
@@ -361,8 +360,8 @@ func envDuration(name string, dst *time.Duration) error {
 // template would otherwise propagate to dial time as a confusing
 // "no such host" error. Skipped when the var is unset or empty
 // per the empty-as-unset rule documented on lookupNonEmptyEnv.
-func envStr(name string, dst *string) {
-	if v, ok := lookupNonEmptyEnv(name); ok {
+func envStr(lookupEnv func(string) (string, bool), name string, dst *string) {
+	if v, ok := lookupNonEmptyEnv(lookupEnv, name); ok {
 		*dst = strings.TrimSpace(v)
 	}
 }
@@ -372,8 +371,8 @@ func envStr(name string, dst *string) {
 // startup-fatal error pointing at the offending env var, never a
 // silent fall-through — port misconfiguration would otherwise
 // surface as a confusing net.Listen error far from the cause.
-func envPort(name string, dst *int) error {
-	v, ok := lookupNonEmptyEnv(name)
+func envPort(lookupEnv func(string) (string, bool), name string, dst *int) error {
+	v, ok := lookupNonEmptyEnv(lookupEnv, name)
 	if !ok {
 		return nil
 	}
@@ -391,8 +390,8 @@ func envPort(name string, dst *int) error {
 // envPortAllowZero is envPort but permits 0, for port fields whose zero value
 // is a meaningful "inherit/derive" sentinel (e.g. Cluster.PeerApiPort = 0 ⇒
 // BindPort+1). Any other out-of-range value still fails startup.
-func envPortAllowZero(name string, dst *int) error {
-	v, ok := lookupNonEmptyEnv(name)
+func envPortAllowZero(lookupEnv func(string) (string, bool), name string, dst *int) error {
+	v, ok := lookupNonEmptyEnv(lookupEnv, name)
 	if !ok {
 		return nil
 	}
@@ -414,8 +413,8 @@ func envPortAllowZero(name string, dst *int) error {
 // and produce a startup failure for an obviously-correct value.
 // Other values fail with an error naming the env var, never
 // silently keeping the YAML/default.
-func envBool(name string, dst *bool) error {
-	v, ok := lookupNonEmptyEnv(name)
+func envBool(lookupEnv func(string) (string, bool), name string, dst *bool) error {
+	v, ok := lookupNonEmptyEnv(lookupEnv, name)
 	if !ok {
 		return nil
 	}
@@ -429,8 +428,8 @@ func envBool(name string, dst *bool) error {
 // override footgun. An unset env var leaves *dst untouched (it stays
 // nil if it was nil); a set env var allocates a *bool with the
 // parsed value. Accepts the same vocabulary as envBool.
-func envBoolPtr(name string, dst **bool) error {
-	v, ok := lookupNonEmptyEnv(name)
+func envBoolPtr(lookupEnv func(string) (string, bool), name string, dst **bool) error {
+	v, ok := lookupNonEmptyEnv(lookupEnv, name)
 	if !ok {
 		return nil
 	}
@@ -471,8 +470,8 @@ func envBoolFromValue(name, v string, dst *bool) error {
 // rule so a templated-but-unfilled var (e.g. `helm --set host=`)
 // doesn't silently overwrite a configured value with the empty
 // string.
-func lookupNonEmptyEnv(name string) (string, bool) {
-	v, ok := os.LookupEnv(name)
+func lookupNonEmptyEnv(lookupEnv func(string) (string, bool), name string) (string, bool) {
+	v, ok := lookupEnv(name)
 	if !ok || v == "" {
 		return "", false
 	}

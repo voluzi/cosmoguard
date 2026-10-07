@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -109,7 +110,7 @@ func TestApplyEnvOverrides_ClusterOptOutClearsExistingYAMLBlock(t *testing.T) {
 	t.Setenv("COSMOGUARD_CLUSTER_ENABLE", "false")
 	cfg := &Config{}
 	cfg.Cache.Cluster = &ClusterConfig{BindAddr: "10.0.0.9", EncryptionKey: testClusterKey}
-	assert.NilError(t, applyClusterEnvOverrides(cfg))
+	assert.NilError(t, applyClusterEnvOverrides(os.LookupEnv, cfg))
 	assert.Assert(t, cfg.Cache.Cluster == nil, "ENABLE=false must clear a YAML-defined cluster block")
 }
 

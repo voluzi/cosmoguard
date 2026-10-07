@@ -94,17 +94,17 @@ func TestCorsDeclChanged(t *testing.T) {
 	if err := b.Compile(); err != nil {
 		t.Fatal(err)
 	}
-	if corsDeclChanged(a, b) {
+	if required, _ := RequiresRestart(&Config{CORS: *a}, &Config{CORS: *b}); required {
 		t.Fatal("identical declarative CORS must compare equal despite compiled closures")
 	}
 	c := &CORSConfig{Enable: true, AllowedOrigins: []string{"https://y"}}
-	if !corsDeclChanged(a, c) {
+	if required, _ := RequiresRestart(&Config{CORS: *a}, &Config{CORS: *c}); !required {
 		t.Fatal("a real origin change must be detected")
 	}
 	// nil vs [] declarative fields are behaviour-neutral → equal.
 	d := &CORSConfig{Enable: false}
 	e := &CORSConfig{Enable: false, AllowedOrigins: []string{}}
-	if corsDeclChanged(d, e) {
+	if required, _ := RequiresRestart(&Config{CORS: *d}, &Config{CORS: *e}); required {
 		t.Fatal("nil vs empty origin list must compare equal")
 	}
 }
@@ -192,12 +192,12 @@ func TestServerReload_EffectiveLimitsNeutral(t *testing.T) {
 	defWS := defaultServerWSRead
 	unset := &ServerConfig{}
 	explicit := &ServerConfig{MaxRequestBody: &defBody, WSReadLimit: &defWS}
-	if serverRuntimeImmutableChanged(unset, explicit) {
+	if required, _ := RequiresRestart(&Config{Server: *unset}, &Config{Server: *explicit}); required {
 		t.Fatal("spelling the default explicitly must be behaviour-neutral")
 	}
 	other := int64(defBody + 1)
 	changed := &ServerConfig{MaxRequestBody: &other}
-	if !serverRuntimeImmutableChanged(unset, changed) {
+	if required, _ := RequiresRestart(&Config{Server: *unset}, &Config{Server: *changed}); !required {
 		t.Fatal("a real limit change must be detected")
 	}
 }

@@ -229,7 +229,10 @@ func cachingStreamHandler(
 		}
 
 		metaPart := grpcCacheKeyMetaPart(stream.Context(), rule.Cache.EffectiveKeyMetadata())
-		key := grpcCacheKey(rule.Fingerprint, method, req.Payload, rule.Cache.KeyMode, p.canonical, metaPart)
+		p.rulesMutex.RLock()
+		canonical := p.canonical
+		p.rulesMutex.RUnlock()
+		key := grpcCacheKey(rule.Fingerprint, method, req.Payload, rule.Cache.KeyMode, canonical, metaPart)
 
 		// Background refreshes keep the credential-stripped metadata but
 		// must not inherit the triggering client's cancellation.

@@ -720,7 +720,7 @@ type GrpcConfig struct {
 	Rules   []*GrpcRule `yaml:"rules,omitempty"`
 	// Protosets is the list of binary FileDescriptorSet files
 	// (produced by `protoc --descriptor_set_out=foo.protoset`).
-	// Loaded at startup and used by gRPC rules with
+	// Loaded at startup and when this list changes on reload; used by gRPC rules with
 	// `cache.keyMode: canonical` to decode + re-encode request
 	// payloads deterministically before hashing — collapses byte-
 	// level differences in protobuf serialization across clients.
@@ -933,9 +933,30 @@ func ReadConfigFromFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error reading config file: %v", err)
 	}
-	interpolated, err := EnvInterpolate(string(raw))
+	cfg, err := parseConfig(raw, os.LookupEnv, path)
 	if err != nil {
-		return nil, fmt.Errorf("error interpolating env vars in %s: %w", path, err)
+		return nil, err
+	}
+	if err := SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// ParseConfig parses, defaults, validates and compiles a fresh declarative config.
+// A nil lookupEnv treats every variable as unset. It does not publish global
+// state or initialize runtime services; DNS discovery remains declarative.
+func ParseConfig(raw []byte, lookupEnv func(string) (string, bool)) (*Config, error) {
+	return parseConfig(raw, lookupEnv, "config")
+}
+
+func parseConfig(raw []byte, lookupEnv func(string) (string, bool), source string) (*Config, error) {
+	if lookupEnv == nil {
+		lookupEnv = func(string) (string, bool) { return "", false }
+	}
+	interpolated, err := envInterpolate(string(raw), lookupEnv)
+	if err != nil {
+		return nil, fmt.Errorf("error interpolating env vars in %s: %w", source, err)
 	}
 	if err := detectRemovedConfigKeys([]byte(interpolated)); err != nil {
 		return nil, err
@@ -953,7 +974,7 @@ func ReadConfigFromFile(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("config file must contain only one YAML document")
 	}
-	if err := PrepareConfig(&cfg); err != nil {
+	if err := prepareConfig(&cfg, lookupEnv); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
@@ -991,6 +1012,16 @@ func detectRemovedConfigKeys(raw []byte) error {
 //
 // Idempotent — Compile() reinitializes the glob fields on each call.
 func PrepareConfig(cfg *Config) error {
+	if err := prepareConfig(cfg, os.LookupEnv); err != nil {
+		return err
+	}
+	if cfg == nil {
+		return nil
+	}
+	return SetTrustedProxies(cfg.Server.TrustedProxies)
+}
+
+func prepareConfig(cfg *Config, lookupEnv func(string) (string, bool)) error {
 	if cfg == nil {
 		return nil
 	}
@@ -1054,7 +1085,7 @@ func PrepareConfig(cfg *Config) error {
 	// Must run AFTER v3→v4 promotion (so cfg.Nodes[0] exists) and
 	// BEFORE per-node validation (so a bad env value fails startup
 	// the same way a bad YAML value would).
-	if err := applyEnvOverrides(cfg); err != nil {
+	if err := applyEnvOverrides(lookupEnv, cfg); err != nil {
 		return err
 	}
 	// Each upstream gets a stable name. Auto-assign when omitted.
@@ -1120,13 +1151,7 @@ func PrepareConfig(cfg *Config) error {
 	if err := validateGrpcLimits(&cfg.GRPC); err != nil {
 		return err
 	}
-	// Publish the trusted-proxies CIDR list so GetSourceIP /
-	// rate-limit / audit code can honor forwarded headers ONLY when
-	// the immediate peer is on the allowlist. Empty list → secure-
-	// by-default (every header is ignored). Validation lives inside
-	// SetTrustedProxies so a typo in a CIDR fails startup loudly
-	// rather than being silently treated as "trust nothing".
-	if err := SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+	if _, err := parseTrustedProxies(cfg.Server.TrustedProxies); err != nil {
 		return err
 	}
 	return nil

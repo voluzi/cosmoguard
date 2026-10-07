@@ -114,6 +114,11 @@ var upstreamRequestsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Upstream fetches cosmoguard performed, by pool, upstream, and rule. Excludes cache hits and coalesced single-flight waiters; internal HTTP retries within one request collapse to a single logical fetch (so misses − this = coalesced-away calls).",
 }, []string{"pool", "upstream", "rule_id"})
 
+var configReloadsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "cosmoguard_config_reloads_total",
+	Help: "Config reload attempts by outcome: applied, restart_required, or invalid (read, parse, or validation failure).",
+}, []string{"outcome"})
+
 // registerSharedMetricsOnce guards the process-wide registration so
 // multiple cosmoguards in one process (the test harness builds several)
 // don't panic on duplicate Register.
@@ -129,6 +134,11 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(upstreamHealthyGauge)
 		_ = prometheus.Register(cacheEvictionsCounter)
 		_ = prometheus.Register(upstreamRequestsCounter)
+		_ = prometheus.Register(configReloadsCounter)
+		// A zero baseline lets rate/increase observe the first reload outcome.
+		for _, outcome := range []string{"applied", "restart_required", "invalid"} {
+			configReloadsCounter.WithLabelValues(outcome)
+		}
 	})
 }
 
