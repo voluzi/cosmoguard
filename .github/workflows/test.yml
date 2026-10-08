@@ -110,6 +110,7 @@ jobs:
           FUZZTIME: ${{ github.event_name == 'schedule' && '5m' || '10s' }}
         run: make fuzz FUZZTIME="$FUZZTIME"
 
+  # The 30m + 45m suite deadlines leave 15m for setup within the job budget.
   bounded-l2:
     name: bounded l2 (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}

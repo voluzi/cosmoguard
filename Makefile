@@ -47,7 +47,7 @@ test.bounded-l2: ## Repeat storage and admission tests with the race detector.
 	go test -race -count=10 -timeout=30m ./internal/olricstore ./internal/bytebudget ./internal/boundedcall ./pkg/cache
 
 test.mixed-engine: ## Exercise native/custom joins, replication and departure.
-	go test -race -tags=integration -count=10 -timeout=60m ./pkg/cosmoguard -run TestMixedEngine
+	go test -race -tags=integration -count=10 -timeout=45m ./pkg/cosmoguard -run TestMixedEngine
 
 clean:
 	rm -rf $(BUILDDIR)/ coverage.out
