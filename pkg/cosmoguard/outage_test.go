@@ -32,7 +32,11 @@ func TestLimiterOutageUsesLocalDecisionsAndRecoversOnDenial(t *testing.T) {
 		require.NoError(t, err)
 		defer local.Close()
 		backend := &outageLimiter{err: olric.ErrOperationTimeout}
-		l := &boundedRateLimiter{RateLimiter: backend, local: local, operationGate: limiterOperations}
+		gate := boundedcall.NewRecovering(limiterOperationCapacity, limiterOperationBudget, func(outcome string) {
+			recordBackendOperationFailure("limiter", outcome)
+		}, func(unavailable bool) { recordBackendUnavailable("limiter", unavailable) })
+		defer gate.Close()
+		l := &boundedRateLimiter{RateLimiter: backend, local: local, operationGate: gate}
 		beforeAllowed := testutil.ToFloat64(limiterFallbackCounter.WithLabelValues("backend_unavailable", "allowed"))
 		beforeDenied := testutil.ToFloat64(limiterFallbackCounter.WithLabelValues("backend_unavailable", "denied"))
 		beforeState := testutil.ToFloat64(backendUnavailableGates.WithLabelValues("limiter"))
