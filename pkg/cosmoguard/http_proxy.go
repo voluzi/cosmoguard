@@ -399,8 +399,8 @@ func (p *HttpProxy) Shutdown(ctx context.Context) error {
 	// limiters below — otherwise in-flight handlers run against a
 	// freed pool or a closed Redis client and either panic or
 	// return nonsense to the still-connected caller.
-	if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		p.log.Warn("http proxy shutdown deadline exceeded; force-closing in-flight conns")
+	if err != nil {
+		p.log.Warn("http proxy shutdown interrupted; force-closing in-flight conns")
 		_ = p.server.Close()
 	}
 	if p.pool != nil {

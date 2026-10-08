@@ -76,8 +76,10 @@ type JsonRpcWebSocketProxy struct {
 	// conns is the live registry of connected clients, keyed by client
 	// pointer. Written once per connection lifecycle (register on
 	// upgrade, deregister on close) — never on the per-frame hot path.
-	connsMu sync.Mutex
-	conns   map[*JsonRpcWsClient]*wsConnInfo
+	connsMu       sync.Mutex
+	conns         map[*JsonRpcWsClient]*wsConnInfo
+	closing       bool
+	closeDeadline time.Time
 }
 
 type wsCoalescedResponse struct {
@@ -361,7 +363,9 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 		idObj = id
 	}
 	connectedAt := time.Now()
-	p.registerConn(client, source, idObj, connectedAt)
+	if !p.registerConn(client, source, idObj, connectedAt) {
+		return
+	}
 	p.recordLifecycle("CONNECT", source, identity, http.StatusSwitchingProtocols, 0)
 	defer func() {
 		p.deregisterConn(client)
@@ -428,14 +432,21 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 }
 
 // registerConn adds a freshly-upgraded client to the live registry.
-func (p *JsonRpcWebSocketProxy) registerConn(c *JsonRpcWsClient, sourceIP string, identity *Identity, at time.Time) {
+func (p *JsonRpcWebSocketProxy) registerConn(c *JsonRpcWsClient, sourceIP string, identity *Identity, at time.Time) bool {
 	info := &wsConnInfo{sourceIP: sourceIP, connectedAt: at, resolved: identity}
 	if identity != nil {
 		info.identity = identity.Name
 	}
 	p.connsMu.Lock()
+	if p.closing {
+		deadline := p.closeDeadline
+		p.connsMu.Unlock()
+		c.closeGoingAway(deadline)
+		return false
+	}
 	p.conns[c] = info
 	p.connsMu.Unlock()
+	return true
 }
 
 // deregisterConn drops a client from the live registry on disconnect.
@@ -923,4 +934,27 @@ func (p *JsonRpcWebSocketProxy) storeWSResponseAsync(hash uint64, response *Json
 		}
 		p.cgDashboard.RecordCardinality(p.section, ruleID, method)
 	}()
+}
+
+// HTTP shutdown does not own hijacked sockets. Marking closure under the registry
+// lock prevents an upgrade from escaping the snapshot while listeners stop.
+func (p *JsonRpcWebSocketProxy) drainConnections(ctx context.Context) {
+	deadline, _ := ctx.Deadline()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(time.Second)
+	}
+	p.connsMu.Lock()
+	p.closing = true
+	p.closeDeadline = deadline
+	clients := make([]*JsonRpcWsClient, 0, len(p.conns))
+	for c := range p.conns {
+		clients = append(clients, c)
+		delete(p.conns, c)
+	}
+	p.connsMu.Unlock()
+	tasks := make([]func() error, 0, len(clients))
+	for _, c := range clients {
+		tasks = append(tasks, func() error { c.closeGoingAway(deadline); return nil })
+	}
+	_ = shutdownTasks(ctx, tasks...)
 }

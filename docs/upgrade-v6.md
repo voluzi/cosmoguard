@@ -49,6 +49,12 @@ unchanged. No new operator configuration is required.
    `/healthz` answers during bootstrap; `/readyz` stays unavailable until the
    proxies serve and their upstream pools are healthy.
 
+9. SIGTERM now fails readiness while serving for five seconds, then closes traffic and operations
+   listeners concurrently. `DrainAndShutdown` implements that path; `Shutdown`
+   is immediate and interrupts a hold. Shutdown runs once, uses a fixed 29s total
+   capped by the caller's deadline, and can report incomplete cleanup rather than
+   extending beyond it. Cleanup workers retain ownership until they actually exit.
+
 ## Embedded Olric fork
 
 The fork starts from upstream v0.7.4 and includes these commits, in order:
@@ -111,6 +117,18 @@ its per-request bounded NX check, with no outage state, so healthy partitions ca
 still reject replayed tokens. Monitor `cosmoguard_backend_unavailable_gates` and
 the `unavailable` backend failures / L2 skips and `backend_unavailable` limiter
 fallback reasons. No operator settings are added.
+
+Termination requires no operator probe or lifecycle change: `/readyz` becomes 503
+at the signal, while health, metrics and traffic remain live for five seconds.
+At +5s traffic and operations listeners stop concurrently; HTTP and finite gRPC work drain until +24s.
+Stuck gRPC streams are forced closed at that deadline. WebSocket close code 1001
+is best effort under a bounded write; clients reconnect and resubscribe. Cleanup
+has at most 2s, capped at +26s; Olric graceful leave has at most 3s, capped at +29s.
+The fixed 29s absolute total fits the operator's 30s termination grace with margin
+and no preStop hook. Shorter caller budgets can curtail phases. The chart's 5s
+preStop plus the binary's 29s fits its 40s grace. Failed startup skips the hold.
+Local signal tests cannot prove an ingress converges within five seconds; the
+published-image on-prem rollout must check the remaining termination 502s.
 
 The native wire codecs are tested in both directions against the real default
 engine, including loopback migration, post-join replication, graceful departure,

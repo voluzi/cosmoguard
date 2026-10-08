@@ -363,6 +363,27 @@ cancels construction and cleans up immediately, including Olric's graceful leave
 Keep discovery of unready peers enabled and allow at least 60s for startup probes
 (for example 30 failures at two-second intervals), as the chart does.
 
+SIGTERM immediately changes `/readyz` to 503 while `/healthz`, metrics, information
+and application traffic continue serving for a fixed **five seconds**. This lets
+endpoints and ingress converge without a preStop hook. After the hold, all
+traffic and operations listeners stop concurrently. Admitted HTTP requests and finite gRPC calls drain
+until at most **24 seconds from the signal**; gRPC streams are forcibly stopped
+at that deadline. WebSocket clients receive a best-effort **1001 (going away)**
+close and their connections/notification queues are closed. Clients must reconnect
+and resubscribe; streams are not transferred to another replica.
+
+Consumer/telemetry cleanup gets up to **two seconds**, capped at signal +26s,
+then Olric gets up to **three seconds** for graceful leave, capped at signal +29s.
+All phases share that absolute deadline and shorter caller budgets can curtail
+any phase. Uncooperative cleanup remains owned but cannot extend process shutdown.
+The binary cannot infer the pod grace period; its fixed **29s total** fits the
+operator's 30s grace with one second of margin and no preStop hook. The chart's
+existing external 5s preStop and 40s grace remain compatible (at most 34s total).
+Failed startup and immediate `Shutdown` skip the propagation hold;
+`DrainAndShutdown` is the signal path. Five seconds cannot guarantee convergence
+of an unhealthy ingress/control plane; correlate termination with endpoint and
+proxy errors when checking a rollout.
+
 Response-cache L2 reads, existence checks and writes share one 128-slot byte gate
 per runtime, with a 100ms caller budget. L1 hits bypass it. Admission does not queue
 workers. Timeout, capacity rejection and backend outage use the cache-miss path;

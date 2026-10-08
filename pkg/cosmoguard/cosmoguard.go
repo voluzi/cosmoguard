@@ -53,8 +53,14 @@ type CosmoGuard struct {
 
 	// Metrics server, populated when Metrics.Enable is true. Per-instance so
 	// multiple CosmoGuards in one process don't clash on http.DefaultServeMux.
-	metricsServer *http.Server
-	constructed   atomic.Bool
+	metricsServer    *http.Server
+	constructed      atomic.Bool
+	draining         atomic.Bool
+	shutdownOnce     sync.Once
+	shutdownHoldOnce sync.Once
+	shutdownHold     chan struct{}
+	shutdownDone     chan struct{}
+	shutdownErr      error
 
 	// Standalone dashboard server, populated when Dashboard.IsEnabled
 	// is true. Bound on its own port so the metrics endpoint can be
@@ -749,7 +755,7 @@ func (cosmoGuard *CosmoGuard) startMetricsServer() error {
 			// have failed UnhealthyAfter times. Covers gRPC + EVM in
 			// addition to LCD + RPC so a gRPC-only or EVM-only
 			// deployment can't lie its way to ready.
-			if !cosmoGuard.constructed.Load() || !cosmoGuard.proxiesServing() || !cosmoGuard.allPoolsReady() {
+			if cosmoGuard.draining.Load() || !cosmoGuard.constructed.Load() || !cosmoGuard.proxiesServing() || !cosmoGuard.allPoolsReady() {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = w.Write([]byte("no healthy upstreams"))
 				return
@@ -1430,122 +1436,4 @@ func (f *CosmoGuard) snapshotConfig() *Config {
 	f.configMutex.Lock()
 	defer f.configMutex.Unlock()
 	return f.cfg
-}
-
-// Shutdown stops every proxy and the metrics server, releasing all listeners.
-// Drains in-flight requests via each proxy's Shutdown(ctx), force-closes on
-// deadline expiry, then tears down the upstream pools, caches, rate
-// limiters, auth, and tracing exporter in dependency order. The signal
-// handler in cmd/cosmoguard wires Shutdown into SIGTERM/SIGINT with a
-// configurable grace window.
-//
-// Safe to call multiple times. Returns the first non-nil error encountered.
-func (f *CosmoGuard) Shutdown(ctx context.Context) error {
-	f.constructed.Store(false)
-	var firstErr error
-	record := func(err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	// Wake the Run() goroutine for cfg-file-less instances (which
-	// would otherwise park on `<-runDone` forever) and let
-	// double-Shutdown stay safe via the sync.Once.
-	if f.runDone != nil {
-		f.runDoneOnce.Do(func() { close(f.runDone) })
-	}
-	// Close the config watcher (if WatchConfigFile is running). Closing
-	// the watcher closes its event channel, which lets the WatchConfigFile
-	// goroutine exit instead of blocking forever on the next receive.
-	// Swap to nil so a second Shutdown call (documented safe) doesn't
-	// double-close the underlying inotify FD.
-	if w := f.configWatcher.Swap(nil); w != nil {
-		record(w.Close())
-	}
-	// Stop the DNS reconciler before tearing down proxies so a
-	// reconcile in flight doesn't try to call AddUpstream on a pool
-	// that's about to close its conns.
-	if f.discovery != nil {
-		f.discovery.Stop()
-	}
-	if f.metricsServer != nil {
-		record(f.metricsServer.Shutdown(ctx))
-	}
-	if f.dashboardServer != nil {
-		record(f.dashboardServer.Shutdown(ctx))
-	}
-	if f.peerApiServer != nil {
-		record(f.peerApiServer.Shutdown(ctx))
-	}
-	if f.lcdProxy != nil {
-		record(f.lcdProxy.Shutdown(ctx))
-	}
-	if f.rpcProxy != nil {
-		record(f.rpcProxy.Shutdown(ctx))
-	}
-	if f.grpcProxy != nil {
-		record(f.grpcProxy.Shutdown(ctx))
-	}
-	if f.evmRpcProxy != nil {
-		record(f.evmRpcProxy.Shutdown(ctx))
-	}
-	if f.evmRpcWsProxy != nil {
-		record(f.evmRpcWsProxy.Shutdown(ctx))
-	}
-	// JSON-RPC handlers own their own cache (separate from the HTTP proxy
-	// cache); reap their goroutines too.
-	if f.jsonRpcHandler != nil {
-		record(f.jsonRpcHandler.Shutdown())
-	}
-	if f.evmJsonRpcHandler != nil {
-		record(f.evmJsonRpcHandler.Shutdown())
-	}
-	if f.evmJsonRpcWsHandler != nil {
-		record(f.evmJsonRpcWsHandler.Shutdown())
-	}
-	// Replay store (if configured) owns its own goroutine / Redis pool.
-	if f.auth != nil {
-		record(f.auth.Close())
-	}
-	// Flush in-flight spans + close the OTLP exporter. No-op when
-	// tracing was never set up. Use a fresh 5s deadline rather than
-	// the caller's ctx: by the time we reach this line the proxy
-	// drain has typically consumed most or all of the operator's
-	// shutdownGrace, and a cancelled flush silently drops buffered
-	// spans — exactly the symptom operators chase under "shutdown
-	// lost the last spans I needed".
-	if f.tracingShutdown != nil {
-		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		record(f.tracingShutdown(flushCtx))
-		cancel()
-	}
-	// Flush the final observability snapshot to the DMap BEFORE we
-	// tear down the olric runtime — otherwise the last 30s of
-	// counters (often the most interesting ones during a planned
-	// rollout) would be lost. Use a fresh 5s deadline rather than
-	// the caller's ctx for the same reason the tracing flush above
-	// does: by the time we reach this line the proxy drain has
-	// typically consumed most of the operator's shutdownGrace, and
-	// a cancelled flush silently drops the snapshot — exactly the
-	// data peers need to seed the restarting pod's dashboard.
-	if f.obsReplicator != nil {
-		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		record(f.obsReplicator.Close(flushCtx))
-		cancel()
-	}
-	// Stop the in-process olric daemon last: every other consumer
-	// (proxies, JSON-RPC handlers, auth) had a chance to drain
-	// in-flight work before we yank the embedded client out from
-	// under them. Same fresh-deadline reasoning as the obs flush and
-	// tracing exporter above: a cancelled ctx makes olric.Shutdown
-	// return immediately and skip the polite memberlist leave, so
-	// peers wait the full failure-detector timeout before redirecting
-	// traffic away from this pod. 5s is well past LeaveTimeout=500ms,
-	// so the cap doesn't cost a healthy shutdown anything.
-	if f.cluster != nil {
-		clusterCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		record(f.cluster.Close(clusterCtx))
-		cancel()
-	}
-	return firstErr
 }

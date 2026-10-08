@@ -27,10 +27,8 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      # Cosmoguard's main.go drains in-flight requests up to
-      # shutdownGrace (30s) on SIGTERM. Match that here so K8s
-      # doesn't SIGKILL the pod mid-drain. Configurable for slower
-      # WS subscribers via .Values.terminationGracePeriodSeconds.
+      # The optional preStop plus the binary's 29s absolute shutdown
+      # budget must fit this grace period to avoid SIGKILL during drain.
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 35 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}

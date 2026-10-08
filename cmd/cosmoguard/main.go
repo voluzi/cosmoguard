@@ -10,15 +10,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard"
 )
 
-const (
-	defaultConfigFileName = "cosmoguard.yaml"
-	shutdownGrace         = 30 * time.Second
-)
+const defaultConfigFileName = "cosmoguard.yaml"
 
 // Top-level flags live on the root FlagSet (flag.CommandLine). Subcommands
 // each get their own FlagSet so subcommand-specific flags don't pollute
@@ -205,18 +201,14 @@ func main() {
 		// operator needs to diagnose the failure — were lost.
 		if err != nil {
 			slog.Error("cosmoguard.Run returned", "error", err)
-			ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-			if sherr := f.Shutdown(ctx); sherr != nil {
+			if sherr := f.Shutdown(context.Background()); sherr != nil {
 				slog.Error("shutdown after Run error returned", "error", sherr)
 			}
-			cancel()
 			os.Exit(1)
 		}
 	case <-startupCtx.Done():
 		slog.Info("shutdown signal received, draining")
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-		defer cancel()
-		if err := f.Shutdown(ctx); err != nil {
+		if err := f.DrainAndShutdown(context.Background()); err != nil {
 			slog.Error("shutdown returned error", "error", err)
 			os.Exit(1)
 		}
