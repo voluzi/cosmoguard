@@ -179,17 +179,17 @@ func main() {
 		return
 	}
 
-	f, err := cosmoguard.NewFromFile(configFile)
+	startupCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	f, err := cosmoguard.NewFromFileContext(startupCtx, configFile)
 	if err != nil {
+		if startupCtx.Err() != nil {
+			slog.Info("startup canceled by shutdown signal")
+			return
+		}
 		slog.Error("cosmoguard startup failed", "error", err)
 		os.Exit(1)
 	}
-
-	// Trap SIGTERM/SIGINT for graceful shutdown. On signal: stop accepting
-	// new connections, drain in-flight requests up to shutdownGrace,
-	// release caches/limiters, then exit.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	runErrCh := make(chan error, 1)
 	go func() { runErrCh <- f.Run() }()
@@ -212,8 +212,8 @@ func main() {
 			cancel()
 			os.Exit(1)
 		}
-	case sig := <-sigCh:
-		slog.Info("shutdown signal received, draining", "signal", sig.String())
+	case <-startupCtx.Done():
+		slog.Info("shutdown signal received, draining")
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
 		if err := f.Shutdown(ctx); err != nil {

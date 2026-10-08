@@ -73,12 +73,19 @@ v5 compatibility; v3 configurations can use `cosmoguard migrate-config`.
   peers for a single cluster-wide view. OpenTelemetry tracing and
   Prometheus metrics round out the surface.
 
-Cluster startup has a 45s default budget; `/healthz` on the metrics port starts
-answering after the bootstrap gate. The chart's startup probe allows 60s; other
-manifests must allow at least 60s. Non-clustered request paths add no wait bounds
-or pools and share the startup default. Embedded tiered writes preserve their
-existing behavior: L2 errors leave L1 untouched. The deprecated rate-limit key
-is ignored in every deployment mode.
+The enabled metrics/ops listener starts during construction: `/healthz` answers
+while Olric bootstraps, and `/readyz` remains unavailable until the proxy
+listeners serve and their upstream pools are healthy. Discovery and daemon start
+have a 45s default budget. A joiner keeps waiting for routing while its cluster
+has quorum and the coordinator answers authenticated PINGs; 45s without that
+evidence aborts startup. SIGTERM cancels startup and shuts down the daemon, so
+it can announce its leave. Embedded tiered writes preserve their existing
+behavior: L2 errors leave L1 untouched. The deprecated rate-limit key is ignored
+in every deployment mode.
+
+Go embedders can cancel construction with `NewContext` or `NewFromFileContext`.
+`New` and `NewFromFile` now start the enabled metrics/ops listener; call `Shutdown`
+even when you have not called `Run`.
 
 ## Installation
 

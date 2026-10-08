@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -53,6 +54,7 @@ type CosmoGuard struct {
 	// Metrics server, populated when Metrics.Enable is true. Per-instance so
 	// multiple CosmoGuards in one process don't clash on http.DefaultServeMux.
 	metricsServer *http.Server
+	constructed   atomic.Bool
 
 	// Standalone dashboard server, populated when Dashboard.IsEnabled
 	// is true. Bound on its own port so the metrics endpoint can be
@@ -176,6 +178,11 @@ func nodeEvmWsAddrs(nodes []NodeConfig) ([]string, error) {
 // found. The detected v3 syntax keeps working forever; the warning is
 // cosmetic.
 func NewFromFile(path string) (*CosmoGuard, error) {
+	return NewFromFileContext(context.Background(), path)
+}
+
+// NewFromFileContext cancels startup and leaves the cluster when ctx is canceled.
+func NewFromFileContext(ctx context.Context, path string) (*CosmoGuard, error) {
 	slog.Info("loading config file", "file", path)
 	cfg, err := ReadConfigFromFile(path)
 	if err != nil {
@@ -190,7 +197,7 @@ func NewFromFile(path string) (*CosmoGuard, error) {
 			LogV3Detection(DetectV3Syntax(&rawCfg), path)
 		}
 	}
-	cg, err := New(cfg)
+	cg, err := NewContext(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -207,10 +214,19 @@ func NewFromFile(path string) (*CosmoGuard, error) {
 // PrepareConfig is safe to invoke on an already-prepared config, so the
 // NewFromFile path (which prepared during load) incurs no extra work.
 func New(cfg *Config) (*CosmoGuard, error) {
-	return newWithLookup(cfg, nil)
+	return NewContext(context.Background(), cfg)
+}
+
+// NewContext cancels startup and leaves the cluster when ctx is canceled.
+func NewContext(ctx context.Context, cfg *Config) (*CosmoGuard, error) {
+	return newWithLookupContext(ctx, cfg, nil)
 }
 
 func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
+	return newWithLookupContext(context.Background(), cfg, lookup)
+}
+
+func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	if err := PrepareConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -260,6 +276,9 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		if success {
 			return
 		}
+		if cosmoGuard.metricsServer != nil {
+			_ = cosmoGuard.metricsServer.Close()
+		}
 		if cosmoGuard.auth != nil {
 			_ = cosmoGuard.auth.Close()
 		}
@@ -277,6 +296,10 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 			cancel()
 		}
 	}()
+
+	if err := cosmoGuard.startMetricsServer(); err != nil {
+		return nil, fmt.Errorf("error starting metrics server: %w", err)
+	}
 
 	// Set up tracing once. SetupTracing installs the W3C propagator
 	// regardless of cfg.Tracing.Enable so traceparent headers flow
@@ -304,6 +327,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// share state across pods. Failure to start is fatal: downstream
 	// consumers assume the runtime is up.
 	cluster, err := newClusterRuntime(clusterRuntimeOptions{
+		Context:                 ctx,
+		Lookup:                  lookup,
 		Cluster:                 cfg.Cache.Cluster,
 		ResponsePoolBytes:       totalCacheBudget.L2MaxBytesPerNode,
 		ResponseLRUBytesPerDMap: cacheBudget.L2MaxBytesPerNode,
@@ -640,26 +665,27 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		}
 	}
 
-	// Construct (but don't yet start) the metrics + ops server. MUST REMAIN
-	// SYNCHRONOUS — Shutdown reads f.metricsServer without a lock, relying on
-	// the happens-before chain: New returns → caller obtains *CosmoGuard →
-	// caller may call Shutdown. If anyone moves this assignment into a
-	// goroutine launched from New the race detector will catch it.
-	//
-	// Each instance gets its own mux so multiple CosmoGuards in one process
-	// (e.g. tests) don't clash on http.DefaultServeMux. The mux serves:
-	//   * /metrics   — Prometheus exposition
-	//   * /healthz   — liveness probe (200 if the process is running)
-	//   * /readyz    — readiness probe; 200 iff every served upstream pool
-	//                  has at least one healthy member. /info's
-	//                  upstreams.healthy mirrors the same gate so the
-	//                  dashboard never says "3/3 healthy" while readiness
-	//                  is failing.
-	//
-	// Gated on Metrics.Enable so operators who explicitly disable the
-	// metrics endpoint don't get an unexpected port bound. Kubernetes
-	// deployments wanting health probes therefore need metrics enabled
-	// (the default).
+	// Standalone read-only dashboard listener. Independent of
+	// Metrics.Enable so an operator who turns metrics off can still
+	// run the dashboard, and vice versa. Construction here keeps the
+	// happens-before chain that Shutdown relies on (see metricsServer
+	// comment above): every server field assigned before New returns.
+	cosmoGuard.dashboardServer = installDashboardServer(cosmoGuard, &cfg.Dashboard, cfg.Host)
+	// Peer-API listener — present only in cluster mode. The fan-out
+	// aggregators on the public dashboard read from this listener on
+	// every cluster peer. Building it AFTER the cluster runtime + the
+	// dashboard observability surfaces means the handlers see a
+	// fully-wired CosmoGuard from the first request.
+	cosmoGuard.peerApiServer = installPeerAPIServer(cosmoGuard)
+
+	cosmoGuard.constructed.Store(true)
+	success = true
+	return cosmoGuard, nil
+}
+
+// Health probes must listen while the coordinator is still preparing routing.
+func (cosmoGuard *CosmoGuard) startMetricsServer() error {
+	cfg := cosmoGuard.cfg
 	if cfg.Metrics.IsEnabled() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
@@ -723,7 +749,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 			// have failed UnhealthyAfter times. Covers gRPC + EVM in
 			// addition to LCD + RPC so a gRPC-only or EVM-only
 			// deployment can't lie its way to ready.
-			if !cosmoGuard.allPoolsReady() {
+			if !cosmoGuard.constructed.Load() || !cosmoGuard.proxiesServing() || !cosmoGuard.allPoolsReady() {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = w.Write([]byte("no healthy upstreams"))
 				return
@@ -740,24 +766,35 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		if cfg.Metrics.WebUI.Enable {
 			installWebUI(mux, cosmoGuard, &cfg.Metrics.WebUI)
 		}
-		cosmoGuard.metricsServer = newMetricsServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Metrics.Port), mux, pprofEnabled)
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !cosmoGuard.constructed.Load() {
+				http.Error(w, "starting", http.StatusServiceUnavailable)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+		cosmoGuard.metricsServer = newMetricsServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Metrics.Port), handler, pprofEnabled)
+		listener, err := net.Listen("tcp", cosmoGuard.metricsServer.Addr)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := cosmoGuard.metricsServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+				slog.Error("metrics server returned", "error", err)
+			}
+		}()
 	}
 
-	// Standalone read-only dashboard listener. Independent of
-	// Metrics.Enable so an operator who turns metrics off can still
-	// run the dashboard, and vice versa. Construction here keeps the
-	// happens-before chain that Shutdown relies on (see metricsServer
-	// comment above): every server field assigned before New returns.
-	cosmoGuard.dashboardServer = installDashboardServer(cosmoGuard, &cfg.Dashboard, cfg.Host)
-	// Peer-API listener — present only in cluster mode. The fan-out
-	// aggregators on the public dashboard read from this listener on
-	// every cluster peer. Building it AFTER the cluster runtime + the
-	// dashboard observability surfaces means the handlers see a
-	// fully-wired CosmoGuard from the first request.
-	cosmoGuard.peerApiServer = installPeerAPIServer(cosmoGuard)
+	return nil
+}
 
-	success = true
-	return cosmoGuard, nil
+func (f *CosmoGuard) proxiesServing() bool {
+	for _, p := range []*HttpProxy{f.lcdProxy, f.rpcProxy, f.evmRpcProxy, f.evmRpcWsProxy} {
+		if p != nil && !p.serving.Load() {
+			return false
+		}
+	}
+	return f.grpcProxy != nil && f.grpcProxy.serving.Load()
 }
 
 // newMetricsServer bounds slow clients on the metrics/ops listener (which
@@ -807,15 +844,6 @@ func (f *CosmoGuard) Run() error {
 	// below, so the race is benign even if it occurred.
 	if f.discovery != nil {
 		f.discovery.Start()
-	}
-
-	if f.metricsServer != nil {
-		go func(srv *http.Server) {
-			slog.Info("starting metrics + ops server (/metrics, /healthz, /readyz)", "address", srv.Addr)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				slog.Error("error starting metrics server", "error", err)
-			}
-		}(f.metricsServer)
 	}
 
 	if f.dashboardServer != nil {
@@ -1413,6 +1441,7 @@ func (f *CosmoGuard) snapshotConfig() *Config {
 //
 // Safe to call multiple times. Returns the first non-nil error encountered.
 func (f *CosmoGuard) Shutdown(ctx context.Context) error {
+	f.constructed.Store(false)
 	var firstErr error
 	record := func(err error) {
 		if err != nil && firstErr == nil {

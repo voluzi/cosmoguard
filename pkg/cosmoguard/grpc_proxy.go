@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/voluzi/olric"
@@ -99,6 +100,7 @@ const (
 )
 
 type GrpcProxy struct {
+	serving       atomic.Bool
 	defaultAction RuleAction
 	rules         []*GrpcRule
 	listener      net.Listener
@@ -269,6 +271,8 @@ func (p *GrpcProxy) Run() error {
 		p.pool.StartHealthchecks()
 	}
 	p.log.WithField("address", p.listener.Addr().String()).Info("starting grpc proxy")
+	p.serving.Store(true)
+	defer p.serving.Store(false)
 	return p.server.Serve(p.listener)
 }
 

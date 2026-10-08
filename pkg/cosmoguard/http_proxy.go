@@ -8,12 +8,14 @@ import (
 	"io"
 	"maps"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,6 +42,7 @@ type Endpoint struct {
 }
 
 type HttpProxy struct {
+	serving          atomic.Bool
 	defaultAction    RuleAction
 	rules            []*HttpRule
 	server           *http.Server
@@ -368,7 +371,13 @@ func (p *HttpProxy) Run() error {
 	}
 
 	p.log.WithField("address", p.server.Addr).Infof("starting http proxy")
-	err := p.server.ListenAndServe()
+	listener, err := net.Listen("tcp", p.server.Addr)
+	if err != nil {
+		return err
+	}
+	p.serving.Store(true)
+	defer p.serving.Store(false)
+	err = p.server.Serve(listener)
 	if err == http.ErrServerClosed {
 		// Clean shutdown via Shutdown(); Run() returns nil so callers don't
 		// treat the orderly close as a fatal error.

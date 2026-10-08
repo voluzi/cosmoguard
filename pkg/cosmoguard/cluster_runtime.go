@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
+	"github.com/redis/go-redis/v9"
 	"github.com/voluzi/olric"
 	"github.com/voluzi/olric/config"
 
@@ -130,13 +131,13 @@ type clusterRuntime struct {
 // behaviour: loopback ephemeral ports, no peers, no replication. A
 // ClusterConfig with Enable=true switches to networked mode.
 type clusterRuntimeOptions struct {
+	Context context.Context
 	// Cluster is the operator-facing cluster config. nil → embedded-only.
 	Cluster *ClusterConfig
 	// LogOutput receives olric's own logs. Defaults to io.Discard because
 	// olric's default DEBUG verbosity drowns the cosmoguard log otherwise.
 	LogOutput io.Writer
-	// StartTimeout bounds discovery, daemon start and bootstrap together.
-	// The default leaves margin within the operator's 60s startup probe.
+	// StartTimeout bounds startup and loss of coordinator reachability.
 	StartTimeout time.Duration
 	// Lookup is the DNS resolver used by the discovery plugin. nil →
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
@@ -155,8 +156,12 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		opts.StartTimeout = 45 * time.Second
 	}
 
+	parent := opts.Context
+	if parent == nil {
+		parent = context.Background()
+	}
 	startedAt := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), opts.StartTimeout)
+	ctx, cancel := context.WithTimeout(parent, opts.StartTimeout)
 	defer cancel()
 
 	// The presence of a Cluster block is the operator's signal that
@@ -231,8 +236,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	c.LogLevel = config.LogLevelError
 	c.LogVerbosity = 1
 
-	// Leaving the cluster fast on shutdown — we never reuse this daemon
-	// after Close() so there's no need to give peers a polite goodbye.
+	// Bound the graceful leave broadcast within the process shutdown budget.
 	c.LeaveTimeout = 500 * time.Millisecond
 
 	var discovery *clusterServiceDiscovery
@@ -363,7 +367,14 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 
 	client := db.NewEmbeddedClient()
 	bootstrapAt := time.Now()
-	if err := waitClusterBootstrap(ctx, client); err != nil {
+	quorum := 1
+	password := ""
+	if clustered {
+		quorum, password = opts.Cluster.Quorum, opts.Cluster.EncryptionKey
+	}
+	if err := waitClusterBootstrapProgress(parent, client, opts.StartTimeout, func(ctx context.Context) bool {
+		return bootstrapCoordinatorReachable(ctx, client, password, quorum)
+	}); err != nil {
 		shutdownCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = db.Shutdown(shutdownCtx)
 		stop()
@@ -404,9 +415,9 @@ func waitClusterBootstrap(ctx context.Context, client interface {
 		mu.Lock()
 		defer mu.Unlock()
 		if last != nil {
-			return fmt.Errorf("%w (last bootstrap error: %w)", ctx.Err(), last)
+			return fmt.Errorf("%w (last bootstrap error: %w)", context.Cause(ctx), last)
 		}
-		return ctx.Err()
+		return context.Cause(ctx)
 	}
 	go func() {
 		logged := false
@@ -445,6 +456,69 @@ func waitClusterBootstrap(ctx context.Context, client interface {
 		}
 		return err
 	}
+}
+
+// A reachable coordinator may be scanning old owners before its first routing push.
+// Keep one native bootstrap worker, but bound waiting without live cluster evidence.
+func waitClusterBootstrapProgress(ctx context.Context, client interface {
+	NewDMap(string, ...olric.DMapOption) (olric.DMap, error)
+}, budget time.Duration, reachable func(context.Context) bool) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+	interval := min(time.Second, budget/4)
+	progress := make(chan bool, 1)
+	go func() {
+		for ctx.Err() == nil {
+			probeCtx, stop := context.WithTimeout(ctx, interval)
+			live := reachable(probeCtx)
+			stop()
+			select {
+			case progress <- live:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case <-time.After(interval):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- waitClusterBootstrap(ctx, client) }()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	for {
+		select {
+		case live := <-progress:
+			if live {
+				timer.Reset(budget)
+			}
+		case <-timer.C:
+			cancel(context.DeadlineExceeded)
+		case err := <-done:
+			return err
+		}
+	}
+}
+
+func bootstrapCoordinatorReachable(ctx context.Context, client *olric.EmbeddedClient, password string, quorum int) bool {
+	members, err := client.Members(ctx)
+	if err != nil || len(members) < quorum {
+		return false
+	}
+	for _, member := range members {
+		if !member.Coordinator {
+			continue
+		}
+		// A separate bounded connection avoids the data pool's routing/replica backlog.
+		probe := redis.NewClient(&redis.Options{Addr: member.Name, Password: password,
+			MaxRetries: -1, PoolSize: 1, ContextTimeoutEnabled: true,
+			DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second})
+		defer probe.Close()
+		return probe.Ping(ctx).Err() == nil
+	}
+	return false
 }
 
 // Client returns the in-process client used by cache, rate-limiter, and
