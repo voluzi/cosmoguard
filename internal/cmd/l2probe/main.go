@@ -140,7 +140,7 @@ func run() (result error) {
 	}
 	client := db.NewEmbeddedClient()
 	names := []string{"cosmoguard-grpc", "cosmoguard-lcd", "cosmoguard-jsonrpc", "cosmoguard-rpc", "cosmoguard-evm_jsonrpc", "cosmoguard-evm_rpc", "cosmoguard-evm_jsonrpc_ws", "cosmoguard-evm_rpc_ws"}
-	operations := cache.BoundedOperations(128, 100*time.Millisecond, *work<<20, nil, nil)
+	operations := cache.RecoveringOperations(128, 100*time.Millisecond, *work<<20, nil, nil, nil)
 	defer operations.CloseOperations()
 	var caches []cache.Cache[string, []byte]
 	for _, name := range names[:*maps] {

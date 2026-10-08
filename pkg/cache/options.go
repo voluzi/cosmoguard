@@ -106,6 +106,7 @@ func (opt Option) CloseOperations() {
 }
 
 // RecoveringOperations skips repeated backend waits during an outage.
+// State callbacks run synchronously under the gate lock and must not re-enter it.
 func RecoveringOperations(capacity int, budget time.Duration, maxBytes uint64, onFailure func(string), onSkip func(string), onUnavailable func(bool)) Option {
 	return boundedOperations(boundedcall.NewRecovering(capacity, budget, onFailure, onUnavailable), maxBytes, onSkip)
 }

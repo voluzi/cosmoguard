@@ -141,4 +141,31 @@ contention and replay timing contracts remain the deterministic test gates.
 Investigate a 95% breach; OOM-free is insufficient. If failure implicates
 pre-admission transport allocations, obtain approval for a concrete Olric/redcon
 byte-admission patch before changing the dependency further. The approved fork
-contains only engine selection/module rename and the two approved race fixes.
+contains engine selection/module rename, two race fixes, bounded parallel ownership
+scans, membership progress and fragment retirement fixes; see the commit table in
+[the v6 upgrade guide](upgrade-v6.md).
+
+
+## Replacement outage and termination evidence
+
+For each replacement, capture the signal time, readiness transition, last new
+connection, traffic drain completion, and Olric leave. v6 holds readiness at 503
+while traffic/operations listeners serve for 5s, then stops those listeners
+concurrently. Traffic is capped at signal +24s, consumer cleanup at +26s, and
+Olric leave at +29s. The operator's 30s grace requires no preStop hook. These
+changes do not alter termination behavior in an old v5.1.0 container.
+
+Capture `cosmoguard_backend_unavailable_gates`, `unavailable` operation failures
+and L2 skips, and `backend_unavailable` limiter fallbacks. Response and limiter
+gates suppress calls after three executed-operation timeouts, then allow one
+foreground recovery probe after 1s. Replay keeps its per-request bounded NX check.
+Compare 20s survivor slices with that run's own healthy control, including the
+clustered limiter; after the initial timeout wave require at least 80% of control
+and no repeated multi-second p95 slices. Check that shared limiter decisions and
+cross-pod L2 hits resume after recovery. Do not count higher fallback throughput
+alone as proof that cross-pod cache sharing recovered.
+
+During slow bootstrap, `/healthz` must answer while `/readyz` stays 503. Preserve
+old and new coordinator logs, pod events and rendered probes/lifecycle settings.
+Published-image mixed rollout, real ingress convergence and the full soak remain
+coordinator gates; loopback and diagnostic containers do not certify them.
