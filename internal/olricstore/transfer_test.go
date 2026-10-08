@@ -2,6 +2,7 @@ package olricstore
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -172,10 +173,54 @@ func TestTransferScratchRejectedThenRetry(t *testing.T) {
 		t.Fatal("leak")
 	}
 }
+func TestNativeRunContainerPackRoundTrip(t *testing.T) {
+	data, err := os.ReadFile("testdata/native-run-pack.msgpack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pack nativePack
+	if err := msgpack.Unmarshal(data, &pack); err != nil {
+		t.Fatal(err)
+	}
+	// Roaring's run cookie follows the 64-bit bucket count and 32-bit bucket key.
+	if binary.LittleEndian.Uint32(pack.OffsetIndex[12:16])&65535 != 12347 || pack.OffsetIndex[16]&1 == 0 {
+		t.Fatal("fixture does not contain a run container")
+	}
+	_, bounded := testEngine(t, 8<<20, Response)
+	native := nativeEngine(t)
+	for _, engine := range []storage.Engine{bounded, native} {
+		if err := engine.Import(data, func(h uint64, v storage.Entry) error { return engine.PutRaw(h, v.Encode()) }); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := engine.GetRaw(42)
+		if err != nil || !bytes.Equal(raw, pack.Memory) {
+			t.Fatal("native run record", err)
+		}
+	}
+	exported, _, err := bounded.TransferIterator().Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := native.Import(exported, func(h uint64, v storage.Entry) error { return native.PutRaw(h, v.Encode()) }); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := native.GetRaw(42)
+	if err != nil || !bytes.Equal(raw, pack.Memory) {
+		t.Fatal("native run round trip", err)
+	}
+}
+
 func FuzzNativePackImport(f *testing.F) {
 	p := nativePack{Allocated: MaxEntryBytes, State: 2, HKeys: map[uint64]uint64{}, OffsetIndex: make([]byte, 8)}
 	b, _ := msgpack.Marshal(p)
 	f.Add(b)
+	for _, name := range []string{"native-pack.msgpack", "native-run-pack.msgpack"} {
+		seed, err := os.ReadFile("testdata/" + name)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(seed)
+	}
 	f.Add([]byte{0xdf, 255, 255, 255, 255})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if len(b) > 2<<20 {
