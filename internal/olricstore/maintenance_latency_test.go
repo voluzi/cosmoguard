@@ -56,10 +56,10 @@ func TestEngineSmallEntryMaintenance(t *testing.T) {
 	if stats.Entries != entries-uint64((entries+270)/271)-deletes || stats.Allocated > stats.Capacity {
 		t.Fatal("maintenance lost live entries or exceeded cap", stats)
 	}
-	if err := p.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	if sweep > time.Second || burst > time.Second {
 		t.Fatalf("pool stalled: sweep=%s, 512 deletes=%s", sweep, burst)
+	}
+	if err := p.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
