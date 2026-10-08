@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/stretchr/testify/require"
-	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
-	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 func TestFullResponsePoolClassifiesRealClientCapacitySkip(t *testing.T) {
