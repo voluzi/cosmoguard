@@ -33,7 +33,7 @@ unchanged. No new operator configuration is required.
    gauges for capacity decisions.
 6. The embedded Olric dependency is now **the voluzi fork**, module
    `github.com/voluzi/olric`, pinned at
-   `v0.7.5-0.20261008191836-b3cbf68722e4`. Consumers that interact with Olric Go
+   `v0.7.5-0.20261008215859-1feb3c1e6cd4`. Consumers that interact with Olric Go
    types must update their Olric imports and requirement as well. There is **no
    replace directive**, including for downstream builds. The public module
    downloads through the default Go proxy. The fork changes listed below retain
@@ -68,6 +68,8 @@ The fork starts from upstream v0.7.4 and includes these commits, in order:
 | `cbe50ad` | Run ownership-length RPCs with bounded parallelism and apply their results in the original order, preserving pruning decisions while reducing serial scan delay. |
 | `980fe50` | Process membership changes and close departed client pools while routing work waits; coalesce routing notifications into the existing worker. |
 | `b3cbf68` | Lock and check fragment retirement before storage access, retry stale lookups, and prevent a queued janitor from removing a recreated fragment. Preserve already-read values when shutdown interrupts the idle check. |
+| `d8d805a` | Finish compaction when a fragment is retired and skip retired storage during eviction, preventing a janitor collision from stopping all later expiry sweeps. |
+| `1feb3c1` | Test parallel pruning over 271 partitions with shared published owner backing; assert identical serial results and no mutation under the race detector. No production change. |
 
 Public integration regressions exercise acknowledged Put/Get/Delete and
 Destroy/recreate with both the default and custom engines. The fork changes do
