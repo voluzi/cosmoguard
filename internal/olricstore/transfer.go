@@ -398,9 +398,6 @@ func (e *Engine) Import(data []byte, f func(uint64, storage.Entry) error) error 
 		kl := int(b[0])
 		n := 29 + kl + int(binary.BigEndian.Uint32(b[25+kl:29+kl]))
 		b = b[:n]
-		if expiredRaw(b, time.Now().UnixMilli()) {
-			continue
-		}
 		v := NewEntry()
 		v.Decode(b)
 		if err := f(k.hash, v); err != nil {
