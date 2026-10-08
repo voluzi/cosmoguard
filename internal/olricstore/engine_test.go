@@ -16,9 +16,6 @@ import (
 func testEngine(t *testing.T, limit uint64, policy Policy) (*Pool, *Engine) {
 	t.Helper()
 	p := NewPool(limit, policy, nil)
-	if err := p.Start(t.Context()); err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		if err := p.Close(context.Background()); err != nil {
 			t.Error(err)
@@ -165,7 +162,6 @@ func TestEngineExpiryAllDMapsAndBackups(t *testing.T) {
 	p, security := testEngine(t, 8<<20, Security)
 	_ = security.Put(1, item("persistent", 1))
 	response := NewPool(8<<20, Response, nil)
-	_ = response.Start(t.Context())
 	t.Cleanup(func() { _ = response.Close(context.Background()) })
 	var children []*Engine
 	for range 16 {
@@ -181,6 +177,9 @@ func TestEngineExpiryAllDMapsAndBackups(t *testing.T) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for response.Snapshot().Entries != 0 && time.Now().Before(deadline) {
+		for _, child := range children {
+			_, _ = child.Compaction()
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	if response.Snapshot().Entries != 0 || response.Snapshot().Allocated != uint64(len(children))*fragmentCharge {

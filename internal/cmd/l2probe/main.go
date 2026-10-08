@@ -109,6 +109,7 @@ func run() (result error) {
 	c.LogOutput = nil
 	c.Logger = log.New(io.Discard, "", 0)
 	c.LeaveTimeout = 500 * time.Millisecond
+	c.DMaps.TriggerCompactionInterval = time.Second
 	c.DMaps.Engine = &config.Engine{Implementation: olricstore.NewEngine(response)}
 	c.DMaps.EvictionPolicy = config.LRUEviction
 	c.DMaps.MaxInuse = int(per.L2MaxBytesPerNode / 2)
@@ -136,12 +137,6 @@ func run() (result error) {
 		return err
 	case <-time.After(30 * time.Second):
 		return errors.New("start timeout")
-	}
-	if err := response.Start(context.Background()); err != nil {
-		return err
-	}
-	if err := security.Start(context.Background()); err != nil {
-		return err
 	}
 	client := db.NewEmbeddedClient()
 	names := []string{"cosmoguard-grpc", "cosmoguard-lcd", "cosmoguard-jsonrpc", "cosmoguard-rpc", "cosmoguard-evm_jsonrpc", "cosmoguard-evm_rpc", "cosmoguard-evm_jsonrpc_ws", "cosmoguard-evm_rpc_ws"}

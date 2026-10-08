@@ -290,6 +290,8 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 			_ = securityPool.Close(context.Background())
 		}
 	}()
+	// Compaction holds the fragment lock while expiring primary and backup records.
+	c.DMaps.TriggerCompactionInterval = time.Second
 	c.DMaps.Engine = &config.Engine{Implementation: olricstore.NewEngine(responsePool)}
 	replicaFactor := 1
 	if clustered && opts.Cluster.ReplicaCount > 0 {
@@ -372,14 +374,6 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	}
 	slog.Info("olric bootstrap ready", "bootstrap_wait", time.Since(bootstrapAt), "startup_elapsed", time.Since(startedAt))
 
-	if err := responsePool.Start(context.Background()); err != nil {
-		_ = db.Shutdown(context.Background())
-		return nil, err
-	}
-	if err := securityPool.Start(context.Background()); err != nil {
-		_ = db.Shutdown(context.Background())
-		return nil, err
-	}
 	success = true
 	cr := &clusterRuntime{
 		db:           db,

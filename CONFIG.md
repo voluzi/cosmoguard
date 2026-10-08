@@ -251,8 +251,9 @@ room. A capacity rejection preserves an existing record on failed growth.
 
 Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor allowance;
 records include fixed indexes/headers and size-class rounding. Empty fragments
-have a small metadata charge rather than a 1MiB table. A pool-owned sweep visits
-all live fragments independently of Olric's DMap order. Expired records release
+have a small metadata charge rather than a 1MiB table. Olric compaction visits
+every primary and backup fragment once per second, holding the fragment lock
+so expiry cannot invalidate an in-progress conditional write or LRU selection. Expired records release
 blocks and fully unused slabs release backing and descriptors for natural GC.
 Security records expire only according to their existing TTL policies.
 Clustered deployments retain **271 partitions** and separate protocol DMaps;

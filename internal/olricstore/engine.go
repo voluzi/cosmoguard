@@ -44,8 +44,6 @@ type Pool struct {
 	nextID                                                 uint64
 	used, entries, putRejected, rawRejected, importDropped uint64
 	codec                                                  *bytebudget.Budget
-	cancel                                                 context.CancelFunc
-	done                                                   chan struct{}
 	closed                                                 bool
 }
 type Engine struct {
@@ -69,49 +67,12 @@ func NewPool(limit uint64, policy Policy, observer Observer) *Pool {
 	}
 	return &Pool{arena: arena{limit: limit}, policy: policy, observer: observer, codec: bytebudget.New(scratch)}
 }
-func (p *Pool) Start(ctx context.Context) error {
+func (p *Pool) Close(_ context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
-		return ErrClosed
-	}
-	if p.cancel != nil {
-		return nil
-	}
-	ctx, p.cancel = context.WithCancel(ctx)
-	p.done = make(chan struct{})
-	go func() {
-		defer close(p.done)
-		t := time.NewTicker(time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				p.sweep(ctx)
-			}
-		}
-	}()
-	return nil
-}
-func (p *Pool) Close(ctx context.Context) error {
-	p.mu.Lock()
 	p.closed = true
-	if p.cancel != nil {
-		p.cancel()
-	}
-	done := p.done
 	for p.engines != nil {
 		p.engines.destroyLocked()
-	}
-	p.mu.Unlock()
-	if done != nil {
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 	}
 	return nil
 }

@@ -34,6 +34,9 @@ type mixedNode struct {
 }
 
 func startMixedNode(t *testing.T, bounded bool, peer string, cap uint64) *mixedNode {
+	return startMixedNodeConfigured(t, bounded, peer, cap, nil)
+}
+func startMixedNodeConfigured(t *testing.T, bounded bool, peer string, cap uint64, configure func(*config.Config, *mixedNode)) *mixedNode {
 	t.Helper()
 	ports := reserveLoopbackPorts(t, 2)
 	c := config.New("local")
@@ -61,6 +64,7 @@ func startMixedNode(t *testing.T, bounded bool, peer string, cap uint64) *mixedN
 	c.LeaveTimeout = 500 * time.Millisecond
 	n := &mixedNode{address: c.MemberlistConfig.Name, gossip: net.JoinHostPort(c.BindAddr, strconv.Itoa(ports[1]))}
 	if bounded {
+		c.DMaps.TriggerCompactionInterval = time.Second
 		n.pool = olricstore.NewPool(cap, olricstore.Response, nil)
 		n.security = olricstore.NewPool(0, olricstore.Security, nil)
 		c.DMaps.Engine = &config.Engine{Implementation: olricstore.NewEngine(n.pool)}
@@ -68,8 +72,9 @@ func startMixedNode(t *testing.T, bounded bool, peer string, cap uint64) *mixedN
 		for _, name := range evictionExemptDMaps {
 			c.DMaps.Custom[name] = config.DMap{Engine: &config.Engine{Implementation: olricstore.NewEngine(n.security)}, EvictionPolicy: config.EvictionPolicy("NONE")}
 		}
-		require.NoError(t, n.pool.Start(t.Context()))
-		require.NoError(t, n.security.Start(t.Context()))
+	}
+	if configure != nil {
+		configure(c, n)
 	}
 	t.Cleanup(func() { n.close(t) })
 	if peer != "" {
