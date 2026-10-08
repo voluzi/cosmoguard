@@ -89,11 +89,7 @@ func (p *Pool) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				p.mu.Lock()
-				for e := p.engines; e != nil; e = e.next {
-					e.sweepLocked(time.Now().UnixMilli())
-				}
-				p.mu.Unlock()
+				p.sweep(ctx)
 			}
 		}
 	}()
@@ -161,10 +157,13 @@ func (e *Engine) Fork(*storage.Config) (storage.Engine, error) {
 	if err := e.readyLocked(); err != nil {
 		return nil, err
 	}
-	child := NewEngine(e.p)
-	if err := child.registerLocked(); err != nil {
-		return nil, err
+	if !e.p.arena.reserve(fragmentCharge) {
+		return nil, ErrCapacity
 	}
+	e.p.nextID++
+	child := &Engine{p: e.p, id: e.p.nextID, next: e.p.engines}
+	e.p.engines = child
+	e.p.used += fragmentCharge
 	return child, nil
 }
 func field(b []byte, off int) uint64       { return binary.LittleEndian.Uint64(b[off : off+8]) }
@@ -283,6 +282,11 @@ func (e *Engine) PutRaw(h uint64, b []byte) error {
 func (e *Engine) put(h uint64, v []byte, isRaw bool) error {
 	e.p.mu.Lock()
 	err := e.putLocked(h, v)
+	if err == nil && !isRaw {
+		loc, _ := e.findLocked(h)
+		raw := rawRecord(e.p.arena.block(loc))
+		binary.BigEndian.PutUint64(raw[17+int(raw[0]):], uint64(time.Now().UnixNano()))
+	}
 	if errors.Is(err, ErrCapacity) {
 		if isRaw {
 			e.p.rawRejected++
@@ -416,6 +420,7 @@ func (e *Engine) UpdateTTL(h uint64, v storage.Entry) error {
 	k := int(b[0])
 	binary.BigEndian.PutUint64(b[1+k:9+k], uint64(v.TTL()))
 	binary.BigEndian.PutUint64(b[9+k:17+k], uint64(v.Timestamp()))
+	binary.BigEndian.PutUint64(b[17+k:25+k], uint64(time.Now().UnixNano()))
 	loc, _ := e.findLocked(h)
 	e.unlinkOrderLocked(loc)
 	e.appendOrderLocked(loc)
@@ -513,7 +518,13 @@ func (e *Engine) walk(after, high uint64, f func(token) bool) {
 	}
 }
 func (e *Engine) RangeHKey(f func(uint64) bool) {
-	e.walk(0, e.highWater(), func(t token) bool { _, ok := e.copyToken(t); return !ok || f(t.hash) })
+	e.walk(0, e.highWater(), func(t token) bool {
+		e.p.mu.Lock()
+		loc, _ := e.findLocked(t.hash)
+		ok := e.readyLocked() == nil && loc != 0 && field(e.p.arena.block(loc), 32) == t.generation
+		e.p.mu.Unlock()
+		return !ok || f(t.hash)
+	})
 }
 func (e *Engine) Range(f func(uint64, storage.Entry) bool) {
 	high := e.highWater()

@@ -113,3 +113,22 @@ func TestResponseBytePressureDoesNotConsumeLimiterOrReplaySlots(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 }
+
+func TestDMapLockLeaseAndTokenUnlock(t *testing.T) {
+	cr, err := newClusterRuntime(clusterRuntimeOptions{ResponsePoolBytes: 4 << 20})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, cr.Close(context.Background())) })
+	dm, err := cr.Client().NewDMap(rateLimitLocksDMap)
+	require.NoError(t, err)
+	lock, err := dm.LockWithTimeout(t.Context(), "lease", time.Second, time.Second)
+	require.NoError(t, err)
+	require.NoError(t, lock.Lease(t.Context(), 2*time.Second))
+	r, err := dm.Get(t.Context(), "lease")
+	require.NoError(t, err)
+	require.Greater(t, r.TTL(), time.Now().Add(time.Second).UnixMilli())
+	require.NoError(t, lock.Unlock(t.Context()))
+	next, err := dm.LockWithTimeout(t.Context(), "lease", time.Second, time.Second)
+	require.NoError(t, err)
+	require.Error(t, lock.Unlock(t.Context()))
+	require.NoError(t, next.Unlock(t.Context()))
+}

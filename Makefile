@@ -38,6 +38,16 @@ fuzz:
 	go test -run=^$$ -fuzz=FuzzParseJsonRpcMessage     -fuzztime=$(FUZZTIME) ./pkg/cosmoguard
 	go test -run=^$$ -fuzz=FuzzHttpRuleCompile         -fuzztime=$(FUZZTIME) ./pkg/cosmoguard
 	go test -run=^$$ -fuzz=FuzzCompileOriginAllowlist  -fuzztime=$(FUZZTIME) ./pkg/cosmoguard
+	go test -run=^$$ -fuzz=FuzzAllocatorModel         -fuzztime=$(FUZZTIME) ./internal/olricstore
+	go test -run=^$$ -fuzz=FuzzNativeEntryDecode      -fuzztime=$(FUZZTIME) ./internal/olricstore
+	go test -run=^$$ -fuzz=FuzzNativePackImport       -fuzztime=$(FUZZTIME) ./internal/olricstore
+
+test.bounded-l2: ## Repeat storage and admission tests with the race detector.
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-bounded-l2-runner.py
+	go test -race -count=10 -timeout=30m ./internal/olricstore ./internal/bytebudget ./internal/boundedcall ./pkg/cache
+
+test.mixed-engine: ## Exercise native/custom joins, replication and departure.
+	go test -race -tags=integration -count=10 -timeout=60m ./pkg/cosmoguard -run TestMixedEngine
 
 clean:
 	rm -rf $(BUILDDIR)/ coverage.out
@@ -63,4 +73,4 @@ helm.package: $(BUILDDIR)/
 		--app-version $(VERSION:v%=%) \
 		-d $(BUILDDIR)
 
-.PHONY: all $(BUILD_TARGETS) test test-race test-cover fuzz clean helm.package compat
+.PHONY: all $(BUILD_TARGETS) test test-race test-cover fuzz clean helm.package compat test.bounded-l2 test.mixed-engine

@@ -195,24 +195,7 @@ func (c *OlricCache[K, V]) keyStr(key K) string {
 	return fmt.Sprintf("%v", key)
 }
 
-// marshalForOlric encodes a value for storage. []byte payloads are passed
-// through directly; everything else goes through msgpack.
-func marshalForOlric(value any) ([]byte, error) {
-	if b, ok := value.([]byte); ok {
-		// Defensive copy: olric writes msgpack-wrapped bytes for non-byte
-		// values, so we mirror the "value is fully owned by olric after
-		// Put" contract by copying. If the caller mutates the slice after
-		// Set, the cached entry stays intact.
-		cp := make([]byte, len(b))
-		copy(cp, b)
-		return cp, nil
-	}
-	return EncodeValue(value)
-}
-
-// unmarshalFromOlric is the inverse of marshalForOlric. When V is []byte we
-// hand back a defensive copy of the payload; otherwise we msgpack-decode
-// into V.
+// unmarshalFromOlric copies byte payloads or decodes MessagePack into V.
 //
 // The copy matters for embedded-mode reads: olric's GetResponse.Byte() walks
 // through resp.Scan, which for *[]byte aliases the entry's internal buffer
@@ -220,7 +203,7 @@ func marshalForOlric(value any) ([]byte, error) {
 // stored slice directly. For keys whose partition owner is this pod, the
 // returned []byte therefore shares memory with the cache's in-memory store
 // — a caller that mutates the slice would corrupt the cached value for
-// every subsequent reader. Symmetric to marshalForOlric, which copies on
+// every subsequent reader. Symmetric to marshalBounded, which copies on
 // the way in.
 func unmarshalFromOlric[V any](raw []byte) (V, error) {
 	var zero V

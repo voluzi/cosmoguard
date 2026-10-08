@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -111,7 +112,7 @@ func TestPoolConcurrentAdmissionAllWritePaths(t *testing.T) {
 func TestEngineLastAccessNativeSemantics(t *testing.T) {
 	_, e := testEngine(t, 8<<20, Response)
 	v := item("k", 5)
-	_ = e.Put(1, v)
+	_ = e.PutRaw(1, v.Encode())
 	raw, _ := e.GetRaw(1)
 	if !bytes.Equal(raw, v.Encode()) {
 		t.Fatal("raw changed access")
@@ -277,5 +278,72 @@ func TestEngineCloseDestroyRaces(t *testing.T) {
 	wg.Wait()
 	if p.Snapshot().Allocated != 0 {
 		t.Fatal("destroy leak")
+	}
+}
+
+func TestEnginePutInitializesNativeLastAccess(t *testing.T) {
+	_, bounded := testEngine(t, 8<<20, Response)
+	for _, e := range []storage.Engine{nativeEngine(t), bounded} {
+		v := item("k", 5)
+		before := time.Now().UnixNano()
+		if err := e.Put(1, v); err != nil {
+			t.Fatal(err)
+		}
+		access, err := e.GetLastAccess(1)
+		if err != nil || access < before || access > time.Now().UnixNano() {
+			t.Fatalf("Put must initialize access time: %d, %v", access, err)
+		}
+		if v.LastAccess() != 456 {
+			t.Fatal("Put mutated caller entry")
+		}
+	}
+}
+
+func TestEngineRangeHKeyDoesNotCopyPayloads(t *testing.T) {
+	_, e := testEngine(t, 32<<20, Response)
+	for i := uint64(0); i < 10; i++ {
+		if err := e.Put(i, item(fmt.Sprint(i), 900<<10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := 0
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	e.RangeHKey(func(uint64) bool { seen++; return true })
+	runtime.ReadMemStats(&after)
+	if seen != 10 {
+		t.Fatalf("visited %d hashes", seen)
+	}
+	if after.TotalAlloc-before.TotalAlloc >= 1<<20 {
+		t.Fatal("hash traversal copied value payloads")
+	}
+}
+
+func TestEngineUpdateTTLNativeLastAccess(t *testing.T) {
+	_, bounded := testEngine(t, 8<<20, Response)
+	for _, e := range []storage.Engine{nativeEngine(t), bounded} {
+		v := item("key", 5)
+		if err := e.PutRaw(1, v.Encode()); err != nil {
+			t.Fatal(err)
+		}
+		v.SetTTL(time.Now().Add(time.Hour).UnixMilli())
+		v.SetTimestamp(789)
+		before := time.Now().UnixNano()
+		if err := e.UpdateTTL(1, v); err != nil {
+			t.Fatal(err)
+		}
+		access, err := e.GetLastAccess(1)
+		if err != nil || access < before || access > time.Now().UnixNano() {
+			t.Fatalf("UpdateTTL access: %d, %v", access, err)
+		}
+		raw, err := e.GetRaw(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := NewEntry()
+		out.Decode(raw)
+		if out.Timestamp() != 789 || out.TTL() != v.TTL() || !bytes.Equal(out.Value(), v.Value()) {
+			t.Fatal("TTL update changed payload or omitted metadata")
+		}
 	}
 }

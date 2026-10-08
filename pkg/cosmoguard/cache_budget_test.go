@@ -1,6 +1,9 @@
 package cosmoguard
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // withMemoryLimit swaps the injectable limit provider for the duration of a
 // test so budget resolution can be exercised deterministically without
@@ -150,5 +153,15 @@ func TestCountResponseCaches(t *testing.T) {
 	}
 	if n := countResponseCaches(&Config{EnableEvm: true}); n != 8 {
 		t.Errorf("evm should build 8 caches, got %d", n)
+	}
+}
+func TestResponseWorkBudgetProfiles(t *testing.T) {
+	for _, tc := range []struct{ limit, want uint64 }{{250 << 20, 16 << 20}, {500 << 20, 32 << 20}, {1 << 30, 64 << 20}, {2 << 30, 64 << 20}} {
+		t.Run(fmt.Sprint(tc.limit), func(t *testing.T) {
+			withMemoryLimit(t, tc.limit, true)
+			if got := responseWorkBytes(); got != tc.want {
+				t.Fatalf("work allowance %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

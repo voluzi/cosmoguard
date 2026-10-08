@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"runtime/metrics"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -32,6 +33,9 @@ func newL2Collector() *l2Collector {
 		c.descs = append(c.descs, prometheus.NewDesc("cosmoguard_l2_"+name, "Active runtime "+name+"; capacity zero means unlimited.", []string{"pool"}, nil))
 	}
 	c.descs = append(c.descs, prometheus.NewDesc("cosmoguard_l2_operation_bytes", "Active response operation reservations.", nil, nil), prometheus.NewDesc("cosmoguard_l2_operation_capacity_bytes", "Active response operation capacities.", nil, nil))
+	c.descs = append(c.descs,
+		prometheus.NewDesc("cosmoguard_gc_cpu_seconds_total", "Process GC CPU seconds.", nil, nil),
+		prometheus.NewDesc("cosmoguard_gc_limiter_last_enabled_cycle", "Last GC cycle that enabled the runtime limiter.", nil, nil))
 	return c
 }
 func (c *l2Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -71,6 +75,10 @@ func (c *l2Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(c.descs[6], prometheus.GaugeValue, float64(reserved))
 	ch <- prometheus.MustNewConstMetric(c.descs[7], prometheus.GaugeValue, float64(capacity))
+	samples := []metrics.Sample{{Name: "/cpu/classes/gc/total:cpu-seconds"}, {Name: "/gc/limiter/last-enabled:gc-cycle"}}
+	metrics.Read(samples)
+	ch <- prometheus.MustNewConstMetric(c.descs[8], prometheus.CounterValue, samples[0].Value.Float64())
+	ch <- prometheus.MustNewConstMetric(c.descs[9], prometheus.GaugeValue, float64(samples[1].Value.Uint64()))
 
 }
 func addL2Metrics(cr *clusterRuntime) func() {

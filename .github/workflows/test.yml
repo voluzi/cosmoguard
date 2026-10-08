@@ -110,6 +110,25 @@ jobs:
           FUZZTIME: ${{ github.event_name == 'schedule' && '5m' || '10s' }}
         run: make fuzz FUZZTIME="$FUZZTIME"
 
+  bounded-l2:
+    name: bounded l2 (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make test.bounded-l2
+      - run: make test.mixed-engine
+
   helm:
     name: helm chart renders + config loads
     runs-on: ubuntu-latest
