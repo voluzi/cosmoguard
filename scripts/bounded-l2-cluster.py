@@ -88,7 +88,11 @@ class Run:
         return pinned
 
     def inventory(self, suffix):
-        self.save("inventory-" + suffix + ".json", self.kubectl("get", "pods,services,secrets,configmaps,statefulsets,serviceaccounts,networkpolicies,poddisruptionbudgets", "-o", "json"))
+        resources = json.loads(self.kubectl("get", "pods,services,secrets,configmaps,statefulsets,serviceaccounts,networkpolicies,poddisruptionbudgets", "-o", "json"))
+        identities = [{"kind": resource["kind"], "namespace": resource["metadata"].get("namespace", ""),
+                       "name": resource["metadata"]["name"], "uid": resource["metadata"]["uid"]}
+                      for resource in resources["items"]]
+        self.save("inventory-" + suffix + ".json", identities)
 
     def prepare(self):
         self.inventory("before")

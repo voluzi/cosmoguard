@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check coordinator control flow without contacting a cluster."""
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -13,6 +14,21 @@ spec.loader.exec_module(runner)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_inventory_writes_only_resource_identities(self):
+        kinds = ["Pod", "Service", "Secret", "ConfigMap", "StatefulSet", "ServiceAccount", "NetworkPolicy", "PodDisruptionBudget"]
+        items = [{"kind": kind, "metadata": {"namespace": "test", "name": kind.lower(), "uid": "uid-" + kind,
+                  "annotations": {"private": "annotation-secret"}, "labels": {"private": "label-secret"}},
+                  "data": {"key": "c2VjcmV0LXZhbHVl"}, "stringData": {"key": "plaintext-secret"},
+                  "spec": {"private": "spec-secret"}, "status": {"private": "status-secret"}} for kind in kinds]
+        with tempfile.TemporaryDirectory() as directory:
+            run = runner.Run(SimpleNamespace(output=str(Path(directory) / "run"),
+                context="unused", namespace="test", size=0))
+            with mock.patch.object(run, "kubectl", return_value=json.dumps({"items": items})):
+                for suffix in ["before", "after"]:
+                    run.inventory(suffix)
+                    saved = json.loads((run.out / ("inventory-" + suffix + ".json")).read_text())
+                    self.assertEqual(saved, [{"kind": kind, "namespace": "test", "name": kind.lower(), "uid": "uid-" + kind} for kind in kinds])
+
     def test_idle_sampling_failure_aborts_scenario(self):
         with tempfile.TemporaryDirectory() as directory:
             run = runner.Run(SimpleNamespace(output=str(Path(directory) / "run"),
