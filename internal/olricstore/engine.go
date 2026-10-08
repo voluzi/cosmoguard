@@ -331,6 +331,9 @@ func (e *Engine) Get(h uint64) (storage.Entry, error) {
 	v.Decode(append([]byte(nil), b...))
 	k := int(b[0])
 	binary.BigEndian.PutUint64(b[17+k:25+k], uint64(time.Now().UnixNano()))
+	loc, _ := e.findLocked(h)
+	e.unlinkOrderLocked(loc)
+	e.appendOrderLocked(loc)
 	return v, nil
 }
 func (e *Engine) GetRaw(h uint64) ([]byte, error) {

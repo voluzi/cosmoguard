@@ -3,6 +3,7 @@ package olricstore
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -69,19 +70,47 @@ func TestNativeWireBothDirections(t *testing.T) {
 }
 func TestTransferDropOnlyAcknowledgedGeneration(t *testing.T) {
 	_, e := testEngine(t, 8<<20, Response)
-	_ = e.Put(1, item("old", 10))
+	for h := uint64(1); h <= 4; h++ {
+		if err := e.Put(h, item(fmt.Sprint(h), 10)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	it := e.TransferIterator()
 	_, idx, err := it.Export()
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = e.Put(1, item("new", 10))
+	if _, err := e.Get(1); err != nil {
+		t.Fatal(err)
+	}
+	ttl := item("2", 10)
+	ttl.SetTTL(time.Now().Add(time.Hour).UnixMilli())
+	if err := e.UpdateTTL(2, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Put(3, item("overwrite", 10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Put(5, item("insert", 10)); err != nil {
+		t.Fatal(err)
+	}
 	if err := it.Drop(idx); err != nil {
 		t.Fatal(err)
 	}
-	v, err := e.Get(1)
-	if err != nil || v.Key() != "new" {
-		t.Fatal("dropped overwrite")
+	for _, tc := range []struct {
+		hash uint64
+		key  string
+	}{{1, "1"}, {2, "2"}, {3, "overwrite"}, {5, "insert"}} {
+		v, err := e.Get(tc.hash)
+		if err != nil || v.Key() != tc.key || !bytes.Equal(v.Value(), bytes.Repeat([]byte{42}, 10)) {
+			t.Fatalf("dropped touched key %d: %v", tc.hash, err)
+		}
+	}
+	if ttl, err := e.GetTTL(2); err != nil || ttl <= time.Now().UnixMilli() {
+		t.Fatal("lost renewed TTL", err)
+	}
+	if _, err := e.Get(4); !errors.Is(err, storage.ErrKeyNotFound) {
+		t.Fatal("retained untouched export", err)
 	}
 }
 func TestTransferResponseFullMakesProgress(t *testing.T) {
