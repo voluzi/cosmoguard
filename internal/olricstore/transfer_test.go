@@ -293,3 +293,58 @@ func TestSparseExportWorkspaceScalesWithFragment(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeTableBoundaryPacksRemainImportable(t *testing.T) {
+	for _, sizes := range [][]int{{MaxEntryBytes / 2, MaxEntryBytes / 2}, {MaxEntryBytes - 1}} {
+		t.Run(fmt.Sprint(sizes), func(t *testing.T) {
+			native := nativeEngine(t)
+			_, bounded := testEngine(t, 8<<20, Response)
+			originals := make(map[uint64][]byte)
+			for i, size := range sizes {
+				raw := item("k", size-30).Encode()
+				if len(raw) != size {
+					t.Fatalf("fixture size %d, want %d", len(raw), size)
+				}
+				h := uint64(i + 1)
+				originals[h] = raw
+				if err := native.PutRaw(h, raw); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if native.Stats().NumTables != len(sizes) {
+				t.Fatal("native admitted an exactly full table", native.Stats())
+			}
+			it := native.TransferIterator()
+			packs := 0
+			for it.Next() {
+				data, id, err := it.Export()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var pack nativePack
+				if err := msgpack.Unmarshal(data, &pack); err != nil {
+					t.Fatal(err)
+				}
+				if pack.Offset >= pack.Allocated || len(pack.Memory) >= MaxEntryBytes {
+					t.Fatal("native exported an exactly full table")
+				}
+				if err := bounded.Import(data, func(h uint64, e storage.Entry) error { return bounded.PutRaw(h, e.Encode()) }); err != nil {
+					t.Fatal(err)
+				}
+				if err := it.Drop(id); err != nil {
+					t.Fatal(err)
+				}
+				packs++
+			}
+			if packs != len(sizes) {
+				t.Fatalf("exported %d tables, want %d", packs, len(sizes))
+			}
+			for h, want := range originals {
+				got, err := bounded.GetRaw(h)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("boundary transfer %d: %v", h, err)
+				}
+			}
+		})
+	}
+}
