@@ -457,12 +457,13 @@ func TestMixedEngineTransferDisconnectRetry(t *testing.T) {
 			require.True(t, iterator.Next())
 			payload, id, err := iterator.Export()
 			require.NoError(t, err)
-			packet, err := msgpack.Marshal(struct {
+			packetBody := struct {
 				PartID  uint64
 				Kind    int
 				Name    string
 				Payload []byte
-			}{hash % 271, 1, name, payload})
+			}{hash % 271, 1, name, payload}
+			packet, err := msgpack.Marshal(packetBody)
 			require.NoError(t, err)
 			frame := func(args ...[]byte) []byte {
 				b := []byte(fmt.Sprintf("*%d\r\n", len(args)))
@@ -494,6 +495,12 @@ func TestMixedEngineTransferDisconnectRetry(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, value, raw.Value())
 			}
+			// The intervening reads touched the source. Acknowledge a fresh export.
+			payload, id, err = iterator.Export()
+			require.NoError(t, err)
+			packetBody.Payload = payload
+			packet, err = msgpack.Marshal(packetBody)
+			require.NoError(t, err)
 			clients := mixedReplicaClients(t, receiver)
 			ack, err := clients[0].Do(t.Context(), "internal.node.movefragment", packet).Text()
 			require.NoError(t, err)
