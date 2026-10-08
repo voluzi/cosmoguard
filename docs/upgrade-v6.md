@@ -26,9 +26,10 @@ unchanged. No new operator configuration is required.
    closing an owner stops new admission without pretending blocked work ended.
 5. Olric storage statistics describe charged shared backing: `Allocated` includes
    slab/tree/descriptor and fragment allowances, and `Inuse` includes rounded live
-   records and fragment metadata. One deterministic live fragment owns each slab
-   attribution; summed stats do not double-count backing. `NumTables` describes
-   that attribution, and native garbage ratios are not comparable. Use pool
+   records and fragment metadata. Shared backing and slab counts are apportioned across registered
+   fragments in constant time, including empty fragments; one fragment receives
+   division remainders so totals remain exact. Native garbage ratios are not
+   comparable. Use pool
    gauges for capacity decisions.
 6. The embedded Olric dependency is now **the voluzi fork**, module
    `github.com/voluzi/olric`, pinned at
@@ -42,6 +43,12 @@ unchanged. No new operator configuration is required.
    `29 + len(key) + len(encoded value) < 1MiB`. This includes native framing, so
    a 1MiB payload does not fit. Generic encoding stops before exceeding that
    bound. Larger upstream results can still populate L1.
+
+8. `New` and `NewFromFile` start the enabled metrics/ops listener during
+   construction. Call `Shutdown` even without calling `Run`. `NewContext` and
+   `NewFromFileContext` allow cancellation while startup waits for routing.
+   `/healthz` answers during bootstrap; `/readyz` stays unavailable until the
+   proxies serve and their upstream pools are healthy.
 
 For example, migrate an existing response owner to:
 
@@ -66,6 +73,14 @@ healthy connected members for RF2 redundant-data cases. Do not restart the whole
 cluster or purge caches as an upgrade workaround. Verify actual replica values
 before testing abrupt owner loss: v0.7.4 does not eagerly create backups for
 pre-join writes, and quorum one does not guarantee every backup accepted a write.
+
+A slow coordinator can spend longer than 45s scanning old owners before pushing
+routing. New joiners remain healthy and not-ready while the advertised cluster
+has quorum and its coordinator answers authenticated PINGs. Startup aborts after
+45s without that reachability evidence; discovery and daemon start retain their
+45s budget. SIGTERM cancels construction and shuts down Olric with its graceful
+leave broadcast. This prevents bootstrap waits from exhausting the startup probe;
+it does not change an old coordinator's scan or cancel its in-flight replica RPCs.
 
 The native wire codecs are tested in both directions against the real default
 engine, including loopback migration, post-join replication, graceful departure,

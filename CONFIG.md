@@ -34,6 +34,13 @@ Table of contents:
 | `metrics.enable` | `true` | Expose `/metrics`, `/healthz`, `/readyz` on `metrics.port`. |
 | `metrics.port` | `9001` | Metrics + health-probe port. |
 
+The enabled metrics listener starts during construction. `/healthz` stays healthy
+while Olric awaits routing; `/readyz` stays unavailable until the proxies serve
+and every configured upstream pool is healthy. The joiner keeps waiting while
+its advertised cluster has quorum and its coordinator answers authenticated
+PINGs, and aborts after 45s without that evidence. Discovery and daemon start
+retain their 45s startup budget. SIGTERM cancels startup and closes the daemon.
+
 `/metrics` exposes `cosmoguard_config_reloads_total{outcome="..."}`, a process-wide
 counter that counts each config reload attempt once, excluding initial startup:
 
