@@ -257,7 +257,9 @@ is unchanged. Allocation checks enforce the shared hard cap when LRU cannot make
 room. A capacity rejection preserves an existing record on failed growth.
 
 Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor/index allowance;
-records include fixed indexes/headers and size-class rounding. Empty fragments
+records include fixed indexes/headers and size-class rounding. Buddy fragmentation
+can leave allocated backing at the cap while live inuse bytes are low: free blocks
+may not fit the requested size class, and partly used slabs retain their backing. Empty fragments
 have a small metadata charge rather than a 1MiB table. Olric compaction visits
 every primary and backup fragment once per second, holding the fragment lock
 so expiry cannot invalidate an in-progress conditional write or LRU selection. Expired records release

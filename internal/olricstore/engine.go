@@ -316,6 +316,7 @@ func (e *Engine) Get(h uint64) (storage.Entry, error) {
 		return nil, err
 	}
 	v := NewEntry()
+	// Native Get returns the pre-touch last access while updating stored metadata.
 	v.Decode(append([]byte(nil), b...))
 	k := int(b[0])
 	binary.BigEndian.PutUint64(b[17+k:25+k], uint64(time.Now().UnixNano()))
