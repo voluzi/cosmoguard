@@ -6,6 +6,7 @@ go 1.25.14
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/MicahParks/keyfunc/v3 v3.8.0
+	github.com/RoaringBitmap/roaring v1.9.4
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/creasty/defaults v1.8.0
 	github.com/fsnotify/fsnotify v1.10.1
@@ -42,7 +43,6 @@ require (
 
 require (
 	github.com/MicahParks/jwkset v0.11.0 // indirect
-	github.com/RoaringBitmap/roaring v1.9.4 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.22.0 // indirect

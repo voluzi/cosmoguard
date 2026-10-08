@@ -49,6 +49,8 @@ type Pool struct {
 	closed                                                 bool
 }
 type Engine struct {
+	exportID               int
+	exportLow, exportHigh  uint64
 	p                      *Pool
 	next                   *Engine
 	id                     uint64
