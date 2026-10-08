@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 	"golang.org/x/time/rate"
 )
 

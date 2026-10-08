@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric/pkg/storage"
+	"github.com/voluzi/olric/pkg/storage"
 )
 
 func testEngine(t *testing.T, limit uint64, policy Policy) (*Pool, *Engine) {

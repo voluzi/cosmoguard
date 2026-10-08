@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/olric-data/olric"
-	"github.com/olric-data/olric/config"
+	"github.com/voluzi/olric"
+	"github.com/voluzi/olric/config"
 
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric"
 )
 
 // observability_replication.go keeps the per-pod dashboard surfaces +
@@ -353,9 +353,8 @@ func (r *observabilityReplicator) flush(ctx context.Context) error {
 	return nil
 }
 
-// Keep restart-restore snapshots within a conservative payload budget, with
-// room for entry framing even if the fallback table size is used.
-const maxReplicationBlobBytes = int(olricTableSizeBytes) - (16 << 10) // 240 KiB
+// Keep restart-restore snapshots within a conservative payload budget.
+const maxReplicationBlobBytes = 240 << 10
 
 // marshalReplicationPayload marshals the payload, trimming the metrics
 // History oldest-first until the blob fits under maxReplicationBlobBytes.

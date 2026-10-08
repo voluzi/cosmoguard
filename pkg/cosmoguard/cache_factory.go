@@ -3,7 +3,7 @@ package cosmoguard
 import (
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 
 	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )

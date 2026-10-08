@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/stretchr/testify/require"
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/olric"
 )
 
 type blockedCacheDMap struct {

@@ -293,7 +293,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// then split across the response caches that share the pod heap: the L1
 	// share is threaded into each proxy via WithCacheBudget, and the per-DMap
 	// L2 share configures olric's LRU eviction below.
-	cacheBudget := cfg.Cache.ResolveBudget().PerCache(countResponseCaches(cfg))
+	totalCacheBudget := cfg.Cache.ResolveBudget()
+	cacheBudget := totalCacheBudget.PerCache(countResponseCaches(cfg))
 
 	// Spin up the in-process olric daemon. In the zero-config default it
 	// runs embedded-only (loopback, ephemeral ports, no gossip); when
@@ -303,8 +304,10 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// share state across pods. Failure to start is fatal: downstream
 	// consumers assume the runtime is up.
 	cluster, err := newClusterRuntime(clusterRuntimeOptions{
-		Cluster:           cfg.Cache.Cluster,
-		L2MaxBytesPerNode: cacheBudget.L2MaxBytesPerNode,
+		Cluster:                 cfg.Cache.Cluster,
+		ResponsePoolBytes:       totalCacheBudget.L2MaxBytesPerNode,
+		ResponseLRUBytesPerDMap: cacheBudget.L2MaxBytesPerNode,
+		L2WorkBytes:             responseWorkBytes(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error setting up cluster runtime: %w", err)

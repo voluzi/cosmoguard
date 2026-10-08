@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric/config"
-	"github.com/olric-data/olric/pkg/storage"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric/config"
+	"github.com/voluzi/olric/pkg/storage"
 )
 
 func nativeEngine(t *testing.T) storage.Engine {

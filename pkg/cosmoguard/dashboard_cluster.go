@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 )
 
 // dashboard_cluster.go implements the cluster-aware dashboard surface

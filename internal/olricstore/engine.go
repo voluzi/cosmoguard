@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olric-data/olric/pkg/storage"
+	"github.com/voluzi/olric/pkg/storage"
 
 	"github.com/voluzi/cosmoguard/v6/internal/bytebudget"
 )

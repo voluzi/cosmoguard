@@ -8,8 +8,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric"
 
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )

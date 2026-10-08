@@ -151,6 +151,10 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(configReloadsCounter)
 		_ = prometheus.Register(backendOperationFailuresCounter)
 		_ = prometheus.Register(limiterFallbackCounter)
+		_ = prometheus.Register(l2Metrics)
+		_ = prometheus.Register(l2StorageRejections)
+		_ = prometheus.Register(l2ImportDrops)
+		_ = prometheus.Register(l2WriteSkips)
 		for _, reason := range []string{"timeout", "capacity", "backend_error"} {
 			for _, outcome := range []string{"allowed", "denied"} {
 				limiterFallbackCounter.WithLabelValues(reason, outcome)

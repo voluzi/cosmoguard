@@ -20,7 +20,7 @@ import (
 func TestL2Eviction_CacheEvictsButExemptDMapsDoNot(t *testing.T) {
 	const capBytes = 1 << 20 // 1 MiB per-node cap → forces eviction quickly
 	ctx := context.Background()
-	cr, err := newClusterRuntime(clusterRuntimeOptions{L2MaxBytesPerNode: capBytes})
+	cr, err := newClusterRuntime(clusterRuntimeOptions{ResponsePoolBytes: 8 << 20, ResponseLRUBytesPerDMap: capBytes})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cr.Close(ctx) })
 	client := cr.Client()

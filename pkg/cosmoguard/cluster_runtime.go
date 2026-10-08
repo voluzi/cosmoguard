@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
-	"github.com/olric-data/olric"
-	"github.com/olric-data/olric/config"
+	"github.com/voluzi/olric"
+	"github.com/voluzi/olric/config"
+
+	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
 )
 
 // Non-cache olric DMap names that must NEVER be subject to the response
@@ -46,18 +48,8 @@ var evictionExemptDMaps = []string{
 // for tighter eviction accuracy — cheap given the cache's short TTL.
 const olricLRUSamples = 10
 
-// embeddedPartitionCount reduces the single-node per-DMap storage floor.
-// With the current 1 MiB engine table size, 16 partitions still mean a 16 MiB
-// floor per DMap; the aggregate can exceed small pods' approximate L2 budget.
-// Clustered members retain the default count because all peers must agree.
+// Standalone members have no clustered peers. Clustered members keep 271.
 const embeddedPartitionCount = 16
-
-// olricTableSizeBytes is the fallback table size when the engine has none.
-// With pinned olric v0.7.4, config.New supplies a 1 MiB table size, so this
-// fallback cannot fire. Native
-// oversized entries are served uncached; clustered response-cache workers also
-// reject payloads above the engine default table size.
-const olricTableSizeBytes uint64 = 256 << 10 // 256 KiB
 
 // l2AssumedEntryOverheadBytes is the assumed per-key heap cost in olric
 // (hashed key, index/access-log slab entry, storage bookkeeping) beyond the
@@ -122,10 +114,12 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 // enable=true) the daemon binds the configured BindAddr:BindPort + GossipPort
 // and joins peers advertised by the configured discovery plugin.
 type clusterRuntime struct {
-	db         *olric.Olric
-	client     *olric.EmbeddedClient
-	discovery  *clusterServiceDiscovery // non-nil only in cluster mode
-	peerAPIKey []byte
+	db                         *olric.Olric
+	client                     *olric.EmbeddedClient
+	discovery                  *clusterServiceDiscovery // non-nil only in cluster mode
+	peerAPIKey                 []byte
+	responsePool, securityPool *olricstore.Pool
+	removeMetrics              func()
 }
 
 // clusterRuntimeOptions configures the runtime.
@@ -145,12 +139,10 @@ type clusterRuntimeOptions struct {
 	// Lookup is the DNS resolver used by the discovery plugin. nil →
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
 	// don't depend on the host's resolver.
-	Lookup LookupFunc
-	// L2MaxBytesPerNode caps the olric L2's per-node in-use bytes for each
-	// response-cache DMap (LRU eviction above the cap). 0 disables L2
-	// eviction (unlimited). The non-cache DMaps (evictionExemptDMaps) are
-	// always kept exempt regardless of this value.
-	L2MaxBytesPerNode uint64
+	Lookup                  LookupFunc
+	ResponsePoolBytes       uint64
+	ResponseLRUBytesPerDMap uint64
+	L2WorkBytes             uint64
 }
 
 func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
@@ -172,15 +164,6 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 
 	c := config.New("local")
 
-	// In embedded/single-pod mode this node owns every partition, so the
-	// olric LRU cap (which can't evict a partition below one entry) has an
-	// effective floor of PartitionCount × maxEntrySize per DMap. olric's
-	// default of 271 partitions would floor a small pod's L2 well above its
-	// budget (271 × 1 MiB = 271 MiB/DMap) and reintroduce the OOM risk this
-	// guards. A smaller count lowers that floor (~16 MiB/DMap) so MaxInuse
-	// actually binds at realistic budgets. Only safe to change in embedded
-	// mode — in a real cluster every peer must agree on PartitionCount, so
-	// there we keep olric's default.
 	if !clustered {
 		c.PartitionCount = embeddedPartitionCount
 	}
@@ -296,30 +279,27 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		}
 	}
 
-	// Preserve the engine's table size, supplying a fallback only when absent.
-	// Entries above the native table limit are served uncached.
-	if c.DMaps == nil {
-		c.DMaps = &config.DMaps{}
-	}
-	if c.DMaps.Engine == nil {
-		c.DMaps.Engine = config.NewEngine()
-	}
-	if c.DMaps.Engine.Config == nil {
-		c.DMaps.Engine.Config = map[string]interface{}{}
-	}
-	if _, set := c.DMaps.Engine.Config["tableSize"]; !set {
-		c.DMaps.Engine.Config["tableSize"] = uint64(olricTableSizeBytes)
-	}
-
-	// Bound the L2 (olric) working set so a high-cardinality query load can't
-	// grow the shared store until the pod is OOMKilled (issue #15). Embedded/
-	// single-pod mode stores no backups (replicaFactor 1); clustered mode
-	// holds replicaCount copies per node, so the cap is divided accordingly.
+	responsePool := olricstore.NewPool(opts.ResponsePoolBytes, olricstore.Response, recordL2StorageRejection)
+	securityPool := olricstore.NewPool(0, olricstore.Security, nil)
+	success := false
+	defer func() {
+		if !success {
+			_ = responsePool.Close(context.Background())
+			_ = securityPool.Close(context.Background())
+		}
+	}()
+	c.DMaps.Engine = &config.Engine{Implementation: olricstore.NewEngine(responsePool)}
 	replicaFactor := 1
 	if clustered && opts.Cluster.ReplicaCount > 0 {
 		replicaFactor = opts.Cluster.ReplicaCount
 	}
-	applyL2EvictionConfig(c.DMaps, opts.L2MaxBytesPerNode, replicaFactor)
+	applyL2EvictionConfig(c.DMaps, opts.ResponseLRUBytesPerDMap, replicaFactor)
+	if c.DMaps.Custom == nil {
+		c.DMaps.Custom = map[string]config.DMap{}
+	}
+	for _, name := range evictionExemptDMaps {
+		c.DMaps.Custom[name] = config.DMap{EvictionPolicy: config.EvictionPolicy("NONE"), Engine: &config.Engine{Implementation: olricstore.NewEngine(securityPool)}}
+	}
 
 	if err := c.Sanitize(); err != nil {
 		return nil, fmt.Errorf("cluster runtime: sanitize: %w", err)
@@ -390,12 +370,24 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	}
 	slog.Info("olric bootstrap ready", "bootstrap_wait", time.Since(bootstrapAt), "startup_elapsed", time.Since(startedAt))
 
-	return &clusterRuntime{
-		db:         db,
-		client:     client,
-		discovery:  discovery,
-		peerAPIKey: peerAPIKey,
-	}, nil
+	if err := responsePool.Start(context.Background()); err != nil {
+		_ = db.Shutdown(context.Background())
+		return nil, err
+	}
+	if err := securityPool.Start(context.Background()); err != nil {
+		_ = db.Shutdown(context.Background())
+		return nil, err
+	}
+	success = true
+	cr := &clusterRuntime{
+		db:           db,
+		client:       client,
+		discovery:    discovery,
+		peerAPIKey:   peerAPIKey,
+		responsePool: responsePool, securityPool: securityPool,
+	}
+	cr.removeMetrics = addL2Metrics(cr)
+	return cr, nil
 }
 
 // One worker retries on the same daemon. NewDMap ignores context, so the
@@ -473,7 +465,13 @@ func (cr *clusterRuntime) Close(ctx context.Context) error {
 	if cr.discovery != nil {
 		_ = cr.discovery.Close()
 	}
-	return cr.db.Shutdown(ctx)
+	err := cr.db.Shutdown(ctx)
+	if cr.removeMetrics != nil {
+		cr.removeMetrics()
+	}
+	_ = cr.responsePool.Close(context.Background())
+	_ = cr.securityPool.Close(context.Background())
+	return err
 }
 
 // pickLoopbackPort asks the kernel for a free TCP port on 127.0.0.1 and

@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
-	"github.com/olric-data/olric/pkg/storage"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric/pkg/storage"
 )
 
 var ErrScratch = errors.New("olric codec scratch capacity exhausted")
@@ -404,6 +404,9 @@ func (e *Engine) Import(data []byte, f func(uint64, storage.Entry) error) error 
 				e.p.mu.Lock()
 				e.p.importDropped++
 				e.p.mu.Unlock()
+				if e.p.observer != nil {
+					e.p.observer("import_drop")
+				}
 				continue
 			}
 			return err

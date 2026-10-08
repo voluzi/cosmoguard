@@ -1,6 +1,6 @@
 package cosmoguard
 
-import "github.com/olric-data/olric"
+import "github.com/voluzi/olric"
 
 type SharedOptions struct {
 	CacheConfig    *CacheGlobalConfig

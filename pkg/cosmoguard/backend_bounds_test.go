@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/olric"
 
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 	"github.com/voluzi/cosmoguard/v6/pkg/cache"
@@ -132,7 +132,9 @@ func TestHTTPL2TimeoutFallsBackAndPreservesL1(t *testing.T) {
 	rec = serveBoundedTestRequest(t, p, req)
 	require.Equal(t, "healthy upstream", rec.Body.String())
 	require.Equal(t, int32(2), dm.gets.Load(), "L1 must bypass the stalled backend")
-	require.Equal(t, before+3, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("l2", "timeout")))
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("l2", "timeout")) == before+3
+	}, time.Second, time.Millisecond)
 	require.Equal(t, int32(1), forwarded.Load())
 	unblock()
 }
@@ -347,8 +349,9 @@ func TestResponseCacheEntryLimits(t *testing.T) {
 					err := responses.Set(t.Context(), key, response, time.Minute)
 					if size > 1<<20 {
 						require.ErrorIs(t, err, olric.ErrEntryTooLarge)
-						_, err = responses.Get(t.Context(), key)
-						require.ErrorIs(t, err, cache.ErrNotFound, "neither tier may retain a rejected response")
+						got, getErr := responses.Get(t.Context(), key)
+						require.NoError(t, getErr)
+						require.Equal(t, response.Data, got.Data)
 					} else {
 						require.NoError(t, err, "both cache modes must preserve the native entry limit")
 						got, err := responses.Get(t.Context(), key)

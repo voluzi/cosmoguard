@@ -16,13 +16,13 @@ require (
 	github.com/hashicorp/memberlist v0.6.0
 	github.com/jellydator/ttlcache/v3 v3.4.1
 	github.com/json-iterator/go v1.1.12
-	github.com/olric-data/olric v0.7.4
 	github.com/prometheus/client_golang v1.24.0
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/segmentio/fasthash v1.0.3
 	github.com/stretchr/testify v1.11.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	github.com/voluzi/olric v0.7.5-0.20261008113341-e1103a045279
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0

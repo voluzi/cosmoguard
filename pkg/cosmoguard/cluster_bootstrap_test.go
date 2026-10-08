@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
-	"github.com/olric-data/olric"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric"
 )
 
 // bootstrapMember and the routing-table payload below mirror olric v0.7.4's

@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 )
 
 // Identity is the resolved subject of an authenticated request. Built by

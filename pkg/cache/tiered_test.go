@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/olric"
 
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
@@ -307,7 +307,7 @@ func TestTieredRequiresBothLayers(t *testing.T) {
 	}
 }
 
-func TestTieredSetPreservesL1OnlyForBoundedFailures(t *testing.T) {
+func TestTieredL1SurvivesAllL2WriteFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		err    error
@@ -316,8 +316,8 @@ func TestTieredSetPreservesL1OnlyForBoundedFailures(t *testing.T) {
 		{"success", nil, true},
 		{"timeout", boundedcall.ErrTimeout, true},
 		{"capacity", boundedcall.ErrRejected, true},
-		{"oversized", olric.ErrEntryTooLarge, false},
-		{"backend", errors.New("backend failed"), false},
+		{"oversized", olric.ErrEntryTooLarge, true},
+		{"backend", errors.New("backend failed"), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, l2 := newTieredForTest[string, []byte](t)

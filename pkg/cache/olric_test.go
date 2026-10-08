@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
-	"github.com/olric-data/olric"
-	"github.com/olric-data/olric/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/olric"
+	"github.com/voluzi/olric/config"
 )
 
 // embeddedOlric spins up a single-node olric daemon on loopback with

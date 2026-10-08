@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"

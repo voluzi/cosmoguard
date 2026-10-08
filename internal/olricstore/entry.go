@@ -17,7 +17,7 @@ package olricstore
 import (
 	"encoding/binary"
 
-	"github.com/olric-data/olric/pkg/storage"
+	"github.com/voluzi/olric/pkg/storage"
 )
 
 // In-memory layout for an entry:
