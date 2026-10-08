@@ -46,8 +46,9 @@ test.bounded-l2: ## Repeat storage and admission tests with the race detector.
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-bounded-l2-runner.py
 	go test -race -count=10 -timeout=30m ./internal/olricstore ./internal/bytebudget ./internal/boundedcall ./pkg/cache
 
+MIXED_ENGINE_COUNT ?= 10
 test.mixed-engine: ## Exercise native/custom joins, replication and departure.
-	go test -race -tags=integration -count=10 -timeout=45m ./pkg/cosmoguard -run TestMixedEngine
+	go test -race -tags=integration -count=$(MIXED_ENGINE_COUNT) -timeout=45m ./pkg/cosmoguard -run TestMixedEngine
 
 clean:
 	rm -rf $(BUILDDIR)/ coverage.out

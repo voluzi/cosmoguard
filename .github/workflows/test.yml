@@ -110,7 +110,7 @@ jobs:
           FUZZTIME: ${{ github.event_name == 'schedule' && '5m' || '10s' }}
         run: make fuzz FUZZTIME="$FUZZTIME"
 
-  # The 30m + 45m suite deadlines leave 15m for setup within the job budget.
+  # CI runs the mixed-engine matrix once; ten runs remain a release gate.
   bounded-l2:
     name: bounded l2 (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
@@ -128,7 +128,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: make test.bounded-l2
-      - run: make test.mixed-engine
+      - run: make test.mixed-engine MIXED_ENGINE_COUNT=1
 
   helm:
     name: helm chart renders + config loads
