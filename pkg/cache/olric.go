@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -146,11 +147,11 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 		if lease != nil {
 			lease.ShrinkTo(operationCharge(29 + len(k) + cap(payload)))
 		}
-		err = c.dm.Put(opCtx, k, payload, olric.EX(itemTTL))
+		err = operationError(c.dm.Put(opCtx, k, payload, olric.EX(itemTTL)))
 		if errors.Is(err, olricstore.ErrCapacity) {
 			return err, nil
 		}
-		return nil, operationError(err)
+		return nil, err
 	})
 	if err == nil {
 		err = backendErr
@@ -286,6 +287,14 @@ func marshalBounded(value any, limit int) ([]byte, error) {
 }
 
 func operationError(err error) error {
+	// RESP preserves unknown errors as messages, including remote storage skips.
+	if err != nil && !errors.Is(err, olricstore.ErrCapacity) {
+		message := err.Error()
+		capacity := olricstore.ErrCapacity.Error()
+		if message == capacity || strings.HasPrefix(message, capacity+": ") {
+			return fmt.Errorf("%w: %w", olricstore.ErrCapacity, err)
+		}
+	}
 	if errors.Is(err, olric.ErrOperationTimeout) {
 		return fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
 	}

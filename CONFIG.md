@@ -497,8 +497,8 @@ provide process runtime observations for the soak ledger, without labels.
 response capacity rejections; `cosmoguard_l2_import_dropped_entries_total` counts
 capacity omissions acknowledged during response transfer.
 `cosmoguard_l2_write_skips_total{reason}` uses `inflight`, `unavailable`, `storage_capacity`,
-`entry_size`, `backend`, or `encode`. A typed capacity cause is needed for
-`storage_capacity`; Olric's opaque write-quorum failure stays `backend`. A quorum
+`entry_size`, `backend`, or `encode`. The adapter restores the unique capacity message after remote RESP forwarding
+so it remains `storage_capacity`; Olric's opaque write-quorum failure stays `backend`. A quorum
 success with a rejected backup increments receiving storage rejection only.
 Counters are process cumulative and never label keys, tenants or DMap names.
 `cosmoguard_cache_evictions_total` retains its L1 budget-eviction meaning.
