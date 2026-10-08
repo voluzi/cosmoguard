@@ -253,11 +253,6 @@ class Run:
         self.sampler = threading.Thread(target=self.sample, args=(maps,))
         self.sampler.start()
         with (self.out / (self.case + "-traffic.jsonl")).open("w") as log:
-            driver = subprocess.Popen(["kubectl", "--context", self.args.context, "-n", self.args.namespace,
-                "exec", self.tools, "--", "l2probe", "-guard-targets", "/tmp/targets.json", "-duration",
-                str(self.args.duration) + "s", "-writers", str(self.args.workers), "-size", str(self.args.size),
-                "-rps", str(self.args.rps)], stdout=log, stderr=log)
-            self.children.append(driver)
             if self.args.mode == "soak":
                 steps = [lambda n=n: self.scale(n) for n in [1, 2, 4, 8, 4, 2]]
             else:
@@ -265,21 +260,31 @@ class Run:
                          lambda: self.scale(3), lambda: self.switch(self.new_image, 1, self.args.memory),
                          lambda: self.switch(self.new_image, 0, self.args.memory),
                          lambda: self.switch(self.old_image, 1, "4Gi"), lambda: self.switch(self.old_image, 0, "4Gi")]
+            traffic_seconds = self.args.duration + 600 * len(steps)
+            driver = subprocess.Popen(["kubectl", "--context", self.args.context, "-n", self.args.namespace,
+                "exec", self.tools, "--", "l2probe", "-guard-targets", "/tmp/targets.json", "-duration",
+                str(traffic_seconds) + "s", "-writers", str(self.args.workers), "-size", str(self.args.size),
+                "-rps", str(self.args.rps)], stdout=log, stderr=log)
+            self.children.append(driver)
             for index, step in enumerate(steps):
+                if driver.poll() is not None:
+                    raise RuntimeError("traffic ended before every rollout phase completed")
                 if self.args.mode == "soak":
                     self.phase_size = self.args.size or [1024, 16384, 256 << 10, 1024, 16384, 256 << 10][index]
                     if index == 3:
                         self.ttl("1h")
                 self.save(self.case + "-phase-" + str(index) + ".json", {"started": time.time_ns(), "size": self.phase_size, "ttl": "1h" if index >= 3 and self.args.mode == "soak" else "10s"})
                 step()
+                if driver.poll() is not None:
+                    raise RuntimeError("traffic ended before the phase dwell completed")
                 until = time.monotonic() + self.args.duration / len(steps)
                 while time.monotonic() < until and driver.poll() is None and not self.stop.wait(1):
                     pass
                 if self.stop.is_set():
                     raise RuntimeError("sampling invariant failed")
-                if driver.poll() is not None:
-                    break
-            if driver.wait(timeout=120) != 0:
+                if driver.poll() is not None and (index < len(steps) - 1 or time.monotonic() < until):
+                    raise RuntimeError("traffic ended before every phase and dwell completed")
+            if driver.wait(timeout=traffic_seconds + 120) != 0:
                 raise RuntimeError("guard traffic or security sentinel failed")
         if self.args.mode == "soak":
             self.save(self.case + "-remaining-cells.json", {"status": "pending", "procedure": "docs/bounded-l2-release-tests.md"})

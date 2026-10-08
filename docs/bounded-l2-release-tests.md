@@ -54,6 +54,11 @@ and reserves 10% of traffic for repeated hot keys. It paces requests without
 a waiter queue and reports success,
 errors and latency percentiles every five seconds. gRPC connections are reused.
 
+Traffic remains active through every required phase and its dwell. The runner adds
+up to the 600s rollout timeout per phase to the requested traffic duration; this
+buffer may extend the load after the last dwell. A driver exit before completion,
+even with status zero, fails the run.
+
 The old image is resolved against the registry's published
 `ghcr.io/voluzi/cosmoguard:5.1.0` manifest and must report 5.1.0 from `--version`.
 The runner records image configs including OCI revision labels. A local rebuild
