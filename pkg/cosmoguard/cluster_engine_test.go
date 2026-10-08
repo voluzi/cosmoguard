@@ -76,7 +76,9 @@ func TestRuntimePoolExpiry(t *testing.T) {
 				swept[metric.Label[0].GetValue()] = metric.Gauge.GetValue() >= before
 			}
 		}
-		return swept["response"] && swept["security"] && cr.responsePool.Snapshot().Entries == 1 && cr.securityPool.Snapshot().Entries == 1
+		response, security := cr.responsePool.Snapshot(), cr.securityPool.Snapshot()
+		return swept["response"] && swept["security"] && response.Entries == 1 && security.Entries == 1 &&
+			float64(response.LastCompactionUnixMilli)/1000 >= before && float64(security.LastCompactionUnixMilli)/1000 >= before
 	}, 3*time.Second, 20*time.Millisecond, "both pools must complete storage sweeps, not just sampled eviction")
 	require.NoError(t, cr.Close(context.Background()))
 	require.Zero(t, cr.responsePool.Snapshot().Allocated)
