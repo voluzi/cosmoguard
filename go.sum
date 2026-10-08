@@ -196,8 +196,8 @@ github.com/vmihailenco/msgpack/v5 v5.4.1 h1:cQriyiUvjTwOHg8QZaPihLWeRAAVoCpE00IU
 github.com/vmihailenco/msgpack/v5 v5.4.1/go.mod h1:GaZTsDaehaPpQVyxrf5mtQlH+pc21PIudVV/E3rRQok=
 github.com/vmihailenco/tagparser/v2 v2.0.0 h1:y09buUbR+b5aycVFQs/g70pqKVZNBmxwAhO7/IwNM9g=
 github.com/vmihailenco/tagparser/v2 v2.0.0/go.mod h1:Wri+At7QHww0WTrCBeu4J6bNtoV6mEfg5OIWRZA9qds=
-github.com/voluzi/olric v0.7.5-0.20261008215859-1feb3c1e6cd4 h1:MGILCu+cYObWBbiIqaRYCF2U1sBdGZVKyrLN5cbl58A=
-github.com/voluzi/olric v0.7.5-0.20261008215859-1feb3c1e6cd4/go.mod h1:EsiqlQqGXpmGGExQJ6BumsRXwYd4VffjNG577lAPH/A=
+github.com/voluzi/olric v0.7.5-0.20261008230314-154bebac9dfa h1:EhhIrjAYLc+HGPG0OwwVMiu+EvBPLCxgor+0g8JDf1M=
+github.com/voluzi/olric v0.7.5-0.20261008230314-154bebac9dfa/go.mod h1:EsiqlQqGXpmGGExQJ6BumsRXwYd4VffjNG577lAPH/A=
 github.com/zeebo/xxh3 v1.1.0 h1:s7DLGDK45Dyfg7++yxI0khrfwq9661w9EN78eP/UZVs=
 github.com/zeebo/xxh3 v1.1.0/go.mod h1:IisAie1LELR4xhVinxWS5+zf1lA4p0MW4T+w+W07F5s=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=

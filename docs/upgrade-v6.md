@@ -33,7 +33,7 @@ unchanged. No new operator configuration is required.
    gauges for capacity decisions.
 6. The embedded Olric dependency is now **the voluzi fork**, module
    `github.com/voluzi/olric`, pinned at
-   `v0.7.5-0.20261008215859-1feb3c1e6cd4`. Consumers that interact with Olric Go
+   `v0.7.5-0.20261008230314-154bebac9dfa`. Consumers that interact with Olric Go
    types must update their Olric imports and requirement as well. There is **no
    replace directive**, including for downstream builds. The public module
    downloads through the default Go proxy. The fork changes listed below retain
@@ -70,6 +70,14 @@ The fork starts from upstream v0.7.4 and includes these commits, in order:
 | `b3cbf68` | Lock and check fragment retirement before storage access, retry stale lookups, and prevent a queued janitor from removing a recreated fragment. Preserve already-read values when shutdown interrupts the idle check. |
 | `d8d805a` | Finish compaction when a fragment is retired and skip retired storage during eviction, preventing a janitor collision from stopping all later expiry sweeps. |
 | `1feb3c1` | Test parallel pruning over 271 partitions with shared published owner backing; assert identical serial results and no mutation under the race detector. No production change. |
+| `d784449` | Derive the member snapshot from synchronous memberlist join/update/leave callbacks under the native node lock, instead of dereferencing mutable Node metadata returned by Members(). Preserve live-member selection and birthdate ordering while fixing metadata races during routing scans. |
+| `154beba` | Compare cached membership with native live-member names and transmitted identities: the local member immediately after Start, same-name rejoin at a new gossip address/ID, metadata updates during reads, and a member declared dead without Leave. No production change. |
+
+The callback snapshot includes suspect members just as native Members() does;
+death and graceful leave both remove a member. Snapshot updates finish before
+event enqueueing, so routing reads do not wait for the asynchronous event loop.
+Tests compare native immutable names and the complete identities from transmitted
+metadata; they avoid reading mutable native Node.Meta outside its private lock.
 
 Public integration regressions exercise acknowledged Put/Get/Delete and
 Destroy/recreate with both the default and custom engines. The fork changes do
