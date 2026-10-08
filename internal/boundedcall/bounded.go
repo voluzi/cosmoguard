@@ -79,7 +79,6 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 	}
 	abort := func() {
 		gate.outage.resolve(op, false, false, false)
-		gate.outage.finish(op)
 	}
 	expired := func(waitCtx context.Context, executed bool) (T, error) {
 		if err := ctx.Err(); err != nil {
@@ -166,11 +165,7 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 
 	done := make(chan callResult[T])
 	workerDone := make(chan struct{})
-	var finished func()
-	if gate.outage != nil {
-		finished = func() { gate.outage.finish(op) }
-	}
-	go runWorker(waitCtx, gate.slots, lease, fn, done, workerDone, finished)
+	go runWorker(waitCtx, gate.slots, lease, fn, done, workerDone)
 	select {
 	case <-waitCtx.Done():
 		return expired(waitCtx, true)
@@ -195,11 +190,8 @@ type callResult[T any] struct {
 	err   error
 }
 
-func runWorker[T any](ctx context.Context, slots chan struct{}, lease *bytebudget.Lease, fn func(context.Context, *bytebudget.Lease) (T, error), done chan<- callResult[T], workerDone chan<- struct{}, finished func()) {
+func runWorker[T any](ctx context.Context, slots chan struct{}, lease *bytebudget.Lease, fn func(context.Context, *bytebudget.Lease) (T, error), done chan<- callResult[T], workerDone chan<- struct{}) {
 	defer close(workerDone)
-	if finished != nil {
-		defer finished()
-	}
 	var res callResult[T]
 	defer func() {
 		if v := recover(); v != nil {

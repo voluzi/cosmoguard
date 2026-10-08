@@ -88,7 +88,7 @@ func TestWeightedGateRetainsCompletedResultUntilHandoff(t *testing.T) {
 				value[0] = 42
 				close(returned)
 				return value, nil
-			}, done, workerDone, nil)
+			}, done, workerDone)
 			<-returned
 			// A descheduled receiver has not yet accepted the completed result.
 			until := time.NewTimer(20 * time.Millisecond)

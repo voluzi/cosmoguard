@@ -396,7 +396,9 @@ After three consecutive executed-operation timeouts, the L2 gate skips backend
 calls with `ErrUnavailable`. After one second, the next real request is its single
 recovery probe. An on-time healthy reply closes the outage state, including a
 cache miss or storage-capacity rejection. Failed probes wait another second;
-a probe still executing cannot be replaced. Caller cancellation/deadlines and
+once a probe caller has resolved, the next cooldown permits a replacement even
+if its worker remains stuck. Old workers retain their slot/byte charges, so
+replacement probes cannot exceed admission capacities. Caller cancellation/deadlines and
 admission/capacity rejection do not open the state. Old in-flight results cannot
 close it. There are no background probes or configuration settings. Three
 timeouts filter isolated delays; the one-second cooldown bounds recovery traffic.
@@ -512,7 +514,10 @@ pool saturation. Replay retains its existing error policy when
 either 100ms budget expires.
 `cosmoguard_backend_unavailable_gates{backend}` counts outage gates, including a
 probe in progress, with fixed labels `l2`, `limiter`, and `replay` (always zero).
-Closed runtimes decrement their L2 state. No new YAML settings are required.
+Recovery requires a real request: on an idle pod this gauge can remain open even
+when the backend has recovered. It records the last observed outage state, not
+an active health check. Closed runtimes decrement their L2 state. No new YAML
+settings are required.
 
 The three pools retain at most 2,688 backend workers: 128 L2, 2,048 limiter,
 and 512 replay. Parked L2 writes retain at most 1 MiB of encoded payload per

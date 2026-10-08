@@ -43,18 +43,20 @@ func TestOutageGateFailsFastAndRetainsReservations(t *testing.T) {
 		_, err := DoWeighted(t.Context(), g, budget, 10, op)
 		require.ErrorIs(t, err, ErrTimeout)
 		time.Sleep(2 * time.Second)
-		_, err = DoWeighted(t.Context(), g, budget, 10, op)
-		require.ErrorIs(t, err, ErrUnavailable, "a probe still running cannot be replaced")
-		require.Equal(t, int32(4), calls.Load())
+		value, err := DoWeighted(t.Context(), g, budget, 10, func(context.Context, *bytebudget.Lease) (int, error) {
+			calls.Add(1)
+			require.Equal(t, uint64(50), budget.Snapshot().Reserved, "old workers retain reservations")
+			return 7, nil
+		})
+		require.NoError(t, err, "a resolved probe may be replaced after cooldown even if its worker is stuck")
+		require.Equal(t, 7, value)
+		require.Equal(t, int32(5), calls.Load())
 		require.Equal(t, uint64(40), budget.Snapshot().Reserved)
+		require.False(t, unavailable.Load())
 		unblock()
 		synctest.Wait()
-		require.True(t, unavailable.Load(), "late results cannot recover an outage")
+		require.False(t, unavailable.Load(), "obsolete workers cannot change recovered state")
 		require.Zero(t, budget.Snapshot().Reserved)
-		value, err := Do(t.Context(), g, func(context.Context) (int, error) { return 7, nil })
-		require.NoError(t, err)
-		require.Equal(t, 7, value)
-		require.False(t, unavailable.Load())
 	})
 }
 
@@ -220,5 +222,26 @@ func TestOutageGateAdmitsOneConcurrentProbe(t *testing.T) {
 		require.NoError(t, <-results)
 		_, err := Do(t.Context(), g, func(context.Context) (int, error) { return 7, nil })
 		require.NoError(t, err)
+	})
+}
+
+func TestOutageReplacementProbeRespectsWorkerCapacity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := NewRecovering(4, 20*time.Millisecond, nil, nil)
+		release := make(chan struct{})
+		defer close(release)
+		var calls atomic.Int32
+		work := func(context.Context) (int, error) { calls.Add(1); <-release; return 42, nil }
+		for range 3 {
+			_, err := Do(t.Context(), g, work)
+			require.ErrorIs(t, err, ErrTimeout)
+		}
+		time.Sleep(time.Second)
+		_, err := Do(t.Context(), g, work)
+		require.ErrorIs(t, err, ErrTimeout)
+		time.Sleep(time.Second)
+		_, err = Do(t.Context(), g, work)
+		require.ErrorIs(t, err, ErrRejected)
+		require.Equal(t, int32(4), calls.Load(), "replacement probes cannot exceed worker capacity")
 	})
 }

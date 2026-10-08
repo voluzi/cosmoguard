@@ -19,15 +19,12 @@ type operation struct {
 
 type outage struct {
 	sync.Mutex
-	generation      uint64
-	timeouts        int
-	open            bool
-	nextProbe       time.Time
-	probe           bool
-	probeGeneration uint64
-	probeResolved   bool
-	probeFinished   bool
-	onUnavailable   func(bool)
+	generation    uint64
+	timeouts      int
+	open          bool
+	nextProbe     time.Time
+	probe         bool
+	onUnavailable func(bool)
 }
 
 // NewRecovering stops repeated waits during an outage. New and NewWaiting
@@ -49,11 +46,10 @@ func (o *outage) admit() (operation, bool) {
 		if o.probe || time.Now().Before(o.nextProbe) {
 			return op, false
 		}
+		o.generation++
+		op.generation = o.generation
 		op.probe = true
 		o.probe = true
-		o.probeGeneration = o.generation
-		o.probeResolved = false
-		o.probeFinished = false
 	}
 	return op, true
 }
@@ -86,10 +82,7 @@ func (o *outage) resolve(op operation, timedOut, healthy, executed bool) {
 		return
 	}
 	if op.probe {
-		o.probeResolved = true
-		if o.probeFinished {
-			o.probe = false
-		}
+		o.probe = false
 		o.nextProbe = time.Now().Add(outageCooldown)
 		if healthy && executed {
 			o.open = false
@@ -115,20 +108,6 @@ func (o *outage) resolve(op operation, timedOut, healthy, executed bool) {
 		o.nextProbe = time.Now().Add(outageCooldown)
 		if o.onUnavailable != nil {
 			o.onUnavailable(true)
-		}
-	}
-}
-
-func (o *outage) finish(op operation) {
-	if o == nil || !op.probe {
-		return
-	}
-	o.Lock()
-	defer o.Unlock()
-	if o.probeGeneration == op.generation {
-		o.probeFinished = true
-		if o.probeResolved {
-			o.probe = false
 		}
 	}
 }
