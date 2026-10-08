@@ -416,3 +416,31 @@ func TestEngineUpdateTTLNativeLastAccess(t *testing.T) {
 		}
 	}
 }
+
+func TestPoolCountsFragmentAdmissionFailures(t *testing.T) {
+	var observed []string
+	var p *Pool
+	p = NewPool(fragmentCharge-1, Response, func(path string) {
+		if p.Snapshot().Allocated != 0 {
+			t.Error("failed registration retained backing")
+		}
+		observed = append(observed, path)
+	})
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+	e := NewEngine(p)
+	if _, err := e.Fork(nil); !errors.Is(err, ErrCapacity) {
+		t.Fatal("fork admission", err)
+	}
+	if err := e.Put(1, item("key", 1)); !errors.Is(err, ErrCapacity) {
+		t.Fatal("put registration", err)
+	}
+	if err := e.PutRaw(1, item("key", 1).Encode()); !errors.Is(err, ErrCapacity) {
+		t.Fatal("raw registration", err)
+	}
+	if got := fmt.Sprint(observed); got != "[fork put put_raw]" {
+		t.Fatal("missing receiving rejection", got)
+	}
+	if s := p.Snapshot(); s.ForkRejected != 1 || s.PutRejected != 1 || s.RawRejected != 1 {
+		t.Fatal("registration rejection counters", s)
+	}
+}

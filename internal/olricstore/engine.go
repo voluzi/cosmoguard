@@ -29,22 +29,22 @@ const fragmentCharge = 512
 const headerSize = 48
 
 type PoolStats struct {
-	Capacity, Allocated, Inuse, Entries, PutRejected, RawRejected, ImportDropped uint64
-	Codec                                                                        bytebudget.Snapshot
+	Capacity, Allocated, Inuse, Entries, ForkRejected, PutRejected, RawRejected, ImportDropped uint64
+	Codec                                                                                      bytebudget.Snapshot
 }
 
 // Observer is called outside the allocator lock.
 type Observer func(string)
 type Pool struct {
-	mu                                                     sync.Mutex
-	arena                                                  arena
-	policy                                                 Policy
-	observer                                               Observer
-	engines                                                *Engine
-	nextID, fragments                                      uint64
-	used, entries, putRejected, rawRejected, importDropped uint64
-	codec                                                  *bytebudget.Budget
-	closed                                                 bool
+	mu                                                                   sync.Mutex
+	arena                                                                arena
+	policy                                                               Policy
+	observer                                                             Observer
+	engines                                                              *Engine
+	nextID, fragments                                                    uint64
+	used, entries, forkRejected, putRejected, rawRejected, importDropped uint64
+	codec                                                                *bytebudget.Budget
+	closed                                                               bool
 }
 type Engine struct {
 	exportID               int
@@ -78,7 +78,7 @@ func (p *Pool) Close(_ context.Context) error {
 }
 func (p *Pool) Snapshot() PoolStats {
 	p.mu.Lock()
-	s := PoolStats{Capacity: p.arena.limit, Allocated: p.arena.allocated, Inuse: p.used, Entries: p.entries, PutRejected: p.putRejected, RawRejected: p.rawRejected, ImportDropped: p.importDropped}
+	s := PoolStats{Capacity: p.arena.limit, Allocated: p.arena.allocated, Inuse: p.used, Entries: p.entries, ForkRejected: p.forkRejected, PutRejected: p.putRejected, RawRejected: p.rawRejected, ImportDropped: p.importDropped}
 	p.mu.Unlock()
 	s.Codec = p.codec.Snapshot()
 	return s
@@ -115,11 +115,16 @@ func (e *Engine) registerLocked() error {
 }
 func (e *Engine) Fork(*storage.Config) (storage.Engine, error) {
 	e.p.mu.Lock()
-	defer e.p.mu.Unlock()
 	if err := e.readyLocked(); err != nil {
+		e.p.mu.Unlock()
 		return nil, err
 	}
 	if !e.p.arena.reserve(fragmentCharge) {
+		e.p.forkRejected++
+		e.p.mu.Unlock()
+		if e.p.observer != nil {
+			e.p.observer("fork")
+		}
 		return nil, ErrCapacity
 	}
 	e.p.nextID++
@@ -127,6 +132,7 @@ func (e *Engine) Fork(*storage.Config) (storage.Engine, error) {
 	e.p.engines = child
 	e.p.used += fragmentCharge
 	e.p.fragments++
+	e.p.mu.Unlock()
 	return child, nil
 }
 func field(b []byte, off int) uint64       { return binary.LittleEndian.Uint64(b[off : off+8]) }

@@ -453,7 +453,7 @@ Gauges aggregate active runtimes; closed runtimes release their collector refere
 `cosmoguard_gc_cpu_seconds_total` and `cosmoguard_gc_limiter_last_enabled_cycle`
 provide process runtime observations for the soak ledger, without labels.
 
-`cosmoguard_l2_storage_rejections_total{path="put"|"put_raw"}` counts receiving
+`cosmoguard_l2_storage_rejections_total{path="fork"|"put"|"put_raw"}` counts receiving
 response capacity rejections; `cosmoguard_l2_import_dropped_entries_total` counts
 capacity omissions acknowledged during response transfer.
 `cosmoguard_l2_write_skips_total{reason}` uses `inflight`, `storage_capacity`,
