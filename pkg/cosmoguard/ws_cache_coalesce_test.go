@@ -46,7 +46,7 @@ func (u *wsCacheUpstream) Stop()                                {}
 func newWSCacheProxy(t *testing.T, coalesce *bool, delay time.Duration) (*JsonRpcWebSocketProxy, *JsonRpcRule, *wsCacheUpstream) {
 	t.Helper()
 
-	responseCache, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, t.Name(), CacheBudget{})
+	responseCache, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, t.Name(), CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
 

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 	"github.com/voluzi/olric"
 )
 
@@ -60,7 +62,7 @@ func TestCapacityRejectionStillFillsL1(t *testing.T) {
 	cr, err := newClusterRuntime(clusterRuntimeOptions{ResponsePoolBytes: 1 << 20})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cr.Close(context.Background()) })
-	c, err := newResponseCache[string, []byte](nil, cr.Client(), "capacity-l1", CacheBudget{})
+	c, err := newResponseCache[string, []byte](nil, cr.Client(), "capacity-l1", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	require.Error(t, c.Set(t.Context(), "k", []byte("cached locally"), time.Minute))
@@ -69,4 +71,45 @@ func TestCapacityRejectionStillFillsL1(t *testing.T) {
 	require.Equal(t, []byte("cached locally"), v)
 	require.Zero(t, cr.responsePool.Snapshot().Entries)
 	require.Positive(t, cr.responsePool.Snapshot().PutRejected)
+}
+func TestRuntimeGatesAreIndependent(t *testing.T) {
+	a, err := newClusterRuntime(clusterRuntimeOptions{L2WorkBytes: 1})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = a.Close(context.Background()) })
+	b, err := newClusterRuntime(clusterRuntimeOptions{L2WorkBytes: 16 << 20})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
+	for i, cr := range []*clusterRuntime{a, b} {
+		c, err := newResponseCache[string, []byte](nil, cr.Client(), "standalone-gate", CacheBudget{}, cr.ResponseOperations())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		_, err = c.Get(t.Context(), "missing")
+		if i == 0 {
+			require.ErrorIs(t, err, boundedcall.ErrRejected)
+		} else {
+			require.ErrorIs(t, err, cache.ErrNotFound)
+		}
+	}
+}
+func TestResponseBytePressureDoesNotConsumeLimiterOrReplaySlots(t *testing.T) {
+	cr, err := newClusterRuntime(clusterRuntimeOptions{L2WorkBytes: 1})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cr.Close(context.Background()) })
+	c, err := newResponseCache[string, []byte](nil, cr.Client(), "blocked-responses", CacheBudget{}, cr.ResponseOperations())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	require.ErrorIs(t, c.Set(t.Context(), "key", []byte("value"), time.Second), boundedcall.ErrRejected)
+	dm, err := cr.Client().NewDMap(replayJTIDMap)
+	require.NoError(t, err)
+	require.NoError(t, dm.Put(t.Context(), "jti", []byte("seen"), olric.NX(), olric.EX(time.Minute)))
+	require.ErrorIs(t, dm.Put(t.Context(), "jti", []byte("twice"), olric.NX()), olric.ErrKeyFound)
+	limiter, err := newRuleRateLimiter(RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1}, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), "pressure")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = limiter.Close() })
+	ok, _, err := limiter.Allow(t.Context(), "subject")
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, _, err = limiter.Allow(t.Context(), "subject")
+	require.NoError(t, err)
+	require.False(t, ok)
 }

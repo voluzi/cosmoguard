@@ -45,7 +45,7 @@ func TestOlricCacheBoundsAllOperations(t *testing.T) {
 			defer unblock()
 			dm := &blockedCacheDMap{release: release, entered: make(chan struct{}, 1)}
 			options := defaultOptions()
-			BoundedOperations(1, 10*time.Millisecond, nil)(options)
+			BoundedOperations(1, 10*time.Millisecond, 0, nil, nil)(options)
 			c := &OlricCache[string, []byte]{dm: dm, cfg: options, namespace: "test"}
 			done := make(chan error, 1)
 			go func() {
@@ -87,7 +87,7 @@ func TestOlricCacheRejectsOversizedPayloadBeforePut(t *testing.T) {
 	defer close(release)
 	dm := &blockedCacheDMap{release: release}
 	options := defaultOptions()
-	BoundedOperations(1, 10*time.Millisecond, nil)(options)
+	BoundedOperations(1, 10*time.Millisecond, 0, nil, nil)(options)
 	c := &OlricCache[string, []byte]{dm: dm, cfg: options, namespace: "test"}
 	err := c.Set(t.Context(), "key", make([]byte, 1<<20+1), time.Minute)
 	require.ErrorIs(t, err, olric.ErrEntryTooLarge)

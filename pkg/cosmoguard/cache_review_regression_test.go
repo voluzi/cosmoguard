@@ -261,7 +261,7 @@ func TestHTTPForegroundMissUsesConfiguredProxyDeadline(t *testing.T) {
 	upstream := &HttpUpstream{Name: "up", Target: target, proxy: reverseProxy}
 	upstream.healthy.Store(true)
 
-	cache, err := newResponseCache[string, CachedResponse](nil, nil, "deadline-test", CacheBudget{})
+	cache, err := newResponseCache[string, CachedResponse](nil, nil, "deadline-test", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cache.Close() })
 	p := &HttpProxy{
@@ -847,7 +847,7 @@ func TestHTTPCoalescedWaiterPreservesRetryAfter(t *testing.T) {
 
 func newJSONCacheHandler(t *testing.T, rule *JsonRpcRule) *JsonRpcHandler {
 	t.Helper()
-	cache, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, "json-review", CacheBudget{})
+	cache, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, "json-review", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cache.Close() })
 	require.NoError(t, rule.Compile())
@@ -1370,7 +1370,7 @@ func TestHTTPBackgroundRefreshUsesIndependentRequestStats(t *testing.T) {
 	})
 	upstream := &HttpUpstream{Name: "up", Target: target, proxy: reverseProxy}
 	upstream.healthy.Store(true)
-	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "stats-test", CacheBudget{})
+	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "stats-test", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = responseCache.Close() })
 	p := &HttpProxy{
@@ -1878,7 +1878,7 @@ func TestHTTPCoalescedForegroundTimeoutStillAnswersLiveCaller(t *testing.T) {
 	upstream := &HttpUpstream{Name: "up", Target: target, proxy: rp}
 	upstream.healthy.Store(true)
 
-	cache, err := newResponseCache[string, CachedResponse](nil, nil, "fg-timeout", CacheBudget{})
+	cache, err := newResponseCache[string, CachedResponse](nil, nil, "fg-timeout", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cache.Close() })
 

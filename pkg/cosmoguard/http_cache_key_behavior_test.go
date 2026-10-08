@@ -221,7 +221,7 @@ func TestHTTPCacheTargetIdentitySeparatesOpaqueFromHierarchical(t *testing.T) {
 	httpUpstream := &HttpUpstream{Name: "up", Target: target, proxy: reverseProxy}
 	httpUpstream.healthy.Store(true)
 
-	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "target-isolation-test", CacheBudget{})
+	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "target-isolation-test", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
 	p := &HttpProxy{

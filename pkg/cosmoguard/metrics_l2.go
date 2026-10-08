@@ -31,6 +31,7 @@ func newL2Collector() *l2Collector {
 	for _, name := range []string{"storage_allocated_bytes", "storage_inuse_bytes", "storage_entries", "storage_capacity_bytes", "codec_bytes", "codec_capacity_bytes"} {
 		c.descs = append(c.descs, prometheus.NewDesc("cosmoguard_l2_"+name, "Active runtime "+name+"; capacity zero means unlimited.", []string{"pool"}, nil))
 	}
+	c.descs = append(c.descs, prometheus.NewDesc("cosmoguard_l2_operation_bytes", "Active response operation reservations.", nil, nil), prometheus.NewDesc("cosmoguard_l2_operation_capacity_bytes", "Active response operation capacities.", nil, nil))
 	return c
 }
 func (c *l2Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -62,6 +63,15 @@ func (c *l2Collector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.descs[i], prometheus.GaugeValue, float64(n), pool)
 		}
 	}
+	var reserved, capacity uint64
+	for _, cr := range runtimes {
+		r, n := cr.responseOperations.OperationBytes()
+		reserved += r
+		capacity += n
+	}
+	ch <- prometheus.MustNewConstMetric(c.descs[6], prometheus.GaugeValue, float64(reserved))
+	ch <- prometheus.MustNewConstMetric(c.descs[7], prometheus.GaugeValue, float64(capacity))
+
 }
 func addL2Metrics(cr *clusterRuntime) func() {
 	registerSharedMetrics()

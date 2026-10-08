@@ -319,7 +319,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		cacheOptions = append(cacheOptions, cache.DefaultTTL(cfg.CacheConfig.TTL))
 	}
 
-	proxy.cache, err = newResponseCache[string, CachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
+	proxy.cache, err = newResponseCache[string, CachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cfg.L2Operations, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}

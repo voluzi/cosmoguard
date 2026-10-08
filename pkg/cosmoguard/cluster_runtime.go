@@ -17,6 +17,7 @@ import (
 	"github.com/voluzi/olric/config"
 
 	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 // Non-cache olric DMap names that must NEVER be subject to the response
@@ -114,6 +115,7 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 // enable=true) the daemon binds the configured BindAddr:BindPort + GossipPort
 // and joins peers advertised by the configured discovery plugin.
 type clusterRuntime struct {
+	responseOperations         cache.Option
 	db                         *olric.Olric
 	client                     *olric.EmbeddedClient
 	discovery                  *clusterServiceDiscovery // non-nil only in cluster mode
@@ -386,6 +388,11 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		peerAPIKey:   peerAPIKey,
 		responsePool: responsePool, securityPool: securityPool,
 	}
+	workBytes := opts.L2WorkBytes
+	if workBytes == 0 {
+		workBytes = responseWorkBytes()
+	}
+	cr.responseOperations = cache.BoundedOperations(l2OperationCapacity, l2OperationBudget, workBytes, func(outcome string) { recordBackendOperationFailure("l2", outcome) }, func(reason string) { l2WriteSkips.WithLabelValues(reason).Inc() })
 	cr.removeMetrics = addL2Metrics(cr)
 	return cr, nil
 }
@@ -465,6 +472,7 @@ func (cr *clusterRuntime) Close(ctx context.Context) error {
 	if cr.discovery != nil {
 		_ = cr.discovery.Close()
 	}
+	cr.responseOperations.CloseOperations()
 	err := cr.db.Shutdown(ctx)
 	if cr.removeMetrics != nil {
 		cr.removeMetrics()
@@ -493,4 +501,11 @@ func pickLoopbackPort() (int, error) {
 		return 0, err
 	}
 	return port, nil
+}
+
+func (cr *clusterRuntime) ResponseOperations() cache.Option {
+	if cr == nil {
+		return nil
+	}
+	return cr.responseOperations
 }

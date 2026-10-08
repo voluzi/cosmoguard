@@ -11,12 +11,6 @@ import (
 const l2OperationBudget = 100 * time.Millisecond
 const l2OperationCapacity = 128
 
-// Share capacity across response namespaces so saturation cannot spawn an
-// unbounded set of detached calls. Limiter admission has its own pool.
-var boundedL2Operations = cache.BoundedOperations(l2OperationCapacity, l2OperationBudget, func(outcome string) {
-	recordBackendOperationFailure("l2", outcome)
-})
-
 // newResponseCache builds the response cache for a proxy / handler:
 // an olric L2 fronted by an in-process L1, namespaced by
 // cacheCfg.Key+name so multiple cosmoguard fleets sharing one olric
@@ -27,6 +21,7 @@ func newResponseCache[K comparable, V any](
 	olricClient *olric.EmbeddedClient,
 	name string,
 	budget CacheBudget,
+	operations cache.Option,
 	opts ...cache.Option,
 ) (cache.Cache[K, V], error) {
 	// Apply the per-instance L1 byte/item caps resolved at startup so the
@@ -49,8 +44,8 @@ func newResponseCache[K comparable, V any](
 		namespace = cacheCfg.Key + name
 	}
 
-	if cacheCfg != nil && cacheCfg.Cluster != nil {
-		opts = append(opts, boundedL2Operations)
+	if operations != nil {
+		opts = append(opts, operations)
 	}
 	l2, err := cache.NewOlricCache[K, V](olricClient, namespace, opts...)
 	if err != nil {

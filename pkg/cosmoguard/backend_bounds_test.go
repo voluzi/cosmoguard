@@ -239,7 +239,7 @@ func TestBackendCapacityIsolationAndLocalCacheBypass(t *testing.T) {
 	require.Equal(t, int32(l2OperationCapacity), dm.gets.Load())
 	cr := newEmbeddedClusterRuntimeForTest(t)
 	for _, client := range []*olric.EmbeddedClient{nil, cr.Client()} {
-		local, err := newResponseCache[string, []byte](&CacheGlobalConfig{}, client, "unbounded-local", CacheBudget{})
+		local, err := newResponseCache[string, []byte](&CacheGlobalConfig{}, client, "unbounded-local", CacheBudget{}, nil)
 		require.NoError(t, err)
 		require.NoError(t, local.Set(t.Context(), "key", []byte("value"), time.Second))
 		got, err := local.Get(t.Context(), "key")
@@ -247,7 +247,7 @@ func TestBackendCapacityIsolationAndLocalCacheBypass(t *testing.T) {
 		require.Equal(t, []byte("value"), got)
 		require.NoError(t, local.Close())
 	}
-	clusteredCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), "bounded-cluster", CacheBudget{})
+	clusteredCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), "bounded-cluster", CacheBudget{}, nil)
 	require.NoError(t, err)
 	defer clusteredCache.Close()
 	_, err = clusteredCache.Get(t.Context(), "key")
@@ -339,7 +339,7 @@ func TestResponseCacheEntryLimits(t *testing.T) {
 			if clustered {
 				cfg.Cluster = &ClusterConfig{}
 			}
-			responses, err := newResponseCache[string, CachedResponse](cfg, cr.Client(), "entry-limits", CacheBudget{})
+			responses, err := newResponseCache[string, CachedResponse](cfg, cr.Client(), "entry-limits", CacheBudget{}, nil)
 			require.NoError(t, err)
 			defer responses.Close()
 			for _, size := range []int{256 << 10, 257 << 10, 1023 << 10, 1<<20 + 1} {

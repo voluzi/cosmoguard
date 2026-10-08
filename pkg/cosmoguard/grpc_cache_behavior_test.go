@@ -157,7 +157,7 @@ func newGRPCCacheTestProxy(t *testing.T, conn *grpc.ClientConn, cacheRule *RuleC
 	}
 	require.NoError(t, rule.Compile())
 
-	responseCache, err := newResponseCache[string, grpcCachedResponse](nil, nil, t.Name(), CacheBudget{})
+	responseCache, err := newResponseCache[string, grpcCachedResponse](nil, nil, t.Name(), CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
 
@@ -614,7 +614,7 @@ func TestGRPCBreakerClassifiesProxyVsCallerDeadline(t *testing.T) {
 		})
 		rule := &GrpcRule{Priority: 1, Action: RuleActionAllow, Methods: []string{grpcCacheTestMethod}, Cache: &RuleCache{Enable: true, TTL: time.Minute}}
 		require.NoError(t, rule.Compile())
-		responseCache, err := newResponseCache[string, grpcCachedResponse](nil, nil, t.Name(), CacheBudget{})
+		responseCache, err := newResponseCache[string, grpcCachedResponse](nil, nil, t.Name(), CacheBudget{}, nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
 		up := newTestGrpcUpstream("raw", 1)

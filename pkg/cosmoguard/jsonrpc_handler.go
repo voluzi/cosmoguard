@@ -120,7 +120,7 @@ func NewJsonRpcHandler(name string, opts ...Option[JsonRpcHandlerOptions]) (*Jso
 	}
 
 	var err error
-	handler.cache, err = newResponseCache[uint64, *JsonRpcMsg](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
+	handler.cache, err = newResponseCache[uint64, *JsonRpcMsg](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cfg.L2Operations, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}
