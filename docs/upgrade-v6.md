@@ -117,11 +117,13 @@ for convergence before each replacement. Lower traffic is a precaution, not a
 measured guarantee of eliminating the stall. There is no evidence that adding
 replicas first prevents it; do not rely on that as an upgrade remedy.
 
-A same-version v6 restart still showed 20–30-second dips at 34–150 requests/s,
-with both outage gates open and low CPU use. This remains under investigation;
-zero restarts and improved termination errors do not establish uninterrupted
-throughput. At this profile the five-second termination hold reduced observed
-502s from 2,698 to 18, without eliminating them.
+External-ingress tests also showed periodic stalls without any rollout; those
+stalls were traced to the test cluster's ingress path. With in-cluster load sent
+directly to the guard Service, a same-version three-replica rolling restart at
+200m/250Mi sustained 5,081–8,403 requests/s in every 15-second slice, with zero
+errors or restarts and one 1.7s maximum-latency observation. Earlier termination
+502s fell from 2,698 to 18 with the five-second hold. These are workload-specific
+on-prem observations for a5f4ae5, not certification of later changes.
 
 The response and clustered-limiter gates suppress backend calls after three
 consecutive executed-operation timeouts. One second later, one real request probes
