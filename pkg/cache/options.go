@@ -74,7 +74,10 @@ func OnEvict(fn func()) Option {
 // Reusing the option shares one admission pool across cache instances.
 // Memory caches ignore it; expired operations may still finish in olric.
 func BoundedOperations(capacity int, budget time.Duration, maxBytes uint64, onFailure func(string), onSkip func(string)) Option {
-	gate := boundedcall.New(capacity, budget, onFailure)
+	return boundedOperations(boundedcall.New(capacity, budget, onFailure), maxBytes, onSkip)
+}
+
+func boundedOperations(gate *boundedcall.Gate, maxBytes uint64, onSkip func(string)) Option {
 	bytes := bytebudget.New(maxBytes)
 	return func(o *Options) { o.operationGate = gate; o.operationBytes = bytes; o.onSkip = onSkip }
 }
@@ -100,4 +103,9 @@ func (opt Option) CloseOperations() {
 		opt(o)
 		o.operationGate.Close()
 	}
+}
+
+// RecoveringOperations skips repeated backend waits during an outage.
+func RecoveringOperations(capacity int, budget time.Duration, maxBytes uint64, onFailure func(string), onSkip func(string), onUnavailable func(bool)) Option {
+	return boundedOperations(boundedcall.NewRecovering(capacity, budget, onFailure, onUnavailable), maxBytes, onSkip)
 }

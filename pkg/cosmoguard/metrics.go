@@ -116,8 +116,21 @@ var upstreamRequestsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 
 var backendOperationFailuresCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "cosmoguard_backend_operation_failures_total",
-	Help: "Clustered request-path backend operations abandoned on timeout or rejected at capacity.",
+	Help: "Request-path backend operations abandoned on timeout, rejected at capacity, or skipped during an outage.",
 }, []string{"backend", "outcome"})
+
+var backendUnavailableGates = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "cosmoguard_backend_unavailable_gates",
+	Help: "Backend gates suppressing calls during an outage, including recovery probes.",
+}, []string{"backend"})
+
+func recordBackendUnavailable(backend string, unavailable bool) {
+	delta := -1.0
+	if unavailable {
+		delta = 1
+	}
+	backendUnavailableGates.WithLabelValues(backend).Add(delta)
+}
 
 func recordBackendOperationFailure(backend, outcome string) {
 	backendOperationFailuresCounter.WithLabelValues(backend, outcome).Inc()
@@ -150,19 +163,21 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(upstreamRequestsCounter)
 		_ = prometheus.Register(configReloadsCounter)
 		_ = prometheus.Register(backendOperationFailuresCounter)
+		_ = prometheus.Register(backendUnavailableGates)
 		_ = prometheus.Register(limiterFallbackCounter)
 		_ = prometheus.Register(l2Metrics)
 		_ = prometheus.Register(l2StorageRejections)
 		_ = prometheus.Register(l2ImportDrops)
 		_ = prometheus.Register(l2WriteSkips)
-		for _, reason := range []string{"timeout", "capacity", "backend_error"} {
+		for _, reason := range []string{"timeout", "capacity", "backend_error", "backend_unavailable"} {
 			for _, outcome := range []string{"allowed", "denied"} {
 				limiterFallbackCounter.WithLabelValues(reason, outcome)
 			}
 		}
 		for _, backend := range []string{"l2", "limiter", "replay"} {
-			for _, outcome := range []string{"timeout", "rejected"} {
-				if backend == "replay" && outcome == "rejected" {
+			backendUnavailableGates.WithLabelValues(backend)
+			for _, outcome := range []string{"timeout", "rejected", "unavailable"} {
+				if backend == "replay" && outcome != "timeout" {
 					continue
 				}
 				backendOperationFailuresCounter.WithLabelValues(backend, outcome)

@@ -27,6 +27,8 @@ func (e skippedWrite) Error() string   { return ErrL2Skipped.Error() + ": " + e.
 func (e skippedWrite) Unwrap() []error { return []error{ErrL2Skipped, e.cause} }
 func writeSkipReason(err error) string {
 	switch {
+	case errors.Is(err, boundedcall.ErrUnavailable):
+		return "unavailable"
 	case boundedcall.IsFailure(err):
 		return "inflight"
 	case errors.Is(err, olricstore.ErrCapacity):
@@ -136,16 +138,23 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 		}
 		charge = operationCharge(29 + len(k) + len(b))
 	}
-	_, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, charge, func(opCtx context.Context, lease *bytebudget.Lease) (struct{}, error) {
+	backendErr, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, charge, func(opCtx context.Context, lease *bytebudget.Lease) (error, error) {
 		payload, err := marshalBounded(value, maxValue)
 		if err != nil {
-			return struct{}{}, err
+			return nil, err
 		}
 		if lease != nil {
 			lease.ShrinkTo(operationCharge(29 + len(k) + cap(payload)))
 		}
-		return struct{}{}, c.dm.Put(opCtx, k, payload, olric.EX(itemTTL))
+		err = c.dm.Put(opCtx, k, payload, olric.EX(itemTTL))
+		if errors.Is(err, olricstore.ErrCapacity) {
+			return err, nil
+		}
+		return nil, operationError(err)
 	})
+	if err == nil {
+		err = backendErr
+	}
 	return skip(err)
 }
 
@@ -170,14 +179,18 @@ func (c *OlricCache[K, V]) GetWithExpiry(ctx context.Context, key K) (V, int64, 
 
 func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, error) {
 	type result struct {
-		value  V
-		expiry int64
+		value   V
+		expiry  int64
+		missing bool
 	}
 	r, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, maxReadOperationCharge, func(opCtx context.Context, lease *bytebudget.Lease) (result, error) {
 		k := c.keyStr(key)
 		resp, err := c.dm.Get(opCtx, k)
+		if errors.Is(err, olric.ErrKeyNotFound) {
+			return result{missing: true}, nil
+		}
 		if err != nil {
-			return result{}, err
+			return result{}, operationError(err)
 		}
 		raw, err := resp.Byte()
 		if err != nil {
@@ -187,9 +200,9 @@ func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, 
 			lease.ShrinkTo(readOperationCharge(29 + len(k) + len(raw)))
 		}
 		v, err := unmarshalFromOlric[V](raw)
-		return result{v, resp.TTL()}, err
+		return result{value: v, expiry: resp.TTL()}, err
 	})
-	if errors.Is(err, olric.ErrKeyNotFound) {
+	if err == nil && r.missing {
 		err = ErrNotFound
 	}
 	return r.value, r.expiry, err
@@ -270,4 +283,11 @@ func marshalBounded(value any, limit int) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %w", errEncode, err)
 	}
 	return w.data, nil
+}
+
+func operationError(err error) error {
+	if errors.Is(err, olric.ErrOperationTimeout) {
+		return fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
+	}
+	return err
 }

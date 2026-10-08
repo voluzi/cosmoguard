@@ -94,6 +94,7 @@ func (s *memoryReplayStore) gcLoop() {
 const replayOperationBudget = 100 * time.Millisecond
 const replayOperationCapacity = 512
 
+// Replay checks each token; outage suppression would broaden fail-open admission.
 var replayOperations = boundedcall.NewWaiting(replayOperationCapacity, replayOperationBudget, func(outcome string) {
 	recordBackendOperationFailure("replay", outcome)
 })

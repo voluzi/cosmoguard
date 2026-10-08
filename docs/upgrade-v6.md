@@ -71,13 +71,14 @@ formats or the clustered limiter algorithm.
 For example, migrate an existing response owner to:
 
 ```go
-operations := cache.BoundedOperations(128, 100*time.Millisecond, 16<<20, onFailure, onSkip)
+operations := cache.RecoveringOperations(128, 100*time.Millisecond, 16<<20, onFailure, onSkip, onUnavailable)
 defer operations.CloseOperations()
 // Pass operations to every NewOlricCache owned by this response runtime.
 ```
 
-`onFailure` retains the existing timeout/rejected outcomes. `onSkip` receives
-`inflight`, `storage_capacity`, `entry_size`, `backend`, or `encode`.
+`BoundedOperations` keeps per-request checks. `RecoveringOperations` adds outage
+suppression; `onUnavailable(bool)` observes transitions. `onFailure` receives
+`timeout`, `rejected`, or `unavailable`. `onSkip` receives `unavailable`, `inflight`, `storage_capacity`, `entry_size`, `backend`, or `encode`.
 `operations.OperationBytes()` returns current and total byte reservations.
 An opaque Olric write-quorum error is `backend`; a failed backup with successful
 quorum can increment storage rejection without producing a caller skip.
@@ -99,6 +100,17 @@ has quorum and its coordinator answers authenticated PINGs. Startup aborts after
 45s budget. SIGTERM cancels construction and shuts down Olric with its graceful
 leave broadcast. This prevents bootstrap waits from exhausting the startup probe;
 it does not change an old coordinator's scan or cancel its in-flight replica RPCs.
+
+The response and clustered-limiter gates suppress backend calls after three
+consecutive executed-operation timeouts. One second later, one real request probes
+recovery. Healthy replies close the state; unfinished probes keep their leases.
+L2 skips to L1/upstream and the limiter uses its existing per-replica fallback.
+The limiter algorithm and deprecated ignored failureMode are unchanged. This
+per-gate state may also divert healthy partitions during an outage. Replay keeps
+its per-request bounded NX check, with no outage state, so healthy partitions can
+still reject replayed tokens. Monitor `cosmoguard_backend_unavailable_gates` and
+the `unavailable` backend failures / L2 skips and `backend_unavailable` limiter
+fallback reasons. No operator settings are added.
 
 The native wire codecs are tested in both directions against the real default
 engine, including loopback migration, post-join replication, graceful departure,

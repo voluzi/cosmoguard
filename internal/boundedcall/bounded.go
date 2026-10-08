@@ -17,7 +17,7 @@ var ErrRejected = errors.New("backend operation capacity exhausted")
 var ErrTimeout = errors.New("backend operation wait timed out")
 
 func IsFailure(err error) bool {
-	return errors.Is(err, ErrTimeout) || errors.Is(err, ErrRejected)
+	return errors.Is(err, ErrTimeout) || errors.Is(err, ErrRejected) || errors.Is(err, ErrUnavailable)
 }
 
 type Gate struct {
@@ -26,6 +26,7 @@ type Gate struct {
 	budget  time.Duration
 	observe func(string)
 	wait    bool
+	outage  *outage
 }
 
 func New(capacity int, budget time.Duration, observe func(string)) *Gate {
@@ -49,6 +50,7 @@ func Do[T any](ctx context.Context, gate *Gate, fn func(context.Context) (T, err
 func (g *Gate) Close() {
 	if g != nil {
 		g.closed.Store(true)
+		g.outage.close()
 	}
 }
 
@@ -62,11 +64,30 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 	if err := ctx.Err(); err != nil {
 		return zero, err
 	}
-	expired := func(waitCtx context.Context) (T, error) {
+	op, admitted := gate.outage.admit()
+	unavailable := func() (T, error) {
 		if err := ctx.Err(); err != nil {
 			return zero, err
 		}
+		if gate.observe != nil {
+			gate.observe("unavailable")
+		}
+		return zero, ErrUnavailable
+	}
+	if !admitted {
+		return unavailable()
+	}
+	abort := func() {
+		gate.outage.resolve(op, false, false, false)
+		gate.outage.finish(op)
+	}
+	expired := func(waitCtx context.Context, executed bool) (T, error) {
+		if err := ctx.Err(); err != nil {
+			gate.outage.resolve(op, false, false, false)
+			return zero, err
+		}
 		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+			gate.outage.resolve(op, true, false, executed)
 			if gate.observe != nil {
 				gate.observe("timeout")
 			}
@@ -75,6 +96,7 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 		return zero, waitCtx.Err()
 	}
 	rejected := func() (T, error) {
+		abort()
 		if err := ctx.Err(); err != nil {
 			return zero, err
 		}
@@ -92,12 +114,12 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 		case gate.slots <- struct{}{}:
 		case <-admissionCtx.Done():
 			cancel()
-			return expired(admissionCtx)
+			return expired(admissionCtx, false)
 		}
 		if admissionCtx.Err() != nil {
 			<-gate.slots
 			cancel()
-			return expired(admissionCtx)
+			return expired(admissionCtx, false)
 		}
 		cancel()
 	} else {
@@ -120,25 +142,50 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 			return rejected()
 		}
 	}
+	var current bool
+	op, current = gate.outage.current(op)
+	if !current {
+		<-gate.slots
+		lease.Release()
+		abort()
+		return unavailable()
+	}
+	if gate.closed.Load() {
+		<-gate.slots
+		lease.Release()
+		return rejected()
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, gate.budget)
 	defer cancel()
 	if waitCtx.Err() != nil {
 		<-gate.slots
 		lease.Release()
-		return expired(waitCtx)
+		abort()
+		return expired(waitCtx, false)
 	}
 
 	done := make(chan callResult[T])
 	workerDone := make(chan struct{})
-	go runWorker(waitCtx, gate.slots, lease, fn, done, workerDone)
+	var finished func()
+	if gate.outage != nil {
+		finished = func() { gate.outage.finish(op) }
+	}
+	go runWorker(waitCtx, gate.slots, lease, fn, done, workerDone, finished)
 	select {
 	case <-waitCtx.Done():
-		return expired(waitCtx)
+		return expired(waitCtx, true)
 	case res := <-done:
-		<-workerDone
-		if ctx.Err() != nil || waitCtx.Err() != nil {
-			return expired(waitCtx)
+		if gate.outage != nil && (ctx.Err() != nil || waitCtx.Err() != nil) {
+			value, err := expired(waitCtx, true)
+			<-workerDone
+			return value, err
 		}
+		timedOut := errors.Is(res.err, ErrTimeout)
+		gate.outage.resolve(op, timedOut, res.err == nil, true)
+		if timedOut && gate.observe != nil {
+			gate.observe("timeout")
+		}
+		<-workerDone
 		return res.value, res.err
 	}
 }
@@ -148,8 +195,11 @@ type callResult[T any] struct {
 	err   error
 }
 
-func runWorker[T any](ctx context.Context, slots chan struct{}, lease *bytebudget.Lease, fn func(context.Context, *bytebudget.Lease) (T, error), done chan<- callResult[T], workerDone chan<- struct{}) {
+func runWorker[T any](ctx context.Context, slots chan struct{}, lease *bytebudget.Lease, fn func(context.Context, *bytebudget.Lease) (T, error), done chan<- callResult[T], workerDone chan<- struct{}, finished func()) {
 	defer close(workerDone)
+	if finished != nil {
+		defer finished()
+	}
 	var res callResult[T]
 	defer func() {
 		if v := recover(); v != nil {

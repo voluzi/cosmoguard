@@ -147,7 +147,7 @@ func TestLimiterWholeAttemptTimeoutUsesLocalFallback(t *testing.T) {
 			cfg := RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1, FailureMode: "fail-closed"}
 			local, err := NewRateLimiter(cfg, nil, "fallback")
 			require.NoError(t, err)
-			limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}, local: local, operationGate: limiterOperations}
+			limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}, local: local, operationGate: boundedcall.New(limiterOperationCapacity, limiterOperationBudget, func(outcome string) { recordBackendOperationFailure("limiter", outcome) })}
 			var forwarded atomic.Int32
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { forwarded.Add(1); _, _ = w.Write([]byte("ok")) }))
 			t.Cleanup(up.Close)

@@ -10,6 +10,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 func TestLimiterFallbackEnforcesPerReplicaAndRecovers(t *testing.T) {
@@ -23,6 +25,7 @@ func TestLimiterFallbackEnforcesPerReplicaAndRecovers(t *testing.T) {
 	for replica := range 2 {
 		limiter, err := newRuleRateLimiter(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), fmt.Sprint(replica))
 		require.NoError(t, err)
+		limiter.(*boundedRateLimiter).operationGate = boundedcall.New(limiterOperationCapacity, limiterOperationBudget, func(outcome string) { recordBackendOperationFailure("limiter", outcome) })
 		dm := &stalledDMap{release: release, stage: "get"}
 		limiter.(*boundedRateLimiter).RateLimiter = &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: float64(cfg.Burst), refillExp: time.Minute}
 		done := make(chan result, 12)
@@ -84,6 +87,7 @@ func TestLimiterFallbackCapacityDecision(t *testing.T) {
 	cfg := RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1}
 	limiter, err := newRuleRateLimiter(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), "capacity-fallback")
 	require.NoError(t, err)
+	limiter.(*boundedRateLimiter).operationGate = boundedcall.New(limiterOperationCapacity, limiterOperationBudget, func(outcome string) { recordBackendOperationFailure("limiter", outcome) })
 	dm := &stalledDMap{release: release, stage: "get"}
 	limiter.(*boundedRateLimiter).RateLimiter = &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}
 	var wg sync.WaitGroup

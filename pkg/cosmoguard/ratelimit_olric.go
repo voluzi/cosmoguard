@@ -214,9 +214,9 @@ func (l *olricRateLimiter) Close() error { return nil }
 const limiterOperationBudget = time.Second
 const limiterOperationCapacity = 2048
 
-var limiterOperations = boundedcall.New(limiterOperationCapacity, limiterOperationBudget, func(outcome string) {
+var limiterOperations = boundedcall.NewRecovering(limiterOperationCapacity, limiterOperationBudget, func(outcome string) {
 	recordBackendOperationFailure("limiter", outcome)
-})
+}, func(unavailable bool) { recordBackendUnavailable("limiter", unavailable) })
 
 type boundedRateLimiter struct {
 	RateLimiter
@@ -234,6 +234,9 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 	}
 	res, err := boundedcall.Do(ctx, l.operationGate, func(opCtx context.Context) (decision, error) {
 		allowed, retry, err := l.RateLimiter.Allow(opCtx, key)
+		if errors.Is(err, olric.ErrOperationTimeout) {
+			err = fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
+		}
 		return decision{allowed, retry}, err
 	})
 	if ctx.Err() != nil {
@@ -243,7 +246,9 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 		return res.allowed, res.retry, nil
 	}
 	reason := "backend_error"
-	if errors.Is(err, boundedcall.ErrTimeout) {
+	if errors.Is(err, boundedcall.ErrUnavailable) {
+		reason = "backend_unavailable"
+	} else if errors.Is(err, boundedcall.ErrTimeout) {
 		reason = "timeout"
 	} else if errors.Is(err, boundedcall.ErrRejected) {
 		reason = "capacity"

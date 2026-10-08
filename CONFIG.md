@@ -353,32 +353,34 @@ cache:
 
 Including a `cache.cluster` block in the config turns the embedded olric daemon into a real cluster. Replicas form a memberlist gossip ring and partition the cache + rate-limiter keyspace. Single binary, single daemon, no external dependencies.
 
-Startup waits for an initial usable olric routing table before constructing
-cache, authentication, limiter, or observability consumers. Bootstrap timeouts
-and insufficient member quorum are retried on the same daemon; permanent errors
-fail immediately. A fixed 45s budget covers initial DNS discovery, daemon start,
-and this gate together; there is no new configuration setting. The first transient cause, elapsed gate
-and total startup time are logged; deadline errors retain the last cause. A native DMap check already in progress can
-finish after the caller's deadline (olric bounds that check to 10s); shutdown
-starts immediately with a 2s allowance.
+Startup starts the operations listener and `/healthz` before waiting for a usable
+Olric routing table. `/readyz` returns 503 during construction, then applies the
+existing upstream readiness checks. Discovery and daemon start have a fixed 45s
+budget. A joiner may continue waiting beyond 45s while the advertised cluster has
+quorum and its coordinator answers authenticated PINGs; without that evidence
+startup fails. Bootstrap does not wait for all migration to finish. SIGTERM
+cancels construction and cleans up immediately, including Olric's graceful leave.
+Keep discovery of unready peers enabled and allow at least 60s for startup probes
+(for example 30 failures at two-second intervals), as the chart does.
 
-The metrics listener and `/healthz` start only in `CosmoGuard.Run`, after
-construction and this bootstrap gate. `/readyz` then applies the existing
-upstream readiness checks; startup does not wait for all data migration to finish.
-Allow at least 60s for a startup probe on the metrics port (for example 30 failures
-at 2s intervals), and keep discovery of unready peers enabled. The chart includes this startup probe for Deployment and StatefulSet. Deployments
-using other manifests must provide the same allowance.
+Response-cache L2 reads, existence checks and writes share one 128-slot byte gate
+per runtime, with a 100ms caller budget. L1 hits bypass it. Admission does not queue
+workers. Timeout, capacity rejection and backend outage use the cache-miss path;
+coalescing and upstream response handling remain unchanged. Tiered writes fill L1
+first, including when L2 rejects capacity, admission, size, encoding or backend
+work. Large native entries can still fit L1. Late operations retain their slots
+and byte reservations until the actual worker exits and can finish a late write.
 
-Clustered response-cache L2 reads, existence checks, and writes have a fixed
-100ms caller-wait budget and share 128 outstanding-operation slots per process.
-L1 hits bypass this pool. At capacity, new operations are rejected immediately
-without a queue. HTTP lookup timeout/rejection follows the cache-miss path,
-including coalescing and response storage. Tiered writes populate L1 on L2 timeout or capacity rejection, while still
-returning the L2 error; other L2 errors leave L1 untouched. Entries whose encoded
-payload exceeds the 1 MiB engine table-size cap are rejected before calling olric and
-remain uncached in both tiers. Subsequent hot-key requests can use L1
-during a stall. Failed storage preserves the upstream response. Cold keys can
-increase upstream traffic during joins or slow peers.
+After three consecutive executed-operation timeouts, the L2 gate skips backend
+calls with `ErrUnavailable`. After one second, the next real request is its single
+recovery probe. An on-time healthy reply closes the outage state, including a
+cache miss or storage-capacity rejection. Failed probes wait another second;
+a probe still executing cannot be replaced. Caller cancellation/deadlines and
+admission/capacity rejection do not open the state. Old in-flight results cannot
+close it. There are no background probes or configuration settings. Three
+timeouts filter isolated delays; the one-second cooldown bounds recovery traffic.
+The state applies across that gate, so a slow partition can temporarily send other
+partitions to L1/upstream. Separate limiter and replay pools remain independent.
 
 Clustered limiter attempts retain v5.1.0's token-bucket algorithm and 250ms
 lock-contention deadline. A separate **1s** caller-wait budget covers the whole
@@ -393,8 +395,11 @@ Each rule owns one existing in-memory limiter for fallback, with the same rate,
 burst, scope, and key. It holds at most 100,000 buckets, with a 10-minute idle
 TTL and capacity eviction; eviction can reset an evicted key's burst. Cache and
 replay saturation cannot consume limiter slots. There are no retries of uncertain
-shared writes. Every subsequent request tries the shared limiter again, so normal
-operation resumes when the backend returns. A failed limiter constructor uses
+shared writes. The clustered limiter gate uses the same three-timeout,
+one-second, single-request-probe outage state as L2. During an outage requests
+immediately use the existing per-replica bucket. A healthy clustered allowance,
+denial or contention result closes it. Token-bucket math, locking and the 250ms
+contention deadline are unchanged. A failed limiter constructor uses
 local buckets and is retried on rule reload.
 
 While falling back, limits are per replica: across N replicas a client can
@@ -422,6 +427,9 @@ Clustered JWT replay checks have 512 slots. At capacity, they wait up to
 full 100ms Put budget: worst-case caller wait is 200ms. Timeout uses the existing replay-store error policy: admit the verified
 identity and log a warning that replay protection was unavailable. This policy
 is unchanged; the wait is bounded. Replay admission shares neither main pool.
+Replay deliberately has no outage suppression: every request still attempts its
+own bounded atomic NX check. Skipping checks during a gate-wide outage would
+admit tokens that an available partition could still reject.
 
 Non-clustered deployments use the same response storage and byte gate. They add
 no limiter or replay admission pools, retain the embedded limiter's 250ms
@@ -442,10 +450,10 @@ level, and release their slots.
 
 `cosmoguard_backend_operation_failures_total` counts abandoned waits and capacity
 rejections. Its labels are `backend` (`l2`, `limiter`, or `replay`) and `outcome`
-(`timeout` or `rejected`) for L2 and limiter, plus replay `timeout`: five
-live combinations. Replay waits for capacity and never emits `rejected`. It does not count cache misses,
+(`timeout`, `rejected` or `unavailable`) for L2 and limiter, plus replay
+`timeout`: seven live combinations. Replay waits for capacity and never emits `rejected`. It does not count cache misses,
 ordinary contention denials, backend panics, or caller context cancellation/deadlines.
-Only expiry of a gate budget counts as a backend timeout. Bounded cache failures, local L2 admission/size/encoding skips and all limiter
+Gate-budget expiry or an executed Olric operation-timeout reply counts as a backend timeout. Bounded cache failures, local L2 admission/size/encoding skips and all limiter
 fallback decisions log at debug level. L2 write skips with `reason="backend"`
 and other cache errors remain errors.
 JWT replay failures retain their warning for the existing security audit path.
@@ -463,21 +471,23 @@ provide process runtime observations for the soak ledger, without labels.
 `cosmoguard_l2_storage_rejections_total{path="fork"|"put"|"put_raw"}` counts receiving
 response capacity rejections; `cosmoguard_l2_import_dropped_entries_total` counts
 capacity omissions acknowledged during response transfer.
-`cosmoguard_l2_write_skips_total{reason}` uses `inflight`, `storage_capacity`,
+`cosmoguard_l2_write_skips_total{reason}` uses `inflight`, `unavailable`, `storage_capacity`,
 `entry_size`, `backend`, or `encode`. A typed capacity cause is needed for
 `storage_capacity`; Olric's opaque write-quorum failure stays `backend`. A quorum
 success with a rejected backup increments receiving storage rejection only.
 Counters are process cumulative and never label keys, tenants or DMap names.
 `cosmoguard_cache_evictions_total` retains its L1 budget-eviction meaning.
 
-`cosmoguard_rate_limit_local_fallback_total` records local decisions with six
-combinations: `reason` (`timeout`, `capacity`, `backend_error`) and `outcome`
+`cosmoguard_rate_limit_local_fallback_total` records local decisions with eight
+combinations: `reason` (`timeout`, `capacity`, `backend_error`, `backend_unavailable`) and `outcome`
 (`allowed`, `denied`). Healthy bursts can also enter local fallback at capacity
 or when the attempt exceeds 1s. Alert on
 `cosmoguard_rate_limit_local_fallback_total{reason="capacity"}` to detect limiter
 pool saturation. Replay retains its existing error policy when
 either 100ms budget expires.
-No new YAML settings or dependencies are required.
+`cosmoguard_backend_unavailable_gates{backend}` counts outage gates, including a
+probe in progress, with fixed labels `l2`, `limiter`, and `replay` (always zero).
+Closed runtimes decrement their L2 state. No new YAML settings are required.
 
 The three pools retain at most 2,688 backend workers: 128 L2, 2,048 limiter,
 and 512 replay. Parked L2 writes retain at most 1 MiB of encoded payload per
