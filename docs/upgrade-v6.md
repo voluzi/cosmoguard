@@ -33,12 +33,11 @@ unchanged. No new operator configuration is required.
    gauges for capacity decisions.
 6. The embedded Olric dependency is now **the voluzi fork**, module
    `github.com/voluzi/olric`, pinned at
-   `v0.7.5-0.20261008123445-16baa29c1b3e`. Consumers that interact with Olric Go
+   `v0.7.5-0.20261008191836-b3cbf68722e4`. Consumers that interact with Olric Go
    types must update their Olric imports and requirement as well. There is **no
    replace directive**, including for downstream builds. The public module
-   downloads through the default Go proxy. The fork contains the approved engine
-   selection/module rename and membership-snapshot/shutdown race fixes; its wire
-   protocol is unchanged.
+   downloads through the default Go proxy. The fork changes listed below retain
+   the native wire protocol.
 7. Enforce the native envelope before cache insertion: keys are ≤255 bytes and
    `29 + len(key) + len(encoded value) < 1MiB`. This includes native framing, so
    a 1MiB payload does not fit. Generic encoding stops before exceeding that
@@ -49,6 +48,25 @@ unchanged. No new operator configuration is required.
    `NewFromFileContext` allow cancellation while startup waits for routing.
    `/healthz` answers during bootstrap; `/readyz` stays unavailable until the
    proxies serve and their upstream pools are healthy.
+
+## Embedded Olric fork
+
+The fork starts from upstream v0.7.4 and includes these commits, in order:
+
+| Commit | Change |
+|---|---|
+| `eea0f7f` | Honor a configured per-DMap engine instead of silently selecting the default engine. |
+| `e1103a0` | Rename the module to `github.com/voluzi/olric`, allowing downstream consumers to use the fork without replace directives. |
+| `ed93708` | Protect membership reads while constructing a Stats snapshot. |
+| `16baa29` | Stop routing callbacks before shutdown waits, preventing concurrent shutdown work from racing the wait. |
+| `cbe50ad` | Run ownership-length RPCs with bounded parallelism and apply their results in the original order, preserving pruning decisions while reducing serial scan delay. |
+| `980fe50` | Process membership changes and close departed client pools while routing work waits; coalesce routing notifications into the existing worker. |
+| `b3cbf68` | Lock and check fragment retirement before storage access, retry stale lookups, and prevent a queued janitor from removing a recreated fragment. Preserve already-read values when shutdown interrupts the idle check. |
+
+Public integration regressions exercise acknowledged Put/Get/Delete and
+Destroy/recreate with both the default and custom engines. The fork changes do
+not add operator settings or alter partition count, replica defaults, transfer
+formats or the clustered limiter algorithm.
 
 For example, migrate an existing response owner to:
 
