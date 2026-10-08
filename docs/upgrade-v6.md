@@ -112,8 +112,10 @@ it does not change an old coordinator's scan or cancel its in-flight replica RPC
 A measured three-replica rollout from published v5.1.0 at 200m/250Mi under
 20 concurrent ingress requests had zero container restarts, but about 1.5 minutes
 of degraded service while v5.1.0 members remained: 20-second slices fell to 7 and
-19 requests/s with p95 latency of 15–19 seconds. Old members have no bounded waits
-or outage gates; the new joiner cannot cancel their work. Plan a maintenance
+19 requests/s with p95 latency of 15–19 seconds. That run used external ingress;
+subsequent controls found independent ingress stalls, so repeat the mixed rollout
+with direct in-cluster load to isolate the upgrade's latency cost. Old members
+have no bounded waits or outage gates; the new joiner cannot cancel their work. Plan a maintenance
 window or lower offered traffic during this one-time v5.x upgrade cost, and wait
 for convergence before each replacement. Lower traffic is a precaution, not a
 measured guarantee of eliminating the stall. There is no evidence that adding
