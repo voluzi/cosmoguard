@@ -128,35 +128,41 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 		return expired(waitCtx)
 	}
 
-	type result struct {
-		value T
-		err   error
-	}
-	done := make(chan result)
-	go func() {
-		var res result
-		defer func() {
-			if v := recover(); v != nil {
-				res.err = fmt.Errorf("backend operation panicked: %v", v)
-				slog.Error("backend operation panicked", "error", res.err, "stack", string(debug.Stack()))
-			}
-			lease.Release()
-			<-gate.slots
-			select {
-			case done <- res:
-			case <-waitCtx.Done():
-			}
-
-		}()
-		res.value, res.err = fn(waitCtx, lease)
-	}()
+	done := make(chan callResult[T])
+	workerDone := make(chan struct{})
+	go runWorker(waitCtx, gate.slots, lease, fn, done, workerDone)
 	select {
 	case <-waitCtx.Done():
 		return expired(waitCtx)
 	case res := <-done:
+		<-workerDone
 		if ctx.Err() != nil || waitCtx.Err() != nil {
 			return expired(waitCtx)
 		}
 		return res.value, res.err
 	}
+}
+
+type callResult[T any] struct {
+	value T
+	err   error
+}
+
+func runWorker[T any](ctx context.Context, slots chan struct{}, lease *bytebudget.Lease, fn func(context.Context, *bytebudget.Lease) (T, error), done chan<- callResult[T], workerDone chan<- struct{}) {
+	defer close(workerDone)
+	var res callResult[T]
+	defer func() {
+		if v := recover(); v != nil {
+			res.err = fmt.Errorf("backend operation panicked: %v", v)
+			slog.Error("backend operation panicked", "error", res.err, "stack", string(debug.Stack()))
+		}
+		select {
+		case done <- res:
+		case <-ctx.Done():
+		}
+		res = callResult[T]{}
+		lease.Release()
+		<-slots
+	}()
+	res.value, res.err = fn(ctx, lease)
 }

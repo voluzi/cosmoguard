@@ -67,3 +67,71 @@ func TestWeightedGatePanicReleases(t *testing.T) {
 		t.Fatal(err, b.Snapshot())
 	}
 }
+
+func TestWeightedGateRetainsCompletedResultUntilHandoff(t *testing.T) {
+	for _, abandon := range []bool{false, true} {
+		t.Run(map[bool]string{false: "deliver", true: "cancel"}[abandon], func(t *testing.T) {
+			g := New(1, time.Second, nil)
+			b := bytebudget.New(1 << 20)
+			lease, ok := b.TryAcquire(1 << 20)
+			if !ok {
+				t.Fatal("initial reservation")
+			}
+			g.slots <- struct{}{}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			returned := make(chan struct{})
+			done := make(chan callResult[[]byte])
+			workerDone := make(chan struct{})
+			go runWorker(ctx, g.slots, lease, func(context.Context, *bytebudget.Lease) ([]byte, error) {
+				value := make([]byte, 1<<20)
+				value[0] = 42
+				close(returned)
+				return value, nil
+			}, done, workerDone)
+			<-returned
+			// A descheduled receiver has not yet accepted the completed result.
+			until := time.NewTimer(20 * time.Millisecond)
+			defer until.Stop()
+			held := true
+			for held {
+				if b.Snapshot().Reserved != 1<<20 {
+					t.Error("released bytes while result was awaiting delivery")
+					break
+				}
+				select {
+				case <-until.C:
+					held = false
+				case <-time.After(time.Millisecond):
+				}
+			}
+			_, err := DoWeighted(t.Context(), g, nil, 0, func(context.Context, *bytebudget.Lease) (int, error) {
+				t.Error("released slot while result was awaiting delivery")
+				return 0, nil
+			})
+			if !errors.Is(err, ErrRejected) {
+				t.Errorf("admitted second worker: %v", err)
+			}
+			if abandon {
+				cancel()
+			} else {
+				res := <-done
+				if res.err != nil || len(res.value) != 1<<20 || res.value[0] != 42 {
+					t.Error("lost delivered value", res.err)
+				}
+			}
+			select {
+			case <-workerDone:
+			case <-time.After(time.Second):
+				t.Fatal("worker did not finish handoff")
+			}
+			if b.Snapshot().Reserved != 0 {
+				t.Error("retained result lease after handoff")
+			}
+			value, err := Do(t.Context(), g, func(context.Context) (int, error) { return 7, nil })
+			if err != nil || value != 7 {
+				t.Fatal("slot not reusable", err)
+			}
+		})
+	}
+}

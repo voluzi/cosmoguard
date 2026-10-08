@@ -280,7 +280,7 @@ size rounded to 4KiB; unknown reads/generic writes reserve 8MiB. Generic encodin
 uses a writer that refuses growth past the native envelope and shrinks the
 reservation once size is known. Read decoding runs within the admitted worker.
 A timed-out or cancelled caller discards a late result, but the actual worker
-retains its slot and byte lease until it exits. Detached work can still finish a
+retains its slot and byte lease until result delivery or discard. Detached work can still finish a
 late write. Limiter and replay work use their independent existing count gates.
 
 Response and security codecs have separate 8MiB and 4MiB scratch allowances from
