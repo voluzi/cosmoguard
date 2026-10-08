@@ -31,6 +31,7 @@ const headerSize = 48
 type PoolStats struct {
 	Capacity, Allocated, Inuse, Entries, ForkRejected, PutRejected, RawRejected, ImportDropped uint64
 	Codec                                                                                      bytebudget.Snapshot
+	LastCompactionUnixMilli                                                                    uint64
 }
 
 // Observer is called outside the allocator lock.
@@ -45,6 +46,7 @@ type Pool struct {
 	used, entries, forkRejected, putRejected, rawRejected, importDropped uint64
 	codec                                                                *bytebudget.Budget
 	closed                                                               bool
+	lastCompactionUnixMilli                                              uint64
 }
 type Engine struct {
 	exportID               int
@@ -78,7 +80,7 @@ func (p *Pool) Close(_ context.Context) error {
 }
 func (p *Pool) Snapshot() PoolStats {
 	p.mu.Lock()
-	s := PoolStats{Capacity: p.arena.limit, Allocated: p.arena.allocated, Inuse: p.used, Entries: p.entries, ForkRejected: p.forkRejected, PutRejected: p.putRejected, RawRejected: p.rawRejected, ImportDropped: p.importDropped}
+	s := PoolStats{Capacity: p.arena.limit, Allocated: p.arena.allocated, Inuse: p.used, Entries: p.entries, ForkRejected: p.forkRejected, PutRejected: p.putRejected, RawRejected: p.rawRejected, ImportDropped: p.importDropped, LastCompactionUnixMilli: p.lastCompactionUnixMilli}
 	p.mu.Unlock()
 	s.Codec = p.codec.Snapshot()
 	return s
@@ -538,7 +540,9 @@ func (e *Engine) Compaction() (bool, error) {
 	if err := e.readyLocked(); err != nil {
 		return false, err
 	}
-	e.sweepLocked(time.Now().UnixMilli())
+	now := time.Now().UnixMilli()
+	e.sweepLocked(now)
+	e.p.lastCompactionUnixMilli = uint64(now)
 	return true, nil
 }
 func (e *Engine) Close() error { e.p.mu.Lock(); defer e.p.mu.Unlock(); e.closed = true; return nil }

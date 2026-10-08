@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 	"github.com/voluzi/cosmoguard/v6/pkg/cache"
@@ -51,10 +52,32 @@ func TestRuntimeSecurityPoolWhenL2Unlimited(t *testing.T) {
 func TestRuntimePoolExpiry(t *testing.T) {
 	cr, err := newClusterRuntime(clusterRuntimeOptions{ResponsePoolBytes: 8 << 20})
 	require.NoError(t, err)
-	dm, err := cr.Client().NewDMap("expiry")
-	require.NoError(t, err)
-	require.NoError(t, dm.Put(t.Context(), "k", []byte("v"), olric.PX(10*time.Millisecond)))
-	require.Eventually(t, func() bool { return cr.responsePool.Snapshot().Entries == 0 }, 3*time.Second, 20*time.Millisecond)
+	t.Cleanup(func() { _ = cr.Close(context.Background()) })
+	before := float64(time.Now().UnixMilli()) / 1000
+	for _, name := range []string{"expiry", replayJTIDMap} {
+		dm, err := cr.Client().NewDMap(name)
+		require.NoError(t, err)
+		require.NoError(t, dm.Put(t.Context(), "anchor", []byte("live")))
+		require.NoError(t, dm.Put(t.Context(), "k", []byte("v"), olric.PX(10*time.Millisecond)))
+	}
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(l2Metrics)
+	require.Eventually(t, func() bool {
+		families, err := registry.Gather()
+		if err != nil {
+			return false
+		}
+		swept := map[string]bool{}
+		for _, family := range families {
+			if family.GetName() != "cosmoguard_l2_last_compaction_timestamp_seconds" {
+				continue
+			}
+			for _, metric := range family.Metric {
+				swept[metric.Label[0].GetValue()] = metric.Gauge.GetValue() >= before
+			}
+		}
+		return swept["response"] && swept["security"] && cr.responsePool.Snapshot().Entries == 1 && cr.securityPool.Snapshot().Entries == 1
+	}, 3*time.Second, 20*time.Millisecond, "both pools must complete storage sweeps, not just sampled eviction")
 	require.NoError(t, cr.Close(context.Background()))
 	require.Zero(t, cr.responsePool.Snapshot().Allocated)
 }

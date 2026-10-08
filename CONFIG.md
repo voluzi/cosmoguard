@@ -486,6 +486,10 @@ Storage metrics use only `pool="response"` or `pool="security"`:
 means unlimited. `cosmoguard_l2_operation_bytes` and
 `cosmoguard_l2_operation_capacity_bytes` report G, including detached workers.
 Gauges aggregate active runtimes; closed runtimes release their collector references.
+`cosmoguard_l2_last_compaction_timestamp_seconds{pool}` reports the latest completed
+storage expiry sweep in an active runtime. Zero means no sweep has completed;
+an unchanged value while fragments remain populated indicates stalled expiry.
+Empty pools have no fragment to sweep, so their timestamps can remain unchanged.
 `cosmoguard_gc_cpu_seconds_total` and `cosmoguard_gc_limiter_last_enabled_cycle`
 provide process runtime observations for the soak ledger, without labels.
 

@@ -36,6 +36,7 @@ func newL2Collector() *l2Collector {
 	c.descs = append(c.descs,
 		prometheus.NewDesc("cosmoguard_gc_cpu_seconds_total", "Process GC CPU seconds.", nil, nil),
 		prometheus.NewDesc("cosmoguard_gc_limiter_last_enabled_cycle", "Last GC cycle that enabled the runtime limiter.", nil, nil))
+	c.descs = append(c.descs, prometheus.NewDesc("cosmoguard_l2_last_compaction_timestamp_seconds", "Last completed storage expiry sweep among active runtimes; zero means none.", []string{"pool"}, nil))
 	return c
 }
 func (c *l2Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -52,17 +53,20 @@ func (c *l2Collector) Collect(ch chan<- prometheus.Metric) {
 	c.mu.Unlock()
 	for _, pool := range []string{"response", "security"} {
 		var values [6]uint64
+		var lastCompaction uint64
 		for _, cr := range runtimes {
 			p := cr.responsePool
 			if pool == "security" {
 				p = cr.securityPool
 			}
 			s := p.Snapshot()
+			lastCompaction = max(lastCompaction, s.LastCompactionUnixMilli)
 			v := [6]uint64{s.Allocated, s.Inuse, s.Entries, s.Capacity, s.Codec.Reserved, s.Codec.Limit}
 			for i, n := range v {
 				values[i] += n
 			}
 		}
+		ch <- prometheus.MustNewConstMetric(c.descs[10], prometheus.GaugeValue, float64(lastCompaction)/1000, pool)
 		for i, n := range values {
 			ch <- prometheus.MustNewConstMetric(c.descs[i], prometheus.GaugeValue, float64(n), pool)
 		}
