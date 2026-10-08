@@ -58,3 +58,32 @@ func TestUnlimitedOverflow(t *testing.T) {
 	}
 	l.Release()
 }
+
+func TestConcurrentDuplicateReleaseKeepsOtherLeases(t *testing.T) {
+	b := New(100)
+	lease, ok := b.TryAcquire(60)
+	if !ok {
+		t.Fatal("first admission")
+	}
+	other, ok := b.TryAcquire(40)
+	if !ok {
+		t.Fatal("second admission")
+	}
+	var workers sync.WaitGroup
+	for range 100 {
+		workers.Go(lease.Release)
+	}
+	workers.Wait()
+	if got := b.Snapshot().Reserved; got != 40 {
+		t.Fatal("duplicate release changed other reservation", got)
+	}
+	other.Release()
+	full, ok := b.TryAcquire(100)
+	if !ok {
+		t.Fatal("released capacity unavailable")
+	}
+	full.Release()
+	if got := b.Snapshot().Reserved; got != 0 {
+		t.Fatal("reservation leak", got)
+	}
+}
