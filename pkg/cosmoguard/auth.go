@@ -244,7 +244,13 @@ type identityRegistry struct {
 // anonymous identity (or nil) and no auth gate is enforced. olricClient
 // is used to back the JWT replay-protection store with a cluster-shared
 // DMap (cosmoguard:jti); pass nil to force the per-pod memory fallback.
+// CosmoGuard construction through New wires the bounded clustered replay store; this constructor
+// uses synchronous replay-store calls even with a clustered client.
 func NewAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient) (*Authenticator, error) {
+	return newAuthenticator(cfg, olricClient, false)
+}
+
+func newAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient, clustered bool) (*Authenticator, error) {
 	if cfg == nil || !cfg.Enable {
 		return &Authenticator{}, nil
 	}
@@ -255,6 +261,11 @@ func NewAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient) (*Auth
 		store, err := NewReplayStore(olricClient, replayJTIDMap)
 		if err != nil {
 			return nil, fmt.Errorf("auth.replayProtection: %w", err)
+		}
+		if clustered {
+			if replay, ok := store.(*olricReplayStore); ok {
+				replay.operationGate = replayOperations
+			}
 		}
 		a.replay = store
 	}

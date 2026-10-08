@@ -49,6 +49,22 @@ check() {
 }
 
 for kind in Deployment StatefulSet; do
+  check "${kind}: startup probe covers bootstrap" \
+    'select(.kind == "'"${kind}"'")' '
+    (.spec.template.spec.containers[0].startupProbe.httpGet.path == "/healthz") and
+    (.spec.template.spec.containers[0].startupProbe.httpGet.port == "metrics") and
+    (.spec.template.spec.containers[0].startupProbe.failureThreshold *
+     .spec.template.spec.containers[0].startupProbe.periodSeconds >= 60)
+  ' --set-string "kind=${kind}"
+  check "${kind}: no probes without metrics" \
+    'select(.kind == "'"${kind}"'")' '
+    .spec.template.spec.containers[0] |
+    (has("startupProbe") or has("livenessProbe") or has("readinessProbe")) | not
+  ' --set-string "kind=${kind}" --set config.metrics.enable=false
+  check "${kind}: startup probe can be disabled" \
+    'select(.kind == "'"${kind}"'")' '
+    .spec.template.spec.containers[0] | has("startupProbe") | not
+  ' --set-string "kind=${kind}" --set startupProbe=null
   check "${kind}: RuntimeDefault seccomp and no service account token" \
     'select(.kind == "'"${kind}"'")' '
     (.spec.template.spec.securityContext.seccompProfile.type == "RuntimeDefault") and

@@ -353,27 +353,23 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 			continue
 		}
 		// Reuse the previous limiter unless it's a failed-init sentinel,
-		// which must be rebuilt so a fail-closed rule recovers once the
+		// which must be rebuilt so the shared limiter recovers once the
 		// backend is healthy again.
 		if l, ok := existing[r.Fingerprint]; ok {
 			if _, failed := l.(failingRateLimiter); !failed {
+				reuseRuleRateLimiter(r.RateLimit, l)
 				newLimiters[r.Fingerprint] = l
 				continue
 			}
 		}
 		keyspace := h.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := NewRateLimiter(*r.RateLimit, h.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, h.cacheConfig, h.olricClient, keyspace)
 		if err != nil {
-			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
-				h.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-closed rule will DENY")
-				newLimiters[r.Fingerprint] = sentinel
-			} else {
-				h.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-open rule will run without limit")
-			}
+			h.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
+			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)
 			continue
 		}
+		reuseRuleRateLimiter(r.RateLimit, l)
 		newLimiters[r.Fingerprint] = l
 	}
 
@@ -566,25 +562,24 @@ func (h *JsonRpcHandler) jsonRpcPolicyVerdict(r *http.Request, request *JsonRpcM
 			return false, -32001, why
 		}
 	}
-	if l, found := limiters[rule.Fingerprint]; found && l != nil {
+	if rule.RateLimit != nil {
+		l := limiters[rule.Fingerprint]
 		idName := ""
 		if id != nil {
 			idName = id.Name
 		}
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, GetSourceIP(r), idName)
-		allowed, _, rlErr := l.Allow(r.Context(), key)
+		allowed, _, rlErr := allowRuleRateLimit(r.Context(), rule.RateLimit, l, key)
 		if rlErr != nil {
-			if rule.RateLimit.FailClosed() {
-				h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; failing closed (denying)")
-				h.cgDashboard.RecordDeny(DenyRecord{
-					Section: h.section, Reason: "rate_limit",
-					SourceIP: GetSourceIP(r), Method: request.Method,
-					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
-				})
-				return false, -32005, "rate limiter unavailable"
+			// The caller is gone: code 0 tells both callers to stop
+			// without a response, a log line or a denial record.
+			if r.Context().Err() != nil {
+				return false, 0, ""
 			}
-			h.log.WithError(rlErr).Warn("jsonrpc rate limiter error; allowing")
-		} else if !allowed {
+			logLimiterBackendError(h.log, rlErr, "jsonrpc rate limiter unavailable")
+			allowed = false
+		}
+		if !allowed {
 			h.cgDashboard.RecordDeny(DenyRecord{
 				Section: h.section, Reason: "rate_limit",
 				SourceIP: GetSourceIP(r), Method: request.Method,
@@ -630,6 +625,9 @@ func (h *JsonRpcHandler) enforceJsonRpcRulePolicy(w http.ResponseWriter, r *http
 	ok, code, reason := h.jsonRpcPolicyVerdict(r, request, rule, limiters)
 	if ok {
 		return true
+	}
+	if code == 0 {
+		return false
 	}
 	status := http.StatusUnauthorized
 	logMsg := "request denied (auth)"
@@ -704,7 +702,7 @@ func (h *JsonRpcHandler) handleHttpSingle(request *JsonRpcMsg, w http.ResponseWr
 					// through on.
 					res, err := h.cache.Get(r.Context(), hash)
 					if err != nil && !errors.Is(err, cache.ErrNotFound) {
-						h.log.Errorf("error retrieving from cache: %v", err)
+						logCacheBackendError(h.log, err, "error retrieving from cache")
 					}
 					if err == nil {
 						effTTL := effectiveTTL(rule.Cache, h.cacheConfig)
@@ -1098,6 +1096,8 @@ func (h *JsonRpcHandler) stageSingleResponse(hash uint64, response bufferedJsonR
 }
 
 func (h *JsonRpcHandler) persistPendingSingleResponse(hash uint64, pending *jsonPendingResponse, ttl time.Duration, ruleTag, method string) {
+	// A timed-out Set can leave an older Put running after this lock is
+	// released. StoredAt still bounds the freshness of a late overwrite.
 	pending.writeMu.Lock()
 	defer pending.writeMu.Unlock()
 	if current, ok := h.pendingSingles.Load(hash); !ok || current != pending {
@@ -1112,7 +1112,7 @@ func (h *JsonRpcHandler) persistSingleResponse(hash uint64, res *JsonRpcMsg, ttl
 	err := h.cache.Set(ctx, hash, res, ttl)
 	cancel()
 	if err != nil {
-		h.log.Errorf("error setting cache value: %v", err)
+		logCacheBackendError(h.log, err, "error setting cache value")
 		return
 	}
 	h.cgDashboard.RecordCardinality(h.section, ruleTag, method)
@@ -1287,6 +1287,9 @@ RequestsLoop:
 				// invoked — or served from cache — inside a batch by a
 				// caller that would be denied as a single request.
 				if vok, code, reason := h.jsonRpcPolicyVerdict(r, req, rule, limitersSnap); !vok {
+					if code == 0 {
+						return
+					}
 					denied++
 					// Notifications (no id) get NO response, even on
 					// denial, per JSON-RPC 2.0 §4.1. Emit the error only
@@ -1328,7 +1331,7 @@ RequestsLoop:
 					// hit RTT for remote-partition entries.
 					res, err := h.cache.Get(r.Context(), hash)
 					if err != nil && !errors.Is(err, cache.ErrNotFound) {
-						h.log.Errorf("error loading response from cache: %v", err)
+						logCacheBackendError(h.log, err, "error loading response from cache")
 					}
 					// Only a FRESH entry is served from cache. A stale entry
 					// (past its logical TTL, still within the stale window

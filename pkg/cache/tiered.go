@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 )
 
 // TieredCache layers an in-process L1 in front of an expiry-aware L2,
@@ -39,13 +41,13 @@ func NewTieredCache[K comparable, V any](
 }
 
 func (c *TieredCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Duration) error {
-	// L2 is the source of truth; surface its error.
-	if err := c.l2.Set(ctx, key, value, ttl); err != nil {
+	// Keep hot responses available locally during bounded L2 failures.
+	err := c.l2.Set(ctx, key, value, ttl)
+	if err != nil && !boundedcall.IsFailure(err) {
 		return err
 	}
-	// L1 is best-effort: on failure the next Get repopulates it.
 	_ = c.l1.Set(ctx, key, value, ttl)
-	return nil
+	return err
 }
 
 func (c *TieredCache[K, V]) Get(ctx context.Context, key K) (V, error) {

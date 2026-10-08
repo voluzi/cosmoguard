@@ -144,10 +144,8 @@ func MWAuthGate(auth *Authenticator, ruleAuth func(Request) *RuleAuthConfig) Mid
 // On denial, surfaces RetryAfter in whole seconds (rounded up per
 // RFC 7231 — truncating a 1.5s wait to 1 would let the client retry
 // early and trip the limiter again). Minimum of 1s so the header is
-// never `Retry-After: 0`. On a limiter backend error the behaviour depends
-// on the rule's failureMode: fail-open (default) admits the request so a
-// coordination hiccup doesn't take down all traffic; fail-closed denies it
-// with 429 so an outage can't silently disable rate limiting cluster-wide.
+// never `Retry-After: 0`. Clustered limiters decide with local buckets when
+// the shared backend is unavailable; deprecated failureMode has no effect.
 func MWRateLimit(
 	rateConfigFor func(Request) (*RateLimitConfig, uint64),
 	limiterFor func(uint64) RateLimiter,
@@ -160,9 +158,6 @@ func MWRateLimit(
 			return next(req)
 		}
 		limiter := limiterFor(fp)
-		if limiter == nil {
-			return next(req)
-		}
 		hr := httpReqFor(req)
 		if hr == nil {
 			return next(req)
@@ -172,24 +167,15 @@ func MWRateLimit(
 			idName = req.Identity().Name
 		}
 		key := rateLimitKey(cfg.Scope, fp, hr, idName)
-		allowed, retry, err := limiter.Allow(req.Context(), key)
+		allowed, retry, err := allowRuleRateLimit(req.Context(), cfg, limiter, key)
 		if err != nil {
-			if cfg.FailClosed() {
-				if logger != nil {
-					logger.WithError(err).Warn("rate limiter error; failing closed (denying)")
-				}
-				return Decision{
-					Stop:       true,
-					Action:     "deny",
-					HTTPStatus: http.StatusTooManyRequests,
-					Reason:     "rate limiter unavailable",
-					RetryAfter: 1,
-				}
+			if req.Context().Err() != nil {
+				return Decision{Stop: true}
 			}
 			if logger != nil {
-				logger.WithError(err).Warn("rate limiter error; failing open")
+				logLimiterBackendError(logger, err, "rate limiter unavailable")
 			}
-			return next(req)
+			allowed = false
 		}
 		if !allowed {
 			ra := int(math.Ceil(retry.Seconds()))

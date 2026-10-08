@@ -17,6 +17,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"go.uber.org/goleak"
 	"gotest.tools/assert"
 )
 
@@ -110,8 +111,18 @@ func newControlledWSBackend(manager UpstreamConnManager, client *JsonRpcWsClient
 			if err := peer.ReadJSON(&req); err != nil {
 				return
 			}
-			backend.requests <- &req
-			response, ok := <-backend.responses
+			select {
+			case backend.requests <- &req:
+			case <-client.Closed():
+				return
+			}
+			var response *JsonRpcMsg
+			var ok bool
+			select {
+			case response, ok = <-backend.responses:
+			case <-client.Closed():
+				return
+			}
 			if !ok {
 				return
 			}
@@ -125,6 +136,43 @@ func newControlledWSBackend(manager UpstreamConnManager, client *JsonRpcWsClient
 		}
 	}()
 	return backend
+}
+
+type controlledReadPeer struct {
+	wsJSONPeer
+	read chan struct{}
+}
+
+func (p *controlledReadPeer) ReadJSON(v any) error {
+	err := p.wsJSONPeer.ReadJSON(v)
+	if err == nil {
+		close(p.read)
+	}
+	return err
+}
+
+func TestControlledWSBackendStopsWhenAbandoned(t *testing.T) {
+	for _, receiveRequest := range []bool{false, true} {
+		t.Run(fmt.Sprintf("receive_request=%t", receiveRequest), func(t *testing.T) {
+			client, peer := newWSCacheClient(t)
+			check := goleak.IgnoreCurrent()
+			observed := &controlledReadPeer{wsJSONPeer: peer, read: make(chan struct{})}
+			manager := CosmosUpstreamConnManager(url.URL{}, &util.UniqueID{}, func(*JsonRpcMsg) {})
+			backend := newControlledWSBackend(manager, client, observed)
+			assert.NilError(t, client.SendMsg(&JsonRpcMsg{Version: jsonRpcVersion, ID: 1, Method: "status"}))
+			select {
+			case <-observed.read:
+			case <-time.After(time.Second):
+				t.Fatal("backend did not read request")
+			}
+			if receiveRequest {
+				mustRecv(t, backend.requests, "backend request")
+			}
+			assert.NilError(t, client.Close())
+			assert.NilError(t, peer.Close())
+			goleak.VerifyNone(t, check)
+		})
+	}
 }
 
 func dispatchManagerMessage(manager UpstreamConnManager, msg *JsonRpcMsg) {

@@ -6,6 +6,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/olric-data/olric"
+	"github.com/stretchr/testify/require"
+
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 )
 
 // fakeL2 is a programmable expiryAwareCache used only by the tiered
@@ -15,6 +20,7 @@ type fakeL2[K comparable, V any] struct {
 	store    map[K]fakeEntry[V]
 	getCalls atomic.Int32
 	closed   bool
+	setErr   error
 }
 
 type fakeEntry[V any] struct {
@@ -27,6 +33,9 @@ func newFakeL2[K comparable, V any]() *fakeL2[K, V] {
 }
 
 func (f *fakeL2[K, V]) Set(_ context.Context, key K, value V, ttl time.Duration) error {
+	if f.setErr != nil {
+		return f.setErr
+	}
 	var expiryMs int64
 	if ttl > 0 {
 		expiryMs = time.Now().Add(ttl).UnixMilli()
@@ -295,5 +304,32 @@ func TestTieredRequiresBothLayers(t *testing.T) {
 	l1, _ := NewMemoryCache[string, string]("t", DefaultTTL(time.Minute))
 	if _, err := NewTieredCache[string, string](l1, nil); err == nil {
 		t.Errorf("NewTieredCache(l1, nil) should error")
+	}
+}
+
+func TestTieredSetPreservesL1OnlyForBoundedFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		cached bool
+	}{
+		{"success", nil, true},
+		{"timeout", boundedcall.ErrTimeout, true},
+		{"capacity", boundedcall.ErrRejected, true},
+		{"oversized", olric.ErrEntryTooLarge, false},
+		{"backend", errors.New("backend failed"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, l2 := newTieredForTest[string, []byte](t)
+			l2.setErr = tc.err
+			require.ErrorIs(t, c.Set(t.Context(), "key", []byte("response"), time.Minute), tc.err)
+			got, err := c.l1.Get(t.Context(), "key")
+			if tc.cached {
+				require.NoError(t, err)
+				require.Equal(t, []byte("response"), got)
+			} else {
+				require.ErrorIs(t, err, ErrNotFound)
+			}
+		})
 	}
 }

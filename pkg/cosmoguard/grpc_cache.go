@@ -381,6 +381,8 @@ func (p *GrpcProxy) grpcFetchAndStore(fetchCtx context.Context, method string, r
 // already permits, not a new failure mode; strict cross-pod ordering would
 // need a distributed lock or versioned L2 writes and is deliberately not done.
 func (p *GrpcProxy) storeNewestGRPCResponse(key string, out grpcCachedResponse, ttl time.Duration) {
+	// A bounded Set releases this stripe before its Put finishes. A late
+	// older write may land after a newer one; StoredAt still bounds freshness.
 	mu := &p.writeLocks[grpcWriteStripe(key)]
 	mu.Lock()
 	defer mu.Unlock()

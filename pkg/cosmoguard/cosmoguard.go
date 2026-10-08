@@ -214,6 +214,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	if err := PrepareConfig(cfg); err != nil {
 		return nil, err
 	}
+	warnDeprecatedRateLimitFailureMode(nil, cfg)
 	// Snapshot the operator-written node config before expansion so a
 	// hot reload can detect a real topology change without tripping on
 	// discovery's in-place rewrite of cfg.Nodes (see CosmoGuard.origNodes
@@ -315,7 +316,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// seen-jti set across replicas. Calling NewAuthenticator earlier
 	// would pass a nil client and silently fall back to a per-pod
 	// memory store — a JWT could then be replayed once per replica.
-	authn, err := NewAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client())
+	authn, err := newAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client(), cfg.Cache.Cluster != nil)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up authenticator: %w", err)
 	}
@@ -1013,6 +1014,7 @@ func (f *CosmoGuard) tryReload() {
 	}
 	// Keep the trusted-proxy list published by ReadConfigFromFile.
 	accepted = true
+	warnDeprecatedRateLimitFailureMode(f.cfg, newCfg)
 	before := f.ruleFingerprintsLocked()
 	f.cfg = newCfg
 	if protosetsChanged {

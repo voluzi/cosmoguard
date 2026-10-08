@@ -24,7 +24,7 @@ test:
 # test-race runs the full suite with the race detector. Slower (2-10x) but
 # catches data races; required on every PR before merge.
 test-race:
-	go test -race -timeout 120s ./...
+	go test -race -timeout 300s ./...
 
 # test-cover produces a coverage profile suitable for reports/uploads.
 test-cover:

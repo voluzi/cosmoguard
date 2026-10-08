@@ -67,19 +67,29 @@ const (
 	crossHeightGRPC = "/cosmos.distribution.v1beta1.Query/CommunityPool"
 )
 
-func crossHeightTasks(h *httpDoer, o Options, height int64, node, guard *grpc.ClientConn) []task {
+func crossHeightTasks(h *httpDoer, o Options, height int64, node, guard *grpc.ClientConn, x *methodExclusions) []task {
 	var tasks []task
+	add := func(name string, send func(context.Context, bool, int64) Response) {
+		if reason := x.reason(crossHeightGRPC); reason != "" {
+			if o.Log != nil {
+				fmt.Fprintf(o.Log, "skipping %s: %s\n", name, reason)
+			}
+			tasks = append(tasks, skippedTask(ProtoCrossHeight, name, reason))
+			return
+		}
+		tasks = append(tasks, crossHeightTask(name, height, o.RoundDelay, send))
+	}
 	if o.enabled(ProtoLCD) {
-		tasks = append(tasks, crossHeightTask("LCD "+crossHeightLCD, height, o.RoundDelay, func(ctx context.Context, toGuard bool, hh int64) Response {
+		add("LCD "+crossHeightLCD, func(ctx context.Context, toGuard bool, hh int64) Response {
 			base := o.Node.LCD
 			if toGuard {
 				base = o.Guard.LCD
 			}
 			return h.do(ctx, http.MethodGet, base+crossHeightLCD, nil, map[string]string{"x-cosmos-block-height": strconv.FormatInt(hh, 10)})
-		}))
+		})
 	}
 	if o.enabled(ProtoGRPC) && node != nil && guard != nil {
-		tasks = append(tasks, crossHeightTask("gRPC "+crossHeightGRPC, height, o.RoundDelay, func(ctx context.Context, toGuard bool, hh int64) Response {
+		add("gRPC "+crossHeightGRPC, func(ctx context.Context, toGuard bool, hh int64) Response {
 			conn := node
 			if toGuard {
 				conn = guard
@@ -87,10 +97,10 @@ func crossHeightTasks(h *httpDoer, o Options, height int64, node, guard *grpc.Cl
 			cctx, cancel := context.WithTimeout(ctx, o.Timeout)
 			defer cancel()
 			return invoke(cctx, conn, crossHeightGRPC, nil, hh)
-		}))
+		})
 	}
 	if o.enabled(ProtoRPC) {
-		tasks = append(tasks, crossHeightTask("RPC abci_query "+crossHeightGRPC, height, o.RoundDelay, func(ctx context.Context, toGuard bool, hh int64) Response {
+		add("RPC abci_query "+crossHeightGRPC, func(ctx context.Context, toGuard bool, hh int64) Response {
 			base := o.Node.RPC
 			if toGuard {
 				base = o.Guard.RPC
@@ -98,7 +108,7 @@ func crossHeightTasks(h *httpDoer, o Options, height int64, node, guard *grpc.Cl
 			body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "abci_query",
 				"params": map[string]any{"path": crossHeightGRPC, "height": strconv.FormatInt(hh, 10)}})
 			return h.do(ctx, http.MethodPost, base, body, nil)
-		}))
+		})
 	}
 	return tasks
 }

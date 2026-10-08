@@ -320,27 +320,23 @@ func (p *GrpcProxy) SetRules(rules []*GrpcRule, defaultAction RuleAction) {
 			continue
 		}
 		// Reuse the previous limiter unless it's a failed-init sentinel,
-		// which must be rebuilt so a fail-closed rule recovers once the
+		// which must be rebuilt so the shared limiter recovers once the
 		// backend is healthy again.
 		if l, ok := existing[r.Fingerprint]; ok {
 			if _, failed := l.(failingRateLimiter); !failed {
+				reuseRuleRateLimiter(r.RateLimit, l)
 				newLimiters[r.Fingerprint] = l
 				continue
 			}
 		}
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
 		if err != nil {
-			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-closed rule will DENY")
-				newLimiters[r.Fingerprint] = sentinel
-			} else {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-open rule will run without limit")
-			}
+			p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
+			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)
 			continue
 		}
+		reuseRuleRateLimiter(r.RateLimit, l)
 		newLimiters[r.Fingerprint] = l
 	}
 
@@ -471,28 +467,22 @@ func (p *GrpcProxy) enforcePolicy(ctx context.Context, method string) (context.C
 			}
 		}
 		// Per-rule rate-limit: token bucket keyed by scope.
-		if l, ok := p.limiters[rule.Fingerprint]; ok && l != nil {
+		if rule.RateLimit != nil {
+			l := p.limiters[rule.Fingerprint]
 			idName := ""
 			if id != nil {
 				idName = id.Name
 			}
 			key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
-			allowed, retryAfter, rlErr := l.Allow(ctx, key)
+			allowed, retryAfter, rlErr := allowRuleRateLimit(ctx, rule.RateLimit, l, key)
 			if rlErr != nil {
-				if rule.RateLimit.FailClosed() {
-					p.log.WithError(rlErr).Warn("grpc rate limiter error; failing closed (denying)")
-					p.cgDashboard.RecordDeny(DenyRecord{
-						Section: p.section, Reason: "rate_limit",
-						SourceIP: source, Method: method,
-						RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
-					})
-					markErrSpan("rate limiter unavailable")
-					return ctx, status.Error(codes.ResourceExhausted, "rate limiter unavailable")
+				if ctx.Err() != nil {
+					return ctx, status.FromContextError(rlErr).Err()
 				}
-				// Fail-open (default) on limiter transport error so an olric
-				// blip doesn't take down traffic.
-				p.log.WithError(rlErr).Warn("grpc rate limiter error; allowing")
-			} else if !allowed {
+				logLimiterBackendError(p.log, rlErr, "grpc rate limiter unavailable")
+				allowed = false
+			}
+			if !allowed {
 				p.cgDashboard.RecordDeny(DenyRecord{
 					Section: p.section, Reason: "rate_limit",
 					SourceIP: source, Method: method,

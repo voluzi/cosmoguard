@@ -427,18 +427,17 @@ podDisruptionBudget:
   # minAvailable: 1
   # maxUnavailable: 1
 
-# Sized for the default clustered runtime (config.cache.cluster.enable: true).
-# A single-replica cluster owns all of olric's partitions, so its L2 cache
-# floors at ~68 MiB/DMap (271 partitions x 256 KiB); the memory limit drives
-# the auto-derived L2 budget (see CacheGlobalConfig.ResolveBudget), so 1Gi
-# keeps that floor comfortably inside budget for the non-EVM DMap set. The
-# request stays modest because the idle/light-load footprint is ~10 MiB —
-# it only grows toward the floor under a full cache of large entries.
-# Minimal single-pod installs that don't need clustering can set
-# config.cache.cluster.enable: false (embedded, 16 partitions) and drop the
-# limit back to 512Mi. EVM-enabled single-pod installs (8 DMaps) should raise
-# the limit further or run >=2 replicas, which spreads partitions and lowers
-# the per-node floor.
+# Olric allocates a 1 MiB Go-heap table when a DMap partition first stores
+# an entry, including on replicas; opening an empty DMap allocates no tables.
+# A single node with all 271 partitions populated in the four non-EVM response
+# DMaps needs at least 1,084 MiB of table buffers, exceeding this 1Gi limit
+# before indexes, L1 and request buffers. Low traffic can fit, but 1Gi is unsafe
+# for that fully populated cache; size the limit above the populated footprint.
+# The auto-derived L2 in-use budget cannot reclaim these live table buffers.
+# Embedded mode (config.cache.cluster.enable: false) uses 16 partitions: four
+# populated response DMaps allocate at least 64 MiB. EVM enables eight response
+# DMaps: 2,168 MiB on one clustered node. More nodes spread primary partitions;
+# replicas still allocate tables for their populated backup partitions.
 resources:
   limits:
     cpu: 1
@@ -563,6 +562,15 @@ topologySpreadConstraints: []
 # Lifecycle probes hit cosmoguard's built-in /healthz and /readyz on
 # the metrics port. /readyz reflects upstream-pool health so a node
 # without a healthy upstream stops receiving traffic.
+# Bootstrap completes before /healthz listens; leave margin over the 45s budget.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: metrics
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 30
+
 livenessProbe:
   httpGet:
     path: /healthz

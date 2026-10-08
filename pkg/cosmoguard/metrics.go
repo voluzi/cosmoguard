@@ -114,6 +114,20 @@ var upstreamRequestsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Upstream fetches cosmoguard performed, by pool, upstream, and rule. Excludes cache hits and coalesced single-flight waiters; internal HTTP retries within one request collapse to a single logical fetch (so misses − this = coalesced-away calls).",
 }, []string{"pool", "upstream", "rule_id"})
 
+var backendOperationFailuresCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "cosmoguard_backend_operation_failures_total",
+	Help: "Clustered request-path backend operations abandoned on timeout or rejected at capacity.",
+}, []string{"backend", "outcome"})
+
+func recordBackendOperationFailure(backend, outcome string) {
+	backendOperationFailuresCounter.WithLabelValues(backend, outcome).Inc()
+}
+
+var limiterFallbackCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "cosmoguard_rate_limit_local_fallback_total",
+	Help: "Per-replica rate limiter decisions when the primary limiter is unavailable.",
+}, []string{"reason", "outcome"})
+
 var configReloadsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "cosmoguard_config_reloads_total",
 	Help: "Config reload attempts by outcome: applied, restart_required, or invalid (read, parse, or validation failure).",
@@ -135,6 +149,21 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(cacheEvictionsCounter)
 		_ = prometheus.Register(upstreamRequestsCounter)
 		_ = prometheus.Register(configReloadsCounter)
+		_ = prometheus.Register(backendOperationFailuresCounter)
+		_ = prometheus.Register(limiterFallbackCounter)
+		for _, reason := range []string{"timeout", "capacity", "backend_error"} {
+			for _, outcome := range []string{"allowed", "denied"} {
+				limiterFallbackCounter.WithLabelValues(reason, outcome)
+			}
+		}
+		for _, backend := range []string{"l2", "limiter", "replay"} {
+			for _, outcome := range []string{"timeout", "rejected"} {
+				if backend == "replay" && outcome == "rejected" {
+					continue
+				}
+				backendOperationFailuresCounter.WithLabelValues(backend, outcome)
+			}
+		}
 		// A zero baseline lets rate/increase observe the first reload outcome.
 		for _, outcome := range []string{"applied", "restart_required", "invalid"} {
 			configReloadsCounter.WithLabelValues(outcome)

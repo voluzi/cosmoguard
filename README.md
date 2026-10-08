@@ -28,15 +28,29 @@ changed from v3; existing v3 configs continue to work — run
   preservation, configurable header allowlists. Backed by an embedded
   olric distributed cache with an in-process L1 — single binary,
   no external dependency, shared automatically across replicas when
-  cluster mode is on.
+  cluster mode is on. Clustered L2 waits are bounded at 100ms and fall
+  back upstream on timeout or saturation; 128 slots bound outstanding
+  L2 calls. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
+  retain coalescing; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
   identity` scopes. Buckets are sharded across replicas through the
   same olric runtime in cluster mode, so configured rates stay correct
-  under HPA without an external store.
+  under HPA without an external store. Clustered attempts wait at most 1s
+  with 2,048 outstanding slots. Timeout, saturation, or backend errors use
+  one bounded local limiter per rule with the same rate, burst, and scope.
+  When shared and local decisions coexist, the aggregate rate can reach the
+  shared rate plus one local rate per replica, or (N + 1) times the configured
+  rate, plus local bursts around transitions. Embedded backend errors also use
+  a local decision, with no new pool or wait.
+  `rateLimit.failureMode` is deprecated and ignored; the per-replica limiter
+  decides on backend failure. The key remains accepted and validated and will be removed in the next major version.
+  See [cluster behavior](CONFIG.md#cluster-mode) for limits and metrics.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
   token introspection, and an external-validator method for
   developer-portal style credential checks. Credential headers are
-  always stripped before forwarding upstream.
+  always stripped before forwarding upstream. Clustered JWT replay checks
+  use 512 slots and separate 100ms admission and Put budgets; store failures retain the
+  verified-identity fail-open policy and warning.
 - **CORS** owned by cosmoguard, not the upstream — preflight handled
   directly; upstream's CORS headers are stripped and replaced.
 - **Multi-upstream nodes** with active healthchecks, weighted round-
@@ -57,6 +71,13 @@ changed from v3; existing v3 configs continue to work — run
   connection/subscription panel. In cluster mode it fans out across
   peers for a single cluster-wide view. OpenTelemetry tracing and
   Prometheus metrics round out the surface.
+
+Cluster startup has a 45s default budget; `/healthz` on the metrics port starts
+answering after the bootstrap gate. The chart's startup probe allows 60s; other
+manifests must allow at least 60s. Non-clustered request paths add no wait bounds
+or pools and share the startup default. Embedded tiered writes preserve their
+existing behavior: L2 errors leave L1 untouched. The deprecated rate-limit key
+is ignored in every deployment mode.
 
 ## Installation
 
@@ -184,7 +205,7 @@ asserting byte-identical relay.
 
 ### Checking a live node
 
-`cmd/cosmoguard-compat` calls every read endpoint it can find on a node,
+`cmd/cosmoguard-compat` calls the read endpoints it can find on a node,
 both directly and through cosmoguard, and reports where the answers
 differ. It finds the endpoints itself: gRPC query methods through server
 reflection (only `*.Query` / `*.QueryService` services and the SDK's
@@ -225,6 +246,26 @@ go run ./cmd/cosmoguard-compat \
   --guard-lcd http://cosmoguard:11317 --guard-rpc http://cosmoguard:16657 \
   --guard-grpc http://cosmoguard:19090 --report compat.json
 ```
+
+Use repeatable `--exclude-method` flags to omit reflected gRPC methods:
+
+```sh
+make compat COMPAT_ARGS="--exclude-method '/eth.evm.v1.Query/TraceCall' --exclude-method '/example.v1.Query/Unsafe*'"
+```
+
+Patterns are exact fully qualified paths or prefixes with one trailing `*`;
+the leading slash is optional. Invalid patterns fail before contacting the
+node. An exclusion also skips the method's annotated LCD routes and its
+cross-height probes (including ABCI), before any comparison request is built.
+Progress and the JSON report retain the matched pattern as a `skipped` reason;
+unmatched user-supplied patterns produce warnings. Exclusions do not cover unrelated parameter
+discovery requests or ordinary CometBFT/EVM JSON-RPC methods.
+
+`/eth.evm.v1.Query/Trace*` is excluded by default: an empty `TraceCall`
+request can panic Nibiru 2.9.0 during decoding. This precaution does not imply
+that every trace method is affected. `--allow-unsafe-methods` disables this
+built-in exclusion and may crash the node under test; explicit
+`--exclude-method` flags still apply.
 
 Each endpoint is reported as `identical`, `differs` (cosmoguard answered
 differently), `denied` (cosmoguard refused a request the node answered),

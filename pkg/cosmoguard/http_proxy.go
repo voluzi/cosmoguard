@@ -19,6 +19,7 @@ import (
 	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 	"github.com/voluzi/cosmoguard/v5/pkg/cache"
 	"github.com/voluzi/cosmoguard/v5/pkg/util"
 )
@@ -443,12 +444,11 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		if r.RateLimit == nil {
 			continue
 		}
-		// Reuse the previous limiter if the rule fingerprint didn't change —
-		// UNLESS it's a failed-init sentinel, which must be rebuilt so a
-		// fail-closed rule recovers once the backend is healthy again
-		// (otherwise a transient olric error would deny that rule forever).
+		// Preserve buckets across unchanged rules; retry failed constructors so
+		// local fallback does not outlive a backend failure after a reload.
 		if l, ok := existing[r.Fingerprint]; ok {
 			if _, failed := l.(failingRateLimiter); !failed {
+				reuseRuleRateLimiter(r.RateLimit, l)
 				newLimiters[r.Fingerprint] = l
 				continue
 			}
@@ -456,18 +456,13 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		// Each rule's bucket pool gets its own keyspace under the proxy
 		// name so multiple proxies (lcd, rpc, etc.) don't share buckets.
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := NewRateLimiter(*r.RateLimit, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
 		if err != nil {
-			if sentinel := limiterForFailedInit(r.RateLimit, err); sentinel != nil {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-closed rule will DENY")
-				newLimiters[r.Fingerprint] = sentinel
-			} else {
-				p.log.WithError(err).WithField("rule_priority", r.Priority).
-					Error("rate limiter init failed; fail-open rule will run without limit")
-			}
+			p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
+			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)
 			continue
 		}
+		reuseRuleRateLimiter(r.RateLimit, l)
 		newLimiters[r.Fingerprint] = l
 	}
 
@@ -567,6 +562,10 @@ func (p *HttpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	decision := p.gateChainSnap(rulesSnap, limitersSnap, &matchedRule)(req)
 	// Middlewares enrich the context; pick up the latest copy.
 	r = req.r
+	// A cancelled rate-limit gate stops without a response, like cancelled cache waits.
+	if decision.Stop && decision.HTTPStatus == 0 && r.Context().Err() != nil {
+		return
+	}
 
 	// Endpoint handlers (JSON-RPC POST /, EVM-WS GET /websocket) run once
 	// the gate has passed — for the no-rule-matched case AND for an
@@ -807,7 +806,8 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 			p.log.Errorf("error getting hash of request: %v", err)
 		} else {
 			// Single round-trip lookup. ErrNotFound is a miss (cold
-			// path, no logging); anything else is a backend failure
+			// path, no logging); bounded waits also use the miss/store path so
+			// L1 stays useful during an L2 stall. Other errors are backend failures
 			// that we surface as cache=error so operators alerting
 			// on hit-rate see the regression instead of having an
 			// outage masquerade as cold-cache traffic. The previous
@@ -815,7 +815,9 @@ func (p *HttpProxy) allow(w http.ResponseWriter, r *http.Request, rule *HttpRule
 			// the olric backend (Has() = Get() internally), so
 			// remote-partition hits paid two RTTs per lookup.
 			res, lookupErr := p.cache.Get(r.Context(), hash)
-			if lookupErr != nil && !errors.Is(lookupErr, cache.ErrNotFound) {
+			if boundedcall.IsFailure(lookupErr) {
+				logCacheBackendError(p.log, lookupErr, "error getting cached value")
+			} else if lookupErr != nil && !errors.Is(lookupErr, cache.ErrNotFound) {
 				p.log.Errorf("error getting cached value: %v", lookupErr)
 				ww := WrapStatusOnly(w)
 				p.pool.ServeHTTP(ww, r)
@@ -1430,6 +1432,8 @@ func (p *HttpProxy) stageHTTPResponse(requestHash string, response bufferedUpstr
 }
 
 func (p *HttpProxy) persistPendingHTTPResponse(requestHash string, pending *httpPendingResponse, ttl time.Duration, ruleTag, cardinalityKey string) {
+	// A bounded Set can return before its Put finishes; a late older write
+	// may overwrite a newer one. StoredAt still bounds its freshness.
 	pending.writeMu.Lock()
 	defer pending.writeMu.Unlock()
 	if current, ok := p.pendingMisses.Load(requestHash); !ok || current != pending {
@@ -1444,7 +1448,7 @@ func (p *HttpProxy) persistCachedHTTPResponse(requestHash string, cached CachedR
 	setErr := p.cache.Set(writeCtx, requestHash, cached, ttl)
 	cancel()
 	if setErr != nil {
-		p.log.Errorf("error setting cache value: %v", setErr)
+		logCacheBackendError(p.log, setErr, "error setting cache value")
 		return
 	}
 	p.cgDashboard.RecordCardinality(p.section, ruleTag, cardinalityKey)

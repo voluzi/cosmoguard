@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"time"
 
 	"github.com/olric-data/olric"
 	"github.com/vmihailenco/msgpack/v5"
+
+	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
 )
 
 // olricRateLimiter is the cluster-aware token-bucket implementation: the
@@ -109,10 +112,9 @@ func newOlricRateLimiter(client *olric.EmbeddedClient, cfg RateLimitConfig, keys
 	}, nil
 }
 
-// Allow implements RateLimiter. The whole critical section runs under
-// an olric distributed lock; if the lock can't be acquired in 250 ms we
-// surface the request as denied (with no retry-after) so the proxy
-// doesn't stall — the next request retries the bucket.
+// Allow updates one bucket under an olric distributed lock. Lock contention
+// denies without retry-after; clustered backend failures use local fallback.
+// Clustered proxies bound caller waiting around this entire attempt.
 func (l *olricRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
 	fullKey := l.keyspace + ":" + key
 	// Olric's Lock stores its random token at the supplied key in the
@@ -123,11 +125,8 @@ func (l *olricRateLimiter) Allow(ctx context.Context, key string) (bool, time.Du
 	// the split, the lock key is just fullKey verbatim — same string
 	// across all pods so they converge on the same lock object.
 
-	// LockWithTimeout(deadline=250ms, lease=2s):
-	//   - deadline bounds how long Allow() will wait for the lock.
-	//   - lease is the maximum hold time before olric auto-releases.
-	//     If we crash mid-critical-section, the lease ensures the
-	//     bucket isn't stuck locked forever.
+	// The contention deadline starts after olric's initial Put; the outer
+	// clustered attempt budget also bounds waits that ignore cancellation.
 	lock, err := l.locks.LockWithTimeout(ctx, fullKey, 2*time.Second, 250*time.Millisecond)
 	if err != nil {
 		if errors.Is(err, olric.ErrLockNotAcquired) {
@@ -143,7 +142,7 @@ func (l *olricRateLimiter) Allow(ctx context.Context, key string) (bool, time.Du
 	// locked for the 2 s lease, denying every concurrent request on the
 	// same key as "contention" for that whole window. Detach the ctx so
 	// Unlock actually runs, capped at a short deadline so a half-dead
-	// peer can't pin the deferred call.
+	// peer is asked to finish promptly; olric may ignore this deadline.
 	defer func() {
 		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
 		defer cancel()
@@ -211,3 +210,78 @@ func (l *olricRateLimiter) Allow(ctx context.Context, key string) (bool, time.Du
 // clusterRuntime, not by the limiter. Closing it here would yank the
 // daemon out from under the cache + observability replication too.
 func (l *olricRateLimiter) Close() error { return nil }
+
+const limiterOperationBudget = time.Second
+const limiterOperationCapacity = 2048
+
+var limiterOperations = boundedcall.New(limiterOperationCapacity, limiterOperationBudget, func(outcome string) {
+	recordBackendOperationFailure("limiter", outcome)
+})
+
+type boundedRateLimiter struct {
+	RateLimiter
+	local         RateLimiter
+	operationGate *boundedcall.Gate
+}
+
+func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
+	}
+	type decision struct {
+		allowed bool
+		retry   time.Duration
+	}
+	res, err := boundedcall.Do(ctx, l.operationGate, func(opCtx context.Context) (decision, error) {
+		allowed, retry, err := l.RateLimiter.Allow(opCtx, key)
+		return decision{allowed, retry}, err
+	})
+	if ctx.Err() != nil {
+		return false, 0, ctx.Err()
+	}
+	if err == nil {
+		return res.allowed, res.retry, nil
+	}
+	reason := "backend_error"
+	if errors.Is(err, boundedcall.ErrTimeout) {
+		reason = "timeout"
+	} else if errors.Is(err, boundedcall.ErrRejected) {
+		reason = "capacity"
+	}
+	return localLimiterDecision(ctx, l.local, key, reason, err)
+}
+
+func newRuleRateLimiter(cfg RateLimitConfig, cacheCfg *CacheGlobalConfig, client *olric.EmbeddedClient, keyspace string) (RateLimiter, error) {
+	limiter, err := NewRateLimiter(cfg, client, keyspace)
+	if err != nil {
+		return nil, err
+	}
+	local := cfg.local
+	if local == nil {
+		local, err = NewRateLimiter(cfg, nil, keyspace)
+		if err != nil {
+			_ = limiter.Close()
+			return nil, err
+		}
+	}
+	var gate *boundedcall.Gate
+	if client != nil && cacheCfg != nil && cacheCfg.Cluster != nil {
+		gate = limiterOperations
+	}
+	return &boundedRateLimiter{RateLimiter: limiter, local: local, operationGate: gate}, nil
+}
+
+func localLimiterDecision(ctx context.Context, local RateLimiter, key, reason string, backendErr error) (bool, time.Duration, error) {
+	allowed, retry, err := local.Allow(ctx, key)
+	outcome := "denied"
+	if allowed {
+		outcome = "allowed"
+	}
+	limiterFallbackCounter.WithLabelValues(reason, outcome).Inc()
+	slog.Debug("rate limiter local fallback", "reason", reason, "allowed", allowed, "error", backendErr)
+	return allowed, retry, err
+}
+
+func (l *boundedRateLimiter) Close() error {
+	return errors.Join(l.RateLimiter.Close(), l.local.Close())
+}

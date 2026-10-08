@@ -41,6 +41,10 @@ type Options struct {
 	RoundDelay time.Duration
 	// Log receives progress lines.
 	Log io.Writer
+	// ExcludeMethods skips reflected methods and their LCD/cross-height variants.
+	ExcludeMethods []string
+	// AllowUnsafeMethods disables only the built-in trace exclusion.
+	AllowUnsafeMethods bool
 }
 
 func (o Options) enabled(p string) bool { return len(o.Protocols) == 0 || o.Protocols[p] }
@@ -77,6 +81,13 @@ const noEVM = "no EVM endpoint"
 // Run discovers endpoints on the node, calls each one directly and through
 // cosmoguard, and returns the verdicts.
 func Run(ctx context.Context, o Options) (*Report, error) {
+	x, err := newMethodExclusions(o)
+	if err != nil {
+		return nil, err
+	}
+	if o.Log == nil {
+		o.Log = io.Discard
+	}
 	h := newHTTPDoer(o.Timeout)
 	chainID, latest, err := nodeStatus(ctx, h, o.Node.RPC)
 	if err != nil {
@@ -129,6 +140,18 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 			rep.Add(Result{Protocol: ProtoGRPC, Name: svc, Class: Skipped, Detail: "not a known read-only service, so not called"})
 		}
 		for _, m := range methods {
+			if reason := x.reason(m.FullName); reason != "" {
+				if o.enabled(ProtoGRPC) {
+					tasks = append(tasks, skippedTask(ProtoGRPC, m.FullName, reason))
+				}
+				if o.enabled(ProtoLCD) {
+					for _, tmpl := range m.GETs {
+						tasks = append(tasks, skippedTask(ProtoLCD, tmpl, reason))
+					}
+				}
+				logf("skipping %s: %s", m.FullName, reason)
+				continue
+			}
 			if o.enabled(ProtoGRPC) {
 				tasks = append(tasks, grpcTask(node, guard, m, params, height, o))
 			}
@@ -150,8 +173,13 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 		}
 	}
 
-	tasks = append(tasks, crossHeightTasks(h, o, height, node, guard)...)
+	tasks = append(tasks, crossHeightTasks(h, o, height, node, guard, x)...)
 
+	for i, p := range x.patterns[:len(o.ExcludeMethods)] {
+		if !x.matched[i] {
+			logf("warning: unmatched exclusion %s", p)
+		}
+	}
 	logf("running %d comparisons with concurrency %d", len(tasks), o.Concurrency)
 	runTasks(ctx, tasks, o, rep)
 

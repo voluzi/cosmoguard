@@ -2,8 +2,10 @@ package cosmoguard
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -151,7 +153,7 @@ func TestClusterRuntimeTwoNodeStaticDiscovery(t *testing.T) {
 	assert.Equal(t, []byte("hello-from-A"), got)
 }
 
-// reserveLoopbackPorts grabs n distinct free TCP ports on 127.0.0.1 and
+// reserveLoopbackPorts grabs n distinct free TCP/UDP ports on 127.0.0.1 and
 // returns them. The probe listeners are held open across the whole
 // allocation so the kernel doesn't hand the same port out twice for
 // successive calls; then closed all at once. A small TOCTOU window
@@ -161,17 +163,31 @@ func TestClusterRuntimeTwoNodeStaticDiscovery(t *testing.T) {
 func reserveLoopbackPorts(t *testing.T, n int) []int {
 	t.Helper()
 	listeners := make([]*net.TCPListener, 0, n)
+	packets := make([]*net.UDPConn, 0, n)
+	defer func() {
+		for _, l := range listeners {
+			require.NoError(t, l.Close())
+		}
+		for _, p := range packets {
+			require.NoError(t, p.Close())
+		}
+	}()
 	ports := make([]int, 0, n)
-	for i := 0; i < n; i++ {
-		addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+	for len(ports) < n {
+		l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
 		require.NoError(t, err)
-		l, err := net.ListenTCP("tcp", addr)
-		require.NoError(t, err)
+		port := l.Addr().(*net.TCPAddr).Port
+		p, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+		if err != nil {
+			require.NoError(t, l.Close())
+			if errors.Is(err, syscall.EADDRINUSE) {
+				continue
+			}
+			require.NoError(t, err)
+		}
 		listeners = append(listeners, l)
-		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
-	}
-	for _, l := range listeners {
-		require.NoError(t, l.Close())
+		packets = append(packets, p)
+		ports = append(ports, port)
 	}
 	return ports
 }

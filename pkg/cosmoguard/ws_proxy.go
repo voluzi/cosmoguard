@@ -294,25 +294,19 @@ func (p *JsonRpcWebSocketProxy) policyVerdict(request *JsonRpcMsg, rule *JsonRpc
 			return false, -32001, why
 		}
 	}
-	if l, found := limiters[rule.Fingerprint]; found && l != nil {
+	if rule.RateLimit != nil {
+		l := limiters[rule.Fingerprint]
 		idName := ""
 		if identity != nil {
 			idName = identity.Name
 		}
 		key := grpcRateLimitKey(rule.RateLimit.Scope, rule.Fingerprint, source, idName)
-		allowed, _, rlErr := l.Allow(context.Background(), key)
+		allowed, _, rlErr := allowRuleRateLimit(context.Background(), rule.RateLimit, l, key)
 		if rlErr != nil {
-			if rule.RateLimit.FailClosed() {
-				p.log.WithError(rlErr).Warn("ws rate limiter error; failing closed (denying)")
-				p.cgDashboard.RecordDeny(DenyRecord{
-					Section: p.section, Reason: "rate_limit",
-					SourceIP: source, Method: request.Method,
-					RuleTag: ruleTagOrFingerprint(rule.Tag, rule.Fingerprint),
-				})
-				return false, -32005, "rate limiter unavailable"
-			}
-			p.log.WithError(rlErr).Warn("ws rate limiter error; allowing")
-		} else if !allowed {
+			logLimiterBackendError(p.log, rlErr, "ws rate limiter unavailable")
+			allowed = false
+		}
+		if !allowed {
 			p.cgDashboard.RecordDeny(DenyRecord{
 				Section: p.section, Reason: "rate_limit",
 				SourceIP: source, Method: request.Method,
@@ -423,7 +417,7 @@ func (p *JsonRpcWebSocketProxy) HandleConnection(w http.ResponseWriter, r *http.
 		}
 
 		if err := p.handleRequest(client, req, source, idObj); err != nil {
-			p.log.Errorf("error handling request: %v", err)
+			logCacheBackendError(p.log, err, "error handling request")
 			var writeErr *wsWriteError
 			if errors.As(err, &writeErr) || errors.Is(err, ErrClosed) {
 				client.Close()
@@ -648,7 +642,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 						return nil
 					}
 					if err != nil && !errors.Is(err, cache.ErrNotFound) {
-						p.log.Errorf("error getting cached value: %v", err)
+						logCacheBackendError(p.log, err, "error getting cached value")
 					}
 				}
 
@@ -702,7 +696,7 @@ func (p *JsonRpcWebSocketProxy) handleRequest(client *JsonRpcWsClient, request *
 				res.StoredAt = nowOrDefault(p.now).UTC()
 				physTTL := physicalTTL(effectiveTTL(rule.Cache, p.cacheConfig), resolveStaleWindow(rule.Cache, cfgStaleWindow(p.cacheConfig)))
 				if err = p.cache.Set(context.Background(), hash, res, physTTL); err != nil {
-					return fmt.Errorf("error storing in cache: %v", err)
+					return fmt.Errorf("error storing in cache: %w", err)
 				}
 				p.cgDashboard.RecordCardinality(p.section, ruleID, request.Method)
 				return nil
@@ -912,6 +906,8 @@ func (p *JsonRpcWebSocketProxy) storeWSResponseAsync(hash uint64, response *Json
 	pending := &wsPendingResponse{message: cached, writeMu: writeMu}
 	p.pendingMisses.Store(hash, pending)
 	go func() {
+		// A timed-out Set can leave an older Put running after this lock is
+		// released. StoredAt still bounds the freshness of a late overwrite.
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		if current, ok := p.pendingMisses.Load(hash); !ok || current != pending {
@@ -922,7 +918,7 @@ func (p *JsonRpcWebSocketProxy) storeWSResponseAsync(hash uint64, response *Json
 		cancel()
 		p.pendingMisses.CompareAndDelete(hash, pending)
 		if err != nil {
-			p.log.Errorf("error storing in cache: %v", err)
+			logCacheBackendError(p.log, err, "error storing in cache")
 			return
 		}
 		p.cgDashboard.RecordCardinality(p.section, ruleID, method)
