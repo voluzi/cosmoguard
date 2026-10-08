@@ -398,7 +398,7 @@ func (e *Engine) Delete(h uint64) error {
 	}
 	loc, prev := e.findLocked(h)
 	if loc == 0 {
-		return storage.ErrKeyNotFound
+		return nil
 	}
 	e.removeLocked(loc, prev)
 	return nil
