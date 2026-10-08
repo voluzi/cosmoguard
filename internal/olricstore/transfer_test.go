@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -258,5 +259,37 @@ func TestNativePackGoldenDecode(t *testing.T) {
 	v, err := e.Get(42)
 	if err != nil || v.Key() != "binary\x00key" || v.Timestamp() != 123 || !bytes.Equal(v.Value(), []byte{0, 1, 254, 255}) {
 		t.Fatal("golden pack", err)
+	}
+}
+
+func TestSparseExportWorkspaceScalesWithFragment(t *testing.T) {
+	for _, size := range []int{0, 1024} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			_, e := testEngine(t, 8<<20, Response)
+			if size != 0 {
+				if err := e.PutRaw(1, item("key", size).Encode()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			for range 10 {
+				data, _, err := e.TransferIterator().Export()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var p nativePack
+				if err := msgpack.Unmarshal(data, &p); err != nil {
+					t.Fatal(err)
+				}
+				if p.Allocated != MaxEntryBytes || len(p.HKeys) != min(size, 1) {
+					t.Fatal("native table envelope", p.Allocated, len(p.HKeys))
+				}
+			}
+			runtime.ReadMemStats(&after)
+			if average := (after.TotalAlloc - before.TotalAlloc) / 10; average > 64<<10 {
+				t.Fatalf("sparse export workspace: %d bytes/call, want under 64KiB", average)
+			}
+		})
 	}
 }

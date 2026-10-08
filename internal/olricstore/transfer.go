@@ -47,7 +47,6 @@ func (t *transfer) Export() ([]byte, int, error) {
 		return nil, 0, ErrScratch
 	}
 	defer l.Release()
-	p := nativePack{Allocated: MaxEntryBytes, State: 2, HKeys: make(map[uint64]uint64, 4096), Memory: make([]byte, 0, MaxEntryBytes)}
 	idx := roaring64.New()
 	e.p.mu.Lock()
 	if err := e.readyLocked(); err != nil {
@@ -55,6 +54,11 @@ func (t *transfer) Export() ([]byte, int, error) {
 		return nil, 0, err
 	}
 	e.sweepLocked(time.Now().UnixMilli())
+	capacity := min(e.bytes, 256<<10)
+	if e.head != 0 {
+		capacity = max(capacity, len(rawRecord(e.p.arena.block(e.head))))
+	}
+	p := nativePack{Allocated: MaxEntryBytes, State: 2, HKeys: make(map[uint64]uint64, min(e.length, 4096)), Memory: make([]byte, 0, capacity)}
 	e.exportID++
 	id := e.exportID
 	e.exportLow = 0
