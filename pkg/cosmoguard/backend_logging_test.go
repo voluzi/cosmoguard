@@ -9,6 +9,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
+	"github.com/voluzi/olric"
 )
 
 func TestBoundedBackendFailuresUseDebugLogs(t *testing.T) {
@@ -23,5 +26,23 @@ func TestBoundedBackendFailuresUseDebugLogs(t *testing.T) {
 			require.Contains(t, out.String(), "level=ERROR")
 			require.Contains(t, out.String(), "level=WARN")
 		}
+	}
+}
+
+func TestL2WriteSkipsKeepBackendErrorsVisible(t *testing.T) {
+	for _, tc := range []struct {
+		cause error
+		level string
+	}{
+		{olric.ErrWriteQuorum, "ERROR"},
+		{errors.New("connection refused"), "ERROR"},
+		{olricstore.ErrCapacity, "DEBUG"},
+		{boundedcall.ErrRejected, "DEBUG"},
+		{olric.ErrEntryTooLarge, "DEBUG"},
+	} {
+		var out bytes.Buffer
+		logger := newEntry(slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		logCacheBackendError(logger, errors.Join(cache.ErrL2Skipped, tc.cause), "cache failed")
+		require.Contains(t, out.String(), "level="+tc.level, tc.cause)
 	}
 }

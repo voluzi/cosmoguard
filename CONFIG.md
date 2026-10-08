@@ -438,8 +438,9 @@ rejections. Its labels are `backend` (`l2`, `limiter`, or `replay`) and `outcome
 (`timeout` or `rejected`) for L2 and limiter, plus replay `timeout`: five
 live combinations. Replay waits for capacity and never emits `rejected`. It does not count cache misses,
 ordinary contention denials, backend panics, or caller context cancellation/deadlines.
-Only expiry of a gate budget counts as a backend timeout. Bounded cache failures and all limiter fallback decisions log at debug
-level; other cache errors remain errors.
+Only expiry of a gate budget counts as a backend timeout. Bounded cache failures, local L2 admission/size/encoding skips and all limiter
+fallback decisions log at debug level. L2 write skips with `reason="backend"`
+and other cache errors remain errors.
 JWT replay failures retain their warning for the existing security audit path.
 
 Storage metrics use only `pool="response"` or `pool="security"`:

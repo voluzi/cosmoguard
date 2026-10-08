@@ -78,3 +78,22 @@ func TestWeightedGateNoWaiterQueue(t *testing.T) {
 	require.ErrorIs(t, err, boundedcall.ErrRejected)
 	require.Less(t, time.Since(start), 100*time.Millisecond)
 }
+
+func TestExpectedL2SkipClassification(t *testing.T) {
+	for _, tc := range []struct {
+		cause error
+		want  bool
+	}{
+		{olric.ErrWriteQuorum, false},
+		{errors.New("opaque backend failure"), false},
+		{boundedcall.ErrRejected, true},
+		{olric.ErrEntryTooLarge, true},
+		{errEncode, true},
+	} {
+		err := skippedWrite{tc.cause}
+		require.ErrorIs(t, err, ErrL2Skipped)
+		require.ErrorIs(t, err, tc.cause)
+		require.Equal(t, tc.want, IsExpectedL2Skip(err), tc.cause)
+	}
+	require.False(t, IsExpectedL2Skip(olric.ErrEntryTooLarge))
+}

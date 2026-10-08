@@ -39,6 +39,12 @@ func writeSkipReason(err error) string {
 		return "backend"
 	}
 }
+
+// IsExpectedL2Skip reports a write skipped by admission, size or encoding limits.
+func IsExpectedL2Skip(err error) bool {
+	return errors.Is(err, ErrL2Skipped) && writeSkipReason(err) != "backend"
+}
+
 func roundedOperationBytes(n int) uint64 {
 	n = (n + 4095) / 4096 * 4096
 	if n < 4096 {
