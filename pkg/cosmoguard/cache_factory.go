@@ -5,7 +5,7 @@ import (
 
 	"github.com/olric-data/olric"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 const l2OperationBudget = 100 * time.Millisecond

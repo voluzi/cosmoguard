@@ -10,7 +10,7 @@ import (
 	"github.com/olric-data/olric"
 	"github.com/stretchr/testify/require"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 // fakeL2 is a programmable expiryAwareCache used only by the tiered

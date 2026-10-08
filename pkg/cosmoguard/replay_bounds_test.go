@@ -9,7 +9,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 func TestJWTReplayBoundPreservesVerifiedIdentityAndRecovers(t *testing.T) {

@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 	"go.uber.org/goleak"
 	"gotest.tools/assert"
 )

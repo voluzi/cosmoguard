@@ -3,7 +3,7 @@ package cache
 import (
 	"time"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 const (

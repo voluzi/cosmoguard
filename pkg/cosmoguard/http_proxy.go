@@ -19,9 +19,9 @@ import (
 	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 type EndpointHandler interface {

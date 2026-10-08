@@ -12,8 +12,8 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
-	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard/testharness"
 )
 
 // TestHarness_AllowsPassthroughByDefault verifies that with the default

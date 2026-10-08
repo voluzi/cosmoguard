@@ -1,6 +1,6 @@
 package cosmoguard
 
-import "github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+import "github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 
 func logCacheBackendError(logger *Entry, err error, message string) {
 	if boundedcall.IsFailure(err) {

@@ -7,7 +7,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 // The upstream writes the first event right behind the subscribe

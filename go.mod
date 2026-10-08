@@ -1,4 +1,4 @@
-module github.com/voluzi/cosmoguard/v5
+module github.com/voluzi/cosmoguard/v6
 
 // Stay on Go 1.25 until ReverseProxy.Director is migrated separately.
 go 1.25.14

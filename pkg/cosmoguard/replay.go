@@ -8,7 +8,7 @@ import (
 
 	"github.com/olric-data/olric"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 // ReplayStore tracks seen JWT identifiers (`jti` claim) to block

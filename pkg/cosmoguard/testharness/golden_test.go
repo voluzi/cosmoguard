@@ -10,7 +10,7 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard/testharness"
 )
 
 // TestK_GoldenReplay verifies the Phase K compatibility-replay

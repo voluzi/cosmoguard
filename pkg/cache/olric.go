@@ -9,7 +9,7 @@ import (
 	"github.com/olric-data/olric"
 	"github.com/olric-data/olric/config"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 // Use olric's sanitized engine default; native entry metadata can make the

@@ -11,7 +11,7 @@ import (
 	"github.com/olric-data/olric"
 	"github.com/vmihailenco/msgpack/v5"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 // olricRateLimiter is the cluster-aware token-bucket implementation: the

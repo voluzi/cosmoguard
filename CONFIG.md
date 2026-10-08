@@ -102,7 +102,7 @@ frames accept individual JSON-RPC requests, not batches.
 
 ### Go configuration comparison API
 
-Import `github.com/voluzi/cosmoguard/v5/pkg/cosmoguard`:
+Import `github.com/voluzi/cosmoguard/v6/pkg/cosmoguard`:
 
 ```go
 func ParseConfig(raw []byte, lookupEnv func(string) (string, bool)) (*Config, error)

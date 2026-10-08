@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 // TieredCache layers an in-process L1 in front of an expiry-aware L2,

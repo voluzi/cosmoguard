@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 type trackedLimiter struct {

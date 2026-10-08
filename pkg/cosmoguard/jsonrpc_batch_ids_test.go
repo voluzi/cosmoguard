@@ -13,8 +13,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	cachepkg "github.com/voluzi/cosmoguard/v5/pkg/cache"
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	cachepkg "github.com/voluzi/cosmoguard/v6/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 type batchIDProbeCache struct {
