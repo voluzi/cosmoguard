@@ -276,9 +276,14 @@ limit, each tier falls back to 128MiB. The automatic response-work allowance G i
 Both standalone and clustered response adapters share one **128-slot**, byte-
 budgeted gate per runtime, with a **100ms total caller budget**. Admission never
 queues workers. Known byte values reserve eight times their encoded native entry
-size rounded to 4KiB; unknown reads/generic writes reserve 8MiB. Generic encoding
+size rounded to 4KiB; generic writes reserve 8MiB. A read initially reserves
+2MiB plus 4KiB for the native entry, decoded payload and metadata, then shrinks
+to twice its encoded size rounded to 4KiB plus 4KiB before decoding. Generic encoding
 uses a writer that refuses growth past the native envelope and shrinks the
-reservation once size is known. Read decoding runs within the admitted worker.
+reservation once size is known. At 250Mi/500Mi/1Gi, G admits 7/15/31
+unknown-size reads concurrently. Small reads can reach the 128-slot count cap
+once their sizes are known; even near-envelope reads keep total reservations
+within 16MiB/32MiB/64MiB. Read decoding runs within the admitted worker.
 A timed-out or cancelled caller discards a late result, but the actual worker
 retains its slot and byte lease until result delivery or discard. Detached work can still finish a
 late write. Limiter and replay work use their independent existing count gates.
@@ -305,7 +310,7 @@ shared-slab attribution, not native table count; native table garbage ratios are
 not comparable. L1 accounting remains approximate and depends on object shape.
 
 The hard bound does not cover security cardinality, local limiter identities,
-application-owned request/response bodies, generic encoder internals, accepted
+application-owned request/response bodies, generic encoder/decoder internals, accepted
 connections/pipelined RESP frames, outer fragment decode before Import,
 remote response writers/slow readers, or returned export buffers. The cgroup is
 still the process limit. See [v6 upgrades](docs/upgrade-v6.md) and the

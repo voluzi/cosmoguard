@@ -16,6 +16,7 @@ import (
 
 const maxBoundedOlricPayloadBytes = olricstore.MaxEntryBytes
 const unknownOperationCharge = 8 * olricstore.MaxEntryBytes
+const maxReadOperationCharge = 2*olricstore.MaxEntryBytes + 4096
 
 var ErrL2Skipped = errors.New("response L2 insertion skipped")
 var errEncode = errors.New("response encode failed")
@@ -38,13 +39,18 @@ func writeSkipReason(err error) string {
 		return "backend"
 	}
 }
-func operationCharge(n int) uint64 {
+func roundedOperationBytes(n int) uint64 {
 	n = (n + 4095) / 4096 * 4096
 	if n < 4096 {
 		n = 4096
 	}
-	return uint64(n) * 8
+	return uint64(n)
 }
+
+func operationCharge(n int) uint64 { return roundedOperationBytes(n) * 8 }
+
+// Reads retain the native entry and decoded payload; the allowance covers metadata.
+func readOperationCharge(n int) uint64 { return roundedOperationBytes(n)*2 + 4096 }
 
 // OlricCache implements Cache[K, V] backed by an olric DMap. The DMap name
 // is the cache namespace, so two cache instances created with different
@@ -161,14 +167,18 @@ func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, 
 		value  V
 		expiry int64
 	}
-	r, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, unknownOperationCharge, func(opCtx context.Context, _ *bytebudget.Lease) (result, error) {
-		resp, err := c.dm.Get(opCtx, c.keyStr(key))
+	r, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, maxReadOperationCharge, func(opCtx context.Context, lease *bytebudget.Lease) (result, error) {
+		k := c.keyStr(key)
+		resp, err := c.dm.Get(opCtx, k)
 		if err != nil {
 			return result{}, err
 		}
 		raw, err := resp.Byte()
 		if err != nil {
 			return result{}, err
+		}
+		if lease != nil {
+			lease.ShrinkTo(readOperationCharge(29 + len(k) + len(raw)))
 		}
 		v, err := unmarshalFromOlric[V](raw)
 		return result{v, resp.TTL()}, err

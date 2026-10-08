@@ -49,7 +49,7 @@ func TestWeightedGateAllNamespacesShareBudget(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	dm := &blockedCacheDMap{release: release, entered: make(chan struct{}, 1)}
-	option := BoundedOperations(128, 10*time.Millisecond, 8<<20, nil, nil)
+	option := BoundedOperations(128, 10*time.Millisecond, (2<<20)+4096, nil, nil)
 	a, b := defaultOptions(), defaultOptions()
 	option(a)
 	option(b)
@@ -61,8 +61,8 @@ func TestWeightedGateAllNamespacesShareBudget(t *testing.T) {
 	require.ErrorIs(t, err, boundedcall.ErrRejected)
 	require.Equal(t, int32(1), dm.calls.Load())
 	reserved, capacity := option.OperationBytes()
-	require.Equal(t, uint64(8<<20), reserved)
-	require.Equal(t, uint64(8<<20), capacity)
+	require.Equal(t, uint64((2<<20)+4096), reserved)
+	require.Equal(t, uint64((2<<20)+4096), capacity)
 }
 func TestL2CapacityQuorumErrorClassification(t *testing.T) {
 	for _, err := range []error{olric.ErrWriteQuorum, errors.New("opaque failure")} {
