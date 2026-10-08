@@ -152,6 +152,32 @@ func TestEngineStaticScanAllKeys(t *testing.T) {
 	if _, err := e.ScanRegexMatch(0, "[", 2, func(storage.Entry) bool { return true }); err == nil {
 		t.Fatal("regex")
 	}
+	for _, tc := range []struct {
+		pattern string
+		want    int
+	}{{"^.*$", 100}, {"^missing$", 0}} {
+		seen := map[string]bool{}
+		cursor := uint64(0)
+		for {
+			var err error
+			cursor, err = e.ScanRegexMatch(cursor, tc.pattern, 7, func(v storage.Entry) bool {
+				if seen[v.Key()] || !bytes.Equal(v.Value(), bytes.Repeat([]byte{42}, 10)) {
+					t.Fatal("invalid regex scan entry", v.Key())
+				}
+				seen[v.Key()] = true
+				return true
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cursor == 0 {
+				break
+			}
+		}
+		if len(seen) != tc.want {
+			t.Fatal(tc.pattern, len(seen), tc.want)
+		}
+	}
 	count := 0
 	e.Range(func(h uint64, v storage.Entry) bool { count++; _ = e.Delete(h); return false })
 	if count != 1 || e.Stats().Length != 99 {
@@ -227,6 +253,28 @@ func TestEngineStatsAggregateAccounting(t *testing.T) {
 		t.Fatal(err)
 	}
 	check()
+}
+func TestEngineKeyAndTTLMetadata(t *testing.T) {
+	_, e := testEngine(t, 8<<20, Response)
+	v := item("key-π", 10)
+	v.SetTTL(time.Now().Add(time.Minute).UnixMilli())
+	if err := e.Put(1, v); err != nil {
+		t.Fatal(err)
+	}
+	key, err := e.GetKey(1)
+	if err != nil || key != v.Key() {
+		t.Fatal("stored key", key, err)
+	}
+	ttl, err := e.GetTTL(1)
+	if err != nil || ttl != v.TTL() {
+		t.Fatal("stored deadline", ttl, err)
+	}
+	if _, err := e.GetKey(2); !errors.Is(err, storage.ErrKeyNotFound) {
+		t.Fatal("missing key", err)
+	}
+	if _, err := e.GetTTL(2); !errors.Is(err, storage.ErrKeyNotFound) {
+		t.Fatal("missing deadline", err)
+	}
 }
 func TestEngineTTLAndClose(t *testing.T) {
 	_, e := testEngine(t, 8<<20, Response)
