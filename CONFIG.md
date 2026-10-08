@@ -249,7 +249,7 @@ LRU remain soft eviction thresholds; their existing per-map and replica division
 is unchanged. Allocation checks enforce the shared hard cap when LRU cannot make
 room. A capacity rejection preserves an existing record on failed growth.
 
-Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor allowance;
+Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor/index allowance;
 records include fixed indexes/headers and size-class rounding. Empty fragments
 have a small metadata charge rather than a 1MiB table. Olric compaction visits
 every primary and backup fragment once per second, holding the fragment lock
@@ -302,11 +302,12 @@ byte-admission, oversize, encoding or backend failure. A native entry must have
 large upstream responses can still fit L1. Keys and entry framing reduce the
 maximum value payload. Native entry and transfer wire formats remain unchanged.
 
-Per-fragment Olric statistics now attribute shared slab backing to one
-deterministic live fragment, preventing duplicate allocation totals. `Allocated`
+Per-fragment Olric statistics divide shared slab backing evenly among registered
+fragments, assigning division remainders once so aggregate allocation stays exact.
+This takes constant time and includes empty registered fragments. `Allocated`
 includes backing and charged metadata; `Inuse` includes live size-class blocks and
 fragment metadata. Pool gauges provide the node-level cap view. `NumTables` is
-shared-slab attribution, not native table count; native table garbage ratios are
+the same shared-slab apportionment, not native table count; native table garbage ratios are
 not comparable. L1 accounting remains approximate and depends on object shape.
 
 The hard bound does not cover security cardinality, local limiter identities,

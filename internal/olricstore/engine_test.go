@@ -191,20 +191,42 @@ func TestEngineExpiryAllDMapsAndBackups(t *testing.T) {
 }
 func TestEngineStatsAggregateAccounting(t *testing.T) {
 	p, e := testEngine(t, 8<<20, Response)
-	x, err := NewEngine(p).Fork(nil)
-	if err != nil {
+	engines := []*Engine{e}
+	for range 2 {
+		child, err := NewEngine(p).Fork(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		engines = append(engines, child.(*Engine))
+	}
+	for h := range uint64(2) {
+		if err := engines[h].Put(h, item("large", 900<<10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.Put(3, item("small", 100)); err != nil {
 		t.Fatal(err)
 	}
-	other := x.(*Engine)
-	_ = e.Put(1, item("a", 100))
-	_ = other.Put(2, item("b", 100))
-	if uint64(e.Stats().Allocated+other.Stats().Allocated) != p.Snapshot().Allocated {
-		t.Fatal("attribution")
+	check := func() {
+		var allocated, inuse, entries uint64
+		tables := 0
+		for _, engine := range engines {
+			stats := engine.Stats()
+			allocated += uint64(stats.Allocated)
+			inuse += uint64(stats.Inuse)
+			entries += uint64(stats.Length)
+			tables += stats.NumTables
+		}
+		pool := p.Snapshot()
+		if allocated != pool.Allocated || inuse != pool.Inuse || entries != pool.Entries || tables != 2 {
+			t.Fatal("shared accounting", allocated, inuse, entries, tables, pool)
+		}
 	}
-	_ = e.Destroy()
-	if uint64(other.Stats().Allocated) != p.Snapshot().Allocated {
-		t.Fatal("ownership transfer")
+	check()
+	if err := engines[2].Destroy(); err != nil {
+		t.Fatal(err)
 	}
+	check()
 }
 func TestEngineTTLAndClose(t *testing.T) {
 	_, e := testEngine(t, 8<<20, Response)

@@ -6,20 +6,28 @@ const (
 	slabSize = 2 << 20
 	leafSize = 128
 	treeSize = 2 * (slabSize / leafSize)
-	// The descriptor is at most 128 bytes on amd64 and arm64. Linked registries
-	// have no retained slice capacity or map buckets after a slab is released.
-	slabMetadata = 128
-	slabCharge   = slabSize + treeSize + slabMetadata
+	// Each slab reserves its descriptor and at most nine radix-index nodes.
+	slabDescriptor  = 128
+	indexNodeCharge = 160
+	slabMetadata    = slabDescriptor + 9*indexNodeCharge
+	slabCharge      = slabSize + treeSize + slabMetadata
 )
 
 type slab struct {
 	data, tree []byte
-	next       *slab
+	next, prev *slab
 	id         uint32
 	live       int
-	owner      uint64
 }
+type slabIndex struct {
+	branches [16]*slabIndex
+	value    *slab
+	count    uint8
+}
+
 type arena struct {
+	index            *slabIndex
+	slabs            uint64
 	head             *slab
 	nextID           uint32
 	limit, allocated uint64
@@ -83,39 +91,81 @@ func (a *arena) allocate(want int) (uint64, bool) {
 	}
 	a.nextID++
 	s := &slab{data: make([]byte, slabSize), tree: make([]byte, treeSize), id: a.nextID, next: a.head, live: 1}
+	if a.head != nil {
+		a.head.prev = s
+	}
 	a.head = s
+	a.slabs++
+	a.addSlab(s)
 	off, _ := s.allocate(1, 0, slabSize, want)
 	return uint64(s.id)<<32 | uint64(off+1), true
 }
-func (a *arena) slab(loc uint64) *slab {
-	for s := a.head; s != nil; s = s.next {
-		if s.id == uint32(loc>>32) {
-			return s
-		}
+func (a *arena) addSlab(s *slab) {
+	if a.index == nil {
+		a.index = &slabIndex{}
 	}
-	return nil
+	node := a.index
+	for shift := 28; shift >= 0; shift -= 4 {
+		i := s.id >> shift & 15
+		if node.branches[i] == nil {
+			node.branches[i] = &slabIndex{}
+			node.count++
+		}
+		node = node.branches[i]
+	}
+	node.value = s
+}
+func (a *arena) slab(loc uint64) *slab {
+	node := a.index
+	id := uint32(loc >> 32)
+	for shift := 28; shift >= 0 && node != nil; shift -= 4 {
+		node = node.branches[id>>shift&15]
+	}
+	if node == nil {
+		return nil
+	}
+	return node.value
+}
+func (a *arena) dropSlab(id uint32) {
+	var path [9]*slabIndex
+	path[0] = a.index
+	for i := 1; i <= 8; i++ {
+		path[i] = path[i-1].branches[id>>(32-i*4)&15]
+	}
+	path[8].value = nil
+	for i := 8; i > 0; i-- {
+		if path[i].count != 0 || path[i].value != nil {
+			break
+		}
+		parent := path[i-1]
+		parent.branches[id>>(32-i*4)&15] = nil
+		parent.count--
+	}
+	if a.index.count == 0 {
+		a.index = nil
+	}
 }
 func (a *arena) block(loc uint64) []byte { return a.slab(loc).data[int(uint32(loc)-1):] }
 func (a *arena) free(loc uint64, size int) {
-	var prev *slab
-	for s := a.head; s != nil; s = s.next {
-		if s.id != uint32(loc>>32) {
-			prev = s
-			continue
-		}
-		s.free(int(uint32(loc)-1), size)
-		s.live--
-		if s.live == 0 {
-			if prev == nil {
-				a.head = s.next
-			} else {
-				prev.next = s.next
-			}
-			s.data = nil
-			s.tree = nil
-			s.next = nil
-			a.allocated -= slabCharge
-		}
+	s := a.slab(loc)
+	if s == nil {
 		return
 	}
+	s.free(int(uint32(loc)-1), size)
+	s.live--
+	if s.live != 0 {
+		return
+	}
+	if s.prev == nil {
+		a.head = s.next
+	} else {
+		s.prev.next = s.next
+	}
+	if s.next != nil {
+		s.next.prev = s.prev
+	}
+	a.dropSlab(s.id)
+	s.data, s.tree, s.next, s.prev = nil, nil, nil, nil
+	a.slabs--
+	a.allocated -= slabCharge
 }

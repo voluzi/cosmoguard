@@ -22,7 +22,7 @@ func TestAllocatorAllOrders(t *testing.T) {
 			t.Fatal("not released")
 		}
 	}
-	if unsafe.Sizeof(slab{}) > slabMetadata {
+	if unsafe.Sizeof(slab{}) > slabDescriptor || unsafe.Sizeof(slabIndex{}) > indexNodeCharge {
 		t.Fatal("descriptor charge")
 	}
 }
@@ -64,7 +64,7 @@ func TestAllocatorDescriptorChurnDoesNotGrow(t *testing.T) {
 			t.Fatal("admission")
 		}
 		a.free(l, slabSize)
-		if a.head != nil || a.allocated != 0 {
+		if a.head != nil || a.index != nil || a.allocated != 0 {
 			t.Fatal("retained descriptor")
 		}
 	}

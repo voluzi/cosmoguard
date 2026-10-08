@@ -41,7 +41,7 @@ type Pool struct {
 	policy                                                 Policy
 	observer                                               Observer
 	engines                                                *Engine
-	nextID                                                 uint64
+	nextID, fragments                                      uint64
 	used, entries, putRejected, rawRejected, importDropped uint64
 	codec                                                  *bytebudget.Budget
 	closed                                                 bool
@@ -110,6 +110,7 @@ func (e *Engine) registerLocked() error {
 	e.next = e.p.engines
 	e.p.engines = e
 	e.p.used += fragmentCharge
+	e.p.fragments++
 	return nil
 }
 func (e *Engine) Fork(*storage.Config) (storage.Engine, error) {
@@ -125,6 +126,7 @@ func (e *Engine) Fork(*storage.Config) (storage.Engine, error) {
 	child := &Engine{p: e.p, id: e.p.nextID, next: e.p.engines}
 	e.p.engines = child
 	e.p.used += fragmentCharge
+	e.p.fragments++
 	return child, nil
 }
 func field(b []byte, off int) uint64       { return binary.LittleEndian.Uint64(b[off : off+8]) }
@@ -175,7 +177,6 @@ func (e *Engine) appendOrderLocked(loc uint64) {
 func (e *Engine) removeLocked(loc, prev uint64) {
 	b := e.p.arena.block(loc)
 	h, next, size := field(b, 0), field(b, 8), blockCharge(b)
-	s := e.p.arena.slab(loc)
 	if prev == 0 {
 		e.buckets[h%32] = next
 	} else {
@@ -187,23 +188,6 @@ func (e *Engine) removeLocked(loc, prev uint64) {
 	e.p.used -= uint64(size)
 	e.p.entries--
 	e.p.arena.free(loc, size)
-	if s.live > 0 && s.owner == e.id {
-		e.p.assignOwnerLocked(s)
-	}
-}
-
-// Slab backing is attributed to one deterministic live fragment, avoiding
-// double charging shared backing in independent Olric Stats calls.
-func (p *Pool) assignOwnerLocked(s *slab) {
-	s.owner = 0
-	for e := p.engines; e != nil; e = e.next {
-		for loc := e.head; loc != 0; loc = field(p.arena.block(loc), 24) {
-			if uint32(loc>>32) == s.id && (s.owner == 0 || e.id < s.owner) {
-				s.owner = e.id
-				break
-			}
-		}
-	}
 }
 func expiredRaw(b []byte, now int64) bool {
 	k := int(b[0])
@@ -211,15 +195,18 @@ func expiredRaw(b []byte, now int64) bool {
 	return ttl != 0 && ttl <= now
 }
 func (e *Engine) sweepLocked(now int64) {
-	for loc := e.head; loc != 0; {
-		b := e.p.arena.block(loc)
-		next := field(b, 24)
-		if expiredRaw(rawRecord(b), now) {
-			h := field(b, 0)
-			_, prev := e.findLocked(h)
-			e.removeLocked(loc, prev)
+	for _, first := range e.buckets {
+		var prev uint64
+		for loc := first; loc != 0; {
+			b := e.p.arena.block(loc)
+			next := field(b, 8)
+			if expiredRaw(rawRecord(b), now) {
+				e.removeLocked(loc, prev)
+			} else {
+				prev = loc
+			}
+			loc = next
 		}
-		loc = next
 	}
 }
 func (e *Engine) Put(h uint64, v storage.Entry) error {
@@ -286,10 +273,6 @@ func (e *Engine) putLocked(h uint64, v []byte) error {
 	if !ok {
 		return ErrCapacity
 	}
-	s := e.p.arena.slab(dest)
-	if s.owner == 0 || e.id < s.owner {
-		s.owner = e.id
-	}
 	if loc != 0 {
 		e.removeLocked(loc, prev)
 	}
@@ -305,9 +288,6 @@ func (e *Engine) putLocked(h uint64, v []byte) error {
 	e.length++
 	e.p.used += uint64(size)
 	e.p.entries++
-	if s.owner == 0 || e.id < s.owner {
-		s.owner = e.id
-	}
 	return nil
 }
 func (e *Engine) lookupLocked(h uint64) ([]byte, error) {
@@ -415,12 +395,13 @@ func (e *Engine) Stats() storage.Stats {
 	if e.destroyed || e.id == 0 {
 		return storage.Stats{}
 	}
-	s := storage.Stats{Allocated: fragmentCharge, Inuse: e.bytes + fragmentCharge, Length: e.length}
-	for slab := e.p.arena.head; slab != nil; slab = slab.next {
-		if slab.owner == e.id {
-			s.Allocated += slabCharge
-			s.NumTables++
-		}
+	n := e.p.fragments
+	backing := e.p.arena.allocated - n*fragmentCharge
+	s := storage.Stats{Allocated: fragmentCharge + int(backing/n), Inuse: e.bytes + fragmentCharge, Length: e.length, NumTables: int(e.p.arena.slabs / n)}
+	// Assign division remainders once so fragment totals equal the pool's backing.
+	if e == e.p.engines {
+		s.Allocated += int(backing % n)
+		s.NumTables += int(e.p.arena.slabs % n)
 	}
 	return s
 }
@@ -559,10 +540,10 @@ func (e *Engine) destroyLocked() {
 	if e.destroyed {
 		return
 	}
-	for e.head != 0 {
-		h := field(e.p.arena.block(e.head), 0)
-		_, prev := e.findLocked(h)
-		e.removeLocked(e.head, prev)
+	for i := range e.buckets {
+		for e.buckets[i] != 0 {
+			e.removeLocked(e.buckets[i], 0)
+		}
 	}
 	if e.id != 0 {
 		var prev *Engine
@@ -579,6 +560,7 @@ func (e *Engine) destroyLocked() {
 		}
 		e.p.arena.allocated -= fragmentCharge
 		e.p.used -= fragmentCharge
+		e.p.fragments--
 	}
 	e.closed = true
 	e.destroyed = true
