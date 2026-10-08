@@ -228,39 +228,102 @@ cache:
 
 ### Memory budget
 
-The cache is bounded so a high-cardinality query load (e.g. `/tx`, `/block_search`, `/tx_search` — one entry per distinct hash / query) can't grow the working set until the pod is OOMKilled. Both cache tiers that share the pod heap are capped: the in-process **L1** (LRU by approximate payload bytes) and the olric **L2** (per-node LRU). The rate-limiter, JWT replay set, and observability DMaps are **never** evicted.
+Response L2 storage uses a shared byte-budgeted slab pool in the embedded Olric
+runtime. L1 uses LRU with approximate object/payload costs. A separate security
+pool holds rate-limit buckets, locks, JWT replay and observability records; response
+pressure never evicts those records. The security pool has no finite storage cap.
 
-By default the budget is **derived automatically from the pod's memory limit** (read from the cgroup, v1/v2), so it scales with the pod without any configuration:
+The automatic budget still comes from the pod's cgroup v1/v2 memory limit:
 
 ```
-reserve = max(128 MiB, 0.20 × limit)   # runtime + buffers + cache overhead
-budget  = limit − reserve              # total cache footprint
-L1 = 40% of budget,  L2 = 60% of budget   (L2 also holds replicas)
+reserve = min(0.50 × limit, max(128 MiB, 0.20 × limit))
+budget  = limit − reserve
+L1 = 40% of budget, L2 = 60% of budget
 ```
 
-The total is then split evenly across the response caches that run in the pod (one per proxy). The **caps are the primary OOM defence**. In parallel, `GOMEMLIMIT` is set to **90% of the limit** and `GOMAXPROCS` to the CPU quota — a secondary GC backstop for transient/non-cache allocations (it can only reclaim freeable memory, not the live cache set). When no cgroup limit is detectable (bare metal), each tier falls back to a fixed **128 MiB**.
+L1's budget is divided evenly among enabled response caches. L2's **unsplit node
+budget** limits charged response backing and metadata across every response DMap,
+primary, replica, previous-owner and imported copy. Its cap is neither multiplied
+nor divided by the replica factor. Olric's per-DMap `MaxInuse`/`MaxKeys` and sampled
+LRU remain soft eviction thresholds; their existing per-map and replica division
+is unchanged. Allocation checks enforce the shared hard cap when LRU cannot make
+room. A capacity rejection preserves an existing record on failed growth.
 
-**The L2 (olric) cap is approximate by construction** — unlike the exact L1 byte bound. olric evicts by *sampled* LRU and cannot hold a partition below one entry, so each populated cache DMap has a floor of roughly `ownedPartitions × maxEntrySize`, and the aggregate L2 floor is `N_dmaps × ownedPartitions × 1 MiB`. The per-node cap is enforced by two complementary bounds — `MaxInuse` (bytes) and `MaxKeys` (count, derived from the byte budget) — so a flood of tiny entries can't exhaust heap in per-key index structures before the byte counter trips.
+Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor allowance;
+records include fixed indexes/headers and size-class rounding. Empty fragments
+have a small metadata charge rather than a 1MiB table. A pool-owned sweep visits
+all live fragments independently of Olric's DMap order. Expired records release
+blocks and fully unused slabs release backing and descriptors for natural GC.
+Security records expire only according to their existing TTL policies.
+Clustered deployments retain **271 partitions** and separate protocol DMaps;
+standalone deployments retain 16 partitions. Cross-pod response sharing and the
+default replica factor remain unchanged.
 
-Tables are allocated lazily when a partition first stores an entry (including replication/read repair), rather than when the DMap opens. Each table is a normal Go-heap byte slice; pages become resident as they are touched. With all 271 partitions populated in each of four non-EVM response DMaps, table buffers alone allocate 1,084 MiB, exceeding the chart's 1Gi limit before other memory. That default can fit low traffic but is unsafe for this fully populated footprint; the auto-derived in-use budget does not reclaim live table buffers.
+`GOMEMLIMIT` remains **90% of the cgroup limit**, and `GOMAXPROCS` follows the CPU
+quota. GOMEMLIMIT is a soft GC target, not a process RSS limit. Neither L1's
+approximate costs nor the storage cap bounds the whole process. Without a detected
+limit, each tier falls back to 128MiB. The automatic response-work allowance G is
+`min(64MiB, roundUpToMiB(limit/16))`, or 16MiB without a detected limit.
 
-- **Embedded/single-pod** mode uses 16 partitions, reducing the floor to 16 MiB per DMap with the current engine table size. Eight response DMaps still have a 128 MiB aggregate floor, which can exceed a small pod's resolved L2 budget.
-- **Clustered** mode keeps olric's default partition count (271) because the count is fixed at cluster formation and every peer must agree on it, and a lower count would hurt key distribution as the cluster scales. The trade-off: a *small* cluster (e.g. 2 nodes, `replicaCount: 2`) has a large per-node floor (each node owns nearly every partition as primary or replica), so **a small cluster on small pods can exceed the resolved L2 budget.** Size clustered pods with headroom above `N_dmaps × ownedPartitions × 1 MiB`, or run more/larger nodes.
+| Pod limit | Total L1 | Response storage cap | G | GOMEMLIMIT |
+| --- | ---: | ---: | ---: | ---: |
+| 250Mi | 50Mi | 75Mi | 16Mi | 225Mi |
+| 500Mi | 148.8Mi | 223.2Mi | 32Mi | 450Mi |
+| 1Gi | 327.68Mi | 491.52Mi | 64Mi | 921.6Mi |
+| No detected limit | 128Mi | 128Mi | 16Mi | Not automatically derived |
 
-Size the pod so its L2 budget clears the floor, or raise the memory limit. The sanitized olric default currently retains a 1 MiB fragment `tableSize`;
-entries above that native limit are served uncached. The clustered caller-wait
-adapter derives its early rejection cap from the same sanitized engine default
-and rejects encoded payloads above 1 MiB before Put. Native key/entry framing can
-reject a slightly smaller value; successful embedded and clustered cache writes
-retain the same native entry-size boundary.
-Embedded mode retains the native size limit. Clustered deployments also divide the per-node cap by `replicaCount`, since each node holds replica copies that olric's primary-write cap doesn't govern. The L1 byte cap and `GOMEMLIMIT` are unaffected by any of this.
+Both standalone and clustered response adapters share one **128-slot**, byte-
+budgeted gate per runtime, with a **100ms total caller budget**. Admission never
+queues workers. Known byte values reserve eight times their encoded native entry
+size rounded to 4KiB; unknown reads/generic writes reserve 8MiB. Generic encoding
+uses a writer that refuses growth past the native envelope and shrinks the
+reservation once size is known. Read decoding runs within the admitted worker.
+A timed-out or cancelled caller discards a late result, but the actual worker
+retains its slot and byte lease until it exits. Detached work can still finish a
+late write. Limiter and replay work use their independent existing count gates.
+
+Response and security codecs have separate 8MiB and 4MiB scratch allowances from
+the runtime reserve. Codec admission is immediate and retryable. A response
+import processes every record and can acknowledge omitted capacity-rejected
+responses, counted individually; a security callback failure propagates and must
+not acknowledge a dropped security record. Export retries retain source data
+until acknowledgement. Returned export buffers outlive encoding admission.
+
+Tiered `Set` fills L1 first and returns any L2 failure to Go callers. Response
+handlers serve the upstream result and retain that local entry after capacity,
+byte-admission, oversize, encoding or backend failure. A native entry must have
+`29 + len(key) + len(encoded value) < 1MiB`, with a key no longer than 255 bytes;
+large upstream responses can still fit L1. Keys and entry framing reduce the
+maximum value payload. Native entry and transfer wire formats remain unchanged.
+
+Per-fragment Olric statistics now attribute shared slab backing to one
+deterministic live fragment, preventing duplicate allocation totals. `Allocated`
+includes backing and charged metadata; `Inuse` includes live size-class blocks and
+fragment metadata. Pool gauges provide the node-level cap view. `NumTables` is
+shared-slab attribution, not native table count; native table garbage ratios are
+not comparable. L1 accounting remains approximate and depends on object shape.
+
+The hard bound does not cover security cardinality, local limiter identities,
+application-owned request/response bodies, generic encoder internals, accepted
+connections/pipelined RESP frames, outer fragment decode before Import,
+remote response writers/slow readers, or returned export buffers. The cgroup is
+still the process limit. See [v6 upgrades](docs/upgrade-v6.md) and the
+[release test procedure](docs/bounded-l2-release-tests.md) for measured profiles
+and release gates. The local diagnostic breached the 95% peak criterion in some
+cases; 250Mi and 500Mi whole-guard acceptance remain pending on-prem evidence.
+
+During a mixed rollout, **old v5 nodes retain native table allocation**: populating
+all 271 partitions in four/eight response DMaps costs at least 1,084/2,168MiB of
+table backing on one node before replicas, L1 and runtime allocations. Provide
+old nodes sufficient memory for full-cache compatibility tests. The new engine
+cannot improve an old node's allocator before that node is replaced.
 
 Override any of it explicitly:
 
 ```yaml
 cache:
   memory:
-    maxBytes: 134217728                 # absolute L1 cap (bytes). unset → auto; 0 → no limit
+    maxBytes: 134217728                 # L1 object-cost budget (bytes). unset → auto; 0 → no limit
     maxItems: 0                         # optional L1 entry-count guard. 0 → no limit
     distributedMaxBytesPerNode: 0       # absolute L2 (olric) per-node cap. unset → auto; 0 → no limit
     reserveFraction: 0.20               # auto-mode reserve fraction; must be in [0, 0.9)
@@ -335,8 +398,7 @@ key merely because the pool is full.
 
 `rateLimit.failureMode` is **deprecated and ignored**, but remains parsed and
 validated so existing configurations load and reload. On primary limiter failure,
-the per-replica limiter decides in every deployment mode. It will be removed in the
-next major version. Startup logs one warning naming affected rules; an accepted
+the per-replica limiter decides in every deployment mode. v6 retains this key. Startup logs one warning naming affected rules; an accepted
 reload warns once for rules that introduce the key. The key is absent from rule
 fingerprints and the restart projection, so changing it does not alter bucket identity
 or require a restart. Auth-method `failureMode` settings are unchanged.
@@ -347,10 +409,10 @@ full 100ms Put budget: worst-case caller wait is 200ms. Timeout uses the existin
 identity and log a warning that replay protection was unavailable. This policy
 is unchanged; the wait is bounded. Replay admission shares neither main pool.
 
-Non-clustered deployments add no request-path wait budgets or admission pools,
-retain the embedded limiter's 250ms contention deadline, and share the 45s
-startup default. Their cache implementation and healthy limiter algorithm are
-unchanged. Embedded limiter errors, failed constructors, or a missing primary
+Non-clustered deployments use the same response storage and byte gate. They add
+no limiter or replay admission pools, retain the embedded limiter's 250ms
+contention deadline, and share the 45s startup default. The healthy limiter
+algorithm is unchanged. Embedded limiter errors, failed constructors, or a missing primary
 limiter use the same per-rule local fallback; a rate-limited rule never bypasses
 its limit because the primary is unavailable. Caller cancellation observed before
 local fallback begins returns the context error without consuming a fallback token or counting a fallback.
@@ -372,6 +434,27 @@ ordinary contention denials, backend panics, or caller context cancellation/dead
 Only expiry of a gate budget counts as a backend timeout. Bounded cache failures and all limiter fallback decisions log at debug
 level; other cache errors remain errors.
 JWT replay failures retain their warning for the existing security audit path.
+
+Storage metrics use only `pool="response"` or `pool="security"`:
+`cosmoguard_l2_storage_allocated_bytes`, `cosmoguard_l2_storage_inuse_bytes`,
+`cosmoguard_l2_storage_entries`, `cosmoguard_l2_storage_capacity_bytes`,
+`cosmoguard_l2_codec_bytes` and `cosmoguard_l2_codec_capacity_bytes`. Capacity zero
+means unlimited. `cosmoguard_l2_operation_bytes` and
+`cosmoguard_l2_operation_capacity_bytes` report G, including detached workers.
+Gauges aggregate active runtimes; closed runtimes release their collector references.
+`cosmoguard_gc_cpu_seconds_total` and `cosmoguard_gc_limiter_last_enabled_cycle`
+provide process runtime observations for the soak ledger, without labels.
+
+`cosmoguard_l2_storage_rejections_total{path="put"|"put_raw"}` counts receiving
+response capacity rejections; `cosmoguard_l2_import_dropped_entries_total` counts
+capacity omissions acknowledged during response transfer.
+`cosmoguard_l2_write_skips_total{reason}` uses `inflight`, `storage_capacity`,
+`entry_size`, `backend`, or `encode`. A typed capacity cause is needed for
+`storage_capacity`; Olric's opaque write-quorum failure stays `backend`. A quorum
+success with a rejected backup increments receiving storage rejection only.
+Counters are process cumulative and never label keys, tenants or DMap names.
+`cosmoguard_cache_evictions_total` retains its L1 budget-eviction meaning.
+
 `cosmoguard_rate_limit_local_fallback_total` records local decisions with six
 combinations: `reason` (`timeout`, `capacity`, `backend_error`) and `outcome`
 (`allowed`, `denied`). Healthy bursts can also enter local fallback at capacity
@@ -797,13 +880,12 @@ rateLimit:
   rate: 100/s                        # or "100", "30/min", "1/5s", "250/250ms"
   burst: 200                         # max bucket capacity; defaults to rate
   scope: per-ip                      # per-ip (default) | global | per-identity | compound
-  failureMode: fail-open             # deprecated and ignored; removed next major
+  failureMode: fail-open             # deprecated and ignored; retained in v6
 ```
 
 With a `cache.cluster` block present, rate-limit buckets are sharded across replicas through olric so the configured rate is a true cluster-wide budget. In single-pod / embedded olric mode the rate is enforced per pod.
 
-`rateLimit.failureMode` is deprecated and ignored, and will be removed in the
-next major version. Existing `fail-open` and `fail-closed` values remain valid.
+`rateLimit.failureMode` is deprecated and ignored, and remains accepted in v6. Existing `fail-open` and `fail-closed` values remain valid.
 On backend failure, the per-replica limiter decides in all modes across HTTP,
 JSON-RPC, WebSocket, and gRPC; see [cluster mode](#cluster-mode) for the bounds
 and transition behavior. Auth-method `failureMode` is unaffected.

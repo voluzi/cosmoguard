@@ -11,10 +11,10 @@ port), caches deterministic responses, throttles abusive traffic, fans
 out to multiple upstream nodes with active healthchecks, and authenticates
 clients via API keys / JWT / external validators.
 
-The current major version is **v4**. See the
-[release notes](https://github.com/voluzi/cosmoguard/releases) for what
-changed from v3; existing v3 configs continue to work — run
-`cosmoguard migrate-config` to rewrite them in v4 form when ready.
+The v6 module path is `github.com/voluzi/cosmoguard/v6`. See the
+[v6 upgrade notes](docs/upgrade-v6.md) for Go API changes, bounded L2 behavior
+and rolling replacement/rollback requirements. The configuration schema retains
+v5 compatibility; v3 configurations can use `cosmoguard migrate-config`.
 
 ## Highlights
 
@@ -28,9 +28,10 @@ changed from v3; existing v3 configs continue to work — run
   preservation, configurable header allowlists. Backed by an embedded
   olric distributed cache with an in-process L1 — single binary,
   no external dependency, shared automatically across replicas when
-  cluster mode is on. Clustered L2 waits are bounded at 100ms and fall
+  cluster mode is on. L2 waits are bounded at 100ms in every deployment mode and fall
   back upstream on timeout or saturation; 128 slots bound outstanding
-  L2 calls. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
+  L2 calls and a shared byte gate bounds controlled copies. Response slabs share
+  one replica-inclusive node cap, with a separate security pool. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
   retain coalescing; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
   identity` scopes. Buckets are sharded across replicas through the
@@ -43,7 +44,7 @@ changed from v3; existing v3 configs continue to work — run
   rate, plus local bursts around transitions. Embedded backend errors also use
   a local decision, with no new pool or wait.
   `rateLimit.failureMode` is deprecated and ignored; the per-replica limiter
-  decides on backend failure. The key remains accepted and validated and will be removed in the next major version.
+  decides on backend failure. The key remains accepted and validated in v6.
   See [cluster behavior](CONFIG.md#cluster-mode) for limits and metrics.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
   token introspection, and an external-validator method for
