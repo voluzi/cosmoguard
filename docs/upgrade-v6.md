@@ -43,27 +43,6 @@ shared-budget candidate. Fuller caches can increase heap, GC and RSS despite the
 same numeric caps. Release v6.1.0 only after the shared-budget performance and
 memory matrix in the [release procedure](bounded-l2-release-tests.md) passes.
 
-### Candidate hot-path diagnostics
-
-Local paired benchmarks used warmed 1,024-key caches, alternating legacy/shared
-order and three samples per case. The repeated single-protocol timing test
-(`-count=10`, 100ms samples) measured median string hits at 419.5ns legacy versus
-445.0ns shared, and uint64 hits at 409.5ns versus 390.5ns in the final run. An
-earlier run measured 652.0ns versus 509.5ns and 587.5ns versus 513.0ns, illustrating
-host variation. Both paths allocated zero bytes per hit.
-
-The broader 1/4-CPU, 1/4/8-protocol matrix showed substantial timing variation
-and a parallel regression. At four CPUs, four-protocol parallel hits measured
-237ns versus 673ns for string keys and 249ns versus 656ns for uint64 keys;
-eight-protocol hits measured 386ns versus 968ns and 451ns versus 979ns.
-Mixed readers/writers also regressed. All cases retained zero per-hit allocations.
-These are local diagnostics, not dedicated-runner or deployment measurements.
-The common ttlcache item/metrics locks serialize cross-protocol work; optimizing
-key representation removes extra hashing overhead but does not remove that
-contention. The performance gate remains open: do not release this candidate
-until dedicated-runner comparisons and the reference hot workload pass, or
-revisit the reservation design if they confirm the regression.
-
 ## Breaking changes for Go consumers
 
 1. Import `github.com/voluzi/cosmoguard/v6` and its subpackages. This release is

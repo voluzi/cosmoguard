@@ -563,6 +563,8 @@ so it remains `storage_capacity`; Olric's opaque write-quorum failure stays `bac
 success with a rejected backup increments receiving storage rejection only.
 Counters are process cumulative and never label keys, tenants or DMap names.
 `cosmoguard_cache_evictions_total` retains its L1 budget-eviction meaning.
+With the shared L1, the counter is attributed to the protocol that lost the entry,
+so one protocol's writes can increment another protocol's counter.
 
 `cosmoguard_rate_limit_local_fallback_total` records local decisions with eight
 combinations: `reason` (`timeout`, `capacity`, `backend_error`, `backend_unavailable`) and `outcome`
