@@ -6,10 +6,17 @@ traffic assertions completed; it does **not** certify the entire release matrix.
 Archive the completed matrix and sign off each criterion below before releasing.
 
 Build the candidate image with the release workflow's Go 1.27.2 toolchain. Build
-the fixture image from the same checkout using
-`docker build -f scripts/bounded-l2-tools.Dockerfile -t "$TOOLS_IMAGE" .` and
-publish it through the coordinator's authorized image workflow. Record both
-immutable digests. The tools image contains a deterministic HTTP/JSON-RPC,
+the fixture image from the same checkout under an explicit tag:
+
+```sh
+export TOOLS_TAG='your-registry/bounded-l2-tools:release-candidate'
+docker build -f scripts/bounded-l2-tools.Dockerfile -t "$TOOLS_TAG" .
+```
+
+Publish that tag through the coordinator's authorized image workflow, then set
+`TOOLS_IMAGE` to its resolved immutable digest before running any procedure.
+Record both candidate and tools digests. The tools image contains a deterministic
+HTTP/JSON-RPC,
 WebSocket and reflecting gRPC upstream and the traffic driver. It is never a
 substitute for the published v5.1.0 image or the actual v6 candidate.
 
@@ -32,11 +39,13 @@ become the healthy control.
 
 ```sh
 export TOOLS_IMAGE='your-registry/bounded-l2-tools@sha256:...'
-export PROBE_RPS=... # half of measured saturation for this profile
-scripts/test-bounded-l2-cluster.sh soak --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --new-image "$V6_DIGEST" --cpu 200m --memory 250Mi --requests-equal-limits --duration 2h --output "$RESULTS/250"
-scripts/test-bounded-l2-cluster.sh soak --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --new-image "$V6_DIGEST" --cpu 500m --memory 500Mi --requests-equal-limits --duration 2h --output "$RESULTS/500"
-scripts/test-bounded-l2-cluster.sh soak --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --new-image "$V6_DIGEST" --cpu 1 --memory 1Gi --requests-equal-limits --duration 2h --output "$RESULTS/1gi"
-scripts/test-bounded-l2-cluster.sh mixed-version --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --old-image "$V5_DIGEST" --new-image "$V6_DIGEST" --output "$RESULTS/mixed"
+export RPS_250=... # half of measured saturation at 200m/250Mi
+export RPS_500=... # half of measured saturation at 500m/500Mi
+export RPS_1GI=... # half of measured saturation at 1 CPU/1Gi
+PROBE_RPS="$RPS_250" scripts/test-bounded-l2-cluster.sh soak --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --new-image "$V6_DIGEST" --cpu 200m --memory 250Mi --requests-equal-limits --duration 2h --output "$RESULTS/250"
+PROBE_RPS="$RPS_500" scripts/test-bounded-l2-cluster.sh soak --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --new-image "$V6_DIGEST" --cpu 500m --memory 500Mi --requests-equal-limits --duration 2h --output "$RESULTS/500"
+PROBE_RPS="$RPS_1GI" scripts/test-bounded-l2-cluster.sh soak --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --new-image "$V6_DIGEST" --cpu 1 --memory 1Gi --requests-equal-limits --duration 2h --output "$RESULTS/1gi"
+PROBE_RPS="$RPS_250" scripts/test-bounded-l2-cluster.sh mixed-version --context "$TEST_CONTEXT" --namespace "$TEST_NAMESPACE" --old-image "$V5_DIGEST" --new-image "$V6_DIGEST" --output "$RESULTS/mixed"
 ```
 
 The default soak runs **two hours per 4/8-DMap scenario**, plus 15 minutes idle
@@ -52,7 +61,9 @@ on each request, uses a common HTTP Host/gRPC authority so cache keys remain
 shared across pod addresses, rotates the destination within each protocol,
 and reserves 10% of traffic for repeated hot keys. It paces requests without
 a waiter queue and reports success,
-errors and latency percentiles every five seconds. gRPC connections are reused.
+errors and latency percentiles on a five-second ticker. Sentinel checks can delay
+subsequent reports during faults; use the recorded timestamps for actual intervals.
+gRPC connections are reused.
 
 Traffic remains active through every required phase and its dwell. The runner adds
 up to the 600s rollout timeout per phase to the requested traffic duration; this
@@ -112,8 +123,10 @@ Do not claim stronger lease-renewal or partition-failure semantics in the rollou
 
 The runner writes environment, seed, UID inventories, rendered config, immutable
 image metadata, raw pod status/restarts, logs, traffic JSONL and each pod's full
-Prometheus scrape every five seconds. Preserve sampling errors; permissions or
-missing samples invalidate the affected interval. Logs must remain available
+Prometheus scrape in serial batches, waiting five seconds after each batch.
+Batch timestamps are retained in JSONL and scrape filenames; actual intervals
+include the pod scrapes and grow with their count/latency. Preserve sampling
+errors; permissions or missing samples invalidate the affected interval. Logs must remain available
 before deleting a faulted pod. Use a coordinator-owned host/CRI sampler to match
 each recorded pod/container UID to its cgroup and capture, every five seconds:
 
