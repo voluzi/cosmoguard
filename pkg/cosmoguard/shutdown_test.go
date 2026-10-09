@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"context"
+	"net"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -83,9 +84,19 @@ func TestRepeatedShutdownHonorsItsCallerDeadline(t *testing.T) {
 
 func TestShutdownRetainsClusterUntilDependentWriteFinishes(t *testing.T) {
 	cr := newEmbeddedClusterRuntimeForTest(t)
-	var clusterClosed atomic.Bool
-	removeMetrics := cr.removeMetrics
-	cr.removeMetrics = func() { clusterClosed.Store(true); removeMetrics() }
+	members, err := cr.Client().Members(t.Context())
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	address := members[0].Name
+	listening := func() bool {
+		conn, err := net.DialTimeout("tcp", address, time.Second)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
+	require.True(t, listening())
 	synctest.Test(t, func(t *testing.T) {
 		release, unblock := boundedTestRelease(t)
 		defer unblock()
@@ -99,9 +110,10 @@ func TestShutdownRetainsClusterUntilDependentWriteFinishes(t *testing.T) {
 		require.ErrorIs(t, f.Shutdown(ctx), context.DeadlineExceeded)
 		synctest.Wait()
 		require.Equal(t, int32(1), dm.puts.Load())
-		require.False(t, clusterClosed.Load(), "Olric closed while a dependent write was unfinished")
+		require.True(t, listening(), "Olric stopped while a dependent write was unfinished")
 		unblock()
 		synctest.Wait()
-		require.True(t, clusterClosed.Load(), "late cleanup did not close its retained cluster")
 	})
+	require.Eventually(t, func() bool { return !listening() }, 5*time.Second, 10*time.Millisecond,
+		"late cleanup did not stop the retained daemon")
 }
