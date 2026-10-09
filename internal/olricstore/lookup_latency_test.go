@@ -63,7 +63,45 @@ func TestEngineLargeFragmentLookupLatency(t *testing.T) {
 			t.Errorf("%s stalled a large fragment for %s", operation, elapsed)
 		}
 	}
+	start := time.Now()
+	visited := 0
+	e.RangeHKey(func(uint64) bool {
+		visited++
+		return time.Since(start) < 10*time.Second
+	})
+	if visited != count-operations {
+		t.Fatalf("range stalled after %d of %d keys in %s", visited, count-operations, time.Since(start))
+	}
+	t.Logf("range: %d keys in %s", visited, time.Since(start))
 	if p.Snapshot().Allocated > p.Snapshot().Capacity {
 		t.Fatal("index growth exceeded the pool cap", p.Snapshot())
+	}
+}
+
+func TestEngineRangeHKeyCanDeleteCurrentAndUpcomingKeys(t *testing.T) {
+	_, e := testEngine(t, 8<<20, Response)
+	for h := uint64(0); h < 100; h++ {
+		if err := e.Put(h, item("small", 8)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := make(map[uint64]bool)
+	e.RangeHKey(func(h uint64) bool {
+		if seen[h] || h == 32 {
+			t.Fatal("visited a duplicate or deleted key", h)
+		}
+		seen[h] = true
+		if h == 0 {
+			if err := e.Delete(32); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := e.Delete(h); err != nil {
+			t.Fatal(err)
+		}
+		return true
+	})
+	if len(seen) != 99 || e.Stats().Length != 0 {
+		t.Fatal("range skipped remaining keys", len(seen), e.Stats())
 	}
 }

@@ -492,26 +492,38 @@ func (e *Engine) scanBatch(cursor uint64) ([32]scanToken, int) {
 	return out, n
 }
 
-func (e *Engine) batch(after, high uint64) ([32]token, int) {
+func (e *Engine) batch(after, high uint64, resume token) ([32]token, int, token) {
 	var out [32]token
 	var n int
 	e.p.mu.Lock()
 	defer e.p.mu.Unlock()
 	if e.readyLocked() != nil {
-		return out, 0
+		return out, 0, token{}
 	}
-	for loc := e.head; loc != 0; loc = field(e.p.arena.block(loc), 24) {
+	start := e.head
+	if resume.generation != 0 {
+		// Callbacks may delete or move the next entry between batches.
+		loc, _ := e.findLocked(resume.hash)
+		if loc != 0 && field(e.p.arena.block(loc), 32) == resume.generation {
+			start = loc
+		}
+	}
+	for loc := start; loc != 0; loc = field(e.p.arena.block(loc), 24) {
 		b := e.p.arena.block(loc)
 		g := field(b, 32)
 		if g > after && g <= high {
 			out[n] = token{field(b, 0), g}
 			n++
 			if n == len(out) {
-				break
+				if next := field(b, 24); next != 0 {
+					b = e.p.arena.block(next)
+					return out, n, token{field(b, 0), field(b, 32)}
+				}
+				return out, n, token{}
 			}
 		}
 	}
-	return out, n
+	return out, n, token{}
 }
 func (e *Engine) copyToken(t token, matchGeneration bool) (storage.Entry, bool) {
 	e.p.mu.Lock()
@@ -534,8 +546,9 @@ func (e *Engine) copyToken(t token, matchGeneration bool) (storage.Entry, bool) 
 }
 func (e *Engine) highWater() uint64 { e.p.mu.Lock(); defer e.p.mu.Unlock(); return e.generation }
 func (e *Engine) walk(after, high uint64, f func(token) bool) {
+	var resume token
 	for {
-		batch, n := e.batch(after, high)
+		batch, n, next := e.batch(after, high, resume)
 		if n == 0 {
 			return
 		}
@@ -545,6 +558,10 @@ func (e *Engine) walk(after, high uint64, f func(token) bool) {
 				return
 			}
 		}
+		if next.generation == 0 {
+			return
+		}
+		resume = next
 	}
 }
 func (e *Engine) RangeHKey(f func(uint64) bool) {
