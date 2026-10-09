@@ -10,7 +10,14 @@ type Budget struct {
 	mu                        sync.Mutex
 	limit, reserved, rejected uint64
 }
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
+// Lease must not be copied after acquisition. Share its pointer instead.
 type Lease struct {
+	_ noCopy
 	b *Budget
 	n uint64
 }
