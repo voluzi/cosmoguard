@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,4 +83,56 @@ func TestReadinessRequiresServingListeners(t *testing.T) {
 	response := httptest.NewRecorder()
 	cg.metricsServer.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+}
+
+func TestConstructionCanceledAfterClusterStartsRollsBack(t *testing.T) {
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		_, _ = w.Write([]byte(`{"keys":[{"kty":"oct","kid":"test","alg":"HS256","k":"c2VjcmV0"}]}`))
+	}))
+	defer func() { unblock(); jwks.Close() }()
+	cfg := startupHealthConfig(t)
+	cfg.Cache.Cluster = nil
+	cfg.Auth = AuthConfig{Enable: true, Methods: []AuthMethodConfig{{Type: "jwt", JwksURL: jwks.URL}}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	type outcome struct {
+		guard *CosmoGuard
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() { g, err := NewContext(ctx, cfg); done <- outcome{g, err} }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("constructor did not reach JWKS after cluster start")
+	}
+	cancel()
+	unblock()
+	select {
+	case result := <-done:
+		if result.guard != nil {
+			defer result.guard.Shutdown(context.Background())
+		}
+		require.ErrorIs(t, result.err, context.Canceled)
+		require.Nil(t, result.guard)
+	case <-time.After(5 * time.Second):
+		t.Fatal("constructor did not return after cancellation")
+	}
+	require.Eventually(t, func() bool {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.Metrics.Port), time.Second)
+		if err == nil {
+			c.Close()
+			return false
+		}
+		return true
+	}, 5*time.Second, time.Millisecond)
 }

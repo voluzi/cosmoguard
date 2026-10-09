@@ -279,26 +279,9 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 	// leaks goroutines for the lifetime of the process.
 	success := false
 	defer func() {
-		if success {
-			return
-		}
-		if cosmoGuard.metricsServer != nil {
-			_ = cosmoGuard.metricsServer.Close()
-		}
-		if cosmoGuard.auth != nil {
-			_ = cosmoGuard.auth.Close()
-		}
-		if cosmoGuard.tracingShutdown != nil {
-			_ = cosmoGuard.tracingShutdown(context.Background())
-		}
-		if cosmoGuard.obsReplicator != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cosmoGuard.obsReplicator.Close(ctx)
-			cancel()
-		}
-		if cosmoGuard.cluster != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cosmoGuard.cluster.Close(ctx)
+		if !success {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = cosmoGuard.Shutdown(cleanupCtx)
 			cancel()
 		}
 	}()
@@ -692,6 +675,9 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 	// fully-wired CosmoGuard from the first request.
 	cosmoGuard.peerApiServer = installPeerAPIServer(cosmoGuard)
 
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("construction canceled: %w", err)
+	}
 	cosmoGuard.constructed.Store(true)
 	success = true
 	return cosmoGuard, nil
