@@ -49,6 +49,11 @@ var evictionExemptDMaps = []string{
 // them in recency order, starting with the oldest.
 const olricLRUSamples = 10
 
+const bootstrapMaxWait = 10 * time.Minute
+
+// Capture process startup before configuration and daemon construction.
+var processStartedAt = time.Now()
+
 // Standalone members have no clustered peers. Clustered members keep 271.
 const embeddedPartitionCount = 16
 
@@ -371,7 +376,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	if clustered {
 		quorum, password = opts.Cluster.Quorum, opts.Cluster.EncryptionKey
 	}
-	if err := waitClusterBootstrapProgress(parent, client, opts.StartTimeout, func(ctx context.Context) bool {
+	if err := waitClusterBootstrapProgress(parent, client, opts.StartTimeout, processStartedAt.Add(bootstrapMaxWait), func(ctx context.Context) bool {
 		return bootstrapCoordinatorReachable(ctx, client, password, quorum)
 	}); err != nil {
 		shutdownCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
@@ -461,7 +466,7 @@ func waitClusterBootstrap(ctx context.Context, client interface {
 // Keep one native bootstrap worker, but bound waiting without live cluster evidence.
 func waitClusterBootstrapProgress(ctx context.Context, client interface {
 	NewDMap(string, ...olric.DMapOption) (olric.DMap, error)
-}, budget time.Duration, reachable func(context.Context) bool) error {
+}, budget time.Duration, deadline time.Time, reachable func(context.Context) bool) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
 	interval := min(time.Second, budget/4)
@@ -487,12 +492,22 @@ func waitClusterBootstrapProgress(ctx context.Context, client interface {
 	go func() { done <- waitClusterBootstrap(ctx, client) }()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
+	hardLimit := time.NewTimer(time.Until(deadline))
+	defer hardLimit.Stop()
+	wasReachable := false
 	for {
 		select {
 		case live := <-progress:
 			if live {
+				wasReachable = true
 				timer.Reset(budget)
 			}
+		case <-hardLimit.C:
+			cause := fmt.Errorf("bootstrap exceeded the 10-minute process startup limit: %w", context.DeadlineExceeded)
+			if wasReachable {
+				cause = fmt.Errorf("coordinator was reachable but no routing table arrived: %w", cause)
+			}
+			cancel(cause)
 		case <-timer.C:
 			cancel(context.DeadlineExceeded)
 		case err := <-done:

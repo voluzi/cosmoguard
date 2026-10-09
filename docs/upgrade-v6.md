@@ -120,7 +120,9 @@ A slow coordinator can spend longer than 45s scanning old owners before pushing
 routing. New joiners remain healthy and not-ready while the advertised cluster
 has quorum and its coordinator answers authenticated PINGs. Startup aborts after
 45s without that reachability evidence; discovery and daemon start retain their
-45s budget. SIGTERM cancels construction and shuts down Olric with its graceful
+45s budget. Total waiting is capped at ten minutes from process startup, even
+with a reachable coordinator; failure to receive a usable routing table then
+exits with an explicit error so the kubelet can retry the join. SIGTERM cancels construction and shuts down Olric with its graceful
 leave broadcast. This prevents bootstrap waits from exhausting the startup probe;
 it does not change an old coordinator's scan or cancel its in-flight replica RPCs.
 

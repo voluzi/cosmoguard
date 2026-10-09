@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/hashicorp/memberlist"
@@ -246,7 +247,7 @@ func TestClusterBootstrapProgressRequiresRecentReachability(t *testing.T) {
 			defer cancel()
 			probe := &bootstrapProbe{open: func(int) error { return olric.ErrOperationTimeout }}
 			started := time.Now()
-			err := waitClusterBootstrapProgress(ctx, probe, 50*time.Millisecond, func(context.Context) bool { return reachable })
+			err := waitClusterBootstrapProgress(ctx, probe, 50*time.Millisecond, time.Now().Add(bootstrapMaxWait), func(context.Context) bool { return reachable })
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 			require.ErrorIs(t, err, olric.ErrOperationTimeout)
 			if reachable {
@@ -269,4 +270,18 @@ func TestClusterBootstrapReachabilityRequiresAuthenticationAndQuorum(t *testing.
 	require.True(t, bootstrapCoordinatorReachable(t.Context(), cr.Client(), testClusterEncryptionKey, 1))
 	require.False(t, bootstrapCoordinatorReachable(t.Context(), cr.Client(), "wrong secret", 1))
 	require.False(t, bootstrapCoordinatorReachable(t.Context(), cr.Client(), testClusterEncryptionKey, 2))
+}
+
+func TestClusterBootstrapReachableCoordinatorHasHardDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		processStart := time.Now()
+		time.Sleep(2 * time.Minute)
+		probe := &bootstrapProbe{open: func(int) error { return olric.ErrOperationTimeout }}
+		ctx, cancel := context.WithTimeout(t.Context(), 11*time.Minute)
+		defer cancel()
+		err := waitClusterBootstrapProgress(ctx, probe, 45*time.Second, processStart.Add(bootstrapMaxWait), func(context.Context) bool { return true })
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.ErrorContains(t, err, "coordinator was reachable but no routing table arrived")
+		require.Equal(t, 10*time.Minute, time.Since(processStart))
+	})
 }
