@@ -29,6 +29,7 @@ const headerSize = 48
 
 type PoolStats struct {
 	Capacity, Allocated, Inuse, Entries, ForkRejected, PutRejected, RawRejected, ImportDropped uint64
+	PressureEvictions                                                                          uint64
 	Codec                                                                                      bytebudget.Snapshot
 	LastCompactionUnixMilli                                                                    uint64
 }
@@ -46,6 +47,7 @@ type Pool struct {
 	codec                                                                *bytebudget.Budget
 	closed                                                               bool
 	lastCompactionUnixMilli                                              uint64
+	pressureEvictions                                                    uint64
 }
 type Engine struct {
 	exportID               int
@@ -78,7 +80,7 @@ func (p *Pool) Close(_ context.Context) error {
 }
 func (p *Pool) Snapshot() PoolStats {
 	p.mu.Lock()
-	s := PoolStats{Capacity: p.arena.limit, Allocated: p.arena.allocated, Inuse: p.used, Entries: p.entries, ForkRejected: p.forkRejected, PutRejected: p.putRejected, RawRejected: p.rawRejected, ImportDropped: p.importDropped, LastCompactionUnixMilli: p.lastCompactionUnixMilli}
+	s := PoolStats{Capacity: p.arena.limit, Allocated: p.arena.allocated, Inuse: p.used, Entries: p.entries, ForkRejected: p.forkRejected, PutRejected: p.putRejected, RawRejected: p.rawRejected, ImportDropped: p.importDropped, PressureEvictions: p.pressureEvictions, LastCompactionUnixMilli: p.lastCompactionUnixMilli}
 	p.mu.Unlock()
 	s.Codec = p.codec.Snapshot()
 	return s
@@ -285,10 +287,21 @@ func (e *Engine) PutRaw(h uint64, b []byte) error {
 	return e.put(h, b, true)
 }
 func (e *Engine) put(h uint64, v []byte, isRaw bool) error {
+	var victims int
 	err := func() error {
 		e.p.mu.Lock()
 		defer e.p.mu.Unlock()
 		err := e.putLocked(h, v)
+		if errors.Is(err, ErrCapacity) && e.p.policy == Response && e.p.arena.limit != 0 {
+			for victims < pressureVictimLimit && errors.Is(err, ErrCapacity) {
+				if !e.evictPressureLocked(h) {
+					break
+				}
+				victims++
+				e.p.pressureEvictions++
+				err = e.putLocked(h, v)
+			}
+		}
 		if err == nil && !isRaw {
 			loc, _ := e.findLocked(h)
 			raw := rawRecord(e.p.arena.block(loc))
@@ -303,6 +316,11 @@ func (e *Engine) put(h uint64, v []byte, isRaw bool) error {
 		}
 		return err
 	}()
+	if e.p.observer != nil {
+		for range victims {
+			e.p.observer("pressure_eviction")
+		}
+	}
 	if errors.Is(err, ErrCapacity) && e.p.observer != nil {
 		path := "put"
 		if isRaw {
@@ -312,6 +330,26 @@ func (e *Engine) put(h uint64, v []byte, isRaw bool) error {
 	}
 	return err
 }
+
+// Bound new work under the pool mutex; only the overwritten target may be skipped.
+const pressureVictimLimit = 32
+
+func (e *Engine) evictPressureLocked(target uint64) bool {
+	loc := e.head
+	if loc != 0 && field(e.p.arena.block(loc), 0) == target {
+		loc = field(e.p.arena.block(loc), 24)
+	}
+	if loc == 0 {
+		return false
+	}
+	h := field(e.p.arena.block(loc), 0)
+	// Deletion can invalidate slab locations and hash-chain predecessors.
+	// Each retry therefore resolves the target and victim afresh.
+	loc, prev := e.findLocked(h)
+	e.removeLocked(loc, prev)
+	return true
+}
+
 func (e *Engine) putLocked(h uint64, v []byte) error {
 	if err := e.registerLocked(); err != nil {
 		return err

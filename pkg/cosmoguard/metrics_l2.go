@@ -8,10 +8,15 @@ import (
 )
 
 var l2StorageRejections = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "cosmoguard_l2_storage_rejections_total", Help: "Receiving response storage capacity rejections."}, []string{"path"})
+var l2StoragePressureEvictions = prometheus.NewCounter(prometheus.CounterOpts{Name: "cosmoguard_l2_storage_pressure_evictions_total", Help: "Fragment-local response victims reclaimed under backing capacity pressure."})
 var l2ImportDrops = prometheus.NewCounter(prometheus.CounterOpts{Name: "cosmoguard_l2_import_dropped_entries_total", Help: "Response entries omitted on capacity during acknowledged import."})
 var l2WriteSkips = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "cosmoguard_l2_write_skips_total", Help: "Skipped response L2 insertions by known cause."}, []string{"reason"})
 
 func recordL2StorageRejection(path string) {
+	if path == "pressure_eviction" {
+		l2StoragePressureEvictions.Inc()
+		return
+	}
 	if path == "import_drop" {
 		l2ImportDrops.Inc()
 		return
