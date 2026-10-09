@@ -170,7 +170,7 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 	case <-waitCtx.Done():
 		return expired(waitCtx, true)
 	case res := <-done:
-		if gate.outage != nil && (ctx.Err() != nil || waitCtx.Err() != nil) {
+		if ctx.Err() != nil || waitCtx.Err() != nil {
 			value, err := expired(waitCtx, true)
 			<-workerDone
 			return value, err

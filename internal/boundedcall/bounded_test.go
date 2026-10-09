@@ -195,3 +195,34 @@ func TestBoundedCallCallerDeadlineIsNotBackendTimeout(t *testing.T) {
 		})
 	}
 }
+
+type cancelOnResultContext struct {
+	context.Context
+	cancel context.CancelFunc
+	ready  atomic.Bool
+}
+
+func (c *cancelOnResultContext) Err() error {
+	if c.ready.Load() {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func TestBoundedCallCanceledWorkerResultIsDiscarded(t *testing.T) {
+	for _, waiting := range []bool{false, true} {
+		parent, cancel := context.WithCancel(t.Context())
+		ctx := &cancelOnResultContext{Context: parent, cancel: cancel}
+		gate := New(1, time.Second, nil)
+		if waiting {
+			gate = NewWaiting(1, time.Second, nil)
+		}
+		value, err := Do(ctx, gate, func(context.Context) (int, error) {
+			ctx.ready.Store(true)
+			return 42, nil
+		})
+		cancel()
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, value)
+	}
+}
