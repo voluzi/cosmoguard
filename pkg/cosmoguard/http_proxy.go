@@ -381,7 +381,11 @@ func (p *HttpProxy) Run() error {
 	}
 
 	p.log.WithField("address", p.server.Addr).Infof("starting http proxy")
-	listener, err := net.Listen("tcp", p.server.Addr)
+	addr := p.server.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
