@@ -1,8 +1,7 @@
 package olricstore
 
 import (
-	"bytes"
-	"math/rand/v2"
+	"encoding/binary"
 	"testing"
 	"unsafe"
 )
@@ -72,6 +71,7 @@ func TestAllocatorDescriptorChurnDoesNotGrow(t *testing.T) {
 func FuzzAllocatorModel(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 14, 15, 16, 255})
 	f.Add([]byte{14, 14, 14, 14, 0, 255, 14})
+	f.Add(append(make([]byte, 300), 255))
 	f.Fuzz(func(t *testing.T, ops []byte) {
 		if len(ops) > 1000 {
 			ops = ops[:1000]
@@ -80,9 +80,10 @@ func FuzzAllocatorModel(f *testing.F) {
 		type record struct {
 			loc   uint64
 			size  int
-			value byte
+			value uint64
 		}
 		var live []record
+		var marker uint64
 		for _, op := range ops {
 			if op&128 != 0 && len(live) > 0 {
 				i := int(op) % len(live)
@@ -92,17 +93,21 @@ func FuzzAllocatorModel(f *testing.F) {
 				size := leafSize << uint(op%15)
 				loc, ok := a.allocate(size)
 				if ok {
-					v := byte(rand.IntN(255) + 1)
-					copy(a.block(loc)[:size], bytes.Repeat([]byte{v}, size))
-					live = append(live, record{loc, size, v})
+					marker++
+					block := a.block(loc)[:size]
+					for i := 0; i < size; i += 8 {
+						binary.LittleEndian.PutUint64(block[i:i+8], marker)
+					}
+					live = append(live, record{loc, size, marker})
 				}
 			}
 			if a.allocated > a.limit {
 				t.Fatal("cap")
 			}
 			for _, r := range live {
-				for _, b := range a.block(r.loc)[:r.size] {
-					if b != r.value {
+				block := a.block(r.loc)[:r.size]
+				for i := 0; i < r.size; i += 8 {
+					if binary.LittleEndian.Uint64(block[i:i+8]) != r.value {
 						t.Fatal("overlap/corruption")
 					}
 				}
