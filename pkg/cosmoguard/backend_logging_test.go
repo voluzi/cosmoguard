@@ -43,6 +43,7 @@ func TestL2WriteSkipsKeepBackendErrorsVisible(t *testing.T) {
 		var out bytes.Buffer
 		logger := newEntry(slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug})))
 		logCacheBackendError(logger, errors.Join(cache.ErrL2Skipped, tc.cause), "cache failed")
-		require.Contains(t, out.String(), "level="+tc.level, tc.cause)
+		require.Contains(t, out.String(), "level="+tc.level)
+		require.Contains(t, out.String(), tc.cause.Error())
 	}
 }
