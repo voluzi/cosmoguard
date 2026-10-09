@@ -259,19 +259,44 @@ budget  = limit − reserve
 L1 = 40% of budget, L2 = 60% of budget
 ```
 
-L1's budget is divided evenly among enabled response caches. L2's **unsplit node
-budget** limits charged response backing and metadata across every response DMap,
-primary, replica, previous-owner and imported copy. Its cap is neither multiplied
-nor divided by the replica factor. Olric's per-DMap `MaxInuse`/`MaxKeys` remain
-soft eviction thresholds, with the existing per-map and replica division. The
-slab engine supplies the oldest entries to Olric's LRU sampler. Allocation checks
-enforce the shared hard cap when LRU cannot make room. A capacity rejection preserves an existing record on failed growth.
+L1 uses one runtime-owned store with a global LRU across all response protocols,
+including EVM. Its total byte cost and optional `maxItems` guard are not divided
+among adapters. Entries pay the existing object estimate plus 64 bytes for the
+shared key/interface representation; this is estimated cost, not exact heap use.
+A single active protocol can consume the total. Direct Go constructors without
+`cache.WithMemoryPool` retain their per-instance limits.
+
+L2's **unsplit node budget** limits charged response backing and metadata across
+every response DMap, primary, replica, previous-owner and imported copy. RF neither
+multiplies nor divides the hard cap. Each response DMap gets a soft `MaxInuse`
+threshold of `max(1, floor(total L2 / RF))`; Olric divides that among owned primary
+partitions. `MaxKeys` is derived from that threshold using 512 bytes per key and
+the existing small-value rules. These heuristics can overshoot by a record, and
+both predicates can evict; they do not prove the backing bound. Backups bypass
+native LRU. The slab engine supplies local access order to Olric's LRU sampler.
+
+On finite response-pool capacity pressure, Put/PutRaw can remove at most **32**
+oldest local records and make at most **33** insertion attempts. Only the owning
+fragment participates; the overwritten target is protected until replacement
+allocation succeeds. A failed call can remove other responses but preserves that
+target. Invalid or oversized entries evict nothing. No security entry is eligible.
+The work limit, buddy fragmentation, retained index backing and an empty incoming
+fragment can still cause rejection; there is no cross-fragment fairness or reclaim.
+Get/Put update local access order; PutRaw preserves incoming native LastAccess.
+
+Pressure eviction removes only a local copy, including backups/imported records.
+Surviving replicas may serve a response, and an older still-valid copy can remain
+after a newer copy is lost. Native Olric LRU still deletes copies cluster-wide.
+`cosmoguard_l2_storage_pressure_evictions_total` counts these local victims;
+Olric's lifetime writes/native eviction counters do not. Successful reclaim does
+not count as a final storage rejection. Acknowledged capacity-skipped response
+imports remain separate from pressure victims. Security imports propagate errors.
 
 Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor/index allowance;
 records include fixed headers and size-class rounding. Fragment hash indexes grow
 with cardinality, mixing the hash independently of the partition assignment. Both
-index arrays are charged during growth; a growth that cannot fit rejects the new
-write while preserving existing records. Buddy fragmentation
+index arrays are charged during growth; a growth that cannot fit can reclaim local response victims or reject the new
+write while preserving its target. Buddy fragmentation
 can leave allocated backing at the cap while live inuse bytes are low: free blocks
 may not fit the requested size class, and partly used slabs retain their backing. Empty fragments
 have a small metadata charge rather than a 1MiB table. Olric compaction visits

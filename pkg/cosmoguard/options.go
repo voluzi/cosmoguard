@@ -11,10 +11,10 @@ type SharedOptions struct {
 	ServerConfig   *ServerConfig
 	Authenticator  *Authenticator
 	MetricsEnabled bool
+	memoryPool     *cache.MemoryPool
 	// CacheBudget is the per-instance memory budget for this proxy's
 	// response cache when constructed without the runtime shared L1 owner.
 	// Zero-value means unbounded (the test/programmatic path).
-	memoryPool        *cache.MemoryPool
 	CacheBudget       CacheBudget
 	L2Operations      cache.Option
 	limiterOperations *boundedcall.Gate

@@ -7,6 +7,63 @@ the same. The clustered limiter algorithm, per-replica local fallback and parsed
 deprecated, ignored `rateLimit.failureMode` stay the same. Auth failure modes are
 unchanged. No new operator configuration is required.
 
+## Compatible shared budgets for v6.1
+
+The shared-budget candidate retains module `/v6` and the pinned Olric/ttlcache
+versions. Runtime L1 adapters share one global LRU, total estimated bytes and the
+total entry-count guard. `cache.NewMemoryPool` and `cache.WithMemoryPool` are
+additive Go APIs; callers opting in receive a typed adapter, while existing
+constructors without that option retain their concrete `MemoryCache` behaviour.
+Pooled adapters support the production `string` and `uint64` key types; selecting
+a pool with another key type returns an error. Legacy caches support all
+comparable keys. Close adapters independently and close the pool owner after
+consumers stop.
+`CacheBudget.PerCache` and direct `WithCacheBudget` retain their public semantics.
+
+Every response DMap uses the full node L2 budget before RF division for its soft
+LRU thresholds. The hard response backing cap is unchanged. Finite response
+fragments can reclaim at most 32 local victims on capacity pressure, including
+backup and imported responses. Failed growth preserves its target, but other
+victims may already be gone. Empty incoming fragments cannot reclaim sibling
+occupancy; fragmentation and the work limit can still reject writes. Security
+storage and policy are unchanged. Local victims do not imply durable replica
+retention; surviving older valid response copies can still be read.
+
+Rolling v6.0.0/v6.1 members keep the same 271 partitions, DMaps, keys, native wire
+and transfer formats, encryption, RF and quorums. Local thresholds need no
+consensus handshake or cache purge. Old members keep smaller thresholds and can
+still delete copies on new members through native LRU. Replace one member at a
+time, wait for ownership/transfer convergence and exercise both coordinators.
+Roll back to the actual released v6.0.0 image without flushing. Verify original
+bytes/deadlines, direct backup reads and security sentinels. Loopback tests do not
+replace the published-image rolling/rollback release gate.
+
+The historical measurements below describe v6.0.0 and its predecessors, not the
+shared-budget candidate. Fuller caches can increase heap, GC and RSS despite the
+same numeric caps. Release v6.1.0 only after the shared-budget performance and
+memory matrix in the [release procedure](bounded-l2-release-tests.md) passes.
+
+### Candidate hot-path diagnostics
+
+Local paired benchmarks used warmed 1,024-key caches, alternating legacy/shared
+order and three samples per case. The repeated single-protocol timing test
+(`-count=10`, 100ms samples) measured median string hits at 419.5ns legacy versus
+445.0ns shared, and uint64 hits at 409.5ns versus 390.5ns in the final run. An
+earlier run measured 652.0ns versus 509.5ns and 587.5ns versus 513.0ns, illustrating
+host variation. Both paths allocated zero bytes per hit.
+
+The broader 1/4-CPU, 1/4/8-protocol matrix showed substantial timing variation
+and a parallel regression. At four CPUs, four-protocol parallel hits measured
+237ns versus 673ns for string keys and 249ns versus 656ns for uint64 keys;
+eight-protocol hits measured 386ns versus 968ns and 451ns versus 979ns.
+Mixed readers/writers also regressed. All cases retained zero per-hit allocations.
+These are local diagnostics, not dedicated-runner or deployment measurements.
+The common ttlcache item/metrics locks serialize cross-protocol work; optimizing
+key representation removes extra hashing overhead but does not remove that
+contention. The performance gate remains open: do not release this candidate
+until dedicated-runner comparisons and the reference hot workload pass, or
+revisit the reservation design if they confirm the regression.
+
 ## Breaking changes for Go consumers
 
 1. Import `github.com/voluzi/cosmoguard/v6` and its subpackages. This release is

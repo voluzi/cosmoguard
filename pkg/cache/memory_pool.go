@@ -28,7 +28,7 @@ type sharedMemoryKey struct {
 
 // MemoryPool owns a global L1 LRU and its expiry cleaner. Adapters close only
 // their own entries; the runtime must close the pool when all consumers stop.
-// Pooled adapters support string and uint64 keys; other keys use legacy caches.
+// Pooled adapters support string and uint64 keys; other keys require legacy caches.
 type MemoryPool struct {
 	mu          sync.Mutex
 	cache       *ttlcache.Cache[sharedMemoryKey, any]
