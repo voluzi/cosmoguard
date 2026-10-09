@@ -416,6 +416,43 @@ func (e *Engine) Stats() storage.Stats {
 
 type token struct{ hash, generation uint64 }
 
+type scanToken struct {
+	token
+	cursor uint64
+}
+
+// Scan cursors encode a bucket and chain position. Reads change recency only;
+// writes may change the index, so a scan concurrent with writes is best effort.
+func (e *Engine) scanBatch(cursor uint64) ([32]scanToken, int) {
+	var out [32]scanToken
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	if e.readyLocked() != nil {
+		return out, 0
+	}
+	bucket, position := cursor>>32, uint64(uint32(cursor))
+	n := 0
+	for ; bucket < uint64(len(e.buckets)); bucket++ {
+		loc := e.buckets[bucket]
+		for skip := uint64(0); skip < position && loc != 0; skip++ {
+			loc = field(e.p.arena.block(loc), 8)
+		}
+		for loc != 0 {
+			b := e.p.arena.block(loc)
+			position++
+			next := bucket<<32 | position
+			out[n] = scanToken{token{field(b, 0), field(b, 32)}, next}
+			n++
+			loc = field(b, 8)
+			if n == len(out) {
+				return out, n
+			}
+		}
+		position = 0
+	}
+	return out, n
+}
+
 func (e *Engine) batch(after, high uint64) ([32]token, int) {
 	var out [32]token
 	var n int
@@ -517,20 +554,23 @@ func (e *Engine) scan(c uint64, n int, r *regexp.Regexp, f func(storage.Entry) b
 	if n <= 0 {
 		return 0, nil
 	}
-	var next uint64
-	e.walk(c, e.highWater(), func(t token) bool {
-		v, ok := e.copyToken(t)
-		if !ok || (r != nil && !r.MatchString(v.Key())) {
-			return true
+	for {
+		batch, count := e.scanBatch(c)
+		if count == 0 {
+			return 0, nil
 		}
-		n--
-		if !f(v) || n == 0 {
-			next = t.generation
-			return false
+		for _, t := range batch[:count] {
+			c = t.cursor
+			v, ok := e.copyToken(t.token)
+			if !ok || (r != nil && !r.MatchString(v.Key())) {
+				continue
+			}
+			n--
+			if !f(v) || n == 0 {
+				return c, nil
+			}
 		}
-		return true
-	})
-	return next, nil
+	}
 }
 func (e *Engine) Compaction() (bool, error) {
 	e.p.mu.Lock()

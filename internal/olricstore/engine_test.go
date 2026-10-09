@@ -184,6 +184,53 @@ func TestEngineStaticScanAllKeys(t *testing.T) {
 		t.Fatal("reentry/stop")
 	}
 }
+
+func TestEngineScanTerminatesWhileReadingEachPage(t *testing.T) {
+	for _, regex := range []bool{false, true} {
+		t.Run(fmt.Sprint(regex), func(t *testing.T) {
+			_, e := testEngine(t, 8<<20, Response)
+			const count = 100
+			for h := uint64(0); h < count; h++ {
+				if err := e.Put(h, item(fmt.Sprint(h), 10)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			seen := make(map[string]bool)
+			var cursor uint64
+			for page := 0; page <= count; page++ {
+				var keys []string
+				visit := func(v storage.Entry) bool {
+					keys = append(keys, v.Key())
+					seen[v.Key()] = true
+					return true
+				}
+				var err error
+				if regex {
+					cursor, err = e.ScanRegexMatch(cursor, "^[0-9]+$", 7, visit)
+				} else {
+					cursor, err = e.Scan(cursor, 7, visit)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, key := range keys {
+					var h uint64
+					_, _ = fmt.Sscan(key, &h)
+					if _, err := e.Get(h); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if cursor == 0 {
+					if len(seen) != count {
+						t.Fatal("scan omitted unchanged keys", len(seen))
+					}
+					return
+				}
+			}
+			t.Fatal("scan did not terminate while reading unchanged keys")
+		})
+	}
+}
 func TestEngineExpiryAllDMapsAndBackups(t *testing.T) {
 	p, security := testEngine(t, 8<<20, Security)
 	_ = security.Put(1, item("persistent", 1))
