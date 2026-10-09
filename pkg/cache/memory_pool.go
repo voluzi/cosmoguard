@@ -125,7 +125,7 @@ func (c *pooledMemoryCache[K, V]) Set(_ context.Context, key K, value V, ttl tim
 	if c.closed || c.pool.closed {
 		return errMemoryPoolClosed
 	}
-	if ttl == ttlcache.DefaultTTL {
+	if ttl == ttlcache.DefaultTTL || (ttl == ttlcache.PreviousOrDefaultTTL && !c.pool.cache.Has(c.key(key))) {
 		ttl = c.ttl
 	}
 	c.pool.cache.Set(c.key(key), value, ttl)
@@ -133,8 +133,9 @@ func (c *pooledMemoryCache[K, V]) Set(_ context.Context, key K, value V, ttl tim
 }
 func (c *pooledMemoryCache[K, V]) Get(_ context.Context, key K) (V, error) {
 	if item := c.pool.cache.Get(c.key(key)); item != nil {
-		value, _ := item.Value().(V)
-		return value, nil
+		if value, ok := item.Value().(V); ok {
+			return value, nil
+		}
 	}
 	var zero V
 	return zero, ErrNotFound

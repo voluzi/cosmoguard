@@ -100,9 +100,12 @@ func TestMemoryPoolTTLAndEarlyClose(t *testing.T) {
 	b := pooled[uint64, []byte](t, p, "no-expiry", DefaultTTL(ttlcache.NoTTL))
 	require.NoError(t, a.Set(t.Context(), "key", nil, ttlcache.DefaultTTL))
 	require.NoError(t, b.Set(t.Context(), 1, nil, ttlcache.DefaultTTL))
+	item := p.cache.Get(a.(*pooledMemoryCache[string, []byte]).key("key"))
+	expiresAt := item.ExpiresAt()
 	time.Sleep(10 * time.Millisecond)
 	_, err := a.Get(t.Context(), "key")
 	require.NoError(t, err)
+	require.Equal(t, expiresAt, item.ExpiresAt(), "a hit must preserve the original deadline")
 	time.Sleep(500 * time.Millisecond)
 	_, err = a.Get(t.Context(), "key")
 	require.ErrorIs(t, err, ErrNotFound)
@@ -125,7 +128,7 @@ func TestMemoryPoolNilAndTinyValues(t *testing.T) {
 	c = pooled[string, any](t, unlimited, "nil")
 	require.NoError(t, c.Set(t.Context(), "nil", nil, time.Hour))
 	value, err := c.Get(t.Context(), "nil")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrNotFound)
 	require.Nil(t, value)
 	tiny := pooled[uint64, []byte](t, p, "tiny")
 	for i := uint64(0); i < 10; i++ {
@@ -194,4 +197,48 @@ func TestMemoryPoolKeyTypesDoNotChangeLegacyCaches(t *testing.T) {
 	v, err := c.Get(t.Context(), struct{ ID int }{1})
 	require.NoError(t, err)
 	require.Equal(t, []byte("legacy"), v)
+}
+
+func TestMemoryPoolPreviousOrDefaultTTLMatchesLegacy(t *testing.T) {
+	p := NewMemoryPool(0, 0)
+	defer p.Close()
+	legacy, err := NewMemoryCache[string, string]("legacy", DefaultTTL(time.Hour))
+	require.NoError(t, err)
+	defer legacy.Close()
+	shared := pooled[string, string](t, p, "shared", DefaultTTL(time.Hour))
+	for _, c := range []Cache[string, string]{legacy, shared} {
+		expiry := func(key string) time.Time {
+			switch c := c.(type) {
+			case MemoryCache[string, string]:
+				return c.cache.Get(c.key(key)).ExpiresAt()
+			case *pooledMemoryCache[string, string]:
+				return p.cache.Get(c.key(key)).ExpiresAt()
+			default:
+				t.Fatalf("unexpected cache type %T", c)
+				return time.Time{}
+			}
+		}
+		before := time.Now()
+		require.NoError(t, c.Set(t.Context(), "missing", "first", ttlcache.PreviousOrDefaultTTL))
+		require.WithinRange(t, expiry("missing"), before.Add(time.Hour), time.Now().Add(time.Hour))
+		for _, ttl := range []time.Duration{2 * time.Hour, ttlcache.NoTTL} {
+			require.NoError(t, c.Set(t.Context(), "existing", "first", ttl))
+			deadline := expiry("existing")
+			require.NoError(t, c.Set(t.Context(), "existing", "replacement", ttlcache.PreviousOrDefaultTTL))
+			require.Equal(t, deadline, expiry("existing"))
+			value, err := c.Get(t.Context(), "existing")
+			require.NoError(t, err)
+			require.Equal(t, "replacement", value)
+		}
+	}
+}
+
+func TestMemoryPoolGetRejectsUnexpectedValueType(t *testing.T) {
+	p := NewMemoryPool(0, 0)
+	defer p.Close()
+	c := pooled[string, []byte](t, p, "typed")
+	p.cache.Set(c.(*pooledMemoryCache[string, []byte]).key("key"), "wrong type", time.Hour)
+	value, err := c.Get(t.Context(), "key")
+	require.ErrorIs(t, err, ErrNotFound)
+	require.Nil(t, value)
 }
