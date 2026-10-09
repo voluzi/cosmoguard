@@ -104,7 +104,7 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 		})
 	}
 	t.Run("L2 healthy burst", func(t *testing.T) {
-		responseCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, a.Client(), "healthy-burst", CacheBudget{}, nil)
+		responseCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, a.Client(), "healthy-burst", CacheBudget{}, a.ResponseOperations())
 		require.NoError(t, err)
 		defer responseCache.Close()
 		var rejected, other atomic.Int32
