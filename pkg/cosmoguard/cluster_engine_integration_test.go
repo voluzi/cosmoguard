@@ -633,6 +633,8 @@ func TestMixedEngineSharedResponseBudgetPressure(t *testing.T) {
 			require.NoError(t, dm.Put(t.Context(), keys[0], value, olric.XX(), olric.PXAT(time.Duration(deadline)*time.Millisecond)))
 			_, err = dm.Delete(t.Context(), keys[0])
 			require.NoError(t, err)
+			_, err = dm.Get(t.Context(), keys[0])
+			require.ErrorIs(t, err, olric.ErrKeyNotFound)
 			mixedConfirmReplica(t, dm, name, keys[0], value, deadline, clients)
 			if divisor == 1 {
 				require.Positive(t, a.pool.Snapshot().PressureEvictions+b.pool.Snapshot().PressureEvictions)
