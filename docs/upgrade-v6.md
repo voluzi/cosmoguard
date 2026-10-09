@@ -123,29 +123,29 @@ has quorum and its coordinator answers authenticated PINGs. Startup aborts after
 45s without that reachability evidence; discovery and daemon start retain their
 45s budget. Total waiting is capped at ten minutes from process startup, even
 with a reachable coordinator; failure to receive a usable routing table then
-exits with an explicit error so the kubelet can retry the join. SIGTERM cancels construction and shuts down Olric with its graceful
-leave broadcast. This prevents bootstrap waits from exhausting the startup probe;
+exits with an explicit error so the kubelet can retry the join. SIGTERM cancels
+construction and shuts down Olric with its graceful leave broadcast. This prevents bootstrap waits from exhausting the startup probe;
 it does not change an old coordinator's scan or cancel its in-flight replica RPCs.
 
-A measured three-replica rollout from published v5.1.0 at 200m/250Mi under
-20 concurrent ingress requests had zero container restarts, but about 1.5 minutes
-of degraded service while v5.1.0 members remained: 20-second slices fell to 7 and
-19 requests/s with p95 latency of 15–19 seconds. That run used external ingress;
-subsequent controls found independent ingress stalls, so repeat the mixed rollout
-with direct in-cluster load to isolate the upgrade's latency cost. Old members
-have no bounded waits or outage gates; the new joiner cannot cancel their work. Plan a maintenance
-window or lower offered traffic during this one-time v5.x upgrade cost, and wait
-for convergence before each replacement. Lower traffic is a precaution, not a
-measured guarantee of eliminating the stall. There is no evidence that adding
-replicas first prevents it; do not rely on that as an upgrade remedy.
+Two on-prem upgrades from published v5.1.0 used in-cluster load, three replicas
+at 200m/250Mi, and roughly 6,000–8,500 requests/s before replacement. Both had
+**zero container restarts**:
 
-External-ingress tests also showed periodic stalls without any rollout; those
-stalls were traced to the test cluster's ingress path. With in-cluster load sent
-directly to the guard Service, a same-version three-replica rolling restart at
-200m/250Mi sustained 5,081–8,403 requests/s in every 15-second slice, with zero
-errors or restarts and one 1.7s maximum-latency observation. Earlier termination
-502s fell from 2,698 to 18 with the five-second hold. These are workload-specific
-on-prem observations for a5f4ae5, not certification of later changes.
+- Run A had about 1.5 minutes at 1,400–3,200 requests/s, 11 failed requests out
+  of roughly 1.3 million, and a few requests taking 14–18 seconds.
+- Run B had about 45 seconds at 16–500 requests/s and a later 15-second slice
+  at 38 requests/s. Otherwise, two ready replicas served roughly 2,800–3,200
+  requests/s for about two minutes while the second replaced pod waited
+  2 minutes 20 seconds for the v5.1.0 coordinator's routing table. There were
+  31 failed requests out of roughly 0.9 million, with some taking 12–19 seconds.
+
+This degradation occurs while v5.1.0 pods are still cluster members. They have
+no bounded waits and stall during membership changes, as in a measured v5.1.0
+rolling restart with five restarts per replaced pod and about six minutes of
+degradation. It is a one-time cost of leaving v5.x; **upgrade in a low-traffic
+window**. These two runs establish the observed cost, not a bound on all rollouts.
+A v6-to-v6 rolling restart of 13947aa measured zero restarts, zero errors and no
+throughput collapse, sustaining 4,916–8,588 requests/s throughout.
 
 The response and clustered-limiter gates suppress backend calls after three
 consecutive executed-operation timeouts. One second later, one real request probes
@@ -168,16 +168,16 @@ has at most 2s, capped at +26s; Olric graceful leave has at most 3s, capped at +
 The fixed 29s absolute total fits the operator's 30s termination grace with margin
 and no preStop hook. Shorter caller budgets can curtail phases. The chart's 5s
 preStop plus the binary's 29s fits its 40s grace. Failed startup skips the hold.
-Local signal tests cannot prove an ingress converges within five seconds; the
-published-image on-prem rollout must check the remaining termination 502s.
+Local signal tests alone cannot prove an ingress converges within five seconds;
+the on-prem v6 rolling restart above observed zero errors with in-cluster load.
 
 The native wire codecs are tested in both directions against the real default
 engine, including loopback migration, post-join replication, graceful departure,
-rollback and disconnect/retry. The **published v5.1.0-image rollout remains a
-coordinator release gate**, not a result inferred from those tests. Run
+rollback and disconnect/retry. The two published-v5.1.0 forward upgrades above
+provide on-prem evidence for that direction. Run
 [the release procedure](bounded-l2-release-tests.md) with immutable actual image
-digests and archive its evidence before treating rolling compatibility as proven.
-The same procedure checks reverse rollback to the published old image.
+digests and archive its evidence. Reverse rollback to the published old image
+remains unverified; the local native-engine matrix is not that image test.
 
 Old v5 members still have a lazy native 1MiB table for each populated primary or
 backup fragment. Four/eight fully populated response namespaces alone can cost
@@ -219,13 +219,6 @@ same CPU-limited container; their rps are diagnostics, not deployment benchmarks
 Use `cosmoguard_upstream_requests_total` to validate the real savings on-prem.
 Response timing and cache marker semantics are unchanged.
 
-The coordinator's final b9759fd on-prem validation used in-cluster Service load:
-v5.1.0 upgrade had zero restarts, 11 errors in about 1.3 million requests, and
-1,443–3,213 rps for about 1.5 minutes while old members remained, with a few
-14–18s requests. A same-version rolling restart had zero errors and restarts,
-minimum 3,713 rps and maximum latency 1.5s. These validate the existing outage
-state and readiness-first drain; full soak and rollback gates remain separate.
-
 ## Memory and operational limits
 
 See [CONFIG.md](../CONFIG.md#memory-budget) for the budget table, standalone gate,
@@ -233,8 +226,11 @@ pool metrics and capacity behavior. GOMEMLIMIT stays at 90%; chart limits stay
 1Gi with their existing requests/CPU defaults. A 500m/500Mi requests=limits
 reference and 200m/250Mi lower compatibility profile require the stated workload
 and release evidence. Local unthrottled engine/L1 diagnostics recorded no OOM
-but breached the 95% peak criterion in some cases. Whole-guard two-hour soaks,
-15-minute expiry/idle gates and published-image compatibility are pending.
+but breached the 95% peak criterion in some cases. On-prem validation of 13947aa
+measured 22–28MiB heap / about 60MiB RSS at 250Mi and 25–33MiB heap / about
+66MiB RSS at 500Mi, zero idle GC, and the response
+pool returning to zero after TTL. Whole-guard long soaks, the Linux CI architecture
+matrix and published-image reverse rollback remain unverified.
 
 Response backing and controlled local/codec copies are bounded. Security
 cardinality, fallback identities, application-owned bodies/encoder internals,

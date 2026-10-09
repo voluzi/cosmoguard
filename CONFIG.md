@@ -340,7 +340,9 @@ remote response writers/slow readers, or returned export buffers. The cgroup is
 still the process limit. See [v6 upgrades](docs/upgrade-v6.md) and the
 [release test procedure](docs/bounded-l2-release-tests.md) for measured profiles
 and release gates. The local diagnostic breached the 95% peak criterion in some
-cases; 250Mi and 500Mi whole-guard acceptance remain pending on-prem evidence.
+cases. On-prem validation of 13947aa measured 22–28MiB heap / about 60MiB RSS
+at 250Mi and 25–33MiB heap / about 66MiB RSS at 500Mi, zero idle GC, and the
+response pool returning to zero after TTL. Long soaks remain unverified.
 
 During a mixed rollout, **old v5 nodes retain native table allocation**: populating
 all 271 partitions in four/eight response DMaps costs at least 1,084/2,168MiB of
