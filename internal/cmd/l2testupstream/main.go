@@ -111,8 +111,19 @@ func (u *upstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		q, id = rpc.Params, rpc.ID
 	} else {
 		q.Key = r.URL.Path + "?" + r.URL.Query().Get("key")
-		q.Size, _ = strconv.Atoi(r.URL.Query().Get("size"))
-		q.Delay, _ = strconv.Atoi(r.URL.Query().Get("delay_ms"))
+		for _, field := range []struct {
+			name  string
+			value *int
+		}{{"size", &q.Size}, {"delay_ms", &q.Delay}} {
+			if raw := r.URL.Query().Get(field.name); raw != "" {
+				value, err := strconv.Atoi(raw)
+				if err != nil {
+					http.Error(w, "invalid "+field.name, http.StatusBadRequest)
+					return
+				}
+				*field.value = value
+			}
+		}
 	}
 	value, err := u.response(r.Context(), q)
 	if err != nil {
