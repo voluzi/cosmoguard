@@ -159,7 +159,7 @@ func (c *guardClient) request(ctx context.Context, t guardTarget, key string, si
 }
 
 func guardRun(ctx context.Context, file string, duration time.Duration, workers, size, rps int) error {
-	if workers < 1 || rps < 0 || size < 0 || size > 2<<20 {
+	if workers < 1 || rps < 0 || (rps > 0 && time.Second/time.Duration(rps) == 0) || size < 0 || size > 2<<20 {
 		return errors.New("invalid guard workload")
 	}
 	client := &guardClient{connections: make(map[string]*grpc.ClientConn)}
@@ -177,6 +177,11 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 		err = json.Unmarshal(b, &targets)
 		if err != nil || len(targets) == 0 {
 			return nil, errors.New("guard target file must contain a nonempty JSON array")
+		}
+		for _, target := range targets {
+			if target.Size > 2<<20 {
+				return nil, errors.New("guard target size exceeds 2 MiB")
+			}
 		}
 		return targets, nil
 	}
