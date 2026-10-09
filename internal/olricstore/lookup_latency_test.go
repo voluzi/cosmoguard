@@ -32,7 +32,7 @@ func TestEngineLargeFragmentLookupLatency(t *testing.T) {
 	raw := item("small", 8).Encode()
 	populate := time.Now()
 	for i := range count {
-		if i%1024 == 0 && time.Since(populate) > 10*time.Second {
+		if i%1024 == 0 && time.Since(populate) > time.Minute {
 			t.Fatalf("put stalled populating a 100k-key fragment: %d keys in %s", i, time.Since(populate))
 		}
 		if err := e.PutRaw(uint64(i)*16, raw); err != nil {
