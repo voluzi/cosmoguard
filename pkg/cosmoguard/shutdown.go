@@ -54,7 +54,7 @@ func (f *CosmoGuard) shutdown(ctx context.Context, hold bool) error {
 			f.shutdownErr = f.stopListeners(trafficCtx)
 			stopTraffic()
 			cleanupCtx, stopCleanup := context.WithDeadline(totalCtx, minTime(time.Now().Add(shutdownCleanup), started.Add(shutdownTraffic+shutdownCleanup)))
-			cleanupErr, dependentDone := f.closeConsumers(cleanupCtx)
+			dependentDone, cleanupErr := f.closeConsumers(cleanupCtx)
 			f.shutdownErr = errors.Join(f.shutdownErr, cleanupErr)
 			stopCleanup()
 			if f.cluster != nil {
@@ -143,7 +143,7 @@ func (f *CosmoGuard) stopListeners(ctx context.Context) error {
 	return shutdownTasks(ctx, tasks...)
 }
 
-func (f *CosmoGuard) closeConsumers(ctx context.Context) (error, <-chan struct{}) {
+func (f *CosmoGuard) closeConsumers(ctx context.Context) (<-chan struct{}, error) {
 	var tasks []func() error
 	dependentDone := make(chan struct{})
 	for _, h := range []*JsonRpcHandler{f.jsonRpcHandler, f.evmJsonRpcHandler, f.evmJsonRpcWsHandler} {
@@ -162,7 +162,7 @@ func (f *CosmoGuard) closeConsumers(ctx context.Context) (error, <-chan struct{}
 	} else {
 		close(dependentDone)
 	}
-	return shutdownTasks(ctx, tasks...), dependentDone
+	return dependentDone, shutdownTasks(ctx, tasks...)
 }
 
 // A timed-out cleanup can still return into its buffered result channel; its
