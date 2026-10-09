@@ -170,7 +170,7 @@
   },
   "odd query": {
     "Method": "GET",
-    "URL": "/status?bad=%zz\u0026semi=a;b\u0026ok=%2f+%20\u0026dup=1\u0026dup=2\u0026empty=",
+    "URL": "/status?dup=1\u0026dup=2\u0026empty=\u0026ok=%2F++",
     "Host": "rpc.public.example:8080",
     "Protocol": "HTTP/1.1",
     "SourceIP": "192.0.2.1",

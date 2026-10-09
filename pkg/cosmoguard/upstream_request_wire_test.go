@@ -114,3 +114,43 @@ func TestUpstreamRequestWireContract(t *testing.T) {
 	}
 	require.Len(t, expected, len(cases))
 }
+
+func TestUpstreamDropsUnparseableQueryParameters(t *testing.T) {
+	auth, err := NewAuthenticator(&AuthConfig{Enable: true,
+		Methods:    []AuthMethodConfig{{Type: "api-key", QueryParam: "api_key"}},
+		Identities: []IdentityConfig{{Name: "client", APIKey: "secret"}},
+	}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = auth.Close() })
+	for _, tc := range []struct {
+		name, query, want string
+		strip             bool
+	}{
+		{name: "bad escape", query: "height=42&uninspected=%zz&keep=ok", want: "height=42&keep=ok"},
+		{name: "semicolon", query: "height=42&uninspected=one;admin=true&keep=ok", want: "height=42&keep=ok"},
+		{name: "credential and bad escape", query: "height=42&api_key=secret&uninspected=%zz", want: "height=42", strip: true},
+		{name: "credential and semicolon", query: "height=42&api_key=secret&uninspected=one;admin=true", want: "height=42", strip: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan string, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.URL.RawQuery
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+			target := upstream.URL
+			var hook func(*http.Request)
+			if tc.strip {
+				hook = auth.StripCredentialQuery
+			}
+			u, err := buildHttpUpstream(NodeConfig{Name: "query", RpcURL: target}, serviceRPC, hook)
+			require.NoError(t, err)
+			request := httptest.NewRequest(http.MethodGet, "/probe?"+tc.query, nil)
+			require.False(t, request.URL.Query().Has("uninspected"))
+			response := httptest.NewRecorder()
+			u.proxy.ServeHTTP(response, request.WithContext(t.Context()))
+			require.Equal(t, http.StatusNoContent, response.Code)
+			require.Equal(t, tc.want, <-received)
+		})
+	}
+}

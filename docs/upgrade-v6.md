@@ -62,6 +62,17 @@ unchanged. No new operator configuration is required.
     image uses Go 1.27.2; these patch versions include the HTTP/2 fix for
     GO-2026-6617, alongside `golang.org/x/net` v0.60.0.
 
+## HTTP query behavior
+
+The HTTP proxy now drops query parameters that Go cannot parse, including invalid
+percent escapes and entire segments containing an unescaped semicolon. For example,
+`?height=42&hidden=%zz&mode=read;admin=true` is forwarded as `?height=42`.
+This deliberately changes v5.1.0's raw-query forwarding: upstreams no longer receive
+parameters that CosmoGuard's parsed-query rules and authentication cannot inspect.
+When sanitation is needed, valid parameters are re-encoded; valid raw queries keep
+their encoding. Configured credential query parameters are still stripped before
+forwarding.
+
 ## Embedded Olric fork
 
 The fork starts from upstream v0.7.4 and includes these commits, in order:

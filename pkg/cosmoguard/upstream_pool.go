@@ -575,10 +575,8 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteRequest func(*http.R
 	rewriteHost := n.TLS || nodeServiceOverride(n, service) != ""
 	rp := &httputil.ReverseProxy{}
 	rp.Rewrite = func(pr *httputil.ProxyRequest) {
-		// Rewrite runs after sanitation; the hook needs the incoming headers and
-		// raw query, with Connection-named headers removed after it runs.
-		cleanedQuery := pr.Out.URL.RawQuery
-		pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+		// Restore headers for the hook, keeping the query sanitized by Rewrite.
+		// Connection-named headers are removed after the hook runs.
 		pr.Out.Header = pr.In.Header.Clone()
 		if pr.Out.Header == nil {
 			pr.Out.Header = make(http.Header)
@@ -609,12 +607,8 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteRequest func(*http.R
 		// inject either the current span or whatever traceparent the
 		// inbound request carried.
 		InjectHTTPHeaders(r.Context(), r.Header)
-		if r.Form != nil {
-			if r.URL.RawQuery == pr.In.URL.RawQuery {
-				r.URL.RawQuery = cleanedQuery
-			} else if values, err := url.ParseQuery(r.URL.RawQuery); err != nil {
-				r.URL.RawQuery = values.Encode()
-			}
+		if values, err := url.ParseQuery(r.URL.RawQuery); err != nil {
+			r.URL.RawQuery = values.Encode()
 		}
 		r.Close = false
 		finishUpstreamHeaders(r, pr.In.Header)
