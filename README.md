@@ -100,7 +100,7 @@ curl -s https://get.voluzi.com/cosmoguard! | bash
 ```
 
 ### Prerequisites
-- Go 1.25+ (for building from source).
+- Go 1.26.9+ (for building from source).
 
 ### Docker
 

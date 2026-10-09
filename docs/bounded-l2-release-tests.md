@@ -5,7 +5,7 @@ implementer does not contact Kubernetes. A successful runner exit means its
 traffic assertions completed; it does **not** certify the entire release matrix.
 Archive the completed matrix and sign off each criterion below before releasing.
 
-Build the candidate image with the release workflow's Go 1.27.1 toolchain. Build
+Build the candidate image with the release workflow's Go 1.27.2 toolchain. Build
 the fixture image from the same checkout using
 `docker build -f scripts/bounded-l2-tools.Dockerfile -t "$TOOLS_IMAGE" .` and
 publish it through the coordinator's authorized image workflow. Record both
@@ -72,7 +72,7 @@ to isolate a case, and repeat at moderate load with old nodes at their actual
 ## Local release regressions
 
 CI runs the mixed native/custom loopback matrix once on each architecture. Before
-release, run `make test.mixed-engine MIXED_ENGINE_COUNT=10` with Go 1.25.14; this
+release, run `make test.mixed-engine MIXED_ENGINE_COUNT=10` with Go 1.26.9; this
 keeps ten race-detector repetitions as a release gate without multiplying every
 CI run's cluster setup and convergence waits. `make test.bounded-l2` also retains
 ten race repetitions for storage, admission and response cache tests.

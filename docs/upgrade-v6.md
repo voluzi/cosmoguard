@@ -55,6 +55,10 @@ unchanged. No new operator configuration is required.
    capped by the caller's deadline, and can report incomplete cleanup rather than
    extending beyond it. Cleanup workers retain ownership until they actually exit.
 
+10. Building or importing the module requires Go 1.26.9 or later. The release
+    image uses Go 1.27.2; these patch versions include the HTTP/2 fix for
+    GO-2026-6617, alongside `golang.org/x/net` v0.60.0.
+
 ## Embedded Olric fork
 
 The fork starts from upstream v0.7.4 and includes these commits, in order:
