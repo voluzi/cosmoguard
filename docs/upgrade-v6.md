@@ -33,7 +33,7 @@ unchanged. No new operator configuration is required.
    gauges for capacity decisions.
 6. The embedded Olric dependency is now **the voluzi fork**, module
    `github.com/voluzi/olric`, pinned at
-   `v0.7.5-0.20261009002017-a106ad34f24e`. Consumers that interact with Olric Go
+   `v0.7.5-0.20261009015321-b44a5f871051`. Consumers that interact with Olric Go
    types must update their Olric imports and requirement as well. There is **no
    replace directive**, including for downstream builds. The public module
    downloads through the default Go proxy. The fork changes listed below retain
@@ -74,6 +74,7 @@ The fork starts from upstream v0.7.4 and includes these commits, in order:
 | `154beba` | Compare cached membership with native live-member names and transmitted identities: the local member immediately after Start, same-name rejoin at a new gossip address/ID, metadata updates during reads, and a member declared dead without Leave. No production change. |
 | `5b4d8db` | Test that one compaction pass continues past a retired fragment. No production change. |
 | `a106ad3` | Remove a retired fragment from its partition after successful Close even if Destroy returns an error; test error propagation and a real DMap write/recreate. |
+| `b44a5f8` | Unmap a retired fragment even when Close fails and cancels its context; test both Close/Destroy errors and a real Put/Get on the recreated fragment. |
 
 Ownership scans have 16 workers. Active RPC concurrency to each peer also shares
 Olric's client pool, whose default size is `10 × GOMAXPROCS`; at GOMAXPROCS=1 a
