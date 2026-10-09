@@ -245,3 +245,23 @@ func TestOutageReplacementProbeRespectsWorkerCapacity(t *testing.T) {
 		require.Equal(t, int32(4), calls.Load(), "replacement probes cannot exceed worker capacity")
 	})
 }
+
+func TestOutageProbeNonTimeoutErrorClosesGate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var unavailable atomic.Bool
+		g := NewRecovering(8, time.Second, nil, unavailable.Store)
+		for range 3 {
+			_, err := Do(t.Context(), g, func(context.Context) (int, error) { return 0, ErrTimeout })
+			require.ErrorIs(t, err, ErrTimeout)
+		}
+		require.True(t, unavailable.Load())
+		time.Sleep(time.Second)
+		backendError := errors.New("write quorum not reached")
+		_, err := Do(t.Context(), g, func(context.Context) (int, error) { return 0, backendError })
+		require.ErrorIs(t, err, backendError)
+		require.False(t, unavailable.Load(), "an on-time backend error proves recovery")
+		value, err := Do(t.Context(), g, func(context.Context) (int, error) { return 42, nil })
+		require.NoError(t, err)
+		require.Equal(t, 42, value)
+	})
+}

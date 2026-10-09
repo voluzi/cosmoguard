@@ -176,7 +176,7 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 			return value, err
 		}
 		timedOut := errors.Is(res.err, ErrTimeout)
-		gate.outage.resolve(op, timedOut, res.err == nil, true)
+		gate.outage.resolve(op, timedOut, !timedOut, true)
 		if timedOut && gate.observe != nil {
 			gate.observe("timeout")
 		}
