@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -135,4 +136,40 @@ func TestLimiterOutageDoesNotDivertAnotherOwner(t *testing.T) {
 	require.False(t, allowed, "the healthy backend denies; local fallback would allow")
 	require.Equal(t, time.Second, retry)
 	require.Equal(t, int32(1), good.calls.Load())
+}
+
+func TestLimiterRecoveryProbeClassifiesDomainErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err     error
+		healthy bool
+	}{{olric.ErrKeyTooLarge, true}, {olric.ErrEntryTooLarge, true}, {olric.ErrWriteQuorum, false}, {olric.ErrClusterQuorum, false}, {errors.New("connection refused"), false}} {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				local, err := NewRateLimiter(RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 20}, nil, "probe-classification")
+				require.NoError(t, err)
+				defer local.Close()
+				backend := &outageLimiter{err: olric.ErrOperationTimeout}
+				gate := newLimiterOperations()
+				defer gate.Close()
+				l := &boundedRateLimiter{RateLimiter: backend, local: local, operationGate: gate}
+				for range 3 {
+					_, _, err := l.Allow(t.Context(), "key")
+					require.NoError(t, err)
+				}
+				time.Sleep(time.Second)
+				backend.err = tc.err
+				_, _, err = l.Allow(t.Context(), "key")
+				require.NoError(t, err)
+				backend.err = nil
+				allowed, _, err := l.Allow(t.Context(), "key")
+				require.NoError(t, err)
+				require.Equal(t, !tc.healthy, allowed, "an open outage uses the available local bucket")
+				want := int32(4)
+				if tc.healthy {
+					want = 5
+				}
+				require.Equal(t, want, backend.calls.Load())
+			})
+		})
+	}
 }

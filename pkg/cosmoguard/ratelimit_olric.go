@@ -237,10 +237,7 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 	}
 	res, err := boundedcall.Do(ctx, l.operationGate, func(opCtx context.Context) (decision, error) {
 		allowed, retry, err := l.RateLimiter.Allow(opCtx, key)
-		if errors.Is(err, olric.ErrOperationTimeout) {
-			err = fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
-		}
-		return decision{allowed, retry}, err
+		return decision{allowed, retry}, limiterOperationError(err)
 	})
 	if ctx.Err() != nil {
 		return false, 0, ctx.Err()
@@ -302,4 +299,16 @@ func (l *boundedRateLimiter) Close() error {
 		l.operationGate.Close()
 	}
 	return errors.Join(l.RateLimiter.Close(), l.local.Close())
+}
+
+func limiterOperationError(err error) error {
+	switch {
+	case errors.Is(err, olric.ErrOperationTimeout):
+		return fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
+	case errors.Is(err, olric.ErrKeyTooLarge), errors.Is(err, olric.ErrEntryTooLarge):
+		return boundedcall.HealthyError(err)
+	default:
+		// Allow reports a healthy allowance, denial or contention as a nil error.
+		return err
+	}
 }
