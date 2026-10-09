@@ -278,7 +278,8 @@ func TestOutageProbeRecognizedDomainErrorClosesGate(t *testing.T) {
 		_, err := Do(t.Context(), g, func(context.Context) (int, error) { return 0, HealthyError(domain) })
 		require.ErrorIs(t, err, domain)
 		require.False(t, unavailable.Load())
-		_, err = Do(t.Context(), g, func(context.Context) (int, error) { return 42, nil })
+		value, err := Do(t.Context(), g, func(context.Context) (int, error) { return 42, nil })
 		require.NoError(t, err)
+		require.Equal(t, 42, value)
 	})
 }
