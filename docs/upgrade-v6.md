@@ -25,7 +25,7 @@ unchanged. No new operator configuration is required.
    admission policy. Timed-out workers keep their reservations until they exit;
    closing an owner stops new admission without pretending blocked work ended.
 5. Olric storage statistics describe charged shared backing: `Allocated` includes
-   slab/tree/descriptor and fragment allowances, and `Inuse` includes rounded live
+   slab/tree/descriptor, grown hash indexes and fragment allowances, and `Inuse` includes rounded live
    records and fragment metadata. Shared backing and slab counts are apportioned across registered
    fragments in constant time, including empty fragments; one fragment receives
    division remainders so totals remain exact. Native garbage ratios are not
@@ -199,7 +199,9 @@ The existing limiter uses fixed-timeout locks and local fallback.
 Slab Range now supplies Olric's LRU sampler with the oldest entries, so a recently
 touched key survives eviction before an untouched older key. Hash indexes grow
 with fragment cardinality, charging both arrays during growth; failure preserves
-existing keys. Scan cursors follow the hash index instead of access generations,
+existing keys. Range batches resume from a validated next entry instead of
+rescanning earlier entries; callbacks can still delete entries safely. Scan
+cursors follow the hash index instead of access generations,
 so scanning and reading unchanged keys terminates. Scans concurrent with writes
 remain best effort, as with native storage.
 
