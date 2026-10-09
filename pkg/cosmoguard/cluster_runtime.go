@@ -45,9 +45,8 @@ var evictionExemptDMaps = []string{
 	replicationDMap,
 }
 
-// olricLRUSamples is the sample size for olric's approximate (Redis-style)
-// LRU. Deliberately 2× olric's own default of 5 (config.DefaultLRUSamples)
-// for tighter eviction accuracy — cheap given the cache's short TTL.
+// olricLRUSamples bounds Olric's eviction candidates; the slab engine supplies
+// them in recency order, starting with the oldest.
 const olricLRUSamples = 10
 
 // Standalone members have no clustered peers. Clustered members keep 271.

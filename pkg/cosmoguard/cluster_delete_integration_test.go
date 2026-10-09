@@ -68,6 +68,31 @@ func TestMixedEngineLRUEvictsWithMissingBackup(t *testing.T) {
 	require.Equal(t, []byte("replacement"), value)
 }
 
+func TestMixedEngineLRUEvictsOldestUntouchedKey(t *testing.T) {
+	const count = 32
+	n := startMixedNodeConfigured(t, true, "", 16<<20, func(c *config.Config, _ *mixedNode) {
+		c.ReplicaCount = 1
+		c.DMaps.EvictionPolicy = config.LRUEviction
+		c.DMaps.LRUSamples = olricLRUSamples
+		c.DMaps.MaxKeys = count * int(c.PartitionCount)
+		c.DMaps.CheckEmptyFragmentsInterval = time.Hour
+	})
+	const name = "lru-recency"
+	dm, err := n.db.NewEmbeddedClient().NewDMap(name)
+	require.NoError(t, err)
+	keys := samePartitionKeys(name, count+1)
+	for _, key := range keys[:count] {
+		require.NoError(t, dm.Put(t.Context(), key, []byte("response")))
+	}
+	_, err = dm.Get(t.Context(), keys[0])
+	require.NoError(t, err)
+	require.NoError(t, dm.Put(t.Context(), keys[count], []byte("replacement")))
+	_, err = dm.Get(t.Context(), keys[0])
+	require.NoError(t, err, "the recently touched key must survive")
+	_, err = dm.Get(t.Context(), keys[1])
+	require.ErrorIs(t, err, olric.ErrKeyNotFound, "evict the oldest untouched key")
+}
+
 type beforeBucketRead struct {
 	olric.DMap
 	before func()

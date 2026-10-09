@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"log"
-	"math/rand/v2"
 	"regexp"
 	"sync"
 	"time"
@@ -453,6 +452,7 @@ func (e *Engine) copyToken(t token) (storage.Entry, bool) {
 		return nil, false
 	}
 	v := NewEntry()
+	// Range and Scan expose a full entry after unlocking; its payload must be owned.
 	v.Decode(append([]byte(nil), rawRecord(b)...))
 	return v, true
 }
@@ -483,9 +483,6 @@ func (e *Engine) RangeHKey(f func(uint64) bool) {
 func (e *Engine) Range(f func(uint64, storage.Entry) bool) {
 	high := e.highWater()
 	start := uint64(0)
-	if high > 0 {
-		start = rand.Uint64N(high)
-	}
 	stopped := false
 	visit := func(t token) bool {
 		v, ok := e.copyToken(t)

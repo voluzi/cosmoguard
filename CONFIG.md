@@ -251,9 +251,9 @@ L1 = 40% of budget, L2 = 60% of budget
 L1's budget is divided evenly among enabled response caches. L2's **unsplit node
 budget** limits charged response backing and metadata across every response DMap,
 primary, replica, previous-owner and imported copy. Its cap is neither multiplied
-nor divided by the replica factor. Olric's per-DMap `MaxInuse`/`MaxKeys` and sampled
-LRU remain soft eviction thresholds; their existing per-map and replica division
-is unchanged. Allocation checks enforce the shared hard cap when LRU cannot make
+nor divided by the replica factor. Olric's per-DMap `MaxInuse`/`MaxKeys` remain
+soft eviction thresholds, with the existing per-map and replica division. The
+slab engine supplies the oldest entries to Olric's LRU sampler. Allocation checks enforce the shared hard cap when LRU cannot make
 room. A capacity rejection preserves an existing record on failed growth.
 
 Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor/index allowance;
