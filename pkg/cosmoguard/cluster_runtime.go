@@ -116,6 +116,7 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 // and joins peers advertised by the configured discovery plugin.
 type clusterRuntime struct {
 	responseOperations                  cache.Option
+	memoryPool                          *cache.MemoryPool
 	limiterOperations, replayOperations *boundedcall.Gate
 	db                                  *olric.Olric
 	client                              *olric.EmbeddedClient
@@ -144,6 +145,7 @@ type clusterRuntimeOptions struct {
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
 	// don't depend on the host's resolver.
 	Lookup                  LookupFunc
+	L1MaxBytes, L1MaxItems  uint64
 	ResponsePoolBytes       uint64
 	ResponseLRUBytesPerDMap uint64
 	L2WorkBytes             uint64
@@ -286,11 +288,13 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		}
 	}
 
+	memoryPool := cache.NewMemoryPool(opts.L1MaxBytes, opts.L1MaxItems)
 	responsePool := olricstore.NewPool(opts.ResponsePoolBytes, olricstore.Response, recordL2StorageRejection)
 	securityPool := olricstore.NewPool(0, olricstore.Security, nil)
 	success := false
 	defer func() {
 		if !success {
+			_ = memoryPool.Close()
 			_ = responsePool.Close(context.Background())
 			_ = securityPool.Close(context.Background())
 		}
@@ -393,6 +397,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	success = true
 	cr := &clusterRuntime{
 		db:           db,
+		memoryPool:   memoryPool,
 		client:       client,
 		discovery:    discovery,
 		peerAPIKey:   peerAPIKey,
@@ -558,6 +563,7 @@ func (cr *clusterRuntime) Close(ctx context.Context) error {
 		_ = cr.discovery.Close()
 	}
 	cr.responseOperations.CloseOperations()
+	_ = cr.memoryPool.Close()
 	cr.limiterOperations.Close()
 	cr.replayOperations.Close()
 	err := cr.db.Shutdown(ctx)

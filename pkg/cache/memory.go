@@ -32,6 +32,10 @@ func NewMemoryCache[K comparable, V any](namespace string, opts ...Option) (Cach
 		opt(options)
 	}
 
+	if options.memoryPool != nil {
+		return newPooledMemoryCache[K, V](namespace, options)
+	}
+
 	cacheOptions := []ttlcache.Option[namespacedKey[K], V]{
 		ttlcache.WithDisableTouchOnHit[namespacedKey[K], V](),
 		ttlcache.WithTTL[namespacedKey[K], V](options.TTL),

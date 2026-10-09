@@ -146,15 +146,6 @@ func TestPerCache_DividesAcrossInstances(t *testing.T) {
 	}
 }
 
-// TestCountResponseCaches tracks the proxy construction in New().
-func TestCountResponseCaches(t *testing.T) {
-	if n := countResponseCaches(&Config{EnableEvm: false}); n != 4 {
-		t.Errorf("non-evm should build 4 caches, got %d", n)
-	}
-	if n := countResponseCaches(&Config{EnableEvm: true}); n != 8 {
-		t.Errorf("evm should build 8 caches, got %d", n)
-	}
-}
 func TestResponseWorkBudgetProfiles(t *testing.T) {
 	for _, tc := range []struct{ limit, want uint64 }{{250 << 20, 16 << 20}, {500 << 20, 32 << 20}, {1 << 30, 64 << 20}, {2 << 30, 64 << 20}} {
 		t.Run(fmt.Sprint(tc.limit), func(t *testing.T) {

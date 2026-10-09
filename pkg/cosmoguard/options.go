@@ -12,8 +12,9 @@ type SharedOptions struct {
 	Authenticator  *Authenticator
 	MetricsEnabled bool
 	// CacheBudget is the per-instance memory budget for this proxy's
-	// response cache, already divided across the enabled caches by New().
+	// response cache when constructed without the runtime shared L1 owner.
 	// Zero-value means unbounded (the test/programmatic path).
+	memoryPool        *cache.MemoryPool
 	CacheBudget       CacheBudget
 	L2Operations      cache.Option
 	limiterOperations *boundedcall.Gate
@@ -124,10 +125,8 @@ func WithCacheConfig[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions 
 	}
 }
 
-// WithCacheBudget threads the per-instance response-cache memory budget
-// (issue #15) into a proxy. New() resolves the total budget from the pod's
-// memory limit and divides it across the enabled caches before passing each
-// share here. The zero value leaves the cache unbounded (test path).
+// WithCacheBudget sets per-instance limits for directly constructed proxies.
+// Runtime-owned shared L1 pools use their total limits instead. Zero is unlimited.
 func WithCacheBudget[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions | GrpcProxyOptions](b CacheBudget) Option[T] {
 	return func(opts *T) {
 		switch x := any(opts).(type) {
@@ -139,6 +138,23 @@ func WithCacheBudget[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions 
 			x.CacheBudget = b
 		case *GrpcProxyOptions:
 			x.CacheBudget = b
+		default:
+			panic("unexpected use")
+		}
+	}
+}
+
+func withMemoryPool[T SharedOptions | HttpProxyOptions | JsonRpcHandlerOptions | GrpcProxyOptions](p *cache.MemoryPool) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *SharedOptions:
+			x.memoryPool = p
+		case *HttpProxyOptions:
+			x.memoryPool = p
+		case *JsonRpcHandlerOptions:
+			x.memoryPool = p
+		case *GrpcProxyOptions:
+			x.memoryPool = p
 		default:
 			panic("unexpected use")
 		}

@@ -63,19 +63,6 @@ func (b CacheBudget) PerCache(n int) CacheBudget {
 	}
 }
 
-// countResponseCaches returns how many response-cache instances New() will
-// build, so the shared pod budget can be split evenly. Always-on services
-// (grpc, lcd, rpc HTTP + its jsonrpc handler) contribute 4; enabling EVM
-// adds its rpc/ws HTTP proxies and jsonrpc handlers (4 more). This must
-// track the proxy construction in New().
-func countResponseCaches(cfg *Config) int {
-	const baseCaches = 4 // grpc, lcd, jsonrpc, rpc
-	if cfg.EnableEvm {
-		return baseCaches + 4 // evm_jsonrpc, evm_rpc, evm_jsonrpc_ws, evm_rpc_ws
-	}
-	return baseCaches
-}
-
 // ResolveBudget turns the (possibly sparse) CacheMemoryConfig into concrete
 // per-tier byte caps. Explicit config wins per tier; otherwise the tier is
 // auto-derived from the detected cgroup memory limit via the scaling-reserve
