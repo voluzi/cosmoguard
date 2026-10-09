@@ -40,10 +40,9 @@ type CacheBudget struct {
 	L2MaxBytesPerNode uint64
 }
 
-// PerCache divides a total budget across n response-cache instances that
-// share the pod heap (one L1 ttlcache + one olric DMap per enabled proxy),
-// so their combined footprint stays within the total. A 0 (unlimited) field
-// stays 0. n < 1 is treated as 1.
+// PerCache divides a budget across n independently constructed response caches.
+// Production uses shared tier totals instead. A 0 (unlimited) field stays 0;
+// n < 1 is treated as 1.
 func (b CacheBudget) PerCache(n int) CacheBudget {
 	if n < 1 {
 		n = 1

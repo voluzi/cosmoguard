@@ -299,12 +299,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 	}
 	cosmoGuard.tracingShutdown = shutdown
 
-	// Resolve the cache memory budget (issue #15) BEFORE building the olric
-	// daemon and the proxies, since both consume it. The total budget is
-	// auto-derived from the pod's memory limit (or config overrides) and
-	// then split across the response caches that share the pod heap: the L1
-	// share is threaded into each proxy via WithCacheBudget, and the per-DMap
-	// L2 share configures olric's LRU eviction below.
+	// Resolve total tier budgets before constructing the runtime and proxies.
 	totalCacheBudget := cfg.Cache.ResolveBudget()
 	cacheBudget := totalCacheBudget.PerCache(countResponseCaches(cfg))
 
@@ -320,7 +315,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		Lookup:                  lookup,
 		Cluster:                 cfg.Cache.Cluster,
 		ResponsePoolBytes:       totalCacheBudget.L2MaxBytesPerNode,
-		ResponseLRUBytesPerDMap: cacheBudget.L2MaxBytesPerNode,
+		ResponseLRUBytesPerDMap: totalCacheBudget.L2MaxBytesPerNode,
 		L2WorkBytes:             responseWorkBytes(),
 	})
 	if err != nil {
