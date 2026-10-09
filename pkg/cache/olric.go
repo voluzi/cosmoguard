@@ -19,6 +19,12 @@ const maxBoundedOlricPayloadBytes = olricstore.MaxEntryBytes
 const unknownOperationCharge = 8 * olricstore.MaxEntryBytes
 const maxReadOperationCharge = 2*olricstore.MaxEntryBytes + 4096
 
+// CacheEncodedSizer bounds MessagePack bytes before encoding. The encoder also
+// enforces this bound, so an underestimated size cannot escape byte admission.
+type CacheEncodedSizer interface {
+	CacheEncodedSize() uint64
+}
+
 var ErrL2Skipped = errors.New("response L2 insertion skipped")
 var errEncode = errors.New("response encode failed")
 
@@ -133,6 +139,10 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 	}
 	maxValue := maxBoundedOlricPayloadBytes - 1 - 29 - len(k)
 	charge := uint64(unknownOperationCharge)
+	if sized, ok := any(value).(CacheEncodedSizer); ok {
+		maxValue = int(min(uint64(maxValue), sized.CacheEncodedSize()))
+		charge = operationCharge(29 + len(k) + maxValue)
+	}
 	if b, ok := any(value).([]byte); ok {
 		if len(b) > maxValue {
 			return skip(olric.ErrEntryTooLarge)

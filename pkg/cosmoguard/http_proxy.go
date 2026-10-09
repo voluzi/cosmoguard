@@ -191,6 +191,14 @@ func (r CachedResponse) CacheCost() uint64 {
 	return cost
 }
 
+func (r CachedResponse) CacheEncodedSize() uint64 {
+	size := uint64(len(r.Data)) + 256
+	for k, v := range r.Headers {
+		size += uint64(len(k) + len(v) + 10)
+	}
+	return size
+}
+
 // httpCacheWriteTimeout bounds how long a detached cache-write context
 // stays alive. The response has already been produced and is just as
 // cacheable as one whose client stuck around; a slow/wedged cache

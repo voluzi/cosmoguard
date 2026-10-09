@@ -9,9 +9,59 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vmihailenco/msgpack/v5"
 	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 	"github.com/voluzi/olric"
 )
+
+type sizedMarshalValue struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (s sizedMarshalValue) CacheEncodedSize() uint64 { return 128 }
+func (s sizedMarshalValue) EncodeMsgpack(enc *msgpack.Encoder) error {
+	s.entered <- struct{}{}
+	<-s.release
+	return enc.EncodeBytes([]byte("shared response"))
+}
+
+func TestOlricCacheSizedMarshalsLeaveReadAdmissionAvailable(t *testing.T) {
+	client := embeddedOlric(t)
+	options := BoundedOperations(128, time.Second, 16<<20, nil, nil)
+	reader, err := NewOlricCache[string, []byte](client, "sized-marshals", options)
+	require.NoError(t, err)
+	require.NoError(t, reader.Set(t.Context(), "read", []byte("cached"), time.Minute))
+	writer, err := NewOlricCache[string, sizedMarshalValue](client, "sized-marshals", options)
+	require.NoError(t, err)
+	const writes = 3
+	entered, release := make(chan struct{}, writes), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	done := make(chan error, writes)
+	for i := range writes {
+		go func() {
+			done <- writer.Set(t.Context(), fmt.Sprint(i), sizedMarshalValue{entered, release}, time.Minute)
+		}()
+	}
+	for range writes {
+		select {
+		case <-entered:
+		case err := <-done:
+			t.Fatalf("a small sized marshal was rejected: %v", err)
+		case <-time.After(time.Second):
+			t.Fatal("small marshals did not enter")
+		}
+	}
+	value, err := reader.Get(t.Context(), "read")
+	require.NoError(t, err)
+	require.Equal(t, []byte("cached"), value)
+	unblock()
+	for range writes {
+		require.NoError(t, <-done)
+	}
+}
 
 type blockedCacheDMap struct {
 	olric.DMap
@@ -216,4 +266,21 @@ func TestOlricCacheShrinksReadsBeforeDecode(t *testing.T) {
 	require.Empty(t, failures)
 	reserved, _ = option.OperationBytes()
 	require.Zero(t, reserved)
+}
+
+type undersizedMarshalValue struct{ sizedMarshalValue }
+
+func (undersizedMarshalValue) CacheEncodedSize() uint64 { return 1 }
+
+func TestOlricCacheRejectsUnderreportedEncodedSize(t *testing.T) {
+	client := embeddedOlric(t)
+	c, err := NewOlricCache[string, undersizedMarshalValue](client, "underreported-size", BoundedOperations(128, time.Second, 16<<20, nil, nil))
+	require.NoError(t, err)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	close(release)
+	err = c.Set(t.Context(), "key", undersizedMarshalValue{sizedMarshalValue{entered, release}}, time.Minute)
+	require.ErrorIs(t, err, olric.ErrEntryTooLarge)
+	_, err = c.dm.Get(t.Context(), "key")
+	require.ErrorIs(t, err, olric.ErrKeyNotFound)
 }

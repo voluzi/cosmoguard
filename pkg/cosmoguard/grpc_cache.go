@@ -85,6 +85,19 @@ func (g grpcCachedResponse) CacheCost() uint64 {
 	return uint64(len(g.Payload)+grpcMDSize(g.Header)+grpcMDSize(g.Trailer)) + 64
 }
 
+func (g grpcCachedResponse) CacheEncodedSize() uint64 {
+	size := uint64(len(g.Payload)) + 128
+	for _, md := range []metadata.MD{g.Header, g.Trailer} {
+		for k, vals := range md {
+			size += uint64(len(k) + 12)
+			for _, v := range vals {
+				size += uint64(len(v) + 5)
+			}
+		}
+	}
+	return size
+}
+
 func grpcMDSize(md metadata.MD) int {
 	n := 0
 	for k, vals := range md {
