@@ -348,14 +348,14 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 			}
 			for _, target := range targets {
 				_, status, err := client.request(ctx, target, "sentinel", 1024, token)
-				if err == nil && status != http.StatusUnauthorized {
-					fail(fmt.Errorf("lost replay sentinel on %s: %d", target.Address, status))
+				if err != nil || status != http.StatusUnauthorized {
+					fail(fmt.Errorf("lost replay sentinel on %s: status=%d: %v", target.Address, status, err))
 					break
 				}
 				if target.Sentinels {
 					_, status, err = client.request(ctx, target, "limiter-sentinel", 1024, limiterToken)
-					if err == nil && status != http.StatusTooManyRequests {
-						fail(fmt.Errorf("lost limiter sentinel on %s: %d", target.Address, status))
+					if err != nil || status != http.StatusTooManyRequests {
+						fail(fmt.Errorf("lost limiter sentinel on %s: status=%d: %v", target.Address, status, err))
 						break
 					}
 				}
