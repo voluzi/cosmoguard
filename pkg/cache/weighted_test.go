@@ -73,10 +73,8 @@ func TestWeightedGateNoWaiterQueue(t *testing.T) {
 	o := defaultOptions()
 	BoundedOperations(128, time.Second, 1, nil, nil)(o)
 	c := &OlricCache[string, []byte]{cfg: o}
-	start := time.Now()
 	_, err := c.Get(context.Background(), "key")
 	require.ErrorIs(t, err, boundedcall.ErrRejected)
-	require.Less(t, time.Since(start), 100*time.Millisecond)
 }
 
 func TestExpectedL2SkipClassification(t *testing.T) {

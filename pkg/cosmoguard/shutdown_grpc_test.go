@@ -76,7 +76,11 @@ func TestShutdownDrainsFiniteGRPCWhileHTTPAndStreamAreStuck(t *testing.T) {
 			_ = r.Body.Close()
 		}
 	}()
-	<-httpEntered
+	select {
+	case <-httpEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTP request did not reach the handler")
+	}
 	f := &CosmoGuard{lcdProxy: &HttpProxy{server: srv.Config, log: log.WithField("test", t.Name())}, grpcProxy: p}
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()

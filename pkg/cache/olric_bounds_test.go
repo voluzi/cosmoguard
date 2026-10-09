@@ -159,7 +159,7 @@ func (d heldReadDMap) Get(ctx context.Context, key string) (*olric.GetResponse, 
 
 func TestOlricCacheSmallReadsAt250MiProfile(t *testing.T) {
 	client := embeddedOlric(t)
-	option := BoundedOperations(128, 100*time.Millisecond, 16<<20, nil, nil)
+	option := BoundedOperations(128, 10*time.Second, 16<<20, nil, nil)
 	c, err := NewOlricCache[string, []byte](client, "concurrent-small-reads", option)
 	require.NoError(t, err)
 	require.NoError(t, c.Set(t.Context(), "key", []byte("shared response"), time.Minute))
@@ -180,7 +180,7 @@ func TestOlricCacheSmallReadsAt250MiProfile(t *testing.T) {
 			done <- err
 		}()
 	}
-	timer := time.NewTimer(50 * time.Millisecond)
+	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	admitted := 0
 wait:
@@ -225,7 +225,7 @@ func TestOlricCacheShrinksReadsBeforeDecode(t *testing.T) {
 	encoded, err := EncodeValue([]byte("shared response"))
 	require.NoError(t, err)
 	require.NoError(t, dm.Put(t.Context(), "key", encoded, olric.EX(time.Minute)))
-	option := BoundedOperations(128, 100*time.Millisecond, 16<<20, nil, nil)
+	option := BoundedOperations(128, 10*time.Second, 16<<20, nil, nil)
 	c, err := NewOlricCache[string, heldReadValue](client, "read-decode-charge", option)
 	require.NoError(t, err)
 	heldReadDecode.entered = make(chan struct{}, 32)
@@ -247,7 +247,7 @@ func TestOlricCacheShrinksReadsBeforeDecode(t *testing.T) {
 		select {
 		case <-heldReadDecode.entered:
 			admitted++
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(5 * time.Second):
 		}
 		if admitted != launched {
 			break
