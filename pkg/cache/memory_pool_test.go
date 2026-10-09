@@ -128,7 +128,7 @@ func TestMemoryPoolNilAndTinyValues(t *testing.T) {
 	c = pooled[string, any](t, unlimited, "nil")
 	require.NoError(t, c.Set(t.Context(), "nil", nil, time.Hour))
 	value, err := c.Get(t.Context(), "nil")
-	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, err)
 	require.Nil(t, value)
 	tiny := pooled[uint64, []byte](t, p, "tiny")
 	for i := uint64(0); i < 10; i++ {
@@ -241,4 +241,19 @@ func TestMemoryPoolGetRejectsUnexpectedValueType(t *testing.T) {
 	value, err := c.Get(t.Context(), "key")
 	require.ErrorIs(t, err, ErrNotFound)
 	require.Nil(t, value)
+}
+
+func TestMemoryPoolNilInterfaceMatchesLegacy(t *testing.T) {
+	p := NewMemoryPool(0, 0)
+	defer p.Close()
+	legacy, err := NewMemoryCache[string, any]("legacy")
+	require.NoError(t, err)
+	defer legacy.Close()
+	shared := pooled[string, any](t, p, "shared")
+	for _, c := range []Cache[string, any]{legacy, shared} {
+		require.NoError(t, c.Set(t.Context(), "nil", nil, time.Hour))
+		value, err := c.Get(t.Context(), "nil")
+		require.NoError(t, err)
+		require.Nil(t, value)
+	}
 }

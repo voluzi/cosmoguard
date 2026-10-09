@@ -133,7 +133,12 @@ func (c *pooledMemoryCache[K, V]) Set(_ context.Context, key K, value V, ttl tim
 }
 func (c *pooledMemoryCache[K, V]) Get(_ context.Context, key K) (V, error) {
 	if item := c.pool.cache.Get(c.key(key)); item != nil {
-		if value, ok := item.Value().(V); ok {
+		value := item.Value()
+		if value == nil {
+			var zero V
+			return zero, nil
+		}
+		if value, ok := value.(V); ok {
 			return value, nil
 		}
 	}
