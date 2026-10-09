@@ -33,7 +33,7 @@ unchanged. No new operator configuration is required.
    gauges for capacity decisions.
 6. The embedded Olric dependency is now **the voluzi fork**, module
    `github.com/voluzi/olric`, pinned at
-   `v0.7.5-0.20261008230314-154bebac9dfa`. Consumers that interact with Olric Go
+   `v0.7.5-0.20261009002017-a106ad34f24e`. Consumers that interact with Olric Go
    types must update their Olric imports and requirement as well. There is **no
    replace directive**, including for downstream builds. The public module
    downloads through the default Go proxy. The fork changes listed below retain
@@ -72,12 +72,8 @@ The fork starts from upstream v0.7.4 and includes these commits, in order:
 | `1feb3c1` | Test parallel pruning over 271 partitions with shared published owner backing; assert identical serial results and no mutation under the race detector. No production change. |
 | `d784449` | Derive the member snapshot from synchronous memberlist join/update/leave callbacks under the native node lock, instead of dereferencing mutable Node metadata returned by Members(). Preserve live-member selection and birthdate ordering while fixing metadata races during routing scans. |
 | `154beba` | Compare cached membership with native live-member names and transmitted identities: the local member immediately after Start, same-name rejoin at a new gossip address/ID, metadata updates during reads, and a member declared dead without Leave. No production change. |
-
-Round-3 local fork additions are evaluated but **not in the public pin above**:
-`5b4d8db` tests that one compaction pass continues past a retired fragment;
-`a106ad3` removes a retired fragment from its partition after successful Close even if Destroy
-returns an error, with a real DMap write/recreate regression. Publication and the
-CosmoGuard pin update await owner approval.
+| `5b4d8db` | Test that one compaction pass continues past a retired fragment. No production change. |
+| `a106ad3` | Remove a retired fragment from its partition after successful Close even if Destroy returns an error; test error propagation and a real DMap write/recreate. |
 
 Ownership scans have 16 workers. Active RPC concurrency to each peer also shares
 Olric's client pool, whose default size is `10 × GOMAXPROCS`; at GOMAXPROCS=1 a
