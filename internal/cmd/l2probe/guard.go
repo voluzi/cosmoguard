@@ -61,6 +61,8 @@ func (c *guardClient) close() {
 }
 
 func (c *guardClient) request(ctx context.Context, t guardTarget, key string, size int, token string) ([]byte, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	parameters, err := json.Marshal(map[string]any{"key": key, "size": size})
 	if err != nil {
 		return nil, 0, err
