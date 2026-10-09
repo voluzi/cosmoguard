@@ -75,7 +75,7 @@ The fork starts from upstream v0.7.4 and includes these commits, in order:
 
 Round-3 local fork additions are evaluated but **not in the public pin above**:
 `5b4d8db` tests that one compaction pass continues past a retired fragment;
-`17ea051` removes a retired fragment from its partition even if Close or Destroy
+`a106ad3` removes a retired fragment from its partition after successful Close even if Destroy
 returns an error, with a real DMap write/recreate regression. Publication and the
 CosmoGuard pin update await owner approval.
 

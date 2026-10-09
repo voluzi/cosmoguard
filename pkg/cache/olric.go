@@ -235,16 +235,10 @@ func (c *OlricCache[K, V]) keyStr(key K) string {
 	return fmt.Sprintf("%v", key)
 }
 
-// unmarshalFromOlric copies byte payloads or decodes MessagePack into V.
-//
-// The copy matters for embedded-mode reads: olric's GetResponse.Byte() walks
-// through resp.Scan, which for *[]byte aliases the entry's internal buffer
-// (`*v = b` in olric/internal/resp/scan.go) and Entry.Value() returns its
-// stored slice directly. For keys whose partition owner is this pod, the
-// returned []byte therefore shares memory with the cache's in-memory store
-// — a caller that mutates the slice would corrupt the cached value for
-// every subsequent reader. Symmetric to marshalBounded, which copies on
-// the way in.
+// unmarshalFromOlric copies bytes at the adapter's ownership boundary. Native
+// local reads can alias their table. The slab engine returns owned data, but
+// this adapter also accepts native EmbeddedClients; GetResponse exposes no
+// engine-specific ownership contract.
 func unmarshalFromOlric[V any](raw []byte) (V, error) {
 	var zero V
 	if _, isBytes := any(zero).([]byte); isBytes {
