@@ -160,6 +160,9 @@ func (c *guardClient) request(ctx context.Context, t guardTarget, key string, si
 	return []byte(out.Value), 200, nil
 }
 
+// Allow brief replacement pauses, but do not pass a later sustained outage.
+const guardProgressTimeout = 30 * time.Second
+
 func guardRun(ctx context.Context, file string, duration time.Duration, workers, size, rps int) error {
 	if workers < 1 || rps < 0 || (rps > 0 && time.Second/time.Duration(rps) == 0) || size < 0 || size > 2<<20 {
 		return errors.New("invalid guard workload")
@@ -228,6 +231,7 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 	var sequence, succeeded, skipped atomic.Uint64
 	var mu sync.Mutex
 	var latencies []float64
+	lastSuccess := time.Now()
 	var firstErr error
 	fail := func(err error) {
 		mu.Lock()
@@ -315,6 +319,7 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 				}
 				succeeded.Add(1)
 				mu.Lock()
+				lastSuccess = time.Now()
 				if len(latencies) < 100000 {
 					latencies = append(latencies, time.Since(start).Seconds()*1000)
 				}
@@ -331,7 +336,12 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 			mu.Lock()
 			values := latencies
 			latencies = nil
+			stalled := time.Since(lastSuccess) >= guardProgressTimeout
 			mu.Unlock()
+			if stalled {
+				fail(fmt.Errorf("no successful guard requests for %s", guardProgressTimeout))
+				break
+			}
 			sort.Float64s(values)
 			percentile := func(q float64) float64 {
 				if len(values) == 0 {
@@ -363,6 +373,9 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 		}
 	}
 	wg.Wait()
+	if firstErr == nil && time.Since(lastSuccess) >= guardProgressTimeout {
+		return fmt.Errorf("no successful guard requests for %s", guardProgressTimeout)
+	}
 	if firstErr == nil && succeeded.Load() == 0 {
 		return errors.New("no successful guard requests")
 	}

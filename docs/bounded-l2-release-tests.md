@@ -63,7 +63,11 @@ and reserves 10% of traffic for repeated hot keys. It paces requests without
 a waiter queue and reports success,
 errors and latency percentiles on a five-second ticker. Sentinel checks can delay
 subsequent reports during faults; use the recorded timestamps for actual intervals.
-gRPC connections are reused.
+Every periodic sentinel assertion must complete with its expected status on each
+ready target; a timeout or transport error fails the run. A 30-second interval
+without any successful traffic also fails, checked on the reporting ticker and
+at completion. This permits brief replacement pauses without masking an outage
+in a later phase. gRPC connections are reused.
 
 Traffic remains active through every required phase and its dwell. The runner adds
 up to the 600s rollout timeout per phase to the requested traffic duration; this
