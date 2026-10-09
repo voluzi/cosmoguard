@@ -53,7 +53,9 @@ type Engine struct {
 	p                      *Pool
 	next                   *Engine
 	id                     uint64
-	buckets                [32]uint64
+	buckets                []uint64
+	inlineBuckets          [32]uint64
+	indexBytes             uint64
 	head, tail, generation uint64
 	bytes, length          int
 	closed, destroyed      bool
@@ -108,6 +110,7 @@ func (e *Engine) registerLocked() error {
 	}
 	e.p.nextID++
 	e.id = e.p.nextID
+	e.buckets = e.inlineBuckets[:]
 	e.next = e.p.engines
 	e.p.engines = e
 	e.p.used += fragmentCharge
@@ -130,6 +133,7 @@ func (e *Engine) Fork(*storage.Config) (storage.Engine, error) {
 	}
 	e.p.nextID++
 	child := &Engine{p: e.p, id: e.p.nextID, next: e.p.engines}
+	child.buckets = child.inlineBuckets[:]
 	e.p.engines = child
 	e.p.used += fragmentCharge
 	e.p.fragments++
@@ -142,9 +146,43 @@ func rawRecord(b []byte) []byte {
 	return b[headerSize : headerSize+int(binary.LittleEndian.Uint32(b[40:44]))]
 }
 func blockCharge(b []byte) int { return int(binary.LittleEndian.Uint32(b[44:48])) }
+func (e *Engine) bucket(h uint64) int {
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return int(h & uint64(len(e.buckets)-1))
+}
+func (e *Engine) growBucketsLocked() error {
+	if e.length < len(e.buckets)*4 {
+		return nil
+	}
+	charge := uint64(len(e.buckets)) * 16
+	// Reserve both arrays during rehash; each growth handles at most four
+	// records per old bucket on average. Failed growth leaves the index intact.
+	if !e.p.arena.reserve(charge) {
+		return ErrCapacity
+	}
+	e.buckets = make([]uint64, len(e.buckets)*2)
+	for loc := e.head; loc != 0; loc = field(e.p.arena.block(loc), 24) {
+		b := e.p.arena.block(loc)
+		bucket := e.bucket(field(b, 0))
+		setField(b, 8, e.buckets[bucket])
+		e.buckets[bucket] = loc
+	}
+	e.p.arena.allocated -= e.indexBytes
+	e.p.used += charge - e.indexBytes
+	e.bytes += int(charge - e.indexBytes)
+	e.indexBytes = charge
+	return nil
+}
 func (e *Engine) findLocked(h uint64) (uint64, uint64) {
 	var prev uint64
-	for loc := e.buckets[h%32]; loc != 0; {
+	if len(e.buckets) == 0 {
+		return 0, 0
+	}
+	for loc := e.buckets[e.bucket(h)]; loc != 0; {
 		b := e.p.arena.block(loc)
 		if field(b, 0) == h {
 			return loc, prev
@@ -185,7 +223,7 @@ func (e *Engine) removeLocked(loc, prev uint64) {
 	b := e.p.arena.block(loc)
 	h, next, size := field(b, 0), field(b, 8), blockCharge(b)
 	if prev == 0 {
-		e.buckets[h%32] = next
+		e.buckets[e.bucket(h)] = next
 	} else {
 		setField(e.p.arena.block(prev), 8, next)
 	}
@@ -268,6 +306,11 @@ func (e *Engine) putLocked(h uint64, v []byte) error {
 		size *= 2
 	}
 	loc, prev := e.findLocked(h)
+	if loc == 0 {
+		if err := e.growBucketsLocked(); err != nil {
+			return err
+		}
+	}
 	if loc != 0 && blockCharge(e.p.arena.block(loc)) == size {
 		b := e.p.arena.block(loc)
 		e.unlinkOrderLocked(loc)
@@ -285,11 +328,11 @@ func (e *Engine) putLocked(h uint64, v []byte) error {
 	}
 	b := e.p.arena.block(dest)
 	setField(b, 0, h)
-	setField(b, 8, e.buckets[h%32])
+	setField(b, 8, e.buckets[e.bucket(h)])
 	binary.LittleEndian.PutUint32(b[40:44], uint32(len(v)))
 	binary.LittleEndian.PutUint32(b[44:48], uint32(size))
 	copy(b[headerSize:], v)
-	e.buckets[h%32] = dest
+	e.buckets[e.bucket(h)] = dest
 	e.appendOrderLocked(dest)
 	e.bytes += size
 	e.length++
@@ -610,6 +653,11 @@ func (e *Engine) destroyLocked() {
 		e.p.used -= fragmentCharge
 		e.p.fragments--
 	}
+	e.p.arena.allocated -= e.indexBytes
+	e.p.used -= e.indexBytes
+	e.bytes = 0
+	e.indexBytes = 0
+	e.buckets = nil
 	e.closed = true
 	e.destroyed = true
 	e.next = nil
