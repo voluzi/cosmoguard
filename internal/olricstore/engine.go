@@ -577,21 +577,10 @@ func (e *Engine) RangeHKey(f func(uint64) bool) {
 	})
 }
 func (e *Engine) Range(f func(uint64, storage.Entry) bool) {
-	high := e.highWater()
-	start := uint64(0)
-	stopped := false
-	visit := func(t token) bool {
+	e.walk(0, e.highWater(), func(t token) bool {
 		v, ok := e.copyToken(t, true)
-		if ok && !f(t.hash, v) {
-			stopped = true
-			return false
-		}
-		return true
-	}
-	e.walk(start, high, visit)
-	if !stopped {
-		e.walk(0, start, visit)
-	}
+		return !ok || f(t.hash, v)
+	})
 }
 func (e *Engine) Scan(c uint64, n int, f func(storage.Entry) bool) (uint64, error) {
 	return e.scan(c, n, nil, f)
