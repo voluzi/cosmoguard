@@ -24,6 +24,9 @@ unchanged. No new operator configuration is required.
    slab engine too. Standalone limiter and replay behavior retain their existing
    admission policy. Timed-out workers keep their reservations until they exit;
    closing an owner stops new admission without pretending blocked work ended.
+   Olric-backed proxy caches also get this default when a Go consumer omits
+   `WithL2Operations`. `SharedOptions` contains private runtime admission state;
+   use `DefaultSharedOptions` or keyed literals instead of positional literals.
 5. Olric storage statistics describe charged shared backing: `Allocated` includes
    slab/tree/descriptor, grown hash indexes and fragment allowances, and `Inuse` includes rounded live
    records and fragment metadata. Shared backing and slab counts are apportioned across registered
