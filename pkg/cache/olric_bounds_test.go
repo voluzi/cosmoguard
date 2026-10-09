@@ -284,3 +284,18 @@ func TestOlricCacheRejectsUnderreportedEncodedSize(t *testing.T) {
 	_, err = c.dm.Get(t.Context(), "key")
 	require.ErrorIs(t, err, olric.ErrKeyNotFound)
 }
+
+func TestOlricCacheHasDoesNotDecodeExistingValue(t *testing.T) {
+	client := embeddedOlric(t)
+	c, err := NewOlricCache[string, struct{ Value string }](client, "existence-only", BoundedOperations(1, time.Second, 4<<20, nil, nil))
+	require.NoError(t, err)
+	require.NoError(t, c.dm.Put(t.Context(), "corrupt", []byte{0xc1}))
+	_, err = c.Get(t.Context(), "corrupt")
+	require.Error(t, err)
+	present, err := c.Has(t.Context(), "corrupt")
+	require.NoError(t, err)
+	require.True(t, present)
+	present, err = c.Has(t.Context(), "missing")
+	require.NoError(t, err)
+	require.False(t, present)
+}

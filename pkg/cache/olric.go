@@ -219,11 +219,13 @@ func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, 
 	return r.value, r.expiry, err
 }
 func (c *OlricCache[K, V]) Has(ctx context.Context, key K) (bool, error) {
-	_, _, err := c.getWithExpiry(ctx, key)
-	if errors.Is(err, ErrNotFound) {
-		return false, nil
-	}
-	return err == nil, err
+	return boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, maxReadOperationCharge, func(opCtx context.Context, _ *bytebudget.Lease) (bool, error) {
+		_, err := c.dm.Get(opCtx, c.keyStr(key))
+		if errors.Is(err, olric.ErrKeyNotFound) {
+			return false, nil
+		}
+		return err == nil, operationError(err)
+	})
 }
 
 // Close is a no-op: the underlying *olric.EmbeddedClient is owned by the
