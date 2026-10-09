@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,14 +15,18 @@ func TestGuardRejectsUnsupportedRate(t *testing.T) {
 		t.Fatalf("unsupported rate accepted: %v", err)
 	}
 }
-func TestGuardRejectsOversizedTargetBeforeRequests(t *testing.T) {
+func TestGuardRejectsInvalidTargetSizeBeforeRequests(t *testing.T) {
 	t.Setenv("PROBE_JWT_SECRET", "local-fixture-secret")
-	file := filepath.Join(t.TempDir(), "targets.json")
-	if err := os.WriteFile(file, []byte(`[{"protocol":"http","address":"127.0.0.1:1","size":2097153}]`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	err := guardRun(t.Context(), file, time.Second, 1, 1024, 1)
-	if err == nil || !strings.Contains(err.Error(), "target size") {
-		t.Fatalf("oversized target accepted: %v", err)
+	for _, size := range []int{-1, 2097153} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "targets.json")
+			if err := os.WriteFile(file, []byte(fmt.Sprintf(`[{"protocol":"http","address":"127.0.0.1:1","size":%d}]`, size)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := guardRun(t.Context(), file, time.Second, 1, 1024, 1)
+			if err == nil || !strings.Contains(err.Error(), "target size") {
+				t.Fatalf("invalid target size accepted: %v", err)
+			}
+		})
 	}
 }

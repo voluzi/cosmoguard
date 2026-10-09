@@ -181,8 +181,8 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 			return nil, errors.New("guard target file must contain a nonempty JSON array")
 		}
 		for _, target := range targets {
-			if target.Size > 2<<20 {
-				return nil, errors.New("guard target size exceeds 2 MiB")
+			if target.Size < 0 || target.Size > 2<<20 {
+				return nil, errors.New("guard target size must be between 0 and 2 MiB")
 			}
 		}
 		return targets, nil
