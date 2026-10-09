@@ -196,10 +196,19 @@ func TestEngineScanTerminatesWhileReadingEachPage(t *testing.T) {
 				}
 			}
 			seen := make(map[string]bool)
+			readOtherKeys := true
 			var cursor uint64
 			for page := 0; page <= count; page++ {
 				var keys []string
 				visit := func(v storage.Entry) bool {
+					if readOtherKeys {
+						readOtherKeys = false
+						for h := uint64(0); h < count; h++ {
+							if _, err := e.Get(h); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
 					keys = append(keys, v.Key())
 					seen[v.Key()] = true
 					return true

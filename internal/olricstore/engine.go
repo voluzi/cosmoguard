@@ -513,7 +513,7 @@ func (e *Engine) batch(after, high uint64) ([32]token, int) {
 	}
 	return out, n
 }
-func (e *Engine) copyToken(t token) (storage.Entry, bool) {
+func (e *Engine) copyToken(t token, matchGeneration bool) (storage.Entry, bool) {
 	e.p.mu.Lock()
 	defer e.p.mu.Unlock()
 	if e.readyLocked() != nil {
@@ -524,7 +524,7 @@ func (e *Engine) copyToken(t token) (storage.Entry, bool) {
 		return nil, false
 	}
 	b := e.p.arena.block(loc)
-	if field(b, 32) != t.generation {
+	if matchGeneration && field(b, 32) != t.generation {
 		return nil, false
 	}
 	v := NewEntry()
@@ -561,7 +561,7 @@ func (e *Engine) Range(f func(uint64, storage.Entry) bool) {
 	start := uint64(0)
 	stopped := false
 	visit := func(t token) bool {
-		v, ok := e.copyToken(t)
+		v, ok := e.copyToken(t, true)
 		if ok && !f(t.hash, v) {
 			stopped = true
 			return false
@@ -600,7 +600,7 @@ func (e *Engine) scan(c uint64, n int, r *regexp.Regexp, f func(storage.Entry) b
 		}
 		for _, t := range batch[:count] {
 			c = t.cursor
-			v, ok := e.copyToken(t.token)
+			v, ok := e.copyToken(t.token, false)
 			if !ok || (r != nil && !r.MatchString(v.Key())) {
 				continue
 			}
