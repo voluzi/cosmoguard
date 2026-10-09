@@ -146,6 +146,8 @@ observations. It does not expose cgroup peak/events. Record those through the
 host sampler, or mark them missing and keep the gate pending. Old native nodes
 require separate GC CPU/limiter sampling; do not invent values for absent metrics. For diagnostic processes,
 `l2probe` writes the complete ledger directly without forcing collection. Its
+initial empty snapshot establishes CPU and GC baselines and omits their rates;
+subsequent snapshots report rates over the preceding measurement interval. Its
 engine/L1 run is not a substitute for the actual guard soak. Enable `GODEBUG=gctrace=1`
 only for a separately recorded diagnostic if tracing is needed; do not alter
 GOMEMLIMIT or use forced collections to make an idle interval pass.

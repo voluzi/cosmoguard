@@ -171,6 +171,7 @@ func run() (result error) {
 	last := started
 	var lastGC uint32
 	var lastCPU float64
+	haveBaseline := false
 	snapshot := func(stage string) error {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
@@ -196,8 +197,13 @@ func run() (result error) {
 			return strings.TrimSpace(string(b))
 		}
 		r, n := operations.OperationBytes()
-		out := map[string]any{"stage": stage, "elapsed": now.Sub(started).Seconds(), "heap_alloc": m.HeapAlloc, "heap_inuse": m.HeapInuse, "heap_sys": m.HeapSys, "go_managed": m.Sys - m.HeapReleased, "next_gc": m.NextGC, "rss": rss, "gc_rate": float64(m.NumGC-lastGC) / seconds, "gc_cpu": sm[0].Value.Float64(), "gc_limiter_cycle": sm[1].Value.Uint64(), "cpu_millicores": 1000 * (cpu - lastCPU) / seconds, "response": response.Snapshot(), "security": security.Snapshot(), "operation_bytes": r, "operation_capacity": n, "attempts": attempts.Load(), "skips": skips.Load(), "cgroup_current": read("memory.current"), "cgroup_peak": read("memory.peak"), "cgroup_events": read("memory.events"), "cpu_stat": read("cpu.stat"), "cgroup_stat": read("memory.stat")}
+		out := map[string]any{"stage": stage, "elapsed": now.Sub(started).Seconds(), "heap_alloc": m.HeapAlloc, "heap_inuse": m.HeapInuse, "heap_sys": m.HeapSys, "go_managed": m.Sys - m.HeapReleased, "next_gc": m.NextGC, "rss": rss, "gc_cpu": sm[0].Value.Float64(), "gc_limiter_cycle": sm[1].Value.Uint64(), "response": response.Snapshot(), "security": security.Snapshot(), "operation_bytes": r, "operation_capacity": n, "attempts": attempts.Load(), "skips": skips.Load(), "cgroup_current": read("memory.current"), "cgroup_peak": read("memory.peak"), "cgroup_events": read("memory.events"), "cpu_stat": read("cpu.stat"), "cgroup_stat": read("memory.stat")}
+		if haveBaseline && seconds > 0 {
+			out["gc_rate"] = float64(m.NumGC-lastGC) / seconds
+			out["cpu_millicores"] = 1000 * (cpu - lastCPU) / seconds
+		}
 		last, lastGC, lastCPU = now, m.NumGC, cpu
+		haveBaseline = true
 		return json.NewEncoder(os.Stdout).Encode(out)
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"go": runtime.Version(), "arch": runtime.GOARCH, "budget": budget, "dmaps": *maps, "size": *size, "writers": *writers, "ttl": ttl.String(), "seed": 42}); err != nil {
