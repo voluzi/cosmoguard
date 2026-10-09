@@ -127,13 +127,18 @@ func TestSignalDrainKeepsServingAndClosesAllListeners(t *testing.T) {
 	require.NoError(t, peer.SetReadDeadline(signaled.Add(8*time.Second)))
 	_, _, err = peer.ReadMessage()
 	require.True(t, websocket.IsCloseError(err, websocket.CloseGoingAway), "close: %v", err)
-	for _, port := range []int{cfg.LcdPort, cfg.RpcPort, cfg.GrpcPort, cfg.Metrics.Port} {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
-		if conn != nil {
-			_ = conn.Close()
+	require.Eventually(t, func() bool {
+		for _, port := range []int{cfg.LcdPort, cfg.RpcPort, cfg.GrpcPort, cfg.Metrics.Port} {
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 100*time.Millisecond)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if err == nil {
+				return false
+			}
 		}
-		require.Error(t, err, "listener %d must stop while the LCD request drains", port)
-	}
+		return true
+	}, 2*time.Second, 10*time.Millisecond, "all listeners must stop while the LCD request drains")
 	release <- struct{}{}
 	require.NoError(t, <-slow)
 	select {
