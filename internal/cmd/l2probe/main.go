@@ -76,6 +76,9 @@ func run() (result error) {
 	if *maps != 4 && *maps != 8 {
 		return errors.New("dmaps must be 4 or 8")
 	}
+	if *ttl <= 0 {
+		return errors.New("diagnostic TTL must be positive")
+	}
 	if *size < 1 || *size > 900<<10 || *writers < 1 {
 		return errors.New("invalid diagnostic workload")
 	}
