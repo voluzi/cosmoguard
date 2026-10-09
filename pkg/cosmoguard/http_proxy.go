@@ -71,7 +71,8 @@ type HttpProxy struct {
 	// cluster-wide rate limiter (backend=olric, the v4 default). nil
 	// in tests that bypass cosmoguard.New — the limiter constructor
 	// falls back to in-memory in that case.
-	olricClient *olric.EmbeddedClient
+	olricClient       *olric.EmbeddedClient
+	limiterOperations *boundedcall.Gate
 	// limiters maps rule fingerprint to RateLimiter. Rebuilt every SetRules;
 	// stale limiters are Close()'d.
 	limiters map[uint64]RateLimiter
@@ -226,16 +227,17 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		srv.IdleTimeout = sc.IdleTimeout
 	}
 	proxy := HttpProxy{
-		log:              log.WithField("proxy", name),
-		server:           srv,
-		endpointHandlers: cfg.EndpointHandlers,
-		cacheConfig:      cfg.CacheConfig,
-		olricClient:      cfg.OlricClient,
-		proxyName:        name,
-		limiters:         map[uint64]RateLimiter{},
-		auth:             cfg.Authenticator,
-		cors:             cfg.CORSConfig,
-		now:              time.Now,
+		log:               log.WithField("proxy", name),
+		server:            srv,
+		endpointHandlers:  cfg.EndpointHandlers,
+		cacheConfig:       cfg.CacheConfig,
+		olricClient:       cfg.OlricClient,
+		limiterOperations: cfg.limiterOperations,
+		proxyName:         name,
+		limiters:          map[uint64]RateLimiter{},
+		auth:              cfg.Authenticator,
+		cors:              cfg.CORSConfig,
+		now:               time.Now,
 	}
 	if cfg.ServerConfig != nil {
 		proxy.maxRequestBody = cfg.ServerConfig.EffectiveMaxRequestBody()
@@ -473,7 +475,7 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		// Each rule's bucket pool gets its own keyspace under the proxy
 		// name so multiple proxies (lcd, rpc, etc.) don't share buckets.
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace, p.limiterOperations)
 		if err != nil {
 			p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
 			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)

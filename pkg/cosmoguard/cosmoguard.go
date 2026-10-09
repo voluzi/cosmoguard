@@ -350,7 +350,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 	// seen-jti set across replicas. Calling NewAuthenticator earlier
 	// would pass a nil client and silently fall back to a per-pod
 	// memory store — a JWT could then be replayed once per replica.
-	authn, err := newAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client(), cfg.Cache.Cluster != nil)
+	authn, err := newAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client(), cfg.Cache.Cluster != nil, cluster.replayOperations)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up authenticator: %w", err)
 	}
@@ -409,6 +409,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		WithCacheConfig[GrpcProxyOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[GrpcProxyOptions](cacheBudget),
 		WithL2Operations[GrpcProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[GrpcProxyOptions](cluster.limiterOperations),
 		WithOlricClient[GrpcProxyOptions](cosmoGuard.cluster.Client()),
 		WithMetricsEnabled[GrpcProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 		WithAuthenticator[GrpcProxyOptions](cosmoGuard.auth),
@@ -425,6 +426,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[HttpProxyOptions](cacheBudget),
 		WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 		WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -445,6 +447,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
 		WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 		WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 		WithWebSocketEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.RPC.WebSocketIsEnabled()),
 		WithWebSocketBackends[JsonRpcHandlerOptions](rpcWSBackends),
@@ -466,6 +469,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[HttpProxyOptions](cacheBudget),
 		WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 		WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -493,6 +497,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
 			WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 			WithWebSocketEnabled[JsonRpcHandlerOptions](false),
 			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
@@ -513,6 +518,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 			WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[HttpProxyOptions](cacheBudget),
 			WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 			WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 			WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 			WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -539,6 +545,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
 			WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 			WithWebSocketEnabled[JsonRpcHandlerOptions](true),
 			WithWebSocketConnections[JsonRpcHandlerOptions](cosmoGuard.cfg.EVM.WS.WebSocketConnections),
@@ -560,6 +567,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 			WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[HttpProxyOptions](cacheBudget),
 			WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 			WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 			WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 			WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),

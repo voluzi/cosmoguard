@@ -17,6 +17,7 @@ import (
 	"github.com/voluzi/olric"
 	"github.com/voluzi/olric/config"
 
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
 	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
@@ -117,13 +118,14 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 // enable=true) the daemon binds the configured BindAddr:BindPort + GossipPort
 // and joins peers advertised by the configured discovery plugin.
 type clusterRuntime struct {
-	responseOperations         cache.Option
-	db                         *olric.Olric
-	client                     *olric.EmbeddedClient
-	discovery                  *clusterServiceDiscovery // non-nil only in cluster mode
-	peerAPIKey                 []byte
-	responsePool, securityPool *olricstore.Pool
-	removeMetrics              func()
+	responseOperations                  cache.Option
+	limiterOperations, replayOperations *boundedcall.Gate
+	db                                  *olric.Olric
+	client                              *olric.EmbeddedClient
+	discovery                           *clusterServiceDiscovery // non-nil only in cluster mode
+	peerAPIKey                          []byte
+	responsePool, securityPool          *olricstore.Pool
+	removeMetrics                       func()
 }
 
 // clusterRuntimeOptions configures the runtime.
@@ -399,6 +401,8 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		workBytes = responseWorkBytes()
 	}
 	cr.responseOperations = cache.RecoveringOperations(l2OperationCapacity, l2OperationBudget, workBytes, func(outcome string) { recordBackendOperationFailure("l2", outcome) }, func(reason string) { l2WriteSkips.WithLabelValues(reason).Inc() }, func(unavailable bool) { recordBackendUnavailable("l2", unavailable) })
+	cr.limiterOperations = newLimiterOperations()
+	cr.replayOperations = newReplayOperations()
 	cr.removeMetrics = addL2Metrics(cr)
 	return cr, nil
 }
@@ -552,6 +556,8 @@ func (cr *clusterRuntime) Close(ctx context.Context) error {
 		_ = cr.discovery.Close()
 	}
 	cr.responseOperations.CloseOperations()
+	cr.limiterOperations.Close()
+	cr.replayOperations.Close()
 	err := cr.db.Shutdown(ctx)
 	if cr.removeMetrics != nil {
 		cr.removeMetrics()

@@ -85,7 +85,7 @@ func (d *outageReplayDMap) Put(ctx context.Context, _ string, _ any, _ ...olric.
 func TestReplayChecksEveryRequestAfterBackendTimeouts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dm := &outageReplayDMap{fail: true}
-		store := &olricReplayStore{dm: dm, operationGate: replayOperations}
+		store := &olricReplayStore{dm: dm, operationGate: newReplayOperations()}
 		for range 4 {
 			seen, err := store.SeenOrStore(t.Context(), "same-token", time.Minute)
 			require.False(t, seen)
@@ -99,4 +99,40 @@ func TestReplayChecksEveryRequestAfterBackendTimeouts(t *testing.T) {
 		require.True(t, seen, "the recovered backend rejects an existing token immediately")
 		require.Equal(t, int32(5), dm.calls.Load())
 	})
+}
+
+func TestLimiterOutageDoesNotDivertAnotherOwner(t *testing.T) {
+	a := newEmbeddedClusterRuntimeForTest(t)
+	b := newEmbeddedClusterRuntimeForTest(t)
+	cfg := RateLimitConfig{Rate: Rate{PerSecond: 10}, Burst: 10}
+	failing, err := newRuleRateLimiter(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, a.Client(), "failing-owner", a.limiterOperations)
+	require.NoError(t, err)
+	healthy, err := newRuleRateLimiter(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, b.Client(), "healthy-owner", b.limiterOperations)
+	require.NoError(t, err)
+	defer failing.Close()
+	defer healthy.Close()
+	sameOwner, err := newRuleRateLimiter(cfg, &CacheGlobalConfig{Cluster: &ClusterConfig{}}, a.Client(), "same-owner", a.limiterOperations)
+	require.NoError(t, err)
+	defer sameOwner.Close()
+	sibling := &outageLimiter{RateLimiter: sameOwner.(*boundedRateLimiter).RateLimiter}
+	sameOwner.(*boundedRateLimiter).RateLimiter = sibling
+	down := &outageLimiter{RateLimiter: failing.(*boundedRateLimiter).RateLimiter, err: olric.ErrOperationTimeout}
+	good := &outageLimiter{RateLimiter: healthy.(*boundedRateLimiter).RateLimiter}
+	failing.(*boundedRateLimiter).RateLimiter = down
+	healthy.(*boundedRateLimiter).RateLimiter = good
+	defer failing.(*boundedRateLimiter).operationGate.Close()
+	defer healthy.(*boundedRateLimiter).operationGate.Close()
+	for range 3 {
+		_, _, err := failing.Allow(t.Context(), "key")
+		require.NoError(t, err)
+	}
+	allowed, _, err := sameOwner.Allow(t.Context(), "key")
+	require.NoError(t, err)
+	require.True(t, allowed, "the same owner's outage uses local fallback")
+	require.Zero(t, sibling.calls.Load())
+	allowed, retry, err := healthy.Allow(t.Context(), "key")
+	require.NoError(t, err)
+	require.False(t, allowed, "the healthy backend denies; local fallback would allow")
+	require.Equal(t, time.Second, retry)
+	require.Equal(t, int32(1), good.calls.Load())
 }

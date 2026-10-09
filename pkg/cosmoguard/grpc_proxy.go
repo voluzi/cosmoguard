@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 	"github.com/voluzi/olric"
 	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -138,10 +139,11 @@ type GrpcProxy struct {
 	auth *Authenticator
 	// limiters maps a rule's Fingerprint to its token-bucket. Built
 	// in SetRules from each rule's RateLimit; read under rulesMutex.
-	limiters    map[uint64]RateLimiter
-	olricClient *olric.EmbeddedClient
-	proxyName   string
-	setRulesMu  sync.Mutex
+	limiters          map[uint64]RateLimiter
+	olricClient       *olric.EmbeddedClient
+	limiterOperations *boundedcall.Gate
+	proxyName         string
+	setRulesMu        sync.Mutex
 	// writeLocks serializes cache writes per key (striped). The foreground
 	// single-flight group and the background SWR refresh group are
 	// independent, so both can Set the same key concurrently; without this a
@@ -214,6 +216,7 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	proxy.pool = pool
 	proxy.auth = cfg.Authenticator
 	proxy.olricClient = cfg.OlricClient
+	proxy.limiterOperations = cfg.limiterOperations
 	proxy.proxyName = name
 
 	// Build a cache for gRPC responses. Dispatch (olric / redis / memory)
@@ -334,7 +337,7 @@ func (p *GrpcProxy) SetRules(rules []*GrpcRule, defaultAction RuleAction) {
 			}
 		}
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace, p.limiterOperations)
 		if err != nil {
 			p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
 			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)

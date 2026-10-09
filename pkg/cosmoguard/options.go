@@ -1,6 +1,7 @@
 package cosmoguard
 
 import (
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 	"github.com/voluzi/olric"
 )
@@ -13,8 +14,9 @@ type SharedOptions struct {
 	// CacheBudget is the per-instance memory budget for this proxy's
 	// response cache, already divided across the enabled caches by New().
 	// Zero-value means unbounded (the test/programmatic path).
-	CacheBudget  CacheBudget
-	L2Operations cache.Option
+	CacheBudget       CacheBudget
+	L2Operations      cache.Option
+	limiterOperations *boundedcall.Gate
 	// OlricClient is the in-process olric handle used by the v4
 	// cluster-shared rate limiter (cache.backend=olric, the default).
 	// nil when no clusterRuntime is wired (tests, programmatic
@@ -369,6 +371,19 @@ func WithGrpcMessageLimits(maxRecv, maxSend int) Option[GrpcProxyOptions] {
 		}
 		if maxSend > 0 {
 			opts.MaxSendMsgSize = maxSend
+		}
+	}
+}
+
+func withLimiterOperations[T HttpProxyOptions | JsonRpcHandlerOptions | GrpcProxyOptions](gate *boundedcall.Gate) Option[T] {
+	return func(opts *T) {
+		switch x := any(opts).(type) {
+		case *HttpProxyOptions:
+			x.limiterOperations = gate
+		case *JsonRpcHandlerOptions:
+			x.limiterOperations = gate
+		case *GrpcProxyOptions:
+			x.limiterOperations = gate
 		}
 	}
 }

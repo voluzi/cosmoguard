@@ -50,7 +50,7 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 					if bounded {
 						local, err := NewRateLimiter(cfg, nil, keyspace)
 						require.NoError(t, err)
-						limiter = &boundedRateLimiter{RateLimiter: tracker, local: local, operationGate: limiterOperations}
+						limiter = &boundedRateLimiter{RateLimiter: tracker, local: local, operationGate: a.limiterOperations}
 					}
 					limiters = append(limiters, limiter)
 				}

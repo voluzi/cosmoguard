@@ -210,7 +210,7 @@ func TestClusterBoundsDoNotAffectLocalBackends(t *testing.T) {
 		require.NoError(t, err)
 		store := auth.Replay().(*olricReplayStore)
 		if networked {
-			require.Same(t, replayOperations, store.operationGate)
+			require.NotNil(t, store.operationGate)
 		} else {
 			require.Nil(t, store.operationGate)
 		}

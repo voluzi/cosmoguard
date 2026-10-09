@@ -443,7 +443,9 @@ burst, scope, and key. It holds at most 100,000 buckets, with a 10-minute idle
 TTL and capacity eviction; eviction can reset an evicted key's burst. Cache and
 replay saturation cannot consume limiter slots. There are no retries of uncertain
 shared writes. The clustered limiter gate uses the same three-timeout,
-one-second, single-request-probe outage state as L2. During an outage requests
+one-second, single-request-probe outage state as L2. Admission and outage
+state belong to each runtime, so failures in one embedded guard do not divert
+another guard. Replay has its own runtime admission gate without outage state. During an outage requests
 immediately use the existing per-replica bucket. A healthy clustered allowance,
 denial or contention result closes it. Token-bucket math, locking and the 250ms
 contention deadline are unchanged. A failed limiter constructor uses
