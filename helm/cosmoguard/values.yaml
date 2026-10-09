@@ -150,7 +150,9 @@ config:
       # A single replica works and performs identically to embedded loopback,
       # so this is safe even for one-pod installs; scale up (or enable HPA) and
       # every replica shares one olric store. Its response slab budget includes
-      # primary and replica copies on this node. Standalone mode uses 16
+      # primary and replica copies on this node. L1 and response L2 totals
+      # are shared by active protocols, including EVM. RF affects copies and
+      # soft LRU thresholds, never the hard backing cap. Standalone uses 16
       # partitions; clustered mode keeps 271. GitOps rendering cannot look up a
       # generated key, so supply cluster.existingEncryptionKeySecret.
       enable: true

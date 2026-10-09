@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/vmihailenco/msgpack/v5"
 	"github.com/voluzi/olric/config"
 	"github.com/voluzi/olric/pkg/storage"
@@ -270,14 +271,26 @@ func FuzzNativePackImport(f *testing.F) {
 		}
 		f.Add(seed)
 	}
+	first, second := item("first", 100).Encode(), item("second", 100).Encode()
+	offsets := roaring64.New()
+	offsets.Add(0)
+	offsets.Add(uint64(len(first)))
+	packedOffsets, _ := offsets.MarshalBinary()
+	seed, _ := msgpack.Marshal(nativePack{Allocated: MaxEntryBytes, State: 2, HKeys: map[uint64]uint64{200: 0, 201: uint64(len(first))}, OffsetIndex: packedOffsets, Memory: append(first, second...)})
+	f.Add(seed)
 	f.Add([]byte{0xdf, 255, 255, 255, 255})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if len(b) > 2<<20 {
 			return
 		}
-		p, e := testEngine(t, 8<<20, Response)
+		p, e := testEngine(t, slabCharge+fragmentCharge+4096, Response)
+		for h := uint64(0); h < 4; h++ {
+			if err := e.PutRaw(h, item("incumbent", 256<<10).Encode()); err != nil {
+				t.Fatal(err)
+			}
+		}
 		_ = e.Import(b, func(h uint64, v storage.Entry) error { return e.Put(h, v) })
-		if p.Snapshot().Codec.Reserved != 0 || p.Snapshot().Allocated > 8<<20 {
+		if p.Snapshot().Codec.Reserved != 0 || p.Snapshot().Allocated > p.Snapshot().Capacity {
 			t.Fatal("budget leak")
 		}
 	})
@@ -394,5 +407,43 @@ func TestNativeTableBoundaryPacksRemainImportable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTransferPressureDisplacesResponses(t *testing.T) {
+	_, src := testEngine(t, 8<<20, Response)
+	p, dst := testEngine(t, slabCharge+fragmentCharge, Response)
+	for h := uint64(0); h < 8; h++ {
+		if err := src.PutRaw(h, item(fmt.Sprint(h), 128<<10).Encode()); err != nil {
+			t.Fatal(err)
+		}
+		if err := dst.PutRaw(h+100, item("incumbent", 128<<10).Encode()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	it := src.TransferIterator()
+	for it.Next() {
+		data, index, err := it.Export()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := dst.Import(data, func(h uint64, v storage.Entry) error { return dst.PutRaw(h, v.Encode()) }); err != nil {
+			t.Fatal(err)
+		}
+		if err := it.Drop(index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s := p.Snapshot(); s.PressureEvictions != 8 || s.ImportDropped != 0 || s.Entries != 8 || s.Allocated > s.Capacity {
+		t.Fatal("pressure import accounting", s)
+	}
+	for h := uint64(0); h < 8; h++ {
+		raw, err := dst.GetRaw(h)
+		if err != nil || !bytes.Equal(raw, item(fmt.Sprint(h), 128<<10).Encode()) {
+			t.Fatal("import bytes", h, err)
+		}
+	}
+	if src.Stats().Length != 0 {
+		t.Fatal("acknowledged source retained")
 	}
 }

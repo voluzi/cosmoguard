@@ -59,24 +59,24 @@ func TestEngineBufferOwnership(t *testing.T) {
 		t.Fatal("destroy alias")
 	}
 }
-func TestEngineOverwriteAtomicOnCapacity(t *testing.T) {
+func TestEngineOverwriteReclaimsNeighbors(t *testing.T) {
 	p, e := testEngine(t, slabCharge+fragmentCharge, Response)
 	for i := uint64(0); i < 4; i++ {
 		if err := e.Put(i, item(fmt.Sprint(i), 256<<10)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	old, _ := e.GetRaw(0)
-	if err := e.Put(0, item("0", 900<<10)); !errors.Is(err, ErrCapacity) {
-		t.Fatal("expected capacity", err)
+	if err := e.Put(0, item("0", 900<<10)); err != nil {
+		t.Fatal("larger overwrite should reclaim eligible neighbors", err)
 	}
-	now, _ := e.GetRaw(0)
-	if !bytes.Equal(old, now) {
-		t.Fatal("failed growth changed entry")
+	got, err := e.Get(0)
+	if err != nil || len(got.Value()) != 900<<10 {
+		t.Fatal("replacement", err)
 	}
-	if p.Snapshot().Allocated > p.Snapshot().Capacity {
-		t.Fatal("cap")
+	if p.Snapshot().PressureEvictions == 0 || p.Snapshot().Allocated > p.Snapshot().Capacity {
+		t.Fatal("pressure accounting", p.Snapshot())
 	}
+
 }
 func TestPoolConcurrentAdmissionAllWritePaths(t *testing.T) {
 	p, e := testEngine(t, 4<<20, Response)
@@ -102,8 +102,18 @@ func TestPoolConcurrentAdmissionAllWritePaths(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if p.Snapshot().PutRejected == 0 || p.Snapshot().RawRejected == 0 {
-		t.Fatal("missing rejection")
+	foreign, err := e.Fork(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := foreign.Put(10000, item("foreign", 900<<10)); !errors.Is(err, ErrCapacity) {
+		t.Fatal("empty fragment must reject", err)
+	}
+	if err := foreign.PutRaw(10000, item("foreign", 900<<10).Encode()); !errors.Is(err, ErrCapacity) {
+		t.Fatal("empty raw fragment must reject", err)
+	}
+	if p.Snapshot().PutRejected == 0 || p.Snapshot().RawRejected == 0 || p.Snapshot().PressureEvictions == 0 {
+		t.Fatal("missing pressure/rejection accounting", p.Snapshot())
 	}
 }
 func TestEngineLastAccessNativeSemantics(t *testing.T) {

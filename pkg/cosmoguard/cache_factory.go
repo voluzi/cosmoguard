@@ -41,15 +41,9 @@ func newResponseCache[K comparable, V any](
 	operations cache.Option,
 	opts ...cache.Option,
 ) (cache.Cache[K, V], error) {
-	// Apply the per-instance L1 byte/item caps resolved at startup so the
-	// in-process cache can't grow unbounded and OOM the pod (issue #15).
-	// L2 (olric) eviction is configured separately on the daemon.
 	if budget.L1MaxBytes > 0 || budget.L1MaxItems > 0 {
-		opts = append(opts,
-			cache.MaxCost(budget.L1MaxBytes),
-			cache.MaxItems(budget.L1MaxItems),
-			cache.OnEvict(func() { recordCacheEviction(name) }),
-		)
+		opts = append(opts, cache.MaxCost(budget.L1MaxBytes), cache.MaxItems(budget.L1MaxItems),
+			cache.OnEvict(func() { recordCacheEviction(name) }))
 	}
 
 	if olricClient == nil {
@@ -92,4 +86,11 @@ func newResponseCache[K comparable, V any](
 		return &ownedResponseCache[K, V]{response, operations}, nil
 	}
 	return response, nil
+}
+
+func sharedMemoryOptions(pool *cache.MemoryPool, name string, opts []cache.Option) []cache.Option {
+	if pool == nil {
+		return opts
+	}
+	return append(opts, cache.WithMemoryPool(pool), cache.OnEvict(func() { recordCacheEviction(name) }))
 }

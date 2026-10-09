@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/olric"
 )
 
 // TestL2Eviction_CacheEvictsButExemptDMapsDoNot drives a real embedded olric
@@ -60,4 +62,58 @@ func TestL2Eviction_CacheEvictsButExemptDMapsDoNot(t *testing.T) {
 		_, err := exempt.Get(ctx, fmt.Sprintf("jti-%d", i))
 		assert.NoErrorf(t, err, "exempt DMap key jti-%d must survive (never evicted)", i)
 	}
+}
+
+func TestL2NativeLRUAndLocalPressureSequence(t *testing.T) {
+	cr, err := newClusterRuntime(clusterRuntimeOptions{ResponsePoolBytes: 3 << 20, ResponseLRUBytesPerDMap: 32 << 20})
+	require.NoError(t, err)
+	defer cr.Close(context.Background())
+	const name = "pressure-sequence"
+	dm, err := cr.Client().NewDMap(name)
+	require.NoError(t, err)
+	keys := []string{}
+	for i := 0; len(keys) < 5; i++ {
+		key := fmt.Sprint(i)
+		if len(keys) == 0 || xxhash.Sum64String(name+key)%16 == xxhash.Sum64String(name+keys[0])%16 {
+			keys = append(keys, key)
+		}
+	}
+	for _, name := range evictionExemptDMaps {
+		security, err := cr.Client().NewDMap(name)
+		require.NoError(t, err)
+		require.NoError(t, security.Put(t.Context(), "sentinel", []byte("security")))
+	}
+	for _, key := range keys[:4] {
+		require.NoError(t, dm.Put(t.Context(), key, make([]byte, 256<<10)))
+	}
+	require.Equal(t, uint64(4), cr.responsePool.Snapshot().Entries)
+	require.Zero(t, cr.responsePool.Snapshot().PressureEvictions)
+	// Four 512KiB blocks plus metadata cross the 32MiB / 16-partition threshold.
+	_, err = dm.Get(t.Context(), keys[0])
+	require.NoError(t, err)
+	require.NoError(t, dm.Put(t.Context(), keys[4], make([]byte, 900<<10)), "native candidate processing must finish before pressure retries")
+	_, err = dm.Get(t.Context(), keys[1])
+	require.ErrorIs(t, err, olric.ErrKeyNotFound)
+	for _, key := range []string{keys[0], keys[4]} {
+		r, err := dm.Get(t.Context(), key)
+		require.NoError(t, err)
+		v, err := r.Byte()
+		require.NoError(t, err)
+		want := 256 << 10
+		if key == keys[4] {
+			want = 900 << 10
+		}
+		require.Equal(t, make([]byte, want), v)
+	}
+	require.Equal(t, uint64(2), cr.responsePool.Snapshot().PressureEvictions, "native eviction removes one victim before pressure removes two more")
+	for _, name := range evictionExemptDMaps {
+		security, err := cr.Client().NewDMap(name)
+		require.NoError(t, err)
+		r, err := security.Get(t.Context(), "sentinel")
+		require.NoError(t, err)
+		v, err := r.Byte()
+		require.NoError(t, err)
+		require.Equal(t, []byte("security"), v)
+	}
+	require.LessOrEqual(t, cr.responsePool.Snapshot().Allocated, cr.responsePool.Snapshot().Capacity)
 }

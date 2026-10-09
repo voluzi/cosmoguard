@@ -167,6 +167,7 @@ func registerSharedMetrics() {
 		_ = prometheus.Register(limiterFallbackCounter)
 		_ = prometheus.Register(l2Metrics)
 		_ = prometheus.Register(l2StorageRejections)
+		_ = prometheus.Register(l2StoragePressureEvictions)
 		_ = prometheus.Register(l2ImportDrops)
 		_ = prometheus.Register(l2WriteSkips)
 		for _, reason := range []string{"timeout", "capacity", "backend_error", "backend_unavailable"} {

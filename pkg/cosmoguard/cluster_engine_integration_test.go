@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
@@ -573,4 +574,101 @@ func TestMixedEngineRollbackToNative(t *testing.T) {
 		require.Equal(t, []byte(name), value)
 		require.Equal(t, deadline, r.TTL())
 	}
+}
+
+func TestMixedEngineSharedResponseBudgetPressure(t *testing.T) {
+	retained := []int{}
+	for _, divisor := range []uint64{4, 1} {
+		t.Run(fmt.Sprint(divisor), func(t *testing.T) {
+			const cap = 8 << 20
+			configure := func(c *config.Config, _ *mixedNode) {
+				// Avoid the pinned memberlist shutdown race with an in-flight periodic probe.
+				c.MemberlistConfig.ProbeInterval = time.Hour
+				applyL2EvictionConfig(c.DMaps, cap/divisor, 2)
+				c.DMaps.CheckEmptyFragmentsInterval = time.Hour
+			}
+			a := startMixedNodeConfigured(t, true, "", cap, configure)
+			b := startMixedNodeConfigured(t, true, a.gossip, cap, configure)
+			a.awaitRouting(t, 1, "")
+			b.awaitRouting(t, 1, "")
+			const name = "shared-budget-lcd"
+			client := a.db.NewEmbeddedClient()
+			for _, other := range []string{"grpc", "jsonrpc", "rpc", "evm_jsonrpc", "evm_rpc", "evm_jsonrpc_ws", "evm_rpc_ws"} {
+				dm, err := client.NewDMap(other)
+				require.NoError(t, err)
+				require.NoError(t, dm.Put(t.Context(), "idle", []byte("idle")))
+			}
+			dm, err := client.NewDMap(name)
+			require.NoError(t, err)
+			value := bytes.Repeat([]byte{42}, 8<<10)
+			for i := range 900 {
+				err := dm.Put(t.Context(), fmt.Sprint(i), value, olric.EX(time.Hour))
+				if err != nil {
+					require.True(t, errors.Is(err, olricstore.ErrCapacity) || errors.Is(err, olric.ErrWriteQuorum) || err.Error() == olricstore.ErrCapacity.Error(), "unexpected write error: %v", err)
+				}
+				for _, node := range []*mixedNode{a, b} {
+					s := node.pool.Snapshot()
+					require.Equal(t, uint64(cap), s.Capacity)
+					require.LessOrEqual(t, s.Allocated, s.Capacity)
+				}
+			}
+			hits := 0
+			for i := range 900 {
+				r, err := dm.Get(t.Context(), fmt.Sprint(i))
+				if err != nil {
+					require.ErrorIs(t, err, olric.ErrKeyNotFound)
+					continue
+				}
+				v, err := r.Byte()
+				require.NoError(t, err)
+				require.Equal(t, value, v)
+				hits++
+			}
+			retained = append(retained, hits)
+			clients := mixedReplicaClients(t, a, b)
+			keys := samePartitionKeys(name, 2)
+			deadline := time.Now().Add(time.Hour).UnixMilli()
+			mixedConfirmReplica(t, dm, name, keys[0], value, deadline, clients)
+			require.ErrorIs(t, dm.Put(t.Context(), keys[0], value, olric.NX()), olric.ErrKeyFound)
+			require.NoError(t, dm.Put(t.Context(), keys[0], value, olric.XX(), olric.PXAT(time.Duration(deadline)*time.Millisecond)))
+			_, err = dm.Delete(t.Context(), keys[0])
+			require.NoError(t, err)
+			_, err = dm.Get(t.Context(), keys[0])
+			require.ErrorIs(t, err, olric.ErrKeyNotFound)
+			mixedConfirmReplica(t, dm, name, keys[0], value, deadline, clients)
+			if divisor == 1 {
+				require.Positive(t, a.pool.Snapshot().PressureEvictions+b.pool.Snapshot().PressureEvictions)
+			}
+			// Fill remaining blocks in foreign engines before testing an empty fragment.
+			for _, node := range []*mixedNode{a, b} {
+				filler := olricstore.NewEngine(node.pool)
+				record := olricstore.NewEntry()
+				record.SetKey("filler")
+				record.SetValue([]byte{1})
+				raw := record.Encode()
+				full := false
+				for h := uint64(0); h < 100000; h++ {
+					before := node.pool.Snapshot().PressureEvictions
+					err := filler.PutRaw(h, raw)
+					if errors.Is(err, olricstore.ErrCapacity) || node.pool.Snapshot().PressureEvictions > before {
+						full = true
+						break
+					}
+					require.NoError(t, err)
+				}
+				require.True(t, full, "fixture must reach local backing pressure")
+			}
+			empty, err := client.NewDMap("late-empty-fragment")
+			require.NoError(t, err)
+			pressure := a.pool.Snapshot().PressureEvictions + b.pool.Snapshot().PressureEvictions
+			rejected := a.pool.Snapshot().PutRejected + a.pool.Snapshot().RawRejected + b.pool.Snapshot().PutRejected + b.pool.Snapshot().RawRejected
+			err = empty.Put(t.Context(), "large", make([]byte, 900<<10))
+			require.Error(t, err)
+			require.Equal(t, pressure, a.pool.Snapshot().PressureEvictions+b.pool.Snapshot().PressureEvictions, "empty fragments must not reclaim foreign records")
+			require.Greater(t, a.pool.Snapshot().PutRejected+a.pool.Snapshot().RawRejected+b.pool.Snapshot().PutRejected+b.pool.Snapshot().RawRejected, rejected)
+
+		})
+	}
+	require.Len(t, retained, 2)
+	require.Greater(t, retained[1], retained[0], "full-budget thresholds must retain more than the quarter share")
 }

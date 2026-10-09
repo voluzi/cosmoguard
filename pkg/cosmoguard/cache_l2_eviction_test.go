@@ -56,8 +56,8 @@ func TestApplyL2EvictionConfig_Disabled(t *testing.T) {
 }
 
 // TestApplyL2EvictionConfig_ReplicaFactorDividesCap: since backup writes
-// bypass olric's LRU cap, MaxInuse is divided by the replica factor so a
-// node's actual (primary + replica) footprint stays within the budget.
+// bypass Olric's LRU, MaxInuse uses an RF-divided working-set heuristic.
+// The shared allocator separately bounds primary and replica backing.
 func TestApplyL2EvictionConfig_ReplicaFactorDividesCap(t *testing.T) {
 	dmaps := &config.DMaps{}
 	applyL2EvictionConfig(dmaps, 300<<20, 3)

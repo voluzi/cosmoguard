@@ -299,14 +299,8 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 	}
 	cosmoGuard.tracingShutdown = shutdown
 
-	// Resolve the cache memory budget (issue #15) BEFORE building the olric
-	// daemon and the proxies, since both consume it. The total budget is
-	// auto-derived from the pod's memory limit (or config overrides) and
-	// then split across the response caches that share the pod heap: the L1
-	// share is threaded into each proxy via WithCacheBudget, and the per-DMap
-	// L2 share configures olric's LRU eviction below.
+	// Resolve total tier budgets before constructing the runtime and proxies.
 	totalCacheBudget := cfg.Cache.ResolveBudget()
-	cacheBudget := totalCacheBudget.PerCache(countResponseCaches(cfg))
 
 	// Spin up the in-process olric daemon. In the zero-config default it
 	// runs embedded-only (loopback, ephemeral ports, no gossip); when
@@ -319,8 +313,10 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		Context:                 ctx,
 		Lookup:                  lookup,
 		Cluster:                 cfg.Cache.Cluster,
+		L1MaxBytes:              totalCacheBudget.L1MaxBytes,
+		L1MaxItems:              totalCacheBudget.L1MaxItems,
 		ResponsePoolBytes:       totalCacheBudget.L2MaxBytesPerNode,
-		ResponseLRUBytesPerDMap: cacheBudget.L2MaxBytesPerNode,
+		ResponseLRUBytesPerDMap: totalCacheBudget.L2MaxBytesPerNode,
 		L2WorkBytes:             responseWorkBytes(),
 	})
 	if err != nil {
@@ -390,7 +386,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		cosmoGuard.cfg.Nodes, &cosmoGuard.cfg.Upstream,
 		cosmoGuard.cfg.GRPC.Protosets,
 		WithCacheConfig[GrpcProxyOptions](&cosmoGuard.cfg.Cache),
-		WithCacheBudget[GrpcProxyOptions](cacheBudget),
+		withMemoryPool[GrpcProxyOptions](cluster.memoryPool),
 		WithL2Operations[GrpcProxyOptions](cosmoGuard.cluster.ResponseOperations()),
 		withLimiterOperations[GrpcProxyOptions](cluster.limiterOperations),
 		WithOlricClient[GrpcProxyOptions](cosmoGuard.cluster.Client()),
@@ -407,7 +403,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		fmt.Sprintf("%s:%d", cosmoGuard.cfg.Host, cosmoGuard.cfg.LcdPort),
 		cosmoGuard.cfg.Nodes, "lcd",
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
-		WithCacheBudget[HttpProxyOptions](cacheBudget),
+		withMemoryPool[HttpProxyOptions](cluster.memoryPool),
 		WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
 		withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
@@ -428,7 +424,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 	}
 	cosmoGuard.jsonRpcHandler, err = NewJsonRpcHandler("jsonrpc",
 		WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
-		WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
+		withMemoryPool[JsonRpcHandlerOptions](cluster.memoryPool),
 		WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
 		withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 		WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
@@ -450,7 +446,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		fmt.Sprintf("%s:%d", cosmoGuard.cfg.Host, cosmoGuard.cfg.RpcPort),
 		cosmoGuard.cfg.Nodes, "rpc",
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
-		WithCacheBudget[HttpProxyOptions](cacheBudget),
+		withMemoryPool[HttpProxyOptions](cluster.memoryPool),
 		WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
 		withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
@@ -478,7 +474,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		// Setup JSONRPC handler for EVM RPC proxy
 		cosmoGuard.evmJsonRpcHandler, err = NewJsonRpcHandler("evm_jsonrpc",
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
-			WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
+			withMemoryPool[JsonRpcHandlerOptions](cluster.memoryPool),
 			WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
 			withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
@@ -499,7 +495,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 			fmt.Sprintf("%s:%d", cosmoGuard.cfg.Host, cosmoGuard.cfg.EvmRpcPort),
 			cosmoGuard.cfg.Nodes, "evm_rpc",
 			WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
-			WithCacheBudget[HttpProxyOptions](cacheBudget),
+			withMemoryPool[HttpProxyOptions](cluster.memoryPool),
 			WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
 			withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 			WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
@@ -526,7 +522,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 		}
 		cosmoGuard.evmJsonRpcWsHandler, err = NewJsonRpcHandler("evm_jsonrpc_ws",
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
-			WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
+			withMemoryPool[JsonRpcHandlerOptions](cluster.memoryPool),
 			WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
 			withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
@@ -548,7 +544,7 @@ func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (
 			fmt.Sprintf("%s:%d", cosmoGuard.cfg.Host, cosmoGuard.cfg.EvmRpcWsPort),
 			cosmoGuard.cfg.Nodes, "evm_rpc_ws",
 			WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
-			WithCacheBudget[HttpProxyOptions](cacheBudget),
+			withMemoryPool[HttpProxyOptions](cluster.memoryPool),
 			WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
 			withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 			WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),

@@ -31,7 +31,11 @@ v5 compatibility; v3 configurations can use `cosmoguard migrate-config`.
   cluster mode is on. L2 waits are bounded at 100ms in every deployment mode and fall
   back upstream on timeout or saturation; 128 slots bound outstanding
   L2 calls and a shared byte gate bounds controlled copies. Response slabs share
-  one replica-inclusive node cap, with a separate security pool. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
+  one replica-inclusive node cap, with a separate security pool. All protocols,
+  including EVM, share one global L1 LRU and the full response L2 budget;
+  pressure eviction can reclaim at most 32 fragment-local victims per write,
+  while fragmentation or an empty incoming fragment can still cause rejection.
+  Responses still populate L1 during L2 timeout or rejection, and HTTP misses
   retain coalescing; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
   identity` scopes. Buckets are sharded across replicas through the

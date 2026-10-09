@@ -38,6 +38,7 @@ fuzz:
 	go test -run=^$$ -fuzz=FuzzParseJsonRpcMessage     -fuzztime=$(FUZZTIME) ./pkg/cosmoguard
 	go test -run=^$$ -fuzz=FuzzHttpRuleCompile         -fuzztime=$(FUZZTIME) ./pkg/cosmoguard
 	go test -run=^$$ -fuzz=FuzzCompileOriginAllowlist  -fuzztime=$(FUZZTIME) ./pkg/cosmoguard
+	go test -run=^$$ -fuzz=FuzzEnginePressureModel    -fuzztime=$(FUZZTIME) ./internal/olricstore
 	go test -run=^$$ -fuzz=FuzzAllocatorModel         -fuzztime=$(FUZZTIME) ./internal/olricstore
 	go test -run=^$$ -fuzz=FuzzNativeEntryDecode      -fuzztime=$(FUZZTIME) ./internal/olricstore
 	go test -run=^$$ -fuzz=FuzzNativePackImport       -fuzztime=$(FUZZTIME) ./internal/olricstore

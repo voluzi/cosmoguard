@@ -19,6 +19,7 @@ func defaultOptions() *Options {
 
 type Options struct {
 	TTL            time.Duration
+	memoryPool     *MemoryPool
 	operationGate  *boundedcall.Gate
 	operationBytes *bytebudget.Budget
 	onSkip         func(string)
@@ -109,4 +110,11 @@ func (opt Option) CloseOperations() {
 // State callbacks run synchronously under the gate lock and must not re-enter it.
 func RecoveringOperations(capacity int, budget time.Duration, maxBytes uint64, onFailure func(string), onSkip func(string), onUnavailable func(bool)) Option {
 	return boundedOperations(boundedcall.NewRecovering(capacity, budget, onFailure, onUnavailable), maxBytes, onSkip)
+}
+
+// WithMemoryPool shares one global L1 LRU. The pool's total limits override
+// MaxCost and MaxItems; DefaultTTL and OnEvict remain specific to each adapter.
+// NewMemoryCache returns an error for pooled key types other than string/uint64.
+func WithMemoryPool(pool *MemoryPool) Option {
+	return func(o *Options) { o.memoryPool = pool }
 }

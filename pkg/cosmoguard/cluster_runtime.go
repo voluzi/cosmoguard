@@ -71,12 +71,9 @@ const l2AssumedEntryOverheadBytes uint64 = 512
 // eviction disabled (unlimited). Split out so it is unit-testable without
 // standing up a real olric daemon.
 //
-// olric's LRU cap only governs PRIMARY-partition writes; backup (replica)
-// writes bypass it (putOnReplicaFragment → PutRaw). So a node with
-// replicaFactor copies resident holds ~replicaFactor × MaxInuse. To keep the
-// node's actual in-use bytes within l2MaxBytesPerNode we set MaxInuse to
-// l2MaxBytesPerNode / replicaFactor. replicaFactor is 1 in embedded/single-
-// pod mode (no peers → no backups).
+// MaxInuse uses the total response budget divided by RF as a soft working-set
+// threshold. Olric divides it among owned primary partitions; backups bypass
+// native LRU. The shared allocator, not these per-DMap thresholds, bounds backing.
 func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replicaFactor int) {
 	if dmaps == nil || l2MaxBytesPerNode == 0 {
 		return
@@ -93,7 +90,7 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 	// Complement the byte cap with a key-count cap so a high-cardinality flood
 	// of tiny values can't exhaust heap in per-key index structures before the
 	// byte-based Inuse counter trips. olric honors MaxInuse and MaxKeys
-	// together (whichever binds first). Derived from the same per-node byte
+	// together (both may evict). Derived from the same per-node byte
 	// budget and an assumed per-entry overhead.
 	if maxKeys := maxInuse / l2AssumedEntryOverheadBytes; maxKeys > 0 {
 		dmaps.MaxKeys = int(maxKeys)
@@ -119,6 +116,7 @@ func applyL2EvictionConfig(dmaps *config.DMaps, l2MaxBytesPerNode uint64, replic
 // and joins peers advertised by the configured discovery plugin.
 type clusterRuntime struct {
 	responseOperations                  cache.Option
+	memoryPool                          *cache.MemoryPool
 	limiterOperations, replayOperations *boundedcall.Gate
 	db                                  *olric.Olric
 	client                              *olric.EmbeddedClient
@@ -147,6 +145,7 @@ type clusterRuntimeOptions struct {
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
 	// don't depend on the host's resolver.
 	Lookup                  LookupFunc
+	L1MaxBytes, L1MaxItems  uint64
 	ResponsePoolBytes       uint64
 	ResponseLRUBytesPerDMap uint64
 	L2WorkBytes             uint64
@@ -289,11 +288,13 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 		}
 	}
 
+	memoryPool := cache.NewMemoryPool(opts.L1MaxBytes, opts.L1MaxItems)
 	responsePool := olricstore.NewPool(opts.ResponsePoolBytes, olricstore.Response, recordL2StorageRejection)
 	securityPool := olricstore.NewPool(0, olricstore.Security, nil)
 	success := false
 	defer func() {
 		if !success {
+			_ = memoryPool.Close()
 			_ = responsePool.Close(context.Background())
 			_ = securityPool.Close(context.Background())
 		}
@@ -396,6 +397,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	success = true
 	cr := &clusterRuntime{
 		db:           db,
+		memoryPool:   memoryPool,
 		client:       client,
 		discovery:    discovery,
 		peerAPIKey:   peerAPIKey,
@@ -561,6 +563,7 @@ func (cr *clusterRuntime) Close(ctx context.Context) error {
 		_ = cr.discovery.Close()
 	}
 	cr.responseOperations.CloseOperations()
+	_ = cr.memoryPool.Close()
 	cr.limiterOperations.Close()
 	cr.replayOperations.Close()
 	err := cr.db.Shutdown(ctx)

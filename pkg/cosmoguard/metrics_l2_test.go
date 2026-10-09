@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
 )
 
 func TestRuntimeMetricsSnapshotAndCleanup(t *testing.T) {
@@ -84,4 +86,30 @@ func TestRuntimeMetricsSnapshotAndCleanup(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestPressureVictimsAreNotCapacityRejections(t *testing.T) {
+	before := testutil.ToFloat64(l2StoragePressureEvictions)
+	rejected := testutil.ToFloat64(l2StorageRejections.WithLabelValues("put_raw"))
+	var p *olricstore.Pool
+	p = olricstore.NewPool(3<<20, olricstore.Response, func(event string) { _ = p.Snapshot(); recordL2StorageRejection(event) })
+	defer p.Close(t.Context())
+	e := olricstore.NewEngine(p)
+	for h := uint64(0); h < 5; h++ {
+		v := olricstore.NewEntry()
+		v.SetKey("key")
+		v.SetValue(make([]byte, 256<<10))
+		require.NoError(t, e.PutRaw(h, v.Encode()))
+	}
+	require.Equal(t, before+1, testutil.ToFloat64(l2StoragePressureEvictions))
+	require.Equal(t, rejected, testutil.ToFloat64(l2StorageRejections.WithLabelValues("put_raw")))
+	require.Equal(t, uint64(1), p.Snapshot().PressureEvictions)
+	foreign, err := e.Fork(nil)
+	require.NoError(t, err)
+	v := olricstore.NewEntry()
+	v.SetKey("foreign")
+	v.SetValue(make([]byte, 256<<10))
+	require.ErrorIs(t, foreign.PutRaw(100, v.Encode()), olricstore.ErrCapacity)
+	require.Equal(t, rejected+1, testutil.ToFloat64(l2StorageRejections.WithLabelValues("put_raw")))
+	require.Equal(t, before+1, testutil.ToFloat64(l2StoragePressureEvictions))
 }

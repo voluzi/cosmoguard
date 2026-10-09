@@ -94,6 +94,82 @@ keeps ten race-detector repetitions as a release gate without multiplying every
 CI run's cluster setup and convergence waits. `make test.bounded-l2` also retains
 ten race repetitions for storage, admission and response cache tests.
 
+## Shared-budget candidate matrix
+
+Keep the historical v6.0.0 results separate from new measurements. Compare four
+code variants at **both** 200m/250Mi and 500m/500Mi, for each workload below:
+24 core cells. Record immutable image digests and fixed seeds.
+
+| Variant | Implementation |
+| --- | --- |
+| A | Actual released v6.0.0 image |
+| B | Total-budget L2 thresholds only |
+| C | B plus bounded fragment-local response pressure eviction |
+| D | C plus the runtime-owned shared L1 store |
+
+| Workload | Working set |
+| --- | --- |
+| Hot | 2,000 keys × 16KiB |
+| Large | 300 keys × 256KiB |
+| Mixed | 20,000 keys × 16KiB, half the traffic on 2,000 hot keys |
+
+Reproduce A first. Keep three guard members, four kind nodes, RF2/quorums,
+protocol, load balancing, response headers/bodies, upstream latency and TTL60s
+constant. Separate cold start, at least two TTLs warmup, at least ten TTLs steady
+load and idle drain. Repeat seeds; compare fixed offered load below saturation
+and maximum throughput separately. Calculate successful-response offload as
+`1 - U_s / C_s`, where `C_s` counts validated successful client responses and `U_s` counts the distinct upstream
+fetches that produced those responses (including a fetch shared by coalesced
+requests only once). Match requests and fetches across measurement-window
+boundaries; exclude failed/timed-out client requests from both counts and report
+all request, upstream, error and timeout totals separately. Hit headers do not
+count coalescing savings reliably.
+
+Record rps, p50/p95/p99, throttling, user/system/GC CPU, live heap/goal, RSS,
+cgroup current/peak, GC limiter, goroutines, restarts/OOMs and byte correctness.
+Record response/security allocated/inuse/entries/capacity, pressure victims,
+rejections/import drops/skips, operations/codec reservations and compaction time.
+Verify backups directly; quorum-one success does not prove replica retention.
+Capture per-protocol L1 pressure counts and actual tier hit/miss evidence.
+
+Also test two/four busy protocols, a late arrival, EVM with only LCD busy, EVM
+plus LCD, hot-set changes, TTL5s/60s, mixed size classes/near-envelope growth,
+32-victim rejections and empty-fragment admission at a full pool. Run standalone
+16-partition and explicit-override cells. Roll the published v6.0.0 image to D and
+back, with both old/new coordinators and security sentinels; keep 271 clustered
+partitions. Local compatibility tests cannot certify this published-image gate.
+
+For L1, run repeated paired legacy/shared string and uint64 hit benchmarks with
+`-benchmem`: sequential and parallel 1/4/8 protocols, plus readers mixed with
+writes. Hits must add zero allocations and no L2 requests. Benchmark timing is
+measured without the race detector; lifecycle/accounting/allocation checks run
+with it. Investigate >10% median single-protocol cost or >15% multi-protocol
+throughput loss on a dedicated runner. Preserve reference hot-set throughput
+within variation and the **<95%** peak-memory criterion. No changed memory limits,
+reserve, partition count, dependency or operator fallback can substitute for a
+passing gate. The implementer starts no containers or cluster resources.
+
+### Candidate hot-path diagnostics
+
+Local paired benchmarks used warmed 1,024-key caches, alternating legacy/shared
+order and three samples per case. The repeated single-protocol timing test
+(`-count=10`, 100ms samples) measured median string hits at 419.5ns legacy versus
+445.0ns shared, and uint64 hits at 409.5ns versus 390.5ns in the final run. An
+earlier run measured 652.0ns versus 509.5ns and 587.5ns versus 513.0ns, illustrating
+host variation. Both paths allocated zero bytes per hit.
+
+The broader 1/4-CPU, 1/4/8-protocol matrix showed substantial timing variation
+and a parallel regression. At four CPUs, four-protocol parallel hits measured
+237ns versus 673ns for string keys and 249ns versus 656ns for uint64 keys;
+eight-protocol hits measured 386ns versus 968ns and 451ns versus 979ns.
+Mixed readers/writers also regressed. All cases retained zero per-hit allocations.
+These are local diagnostics, not dedicated-runner or deployment measurements.
+The common ttlcache item/metrics locks serialize cross-protocol work; optimizing
+key representation removes extra hashing overhead but does not remove that
+contention. The performance gate remains open: do not release this candidate
+until dedicated-runner comparisons and the reference hot workload pass, or
+revisit the reservation design if they confirm the regression.
+
 ## Additional mandatory cells
 
 Complete these cells separately; the runner records them as pending. Do not
