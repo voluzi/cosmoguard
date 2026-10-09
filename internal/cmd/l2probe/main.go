@@ -85,7 +85,8 @@ func run() (result error) {
 	debug.SetMemoryLimit(int64(*limit<<20) * 9 / 10)
 	cosmoguard.SetupRuntimeTuning(slog.Default())
 	budget := (&cosmoguard.CacheGlobalConfig{}).ResolveBudget()
-	per := budget.PerCache(*maps)
+	memoryPool := cache.NewMemoryPool(budget.L1MaxBytes, budget.L1MaxItems)
+	defer memoryPool.Close()
 	response := olricstore.NewPool(budget.L2MaxBytesPerNode, olricstore.Response, nil)
 	security := olricstore.NewPool(0, olricstore.Security, nil)
 	defer response.Close(context.Background())
@@ -116,7 +117,7 @@ func run() (result error) {
 	c.DMaps.Engine = &config.Engine{Implementation: olricstore.NewEngine(response)}
 	c.DMaps.EvictionPolicy = config.LRUEviction
 	// This probe has one member, so RF2 creates no resident backup copies.
-	c.DMaps.MaxInuse = int(per.L2MaxBytesPerNode)
+	c.DMaps.MaxInuse = int(budget.L2MaxBytesPerNode)
 	c.DMaps.MaxKeys = c.DMaps.MaxInuse / 512
 	c.DMaps.LRUSamples = 10
 	c.DMaps.Custom = map[string]config.DMap{}
@@ -154,7 +155,7 @@ func run() (result error) {
 		}
 		var cc cache.Cache[string, []byte] = l2
 		if *l1 {
-			local, err := cache.NewMemoryCache[string, []byte](name, cache.MaxCost(per.L1MaxBytes))
+			local, err := cache.NewMemoryCache[string, []byte](name, cache.WithMemoryPool(memoryPool))
 			if err != nil {
 				return err
 			}
