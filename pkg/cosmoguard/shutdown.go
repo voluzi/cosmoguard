@@ -54,12 +54,25 @@ func (f *CosmoGuard) shutdown(ctx context.Context, hold bool) error {
 			f.shutdownErr = f.stopListeners(trafficCtx)
 			stopTraffic()
 			cleanupCtx, stopCleanup := context.WithDeadline(totalCtx, minTime(time.Now().Add(shutdownCleanup), started.Add(shutdownTraffic+shutdownCleanup)))
-			f.shutdownErr = errors.Join(f.shutdownErr, f.closeConsumers(cleanupCtx))
+			cleanupErr, dependentDone := f.closeConsumers(cleanupCtx)
+			f.shutdownErr = errors.Join(f.shutdownErr, cleanupErr)
 			stopCleanup()
 			if f.cluster != nil {
-				leaveCtx, stopLeave := context.WithDeadline(totalCtx, minTime(time.Now().Add(shutdownLeave), deadline))
-				f.shutdownErr = errors.Join(f.shutdownErr, shutdownTasks(leaveCtx, func() error { return f.cluster.Close(leaveCtx) }))
-				stopLeave()
+				leave := func() error {
+					leaveCtx, stopLeave := context.WithDeadline(context.Background(), minTime(time.Now().Add(shutdownLeave), deadline))
+					defer stopLeave()
+					return f.cluster.Close(leaveCtx)
+				}
+				select {
+				case <-dependentDone:
+					leaveCtx, stopLeave := context.WithDeadline(totalCtx, minTime(time.Now().Add(shutdownLeave), deadline))
+					f.shutdownErr = errors.Join(f.shutdownErr, shutdownTasks(leaveCtx, leave))
+					stopLeave()
+				default:
+					// A native DMap write may ignore cancellation. Retain its runtime until
+					// it returns; late leave still gets the original absolute deadline.
+					go func() { <-dependentDone; _ = leave() }()
+				}
 			}
 		}()
 	})
@@ -130,8 +143,9 @@ func (f *CosmoGuard) stopListeners(ctx context.Context) error {
 	return shutdownTasks(ctx, tasks...)
 }
 
-func (f *CosmoGuard) closeConsumers(ctx context.Context) error {
+func (f *CosmoGuard) closeConsumers(ctx context.Context) (error, <-chan struct{}) {
 	var tasks []func() error
+	dependentDone := make(chan struct{})
 	for _, h := range []*JsonRpcHandler{f.jsonRpcHandler, f.evmJsonRpcHandler, f.evmJsonRpcWsHandler} {
 		if h != nil {
 			tasks = append(tasks, h.Shutdown)
@@ -144,9 +158,11 @@ func (f *CosmoGuard) closeConsumers(ctx context.Context) error {
 		tasks = append(tasks, func() error { return f.tracingShutdown(ctx) })
 	}
 	if f.obsReplicator != nil {
-		tasks = append(tasks, func() error { return f.obsReplicator.Close(ctx) })
+		tasks = append(tasks, func() error { defer close(dependentDone); return f.obsReplicator.Close(ctx) })
+	} else {
+		close(dependentDone)
 	}
-	return shutdownTasks(ctx, tasks...)
+	return shutdownTasks(ctx, tasks...), dependentDone
 }
 
 // A timed-out cleanup can still return into its buffered result channel; its

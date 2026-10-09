@@ -398,7 +398,9 @@ and resubscribe; streams are not transferred to another replica.
 Consumer/telemetry cleanup gets up to **two seconds**, capped at signal +26s,
 then Olric gets up to **three seconds** for graceful leave, capped at signal +29s.
 All phases share that absolute deadline and shorter caller budgets can curtail
-any phase. Uncooperative cleanup remains owned but cannot extend process shutdown.
+any phase. Uncooperative cleanup remains owned but cannot extend the shutdown wait. An
+unfinished observability DMap write retains Olric until it returns; late leave
+still uses the original absolute deadline and may be incomplete.
 The binary cannot infer the pod grace period; its fixed **29s total** fits the
 operator's 30s grace with one second of margin and no preStop hook. The chart's
 existing external 5s preStop and 40s grace remain compatible (at most 34s total).

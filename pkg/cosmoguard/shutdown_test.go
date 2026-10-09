@@ -80,3 +80,28 @@ func TestRepeatedShutdownHonorsItsCallerDeadline(t *testing.T) {
 		require.ErrorIs(t, <-done, context.DeadlineExceeded)
 	})
 }
+
+func TestShutdownRetainsClusterUntilDependentWriteFinishes(t *testing.T) {
+	cr := newEmbeddedClusterRuntimeForTest(t)
+	var clusterClosed atomic.Bool
+	removeMetrics := cr.removeMetrics
+	cr.removeMetrics = func() { clusterClosed.Store(true); removeMetrics() }
+	synctest.Test(t, func(t *testing.T) {
+		release, unblock := boundedTestRelease(t)
+		defer unblock()
+		dm := &stalledDMap{release: release, stage: "put"}
+		rep, err := newObservabilityReplicator(cr.Client(), newDashboardObservability(), newMetricsHistory(10), nil, "shutdown-owner", true)
+		require.NoError(t, err)
+		rep.dm = dm
+		f := &CosmoGuard{cluster: cr, obsReplicator: rep}
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		defer cancel()
+		require.ErrorIs(t, f.Shutdown(ctx), context.DeadlineExceeded)
+		synctest.Wait()
+		require.Equal(t, int32(1), dm.puts.Load())
+		require.False(t, clusterClosed.Load(), "Olric closed while a dependent write was unfinished")
+		unblock()
+		synctest.Wait()
+		require.True(t, clusterClosed.Load(), "late cleanup did not close its retained cluster")
+	})
+}
