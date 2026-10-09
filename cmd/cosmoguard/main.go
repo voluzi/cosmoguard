@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -179,8 +180,8 @@ func main() {
 	defer stopSignals()
 	f, err := cosmoguard.NewFromFileContext(startupCtx, configFile)
 	if err != nil {
-		if startupCtx.Err() != nil {
-			slog.Info("startup canceled by shutdown signal")
+		if startupCanceledBySignal(startupCtx, err) {
+			slog.Info("startup canceled by shutdown signal", "error", err)
 			return
 		}
 		slog.Error("cosmoguard startup failed", "error", err)
@@ -243,4 +244,8 @@ func setupSlog(levelStr, format string) {
 		handler = slog.NewJSONHandler(os.Stderr, opts)
 	}
 	slog.SetDefault(slog.New(handler))
+}
+
+func startupCanceledBySignal(ctx context.Context, err error) bool {
+	return errors.Is(ctx.Err(), context.Canceled) && errors.Is(err, context.Canceled)
 }
