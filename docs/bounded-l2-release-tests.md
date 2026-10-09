@@ -64,7 +64,9 @@ a waiter queue and reports success,
 errors and latency percentiles on a five-second ticker. Sentinel checks can delay
 subsequent reports during faults; use the recorded timestamps for actual intervals.
 Every periodic sentinel assertion must complete with its expected status on each
-ready target; a timeout or transport error fails the run. A 30-second interval
+ready target; a timeout or transport error fails the run. An assertion already
+admitted when the traffic interval ends retains its own five-second deadline
+and remains subject to caller cancellation. A 30-second interval
 without any successful traffic also fails, checked on the reporting ticker and
 at completion. This permits brief replacement pauses without masking an outage
 in a later phase. gRPC connections are reused.

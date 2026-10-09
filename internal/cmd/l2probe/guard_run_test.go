@@ -23,6 +23,7 @@ type guardRunTransport struct {
 	started                    time.Time
 	failureAfter, failureUntil time.Duration
 	trafficSuccess             atomic.Int32
+	sentinelDelay              time.Duration
 }
 
 func (g *guardRunTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -40,6 +41,13 @@ func (g *guardRunTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		calls = g.limiter.Add(1)
 		if calls > 1 {
 			status = http.StatusTooManyRequests
+		}
+	}
+	if calls >= 3 && g.sentinelDelay > 0 {
+		select {
+		case <-time.After(g.sentinelDelay):
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
 		}
 	}
 	if key == g.failureKey && calls >= 3 {
@@ -136,4 +144,17 @@ func TestGuardRunRequiresContinuedSuccessfulTraffic(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestGuardRunCompletesSentinelAtEndOfTraffic(t *testing.T) {
+	file := guardRunTargets(t)
+	synctest.Test(t, func(t *testing.T) {
+		transport := &guardRunTransport{sentinelDelay: 2 * time.Second}
+		old := http.DefaultClient
+		http.DefaultClient = &http.Client{Transport: transport}
+		defer func() { http.DefaultClient = old }()
+		if err := guardRun(t.Context(), file, 6*time.Second, 1, 1024, 1); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

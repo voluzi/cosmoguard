@@ -226,6 +226,7 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 			return fmt.Errorf("shared limiter sentinel: status=%d: %v", status, err)
 		}
 	}
+	checkCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 	var sequence, succeeded, skipped atomic.Uint64
@@ -333,6 +334,9 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 		select {
 		case <-ctx.Done():
 		case <-ticker.C:
+			if ctx.Err() != nil {
+				break
+			}
 			mu.Lock()
 			values := latencies
 			latencies = nil
@@ -350,20 +354,26 @@ func guardRun(ctx context.Context, file string, duration time.Duration, workers,
 				return values[int(float64(len(values)-1)*q)]
 			}
 			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"time": time.Now().UTC(), "seed": 42, "requests": sequence.Load(), "success": succeeded.Load(), "errors": skipped.Load(), "p50_ms": percentile(.5), "p95_ms": percentile(.95), "p99_ms": percentile(.99)})
-			// Repeat the long-lived token after membership changes.
+			// Let an admitted assertion finish within its own deadline, even if traffic ends.
 			targets, err := readTargets()
 			if err != nil {
 				fail(err)
 				break
 			}
 			for _, target := range targets {
-				_, status, err := client.request(ctx, target, "sentinel", 1024, token)
+				if ctx.Err() != nil {
+					break
+				}
+				_, status, err := client.request(checkCtx, target, "sentinel", 1024, token)
 				if err != nil || status != http.StatusUnauthorized {
 					fail(fmt.Errorf("lost replay sentinel on %s: status=%d: %v", target.Address, status, err))
 					break
 				}
+				if ctx.Err() != nil {
+					break
+				}
 				if target.Sentinels {
-					_, status, err = client.request(ctx, target, "limiter-sentinel", 1024, limiterToken)
+					_, status, err = client.request(checkCtx, target, "limiter-sentinel", 1024, limiterToken)
 					if err != nil || status != http.StatusTooManyRequests {
 						fail(fmt.Errorf("lost limiter sentinel on %s: status=%d: %v", target.Address, status, err))
 						break
