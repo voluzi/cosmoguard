@@ -233,6 +233,15 @@ cache:
 
 `httpForegroundFetchTimeout` and `grpcForegroundFetchTimeout` bound the detached upstream calls shared by coalesced HTTP and gRPC misses. Both default to `5m`, are independent of any one caller's deadline, and can be increased for cacheable endpoints or unary methods that legitimately take longer. Each caller still stops waiting under its own request context.
 
+A `hit` cache marker means the request used an already stored response. A `miss`
+can still share an in-flight fetch or its pending response while the asynchronous
+store finishes; it does not imply another upstream request. This distinction is
+especially visible under CPU throttling when concurrent clients walk the same
+keys in bursts. Use `cosmoguard_upstream_requests_total` to count real upstream
+fetches alongside the hit/miss counters. Foreground response stores use detached
+goroutines, with no bounded queue or deliberate queue-drop policy; L1 fills before
+L2 admission, and `cosmoguard_l2_write_skips_total` records L2 write skips.
+
 ### Memory budget
 
 Response L2 storage uses a shared byte-budgeted slab pool in the embedded Olric
@@ -253,11 +262,14 @@ budget** limits charged response backing and metadata across every response DMap
 primary, replica, previous-owner and imported copy. Its cap is neither multiplied
 nor divided by the replica factor. Olric's per-DMap `MaxInuse`/`MaxKeys` remain
 soft eviction thresholds, with the existing per-map and replica division. The
-slab engine supplies the oldest entries to Olric's LRU sampler. Allocation checks enforce the shared hard cap when LRU cannot make
-room. A capacity rejection preserves an existing record on failed growth.
+slab engine supplies the oldest entries to Olric's LRU sampler. Allocation checks
+enforce the shared hard cap when LRU cannot make room. A capacity rejection preserves an existing record on failed growth.
 
 Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor/index allowance;
-records include fixed indexes/headers and size-class rounding. Buddy fragmentation
+records include fixed headers and size-class rounding. Fragment hash indexes grow
+with cardinality, mixing the hash independently of the partition assignment. Both
+index arrays are charged during growth; a growth that cannot fit rejects the new
+write while preserving existing records. Buddy fragmentation
 can leave allocated backing at the cap while live inuse bytes are low: free blocks
 may not fit the requested size class, and partly used slabs retain their backing. Empty fragments
 have a small metadata charge rather than a 1MiB table. Olric compaction visits
@@ -285,7 +297,9 @@ limit, each tier falls back to 128MiB. The automatic response-work allowance G i
 Both standalone and clustered response adapters share one **128-slot**, byte-
 budgeted gate per runtime, with a **100ms total caller budget**. Admission never
 queues workers. Known byte values reserve eight times their encoded native entry
-size rounded to 4KiB; generic writes reserve 8MiB. A read initially reserves
+size rounded to 4KiB. HTTP and gRPC response wrappers report an encoded-size
+upper bound and reserve against that bound before encoding; the encoder enforces
+it. Other generic writes reserve 8MiB. A read initially reserves
 2MiB plus 4KiB for the native entry, decoded payload and metadata, then shrinks
 to twice its encoded size rounded to 4KiB plus 4KiB before decoding. Generic encoding
 uses a writer that refuses growth past the native envelope and shrinks the
@@ -297,8 +311,8 @@ A timed-out or cancelled caller discards a late result, but the actual worker
 retains its slot and byte lease until result delivery or discard. Detached work can still finish a
 late write. Limiter and replay work use their independent existing count gates.
 
-Response and security codecs have separate 8MiB and 4MiB scratch allowances from
-the runtime reserve. Codec admission is immediate and retryable. A response
+Response and security codecs each have a separate 8MiB scratch allowance from
+the runtime reserve, admitting two concurrent 4MiB transfer charges. Codec admission is immediate and retryable. A response
 import processes every record and can acknowledge omitted capacity-rejected
 responses, counted individually; a security callback failure propagates and must
 not acknowledge a dropped security record. Export retries retain source data
@@ -362,8 +376,10 @@ budget. A joiner may continue waiting beyond 45s while the advertised cluster ha
 quorum and its coordinator answers authenticated PINGs; without that evidence
 startup fails. Bootstrap does not wait for all migration to finish. SIGTERM
 cancels construction and cleans up immediately, including Olric's graceful leave.
-Keep discovery of unready peers enabled and allow at least 60s for startup probes
-(for example 30 failures at two-second intervals), as the chart does.
+Keep discovery of unready peers enabled. The chart allows 60s for the startup
+probe (30 failures at two-second intervals), which checks `/healthz`. Health
+already answers 200 while bootstrap waits; readiness carries that wait and keeps
+the joiner out of service until its routing table is usable.
 
 SIGTERM immediately changes `/readyz` to 503 while `/healthz`, metrics, information
 and application traffic continue serving for a fixed **five seconds**. This lets

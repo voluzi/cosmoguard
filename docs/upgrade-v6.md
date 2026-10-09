@@ -73,6 +73,17 @@ The fork starts from upstream v0.7.4 and includes these commits, in order:
 | `d784449` | Derive the member snapshot from synchronous memberlist join/update/leave callbacks under the native node lock, instead of dereferencing mutable Node metadata returned by Members(). Preserve live-member selection and birthdate ordering while fixing metadata races during routing scans. |
 | `154beba` | Compare cached membership with native live-member names and transmitted identities: the local member immediately after Start, same-name rejoin at a new gossip address/ID, metadata updates during reads, and a member declared dead without Leave. No production change. |
 
+Round-3 local fork additions are evaluated but **not in the public pin above**:
+`5b4d8db` tests that one compaction pass continues past a retired fragment;
+`17ea051` removes a retired fragment from its partition even if Close or Destroy
+returns an error, with a real DMap write/recreate regression. Publication and the
+CosmoGuard pin update await owner approval.
+
+Ownership scans have 16 workers. Active RPC concurrency to each peer also shares
+Olric's client pool, whose default size is `10 × GOMAXPROCS`; at GOMAXPROCS=1 a
+scan against one peer therefore cannot have 16 active RPCs. Cache and replica RPCs
+use the same per-peer pool.
+
 The callback snapshot includes suspect members just as native Members() does;
 death and graceful leave both remove a member. Snapshot updates finish before
 event enqueueing, so routing reads do not wait for the asynchronous event loop.
@@ -182,6 +193,37 @@ acknowledging omitted records. RF2/quorum1 retains Olric's existing partition,
 failover and lock semantics; it is not consensus. Native RF2 lock renewal can
 replicate an empty backup value, an inherited limitation recorded in the procedure.
 The existing limiter uses fixed-timeout locks and local fallback.
+
+## Response cache corrections and hit-rate interpretation
+
+Slab Range now supplies Olric's LRU sampler with the oldest entries, so a recently
+touched key survives eviction before an untouched older key. Hash indexes grow
+with fragment cardinality, charging both arrays during growth; failure preserves
+existing keys. Scan cursors follow the hash index instead of access generations,
+so scanning and reading unchanged keys terminates. Scans concurrent with writes
+remain best effort, as with native storage.
+
+HTTP/gRPC response wrappers bound their encoded size before byte admission.
+Unknown generic values retain the conservative 8MiB charge. Both response and
+security pools admit two codec charges. Byte-cache reads still copy at the adapter
+boundary because the real default engine can return a slice into its table.
+
+The 1.2% hit-header result at 200m does not prove that 98.8% of requests reached the
+upstream. In a local closed-loop 30-client reproduction over 1,500 keys, 200m/250Mi
+produced 1.25% hit markers while avoiding 96.65% of real upstream fetches. Sharing
+an in-flight or pending response retains the inherited `miss` marker. Globally
+interleaving the keys instead produced 92.45% hit markers and 92.73% upstream
+savings. These loopback probes include the generator and fake upstream in the
+same CPU-limited container; their rps are diagnostics, not deployment benchmarks.
+Use `cosmoguard_upstream_requests_total` to validate the real savings on-prem.
+Response timing and cache marker semantics are unchanged.
+
+The coordinator's final b9759fd on-prem validation used in-cluster Service load:
+v5.1.0 upgrade had zero restarts, 11 errors in about 1.3 million requests, and
+1,443–3,213 rps for about 1.5 minutes while old members remained, with a few
+14–18s requests. A same-version rolling restart had zero errors and restarts,
+minimum 3,713 rps and maximum latency 1.5s. These validate the existing outage
+state and readiness-first drain; full soak and rollback gates remain separate.
 
 ## Memory and operational limits
 
