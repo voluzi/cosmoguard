@@ -28,7 +28,7 @@ func TestEngineSmallEntryMaintenance(t *testing.T) {
 	const entries = 500000
 	for i := range entries {
 		raw := liveRaw
-		if i%271 == 0 {
+		if i%2 == 0 {
 			raw = expiredRaw
 		}
 		if err := engines[i%271].PutRaw(uint64(i), raw); err != nil {
@@ -40,6 +40,9 @@ func TestEngineSmallEntryMaintenance(t *testing.T) {
 	sweep := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if engines[0].Check(0) || !engines[0].Check(271) {
+		t.Fatal("sweep failed to distinguish expired and live records")
 	}
 	start = time.Now()
 	const deletes = 512
@@ -53,7 +56,7 @@ func TestEngineSmallEntryMaintenance(t *testing.T) {
 	t.Logf("sweep=%s", sweep)
 	t.Logf("512 deletes=%s", burst)
 	stats := p.Snapshot()
-	if stats.Entries != entries-uint64((entries+270)/271)-deletes || stats.Allocated > stats.Capacity {
+	if stats.Entries != entries-uint64((entries+541)/542)-deletes || stats.Allocated > stats.Capacity {
 		t.Fatal("maintenance lost live entries or exceeded cap", stats)
 	}
 	if sweep > time.Second || burst > time.Second {
