@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -65,6 +66,35 @@ func TestOlricOutageRecoversOnMissAndCapacity(t *testing.T) {
 			_, err = c.Get(t.Context(), "key")
 			require.ErrorIs(t, err, ErrNotFound)
 			require.Equal(t, int32(5), dm.calls.Load())
+		})
+	}
+}
+
+func TestOlricOutageProbeClassifiesBackendErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err     error
+		healthy bool
+	}{
+		{olric.ErrEntryTooLarge, true}, {olric.ErrKeyTooLarge, true}, {errEncode, true}, {olricstore.ErrCapacity, true},
+		{olric.ErrWriteQuorum, false}, {olric.ErrClusterQuorum, false}, {errors.New("connection refused"), false},
+	} {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var unavailable atomic.Bool
+				opts := defaultOptions()
+				RecoveringOperations(8, time.Second, 32<<20, nil, nil, unavailable.Store)(opts)
+				dm := &outageDMap{err: olric.ErrOperationTimeout}
+				c := &OlricCache[string, []byte]{dm: dm, cfg: opts}
+				for range 3 {
+					_, err := c.Get(t.Context(), "key")
+					require.ErrorIs(t, err, boundedcall.ErrTimeout)
+				}
+				time.Sleep(time.Second)
+				dm.err = tc.err
+				err := c.Set(t.Context(), "key", []byte("value"), time.Minute)
+				require.ErrorIs(t, err, tc.err)
+				require.Equal(t, !tc.healthy, unavailable.Load())
+			})
 		})
 	}
 }

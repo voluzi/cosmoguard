@@ -152,7 +152,7 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 	backendErr, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, charge, func(opCtx context.Context, lease *bytebudget.Lease) (error, error) {
 		payload, err := marshalBounded(value, maxValue)
 		if err != nil {
-			return nil, err
+			return nil, operationError(err)
 		}
 		if lease != nil {
 			lease.ShrinkTo(operationCharge(29 + len(k) + cap(payload)))
@@ -211,7 +211,7 @@ func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, 
 			lease.ShrinkTo(readOperationCharge(29 + len(k) + len(raw)))
 		}
 		v, err := unmarshalFromOlric[V](raw)
-		return result{value: v, expiry: resp.TTL()}, err
+		return result{value: v, expiry: resp.TTL()}, boundedcall.HealthyError(err)
 	})
 	if err == nil && r.missing {
 		err = ErrNotFound
@@ -298,11 +298,15 @@ func operationError(err error) error {
 		message := err.Error()
 		capacity := olricstore.ErrCapacity.Error()
 		if message == capacity || strings.HasPrefix(message, capacity+": ") {
-			return fmt.Errorf("%w: %w", olricstore.ErrCapacity, err)
+			err = fmt.Errorf("%w: %w", olricstore.ErrCapacity, err)
 		}
 	}
 	if errors.Is(err, olric.ErrOperationTimeout) {
 		return fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
+	}
+	switch {
+	case errors.Is(err, olricstore.ErrCapacity), errors.Is(err, olric.ErrEntryTooLarge), errors.Is(err, olric.ErrKeyTooLarge), errors.Is(err, errEncode):
+		return boundedcall.HealthyError(err)
 	}
 	return err
 }

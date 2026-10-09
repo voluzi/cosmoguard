@@ -153,7 +153,9 @@ throughput collapse, sustaining 4,916–8,588 requests/s throughout.
 
 The response and clustered-limiter gates suppress backend calls after three
 consecutive executed-operation timeouts. One second later, one real request probes
-recovery. Healthy replies close the state. A timed-out probe may be replaced
+recovery. Successes and recognized domain outcomes (such as a cache miss, capacity skip,
+entry size/encoding rejection or limiter denial) close the state. Transport,
+quorum and unknown errors leave a probe open for the next cooldown. A timed-out probe may be replaced
 after cooldown; unfinished workers retain their slot and byte reservations.
 L2 skips to L1/upstream and the limiter uses its existing per-replica fallback.
 The limiter algorithm and deprecated ignored failureMode are unchanged. This

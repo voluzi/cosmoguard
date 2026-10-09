@@ -176,7 +176,9 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 			return value, err
 		}
 		timedOut := errors.Is(res.err, ErrTimeout)
-		gate.outage.resolve(op, timedOut, !timedOut, true)
+		var domain healthyError
+		healthy := res.err == nil || errors.As(res.err, &domain)
+		gate.outage.resolve(op, timedOut, healthy, true)
 		if timedOut && gate.observe != nil {
 			gate.observe("timeout")
 		}
@@ -184,6 +186,18 @@ func DoWeighted[T any](ctx context.Context, gate *Gate, bytes *bytebudget.Budget
 		return res.value, res.err
 	}
 }
+
+// HealthyError marks an adapter-recognized domain outcome, preserving its cause.
+func HealthyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return healthyError{err}
+}
+
+type healthyError struct{ error }
+
+func (e healthyError) Unwrap() error { return e.error }
 
 type callResult[T any] struct {
 	value T

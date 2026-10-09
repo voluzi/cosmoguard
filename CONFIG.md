@@ -417,8 +417,9 @@ and byte reservations until the actual worker exits and can finish a late write.
 
 After three consecutive executed-operation timeouts, the L2 gate skips backend
 calls with `ErrUnavailable`. After one second, the next real request is its single
-recovery probe. An on-time healthy reply closes the outage state, including a
-cache miss or storage-capacity rejection. Failed probes wait another second;
+recovery probe. Success or a recognized domain outcome closes the outage state, including a
+cache miss, storage-capacity/size/encoding rejection or limiter denial. Transport,
+quorum and unknown errors keep a probe open for another cooldown. Failed probes wait another second;
 once a probe caller has resolved, the next cooldown permits a replacement even
 if its worker remains stuck. Old workers retain their slot/byte charges, so
 replacement probes cannot exceed admission capacities. Caller cancellation/deadlines and

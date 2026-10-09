@@ -246,7 +246,7 @@ func TestOutageReplacementProbeRespectsWorkerCapacity(t *testing.T) {
 	})
 }
 
-func TestOutageProbeNonTimeoutErrorClosesGate(t *testing.T) {
+func TestOutageProbeUnknownErrorKeepsGateOpen(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var unavailable atomic.Bool
 		g := NewRecovering(8, time.Second, nil, unavailable.Store)
@@ -259,9 +259,26 @@ func TestOutageProbeNonTimeoutErrorClosesGate(t *testing.T) {
 		backendError := errors.New("write quorum not reached")
 		_, err := Do(t.Context(), g, func(context.Context) (int, error) { return 0, backendError })
 		require.ErrorIs(t, err, backendError)
-		require.False(t, unavailable.Load(), "an on-time backend error proves recovery")
-		value, err := Do(t.Context(), g, func(context.Context) (int, error) { return 42, nil })
+		require.True(t, unavailable.Load(), "an unknown backend error does not prove recovery")
+		_, err = Do(t.Context(), g, func(context.Context) (int, error) { t.Error("open outage admitted work"); return 42, nil })
+		require.ErrorIs(t, err, ErrUnavailable)
+	})
+}
+
+func TestOutageProbeRecognizedDomainErrorClosesGate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var unavailable atomic.Bool
+		g := NewRecovering(8, time.Second, nil, unavailable.Store)
+		for range 3 {
+			_, err := Do(t.Context(), g, func(context.Context) (int, error) { return 0, ErrTimeout })
+			require.ErrorIs(t, err, ErrTimeout)
+		}
+		time.Sleep(time.Second)
+		domain := errors.New("entry is too large")
+		_, err := Do(t.Context(), g, func(context.Context) (int, error) { return 0, HealthyError(domain) })
+		require.ErrorIs(t, err, domain)
+		require.False(t, unavailable.Load())
+		_, err = Do(t.Context(), g, func(context.Context) (int, error) { return 42, nil })
 		require.NoError(t, err)
-		require.Equal(t, 42, value)
 	})
 }
