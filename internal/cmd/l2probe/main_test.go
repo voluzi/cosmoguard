@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -27,7 +28,7 @@ func TestProbeSnapshotRates(t *testing.T) {
 		t.Fatalf("probe failed: %v", err)
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(out)))
-	stages := 0
+	var stages []string
 	for {
 		var row map[string]any
 		if err := decoder.Decode(&row); err != nil {
@@ -40,7 +41,7 @@ func TestProbeSnapshotRates(t *testing.T) {
 		if !ok {
 			continue
 		}
-		stages++
+		stages = append(stages, stage)
 		for _, name := range []string{"gc_rate", "cpu_millicores"} {
 			value, present := row[name]
 			if stage == "empty" {
@@ -55,7 +56,7 @@ func TestProbeSnapshotRates(t *testing.T) {
 			}
 		}
 	}
-	if stages != 4 {
-		t.Fatalf("got %d snapshots, want empty, sparse, after_writes and idle", stages)
+	if want := []string{"empty", "sparse", "after_writes", "idle"}; !slices.Equal(stages, want) {
+		t.Fatalf("got snapshot stages %v, want %v", stages, want)
 	}
 }
