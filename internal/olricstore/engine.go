@@ -58,6 +58,7 @@ type Engine struct {
 	indexBytes             uint64
 	head, tail, generation uint64
 	bytes, length          int
+	earliestExpiry         int64
 	closed, destroyed      bool
 }
 
@@ -235,7 +236,21 @@ func expiredRaw(b []byte, now int64) bool {
 	ttl := int64(binary.BigEndian.Uint64(b[1+k : 9+k]))
 	return ttl != 0 && ttl <= now
 }
+
+// earliestExpiry is conservative after removal or extension; at most one extra
+// sweep recomputes it. Never skip an earlier deadline inserted by a mutation.
+func (e *Engine) trackExpiryLocked(raw []byte) {
+	k := int(raw[0])
+	ttl := int64(binary.BigEndian.Uint64(raw[1+k : 9+k]))
+	if ttl != 0 && (e.earliestExpiry == 0 || ttl < e.earliestExpiry) {
+		e.earliestExpiry = ttl
+	}
+}
 func (e *Engine) sweepLocked(now int64) {
+	if e.earliestExpiry == 0 || now < e.earliestExpiry {
+		return
+	}
+	e.earliestExpiry = 0
 	for _, first := range e.buckets {
 		var prev uint64
 		for loc := first; loc != 0; {
@@ -244,6 +259,7 @@ func (e *Engine) sweepLocked(now int64) {
 			if expiredRaw(rawRecord(b), now) {
 				e.removeLocked(loc, prev)
 			} else {
+				e.trackExpiryLocked(rawRecord(b))
 				prev = loc
 			}
 			loc = next
@@ -315,6 +331,7 @@ func (e *Engine) putLocked(h uint64, v []byte) error {
 		e.unlinkOrderLocked(loc)
 		binary.LittleEndian.PutUint32(b[40:44], uint32(len(v)))
 		copy(b[headerSize:], v)
+		e.trackExpiryLocked(v)
 		e.appendOrderLocked(loc)
 		return nil
 	}
@@ -331,6 +348,7 @@ func (e *Engine) putLocked(h uint64, v []byte) error {
 	binary.LittleEndian.PutUint32(b[40:44], uint32(len(v)))
 	binary.LittleEndian.PutUint32(b[44:48], uint32(size))
 	copy(b[headerSize:], v)
+	e.trackExpiryLocked(v)
 	e.buckets[e.bucket(h)] = dest
 	e.appendOrderLocked(dest)
 	e.bytes += size
@@ -413,6 +431,7 @@ func (e *Engine) UpdateTTL(h uint64, v storage.Entry) error {
 	}
 	k := int(b[0])
 	binary.BigEndian.PutUint64(b[1+k:9+k], uint64(v.TTL()))
+	e.trackExpiryLocked(b)
 	binary.BigEndian.PutUint64(b[9+k:17+k], uint64(v.Timestamp()))
 	binary.BigEndian.PutUint64(b[17+k:25+k], uint64(time.Now().UnixNano()))
 	loc, _ := e.findLocked(h)
