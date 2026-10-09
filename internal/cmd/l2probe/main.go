@@ -115,7 +115,8 @@ func run() (result error) {
 	c.DMaps.TriggerCompactionInterval = time.Second
 	c.DMaps.Engine = &config.Engine{Implementation: olricstore.NewEngine(response)}
 	c.DMaps.EvictionPolicy = config.LRUEviction
-	c.DMaps.MaxInuse = int(per.L2MaxBytesPerNode / 2)
+	// This probe has one member, so RF2 creates no resident backup copies.
+	c.DMaps.MaxInuse = int(per.L2MaxBytesPerNode)
 	c.DMaps.MaxKeys = c.DMaps.MaxInuse / 512
 	c.DMaps.LRUSamples = 10
 	c.DMaps.Custom = map[string]config.DMap{}
