@@ -36,16 +36,20 @@ func TestProductionResponseL2UsesTotalBudget(t *testing.T) {
 					defer cg.Shutdown(context.Background())
 					dm, err := cg.cluster.Client().NewDMap(cfg.Cache.Key + "lcd")
 					require.NoError(t, err)
-					for i := range 700 {
+					writes, minRetained := 700, 550
+					if !evm && !automatic && replicas == 1 {
+						writes, minRetained = 1600, 1100
+					}
+					for i := range writes {
 						require.NoError(t, dm.Put(t.Context(), fmt.Sprint(i), make([]byte, 8<<10)))
 					}
 					retained := 0
-					for i := range 700 {
+					for i := range writes {
 						if _, err := dm.Get(t.Context(), fmt.Sprint(i)); err == nil {
 							retained++
 						}
 					}
-					require.Greater(t, retained, 550, "one protocol must grow beyond the old quarter/eighth share")
+					require.Greater(t, retained, minRetained, "one protocol must grow beyond the old quarter/eighth share")
 					stats := cg.cluster.responsePool.Snapshot()
 					require.Equal(t, budget.L2MaxBytesPerNode, stats.Capacity)
 					require.LessOrEqual(t, stats.Allocated, stats.Capacity)
