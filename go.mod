@@ -1,11 +1,11 @@
-module github.com/voluzi/cosmoguard/v5
+module github.com/voluzi/cosmoguard/v6
 
-// Stay on Go 1.25 until ReverseProxy.Director is migrated separately.
-go 1.25.14
+go 1.26.9
 
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/MicahParks/keyfunc/v3 v3.8.0
+	github.com/RoaringBitmap/roaring v1.9.4
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/creasty/defaults v1.8.0
 	github.com/fsnotify/fsnotify v1.10.1
@@ -15,13 +15,13 @@ require (
 	github.com/hashicorp/memberlist v0.6.0
 	github.com/jellydator/ttlcache/v3 v3.4.1
 	github.com/json-iterator/go v1.1.12
-	github.com/olric-data/olric v0.7.4
 	github.com/prometheus/client_golang v1.24.0
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/segmentio/fasthash v1.0.3
 	github.com/stretchr/testify v1.11.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	github.com/voluzi/olric v0.7.5-0.20261009015321-b44a5f871051
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0
@@ -30,8 +30,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.45.0
 	go.uber.org/automaxprocs v1.6.0
 	go.uber.org/goleak v1.3.0
-	golang.org/x/net v0.58.0
-	golang.org/x/sync v0.22.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sync v0.23.0
 	golang.org/x/time v0.15.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d
 	google.golang.org/grpc v1.83.2
@@ -42,7 +42,6 @@ require (
 
 require (
 	github.com/MicahParks/jwkset v0.11.0 // indirect
-	github.com/RoaringBitmap/roaring v1.9.4 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.22.0 // indirect
@@ -83,10 +82,10 @@ require (
 	go.opentelemetry.io/otel/metric v1.45.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/mod v0.38.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/tools v0.48.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/tools v0.49.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )

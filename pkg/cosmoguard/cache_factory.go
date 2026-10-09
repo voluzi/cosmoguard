@@ -3,19 +3,30 @@ package cosmoguard
 import (
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 const l2OperationBudget = 100 * time.Millisecond
 const l2OperationCapacity = 128
 
-// Share capacity across response namespaces so saturation cannot spawn an
-// unbounded set of detached calls. Limiter admission has its own pool.
-var boundedL2Operations = cache.BoundedOperations(l2OperationCapacity, l2OperationBudget, func(outcome string) {
-	recordBackendOperationFailure("l2", outcome)
-})
+func newResponseOperations(workBytes uint64) cache.Option {
+	return cache.RecoveringOperations(l2OperationCapacity, l2OperationBudget, workBytes,
+		func(outcome string) { recordBackendOperationFailure("l2", outcome) },
+		func(reason string) { l2WriteSkips.WithLabelValues(reason).Inc() },
+		func(unavailable bool) { recordBackendUnavailable("l2", unavailable) })
+}
+
+type ownedResponseCache[K comparable, V any] struct {
+	cache.Cache[K, V]
+	operations cache.Option
+}
+
+func (c *ownedResponseCache[K, V]) Close() error {
+	c.operations.CloseOperations()
+	return c.Cache.Close()
+}
 
 // newResponseCache builds the response cache for a proxy / handler:
 // an olric L2 fronted by an in-process L1, namespaced by
@@ -27,6 +38,7 @@ func newResponseCache[K comparable, V any](
 	olricClient *olric.EmbeddedClient,
 	name string,
 	budget CacheBudget,
+	operations cache.Option,
 	opts ...cache.Option,
 ) (cache.Cache[K, V], error) {
 	// Apply the per-instance L1 byte/item caps resolved at startup so the
@@ -49,9 +61,18 @@ func newResponseCache[K comparable, V any](
 		namespace = cacheCfg.Key + name
 	}
 
-	if cacheCfg != nil && cacheCfg.Cluster != nil {
-		opts = append(opts, boundedL2Operations)
+	ownsOperations := operations == nil
+	if ownsOperations {
+		operations = newResponseOperations(responseWorkBytes())
 	}
+	opts = append(opts, operations)
+	var response cache.Cache[K, V]
+	success := false
+	defer func() {
+		if ownsOperations && !success {
+			operations.CloseOperations()
+		}
+	}()
 	l2, err := cache.NewOlricCache[K, V](olricClient, namespace, opts...)
 	if err != nil {
 		return nil, err
@@ -59,7 +80,16 @@ func newResponseCache[K comparable, V any](
 	l1, err := cache.NewMemoryCache[K, V](name, opts...)
 	if err != nil {
 		// Degrade to L2-only rather than failing the proxy.
-		return l2, nil
+		response = l2
+	} else {
+		response, err = cache.NewTieredCache[K, V](l1, l2)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return cache.NewTieredCache[K, V](l1, l2)
+	success = true
+	if ownsOperations {
+		return &ownedResponseCache[K, V]{response, operations}, nil
+	}
+	return response, nil
 }

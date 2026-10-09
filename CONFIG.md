@@ -34,6 +34,13 @@ Table of contents:
 | `metrics.enable` | `true` | Expose `/metrics`, `/healthz`, `/readyz` on `metrics.port`. |
 | `metrics.port` | `9001` | Metrics + health-probe port. |
 
+The enabled metrics listener starts during construction. `/healthz` stays healthy
+while Olric awaits routing; `/readyz` stays unavailable until the proxies serve
+and every configured upstream pool is healthy. The joiner keeps waiting while
+its advertised cluster has quorum and its coordinator answers authenticated
+PINGs, and aborts after 45s without that evidence. Discovery and daemon start
+retain their 45s startup budget. SIGTERM cancels startup and closes the daemon.
+
 `/metrics` exposes `cosmoguard_config_reloads_total{outcome="..."}`, a process-wide
 counter that counts each config reload attempt once, excluding initial startup:
 
@@ -102,7 +109,7 @@ frames accept individual JSON-RPC requests, not batches.
 
 ### Go configuration comparison API
 
-Import `github.com/voluzi/cosmoguard/v5/pkg/cosmoguard`:
+Import `github.com/voluzi/cosmoguard/v6/pkg/cosmoguard`:
 
 ```go
 func ParseConfig(raw []byte, lookupEnv func(string) (string, bool)) (*Config, error)
@@ -226,41 +233,131 @@ cache:
 
 `httpForegroundFetchTimeout` and `grpcForegroundFetchTimeout` bound the detached upstream calls shared by coalesced HTTP and gRPC misses. Both default to `5m`, are independent of any one caller's deadline, and can be increased for cacheable endpoints or unary methods that legitimately take longer. Each caller still stops waiting under its own request context.
 
+A `hit` cache marker means the request used an already stored response. A `miss`
+can still share an in-flight fetch or its pending response while the asynchronous
+store finishes; it does not imply another upstream request. This distinction is
+especially visible under CPU throttling when concurrent clients walk the same
+keys in bursts. Use `cosmoguard_upstream_requests_total` to count real upstream
+fetches alongside the hit/miss counters. Foreground response stores use detached
+goroutines, with no bounded queue or deliberate queue-drop policy; L1 fills before
+L2 admission, and `cosmoguard_l2_write_skips_total` records L2 write skips.
+
 ### Memory budget
 
-The cache is bounded so a high-cardinality query load (e.g. `/tx`, `/block_search`, `/tx_search` — one entry per distinct hash / query) can't grow the working set until the pod is OOMKilled. Both cache tiers that share the pod heap are capped: the in-process **L1** (LRU by approximate payload bytes) and the olric **L2** (per-node LRU). The rate-limiter, JWT replay set, and observability DMaps are **never** evicted.
+Response L2 storage uses a shared byte-budgeted slab pool in the embedded Olric
+runtime. L1 uses LRU with approximate object/payload costs. A separate security
+pool holds rate-limit buckets, locks, JWT replay and observability records; response
+pressure never evicts those records. The security pool has no finite storage cap.
 
-By default the budget is **derived automatically from the pod's memory limit** (read from the cgroup, v1/v2), so it scales with the pod without any configuration:
+The budget comes from the pod's cgroup v1/v2 memory limit. An explicit
+`cache.memory.reserveFraction` uses that fraction × limit as the reserve,
+bypassing the automatic 50% cap. Without an explicit fraction:
 
 ```
-reserve = max(128 MiB, 0.20 × limit)   # runtime + buffers + cache overhead
-budget  = limit − reserve              # total cache footprint
-L1 = 40% of budget,  L2 = 60% of budget   (L2 also holds replicas)
+reserve = min(0.50 × limit, max(128 MiB, 0.20 × limit))
+budget  = limit − reserve
+L1 = 40% of budget, L2 = 60% of budget
 ```
 
-The total is then split evenly across the response caches that run in the pod (one per proxy). The **caps are the primary OOM defence**. In parallel, `GOMEMLIMIT` is set to **90% of the limit** and `GOMAXPROCS` to the CPU quota — a secondary GC backstop for transient/non-cache allocations (it can only reclaim freeable memory, not the live cache set). When no cgroup limit is detectable (bare metal), each tier falls back to a fixed **128 MiB**.
+L1's budget is divided evenly among enabled response caches. L2's **unsplit node
+budget** limits charged response backing and metadata across every response DMap,
+primary, replica, previous-owner and imported copy. Its cap is neither multiplied
+nor divided by the replica factor. Olric's per-DMap `MaxInuse`/`MaxKeys` remain
+soft eviction thresholds, with the existing per-map and replica division. The
+slab engine supplies the oldest entries to Olric's LRU sampler. Allocation checks
+enforce the shared hard cap when LRU cannot make room. A capacity rejection preserves an existing record on failed growth.
 
-**The L2 (olric) cap is approximate by construction** — unlike the exact L1 byte bound. olric evicts by *sampled* LRU and cannot hold a partition below one entry, so each populated cache DMap has a floor of roughly `ownedPartitions × maxEntrySize`, and the aggregate L2 floor is `N_dmaps × ownedPartitions × 1 MiB`. The per-node cap is enforced by two complementary bounds — `MaxInuse` (bytes) and `MaxKeys` (count, derived from the byte budget) — so a flood of tiny entries can't exhaust heap in per-key index structures before the byte counter trips.
+Slabs contain 2MiB backing, a charged 32KiB buddy tree and descriptor/index allowance;
+records include fixed headers and size-class rounding. Fragment hash indexes grow
+with cardinality, mixing the hash independently of the partition assignment. Both
+index arrays are charged during growth; a growth that cannot fit rejects the new
+write while preserving existing records. Buddy fragmentation
+can leave allocated backing at the cap while live inuse bytes are low: free blocks
+may not fit the requested size class, and partly used slabs retain their backing. Empty fragments
+have a small metadata charge rather than a 1MiB table. Olric compaction visits
+every primary and backup fragment once per second, holding the fragment lock
+so expiry cannot invalidate an in-progress conditional write or LRU selection. Expired records release
+blocks and fully unused slabs release backing and descriptors for natural GC.
+Security records expire only according to their existing TTL policies.
+Clustered deployments retain **271 partitions** and separate protocol DMaps;
+standalone deployments retain 16 partitions. Cross-pod response sharing and the
+default replica factor remain unchanged.
 
-Tables are allocated lazily when a partition first stores an entry (including replication/read repair), rather than when the DMap opens. Each table is a normal Go-heap byte slice; pages become resident as they are touched. With all 271 partitions populated in each of four non-EVM response DMaps, table buffers alone allocate 1,084 MiB, exceeding the chart's 1Gi limit before other memory. That default can fit low traffic but is unsafe for this fully populated footprint; the auto-derived in-use budget does not reclaim live table buffers.
+`GOMEMLIMIT` remains **90% of the cgroup limit**, and `GOMAXPROCS` follows the CPU
+quota. GOMEMLIMIT is a soft GC target, not a process RSS limit. Neither L1's
+approximate costs nor the storage cap bounds the whole process. Without a detected
+limit, each tier falls back to 128MiB. The automatic response-work allowance G is
+`min(64MiB, roundUpToMiB(limit/16))`, or 16MiB without a detected limit.
 
-- **Embedded/single-pod** mode uses 16 partitions, reducing the floor to 16 MiB per DMap with the current engine table size. Eight response DMaps still have a 128 MiB aggregate floor, which can exceed a small pod's resolved L2 budget.
-- **Clustered** mode keeps olric's default partition count (271) because the count is fixed at cluster formation and every peer must agree on it, and a lower count would hurt key distribution as the cluster scales. The trade-off: a *small* cluster (e.g. 2 nodes, `replicaCount: 2`) has a large per-node floor (each node owns nearly every partition as primary or replica), so **a small cluster on small pods can exceed the resolved L2 budget.** Size clustered pods with headroom above `N_dmaps × ownedPartitions × 1 MiB`, or run more/larger nodes.
+| Pod limit | Total L1 | Response storage cap | G | GOMEMLIMIT |
+| --- | ---: | ---: | ---: | ---: |
+| 250Mi | 50Mi | 75Mi | 16Mi | 225Mi |
+| 500Mi | 148.8Mi | 223.2Mi | 32Mi | 450Mi |
+| 1Gi | 327.68Mi | 491.52Mi | 64Mi | 921.6Mi |
+| No detected limit | 128Mi | 128Mi | 16Mi | Not automatically derived |
 
-Size the pod so its L2 budget clears the floor, or raise the memory limit. The sanitized olric default currently retains a 1 MiB fragment `tableSize`;
-entries above that native limit are served uncached. The clustered caller-wait
-adapter derives its early rejection cap from the same sanitized engine default
-and rejects encoded payloads above 1 MiB before Put. Native key/entry framing can
-reject a slightly smaller value; successful embedded and clustered cache writes
-retain the same native entry-size boundary.
-Embedded mode retains the native size limit. Clustered deployments also divide the per-node cap by `replicaCount`, since each node holds replica copies that olric's primary-write cap doesn't govern. The L1 byte cap and `GOMEMLIMIT` are unaffected by any of this.
+Both standalone and clustered response adapters share one **128-slot**, byte-
+budgeted gate per runtime, with a **100ms total caller budget**. Admission never
+queues workers. Known byte values reserve eight times their encoded native entry
+size rounded to 4KiB. HTTP and gRPC response wrappers report an encoded-size
+upper bound and reserve against that bound before encoding; the encoder enforces
+it. Other generic writes reserve 8MiB. A read initially reserves
+2MiB plus 4KiB for the native entry, decoded payload and metadata, then shrinks
+to twice its encoded size rounded to 4KiB plus 4KiB before decoding. Generic encoding
+uses a writer that refuses growth past the native envelope and shrinks the
+reservation once size is known. At 250Mi/500Mi/1Gi, G admits 7/15/31
+unknown-size reads concurrently. Small reads can reach the 128-slot count cap
+once their sizes are known; even near-envelope reads keep total reservations
+within 16MiB/32MiB/64MiB. Read decoding runs within the admitted worker.
+A timed-out or cancelled caller discards a late result, but the actual worker
+retains its slot and byte lease until result delivery or discard. Detached work can still finish a
+late write. Limiter and replay work use their independent existing count gates.
+
+Response and security codecs each have a separate 8MiB scratch allowance from
+the runtime reserve, admitting two concurrent 4MiB transfer charges. Codec admission is immediate and retryable. A response
+import processes every record and can acknowledge omitted capacity-rejected
+responses, counted individually; a security callback failure propagates and must
+not acknowledge a dropped security record. Export retries retain source data
+until acknowledgement. Returned export buffers outlive encoding admission.
+
+Tiered `Set` fills L1 first and returns any L2 failure to Go callers. Response
+handlers serve the upstream result and retain that local entry after capacity,
+byte-admission, oversize, encoding or backend failure. A native entry must have
+`29 + len(key) + len(encoded value) < 1MiB`, with a key no longer than 255 bytes;
+large upstream responses can still fit L1. Keys and entry framing reduce the
+maximum value payload. Native entry and transfer wire formats remain unchanged.
+
+Per-fragment Olric statistics divide shared slab backing evenly among registered
+fragments, assigning division remainders once so aggregate allocation stays exact.
+This takes constant time and includes empty registered fragments. `Allocated`
+includes backing and charged metadata; `Inuse` includes live size-class blocks and
+fragment metadata. Pool gauges provide the node-level cap view. `NumTables` is
+the same shared-slab apportionment, not native table count; native table garbage ratios are
+not comparable. L1 accounting remains approximate and depends on object shape.
+
+The hard bound does not cover security cardinality, local limiter identities,
+application-owned request/response bodies, generic encoder/decoder internals, accepted
+connections/pipelined RESP frames, outer fragment decode before Import,
+remote response writers/slow readers, or returned export buffers. The cgroup is
+still the process limit. See [v6 upgrades](docs/upgrade-v6.md) and the
+[release test procedure](docs/bounded-l2-release-tests.md) for measured profiles
+and release gates. The local diagnostic breached the 95% peak criterion in some
+cases. On-prem validation of 13947aa measured 22–28MiB heap / about 60MiB RSS
+at 250Mi and 25–33MiB heap / about 66MiB RSS at 500Mi, zero idle GC, and the
+response pool returning to zero after TTL. Long soaks remain unverified.
+
+During a mixed rollout, **old v5 nodes retain native table allocation**: populating
+all 271 partitions in four/eight response DMaps costs at least 1,084/2,168MiB of
+table backing on one node before replicas, L1 and runtime allocations. Provide
+old nodes sufficient memory for full-cache compatibility tests. The new engine
+cannot improve an old node's allocator before that node is replaced.
 
 Override any of it explicitly:
 
 ```yaml
 cache:
   memory:
-    maxBytes: 134217728                 # absolute L1 cap (bytes). unset → auto; 0 → no limit
+    maxBytes: 134217728                 # L1 object-cost budget (bytes). unset → auto; 0 → no limit
     maxItems: 0                         # optional L1 entry-count guard. 0 → no limit
     distributedMaxBytesPerNode: 0       # absolute L2 (olric) per-node cap. unset → auto; 0 → no limit
     reserveFraction: 0.20               # auto-mode reserve fraction; must be in [0, 0.9)
@@ -276,32 +373,69 @@ cache:
 
 Including a `cache.cluster` block in the config turns the embedded olric daemon into a real cluster. Replicas form a memberlist gossip ring and partition the cache + rate-limiter keyspace. Single binary, single daemon, no external dependencies.
 
-Startup waits for an initial usable olric routing table before constructing
-cache, authentication, limiter, or observability consumers. Bootstrap timeouts
-and insufficient member quorum are retried on the same daemon; permanent errors
-fail immediately. A fixed 45s budget covers initial DNS discovery, daemon start,
-and this gate together; there is no new configuration setting. The first transient cause, elapsed gate
-and total startup time are logged; deadline errors retain the last cause. A native DMap check already in progress can
-finish after the caller's deadline (olric bounds that check to 10s); shutdown
-starts immediately with a 2s allowance.
+Startup starts the operations listener and `/healthz` before waiting for a usable
+Olric routing table. `/readyz` returns 503 during construction, then applies the
+existing upstream readiness checks. Discovery and daemon start have a fixed 45s
+budget. A joiner may continue waiting beyond 45s while the advertised cluster has
+quorum and its coordinator answers authenticated PINGs; without that evidence
+startup fails. Total bootstrap waiting has a fixed **10-minute ceiling from each runtime constructor's
+start**, including reachable-coordinator extensions. At that ceiling the process
+exits with a clear error if the coordinator was reachable but no routing table
+arrived, allowing the kubelet to retry the join from scratch. Bootstrap does not wait for all migration to finish. SIGTERM
+cancels construction and cleans up immediately, including Olric's graceful leave.
+Keep discovery of unready peers enabled. The chart allows 60s for the startup
+probe (30 failures at two-second intervals), which checks `/healthz`. Health
+already answers 200 while bootstrap waits; readiness carries that wait and keeps
+the joiner out of service until its routing table is usable.
 
-The metrics listener and `/healthz` start only in `CosmoGuard.Run`, after
-construction and this bootstrap gate. `/readyz` then applies the existing
-upstream readiness checks; startup does not wait for all data migration to finish.
-Allow at least 60s for a startup probe on the metrics port (for example 30 failures
-at 2s intervals), and keep discovery of unready peers enabled. The chart includes this startup probe for Deployment and StatefulSet. Deployments
-using other manifests must provide the same allowance.
+SIGTERM immediately changes `/readyz` to 503 while `/healthz`, metrics, information
+and application traffic continue serving for a fixed **five seconds**. This lets
+endpoints and ingress converge without a preStop hook. After the hold, all
+traffic and operations listeners stop concurrently. Admitted HTTP requests and finite gRPC calls drain
+until at most **24 seconds from the signal**; gRPC streams are forcibly stopped
+at that deadline. WebSocket clients receive a best-effort **1001 (going away)**
+close and their connections/notification queues are closed. Clients must reconnect
+and resubscribe; streams are not transferred to another replica.
 
-Clustered response-cache L2 reads, existence checks, and writes have a fixed
-100ms caller-wait budget and share 128 outstanding-operation slots per process.
-L1 hits bypass this pool. At capacity, new operations are rejected immediately
-without a queue. HTTP lookup timeout/rejection follows the cache-miss path,
-including coalescing and response storage. Tiered writes populate L1 on L2 timeout or capacity rejection, while still
-returning the L2 error; other L2 errors leave L1 untouched. Entries whose encoded
-payload exceeds the 1 MiB engine table-size cap are rejected before calling olric and
-remain uncached in both tiers. Subsequent hot-key requests can use L1
-during a stall. Failed storage preserves the upstream response. Cold keys can
-increase upstream traffic during joins or slow peers.
+Consumer/telemetry cleanup gets up to **two seconds**, capped at signal +26s,
+then Olric gets up to **three seconds** for graceful leave, capped at signal +29s.
+All phases share that absolute deadline and shorter caller budgets can curtail
+any phase. Uncooperative cleanup remains owned but cannot extend the shutdown wait. An
+unfinished observability DMap write retains Olric while the process remains alive.
+Background cleanup can attempt late leave after that write returns, using the
+original absolute deadline, and logs any leave error. The binary does not await
+this background work: it exits when the bounded shutdown returns, so a stuck
+write can prevent graceful leave entirely. An embedding process that stays alive
+can finish the cleanup; this never extends the caller's shutdown budget.
+The binary cannot infer the pod grace period; its fixed **29s total** fits the
+operator's 30s grace with one second of margin and no preStop hook. The chart's
+existing external 5s preStop and 40s grace remain compatible (at most 34s total).
+Failed startup and immediate `Shutdown` skip the propagation hold;
+`DrainAndShutdown` is the signal path. Five seconds cannot guarantee convergence
+of an unhealthy ingress/control plane; correlate termination with endpoint and
+proxy errors when checking a rollout.
+
+Response-cache L2 reads, existence checks and writes share one 128-slot byte gate
+per runtime, with a 100ms caller budget. L1 hits bypass it. Admission does not queue
+workers. Timeout, capacity rejection and backend outage use the cache-miss path;
+coalescing and upstream response handling remain unchanged. Tiered writes fill L1
+first, including when L2 rejects capacity, admission, size, encoding or backend
+work. Large native entries can still fit L1. Late operations retain their slots
+and byte reservations until the actual worker exits and can finish a late write.
+
+After three consecutive executed-operation timeouts, the L2 gate skips backend
+calls with `ErrUnavailable`. After one second, the next real request is its single
+recovery probe. Success or a recognized domain outcome closes the outage state, including a
+cache miss, storage-capacity/size/encoding rejection or limiter denial. Transport,
+quorum and unknown errors keep a probe open for another cooldown. Failed probes wait another second;
+once a probe caller has resolved, the next cooldown permits a replacement even
+if its worker remains stuck. Old workers retain their slot/byte charges, so
+replacement probes cannot exceed admission capacities. Caller cancellation/deadlines and
+admission/capacity rejection do not open the state. Old in-flight results cannot
+close it. There are no background probes or configuration settings. Three
+timeouts filter isolated delays; the one-second cooldown bounds recovery traffic.
+The state applies across that gate, so a slow partition can temporarily send other
+partitions to L1/upstream. Separate limiter and replay pools remain independent.
 
 Clustered limiter attempts retain v5.1.0's token-bucket algorithm and 250ms
 lock-contention deadline. A separate **1s** caller-wait budget covers the whole
@@ -316,8 +450,13 @@ Each rule owns one existing in-memory limiter for fallback, with the same rate,
 burst, scope, and key. It holds at most 100,000 buckets, with a 10-minute idle
 TTL and capacity eviction; eviction can reset an evicted key's burst. Cache and
 replay saturation cannot consume limiter slots. There are no retries of uncertain
-shared writes. Every subsequent request tries the shared limiter again, so normal
-operation resumes when the backend returns. A failed limiter constructor uses
+shared writes. The clustered limiter gate uses the same three-timeout,
+one-second, single-request-probe outage state as L2. Admission and outage
+state belong to each runtime, so failures in one embedded guard do not divert
+another guard. Replay has its own runtime admission gate without outage state. During an outage requests
+immediately use the existing per-replica bucket. A healthy clustered allowance,
+denial or contention result closes it. Token-bucket math, locking and the 250ms
+contention deadline are unchanged. A failed limiter constructor uses
 local buckets and is retried on rule reload.
 
 While falling back, limits are per replica: across N replicas a client can
@@ -335,8 +474,7 @@ key merely because the pool is full.
 
 `rateLimit.failureMode` is **deprecated and ignored**, but remains parsed and
 validated so existing configurations load and reload. On primary limiter failure,
-the per-replica limiter decides in every deployment mode. It will be removed in the
-next major version. Startup logs one warning naming affected rules; an accepted
+the per-replica limiter decides in every deployment mode. v6 retains this key. Startup logs one warning naming affected rules; an accepted
 reload warns once for rules that introduce the key. The key is absent from rule
 fingerprints and the restart projection, so changing it does not alter bucket identity
 or require a restart. Auth-method `failureMode` settings are unchanged.
@@ -346,11 +484,14 @@ Clustered JWT replay checks have 512 slots. At capacity, they wait up to
 full 100ms Put budget: worst-case caller wait is 200ms. Timeout uses the existing replay-store error policy: admit the verified
 identity and log a warning that replay protection was unavailable. This policy
 is unchanged; the wait is bounded. Replay admission shares neither main pool.
+Replay deliberately has no outage suppression: every request still attempts its
+own bounded atomic NX check. Skipping checks during a gate-wide outage would
+admit tokens that an available partition could still reject.
 
-Non-clustered deployments add no request-path wait budgets or admission pools,
-retain the embedded limiter's 250ms contention deadline, and share the 45s
-startup default. Their cache implementation and healthy limiter algorithm are
-unchanged. Embedded limiter errors, failed constructors, or a missing primary
+Non-clustered deployments use the same response storage and byte gate. They add
+no limiter or replay admission pools, retain the embedded limiter's 250ms
+contention deadline, and share the 45s startup default. The healthy limiter
+algorithm is unchanged. Embedded limiter errors, failed constructors, or a missing primary
 limiter use the same per-rule local fallback; a rate-limited rule never bypasses
 its limit because the primary is unavailable. Caller cancellation observed before
 local fallback begins returns the context error without consuming a fallback token or counting a fallback.
@@ -366,20 +507,51 @@ level, and release their slots.
 
 `cosmoguard_backend_operation_failures_total` counts abandoned waits and capacity
 rejections. Its labels are `backend` (`l2`, `limiter`, or `replay`) and `outcome`
-(`timeout` or `rejected`) for L2 and limiter, plus replay `timeout`: five
-live combinations. Replay waits for capacity and never emits `rejected`. It does not count cache misses,
+(`timeout`, `rejected` or `unavailable`) for L2 and limiter, plus replay
+`timeout`: seven live combinations. Replay waits for capacity and never emits `rejected`. It does not count cache misses,
 ordinary contention denials, backend panics, or caller context cancellation/deadlines.
-Only expiry of a gate budget counts as a backend timeout. Bounded cache failures and all limiter fallback decisions log at debug
-level; other cache errors remain errors.
+Gate-budget expiry or an executed Olric operation-timeout reply counts as a backend timeout. Bounded cache failures, local L2 admission/size/encoding skips and all limiter
+fallback decisions log at debug level. L2 write skips with `reason="backend"`
+and other cache errors remain errors.
 JWT replay failures retain their warning for the existing security audit path.
-`cosmoguard_rate_limit_local_fallback_total` records local decisions with six
-combinations: `reason` (`timeout`, `capacity`, `backend_error`) and `outcome`
+
+Storage metrics use only `pool="response"` or `pool="security"`:
+`cosmoguard_l2_storage_allocated_bytes`, `cosmoguard_l2_storage_inuse_bytes`,
+`cosmoguard_l2_storage_entries`, `cosmoguard_l2_storage_capacity_bytes`,
+`cosmoguard_l2_codec_bytes` and `cosmoguard_l2_codec_capacity_bytes`. Capacity zero
+means unlimited. `cosmoguard_l2_operation_bytes` and
+`cosmoguard_l2_operation_capacity_bytes` report G, including detached workers.
+Gauges aggregate active runtimes; closed runtimes release their collector references.
+`cosmoguard_l2_last_compaction_timestamp_seconds{pool}` reports the latest completed
+storage expiry sweep in an active runtime. Zero means no sweep has completed;
+an unchanged value while fragments remain populated indicates stalled expiry.
+Empty pools have no fragment to sweep, so their timestamps can remain unchanged.
+`cosmoguard_gc_cpu_seconds_total` and `cosmoguard_gc_limiter_last_enabled_cycle`
+provide process runtime observations for the soak ledger, without labels.
+
+`cosmoguard_l2_storage_rejections_total{path="fork"|"put"|"put_raw"}` counts receiving
+response capacity rejections; `cosmoguard_l2_import_dropped_entries_total` counts
+capacity omissions acknowledged during response transfer.
+`cosmoguard_l2_write_skips_total{reason}` uses `inflight`, `unavailable`, `storage_capacity`,
+`entry_size`, `backend`, or `encode`. The adapter restores the unique capacity message after remote RESP forwarding
+so it remains `storage_capacity`; Olric's opaque write-quorum failure stays `backend`. A quorum
+success with a rejected backup increments receiving storage rejection only.
+Counters are process cumulative and never label keys, tenants or DMap names.
+`cosmoguard_cache_evictions_total` retains its L1 budget-eviction meaning.
+
+`cosmoguard_rate_limit_local_fallback_total` records local decisions with eight
+combinations: `reason` (`timeout`, `capacity`, `backend_error`, `backend_unavailable`) and `outcome`
 (`allowed`, `denied`). Healthy bursts can also enter local fallback at capacity
 or when the attempt exceeds 1s. Alert on
 `cosmoguard_rate_limit_local_fallback_total{reason="capacity"}` to detect limiter
 pool saturation. Replay retains its existing error policy when
 either 100ms budget expires.
-No new YAML settings or dependencies are required.
+`cosmoguard_backend_unavailable_gates{backend}` counts outage gates, including a
+probe in progress, with fixed labels `l2`, `limiter`, and `replay` (always zero).
+Recovery requires a real request: on an idle pod this gauge can remain open even
+when the backend has recovered. It records the last observed outage state, not
+an active health check. Closed runtimes decrement their L2 state. No new YAML
+settings are required.
 
 The three pools retain at most 2,688 backend workers: 128 L2, 2,048 limiter,
 and 512 replay. Parked L2 writes retain at most 1 MiB of encoded payload per
@@ -797,13 +969,12 @@ rateLimit:
   rate: 100/s                        # or "100", "30/min", "1/5s", "250/250ms"
   burst: 200                         # max bucket capacity; defaults to rate
   scope: per-ip                      # per-ip (default) | global | per-identity | compound
-  failureMode: fail-open             # deprecated and ignored; removed next major
+  failureMode: fail-open             # deprecated and ignored; retained in v6
 ```
 
 With a `cache.cluster` block present, rate-limit buckets are sharded across replicas through olric so the configured rate is a true cluster-wide budget. In single-pod / embedded olric mode the rate is enforced per pod.
 
-`rateLimit.failureMode` is deprecated and ignored, and will be removed in the
-next major version. Existing `fail-open` and `fail-closed` values remain valid.
+`rateLimit.failureMode` is deprecated and ignored, and remains accepted in v6. Existing `fail-open` and `fail-closed` values remain valid.
 On backend failure, the per-replica limiter decides in all modes across HTTP,
 JSON-RPC, WebSocket, and gRPC; see [cluster mode](#cluster-mode) for the bounds
 and transition behavior. Auth-method `failureMode` is unaffected.

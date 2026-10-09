@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/olric"
 )
 
 // TestObservabilityReplicator_RoundTrip is the single-node sanity

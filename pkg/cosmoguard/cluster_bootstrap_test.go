@@ -1,19 +1,22 @@
 package cosmoguard
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/hashicorp/memberlist"
-	"github.com/olric-data/olric"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric"
 )
 
 // bootstrapMember and the routing-table payload below mirror olric v0.7.4's
@@ -34,8 +37,54 @@ func (bootstrapDelegate) LocalState(bool) []byte          { return nil }
 func (bootstrapDelegate) MergeRemoteState([]byte, bool)   {}
 
 func TestClusterRuntimeWaitsForRoutingTable(t *testing.T) {
-	ports := reserveLoopbackPorts(t, 3)
-	coordinator := bootstrapMember{Name: "127.0.0.1:1", ID: 42, Birthdate: 1}
+	ports := reserveLoopbackPorts(t, 4)
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports[3])))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil || len(line) < 3 || line[0] != '*' {
+						return
+					}
+					count, err := strconv.Atoi(line[1 : len(line)-2])
+					if err != nil {
+						return
+					}
+					command := ""
+					for i := 0; i < count; i++ {
+						if _, err := reader.ReadString('\n'); err != nil {
+							return
+						}
+						value, err := reader.ReadString('\n')
+						if err != nil {
+							return
+						}
+						if i == 0 {
+							command = strings.TrimSpace(value)
+						}
+					}
+					switch strings.ToLower(command) {
+					case "auth":
+						_, _ = io.WriteString(conn, "+OK\r\n")
+					case "ping":
+						_, _ = io.WriteString(conn, "+PONG\r\n")
+					default:
+						_, _ = io.WriteString(conn, "-ERR unknown command\r\n")
+					}
+				}
+			}()
+		}
+	}()
+	coordinator := bootstrapMember{Name: listener.Addr().String(), ID: 42, Birthdate: 1}
 	meta, err := msgpack.Marshal(coordinator)
 	require.NoError(t, err)
 	mc := memberlist.DefaultLocalConfig()
@@ -68,7 +117,7 @@ func TestClusterRuntimeWaitsForRoutingTable(t *testing.T) {
 		}
 	})
 	go func() {
-		cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 10 * time.Second})
+		cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 10 * time.Second, BootstrapTimeout: 200 * time.Millisecond})
 		result <- outcome{cr, err}
 	}()
 	var joiner bootstrapMember
@@ -88,7 +137,7 @@ func TestClusterRuntimeWaitsForRoutingTable(t *testing.T) {
 			_ = r.cr.Close(context.Background())
 		}
 		t.Fatalf("runtime returned before routing delivery: %v", r.err)
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(400 * time.Millisecond):
 	}
 	table := map[uint64]any{}
 	for id := uint64(0); id < 271; id++ {
@@ -189,4 +238,51 @@ func TestClusterBootstrapDeadlinePreservesCause(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("bootstrap caller did not stop")
 	}
+}
+
+func TestClusterBootstrapProgressRequiresRecentReachability(t *testing.T) {
+	for _, reachable := range []bool{false, true} {
+		t.Run(strconv.FormatBool(reachable), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+			defer cancel()
+			probe := &bootstrapProbe{open: func(int) error { return olric.ErrOperationTimeout }}
+			started := time.Now()
+			err := waitClusterBootstrapProgress(ctx, probe, 50*time.Millisecond, time.Now().Add(bootstrapMaxWait), func(context.Context) bool { return reachable })
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			require.ErrorIs(t, err, olric.ErrOperationTimeout)
+			if reachable {
+				require.GreaterOrEqual(t, time.Since(started), 140*time.Millisecond)
+			} else {
+				require.Less(t, time.Since(started), 140*time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestClusterBootstrapReachabilityRequiresAuthenticationAndQuorum(t *testing.T) {
+	ports := reserveLoopbackPorts(t, 2)
+	cfg := &ClusterConfig{BindAddr: "127.0.0.1", BindPort: ports[0], GossipPort: ports[1],
+		ReplicaCount: 1, Quorum: 1, EncryptionKey: testClusterEncryptionKey,
+		Discovery: &ClusterDiscoveryConfig{Mode: "static", Static: &StaticDiscoveryConfig{}}}
+	cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg})
+	require.NoError(t, err)
+	defer cr.Close(context.Background())
+	require.True(t, bootstrapCoordinatorReachable(t.Context(), cr.Client(), testClusterEncryptionKey, 1))
+	require.False(t, bootstrapCoordinatorReachable(t.Context(), cr.Client(), "wrong secret", 1))
+	require.False(t, bootstrapCoordinatorReachable(t.Context(), cr.Client(), testClusterEncryptionKey, 2))
+}
+
+func TestClusterBootstrapReachableCoordinatorHasHardDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		time.Sleep(11 * time.Minute)
+		constructorStart := time.Now()
+		time.Sleep(2 * time.Minute)
+		probe := &bootstrapProbe{open: func(int) error { return olric.ErrOperationTimeout }}
+		ctx, cancel := context.WithTimeout(t.Context(), 11*time.Minute)
+		defer cancel()
+		err := waitClusterBootstrapProgress(ctx, probe, 45*time.Second, constructorStart.Add(bootstrapMaxWait), func(context.Context) bool { return true })
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.ErrorContains(t, err, "coordinator was reachable but no routing table arrived")
+		require.Equal(t, 10*time.Minute, time.Since(constructorStart))
+	})
 }

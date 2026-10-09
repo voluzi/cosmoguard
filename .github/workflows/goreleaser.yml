@@ -27,7 +27,7 @@ jobs:
         with:
           # Match the toolchain go.mod requires; without this setup-go
           # picks a default (1.24) and GOTOOLCHAIN=local blocks the
-          # auto-upgrade, so goreleaser fails "go.mod requires go >= 1.25".
+          # auto-upgrade, so goreleaser fails when go.mod requires a newer toolchain.
           go-version-file: go.mod
 
       # For a STABLE release, base the changelog on the previous stable tag

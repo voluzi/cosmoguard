@@ -221,7 +221,7 @@ func TestHTTPCacheTargetIdentitySeparatesOpaqueFromHierarchical(t *testing.T) {
 	httpUpstream := &HttpUpstream{Name: "up", Target: target, proxy: reverseProxy}
 	httpUpstream.healthy.Store(true)
 
-	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "target-isolation-test", CacheBudget{})
+	responseCache, err := newResponseCache[string, CachedResponse](nil, nil, "target-isolation-test", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
 	p := &HttpProxy{
@@ -450,11 +450,10 @@ func TestHTTPKeyMetadataHostUsesRequestAuthority(t *testing.T) {
 		_, _ = fmt.Fprint(w, r.Host)
 	})
 	upstreams := *p.pool.upstreams.Load()
-	director := upstreams[0].proxy.Director
-	upstreams[0].proxy.Director = func(req *http.Request) {
-		host := req.Host
-		director(req)
-		req.Host = host
+	rewrite := upstreams[0].proxy.Rewrite
+	upstreams[0].proxy.Rewrite = func(req *httputil.ProxyRequest) {
+		rewrite(req)
+		req.Out.Host = req.In.Host
 	}
 	rule := cacheRule(t, &RuleCache{
 		Enable:      true,

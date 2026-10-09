@@ -8,20 +8,22 @@ import (
 	"io"
 	"maps"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/voluzi/olric"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 type EndpointHandler interface {
@@ -40,6 +42,7 @@ type Endpoint struct {
 }
 
 type HttpProxy struct {
+	serving          atomic.Bool
 	defaultAction    RuleAction
 	rules            []*HttpRule
 	server           *http.Server
@@ -68,7 +71,8 @@ type HttpProxy struct {
 	// cluster-wide rate limiter (backend=olric, the v4 default). nil
 	// in tests that bypass cosmoguard.New — the limiter constructor
 	// falls back to in-memory in that case.
-	olricClient *olric.EmbeddedClient
+	olricClient       *olric.EmbeddedClient
+	limiterOperations *boundedcall.Gate
 	// limiters maps rule fingerprint to RateLimiter. Rebuilt every SetRules;
 	// stale limiters are Close()'d.
 	limiters map[uint64]RateLimiter
@@ -188,6 +192,14 @@ func (r CachedResponse) CacheCost() uint64 {
 	return cost
 }
 
+func (r CachedResponse) CacheEncodedSize() uint64 {
+	size := uint64(len(r.Data)) + 256
+	for k, v := range r.Headers {
+		size += uint64(len(k) + len(v) + 10)
+	}
+	return size
+}
+
 // httpCacheWriteTimeout bounds how long a detached cache-write context
 // stays alive. The response has already been produced and is just as
 // cacheable as one whose client stuck around; a slow/wedged cache
@@ -215,16 +227,17 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		srv.IdleTimeout = sc.IdleTimeout
 	}
 	proxy := HttpProxy{
-		log:              log.WithField("proxy", name),
-		server:           srv,
-		endpointHandlers: cfg.EndpointHandlers,
-		cacheConfig:      cfg.CacheConfig,
-		olricClient:      cfg.OlricClient,
-		proxyName:        name,
-		limiters:         map[uint64]RateLimiter{},
-		auth:             cfg.Authenticator,
-		cors:             cfg.CORSConfig,
-		now:              time.Now,
+		log:               log.WithField("proxy", name),
+		server:            srv,
+		endpointHandlers:  cfg.EndpointHandlers,
+		cacheConfig:       cfg.CacheConfig,
+		olricClient:       cfg.OlricClient,
+		limiterOperations: cfg.limiterOperations,
+		proxyName:         name,
+		limiters:          map[uint64]RateLimiter{},
+		auth:              cfg.Authenticator,
+		cors:              cfg.CORSConfig,
+		now:               time.Now,
 	}
 	if cfg.ServerConfig != nil {
 		proxy.maxRequestBody = cfg.ServerConfig.EffectiveMaxRequestBody()
@@ -232,8 +245,8 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 
 	// Per-request request rewrite: stripped credential headers, anything
 	// else cosmoguard wants to sanitize before upstream sees it. Applied
-	// inside every per-upstream Director by the pool.
-	rewriteDirector := func(r *http.Request) {
+	// inside every per-upstream rewrite by the pool.
+	rewriteRequest := func(r *http.Request) {
 		if proxy.auth != nil {
 			proxy.auth.StripCredentialHeaders(r.Header)
 			proxy.auth.StripCredentialQuery(r)
@@ -250,7 +263,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 			WithUpstreamRetries(cfg.UpstreamConfig.Retries.Max),
 		)
 	}
-	pool, err := NewHttpUpstreamPool(nodes, service, rewriteDirector, proxy.log, poolOpts...)
+	pool, err := NewHttpUpstreamPool(nodes, service, rewriteRequest, proxy.log, poolOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +332,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 		cacheOptions = append(cacheOptions, cache.DefaultTTL(cfg.CacheConfig.TTL))
 	}
 
-	proxy.cache, err = newResponseCache[string, CachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
+	proxy.cache, err = newResponseCache[string, CachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cfg.L2Operations, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +381,17 @@ func (p *HttpProxy) Run() error {
 	}
 
 	p.log.WithField("address", p.server.Addr).Infof("starting http proxy")
-	err := p.server.ListenAndServe()
+	addr := p.server.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	p.serving.Store(true)
+	defer p.serving.Store(false)
+	err = p.server.Serve(listener)
 	if err == http.ErrServerClosed {
 		// Clean shutdown via Shutdown(); Run() returns nil so callers don't
 		// treat the orderly close as a fatal error.
@@ -390,8 +413,8 @@ func (p *HttpProxy) Shutdown(ctx context.Context) error {
 	// limiters below — otherwise in-flight handlers run against a
 	// freed pool or a closed Redis client and either panic or
 	// return nonsense to the still-connected caller.
-	if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		p.log.Warn("http proxy shutdown deadline exceeded; force-closing in-flight conns")
+	if err != nil {
+		p.log.Warn("http proxy shutdown interrupted; force-closing in-flight conns")
 		_ = p.server.Close()
 	}
 	if p.pool != nil {
@@ -456,7 +479,7 @@ func (p *HttpProxy) SetRules(rules []*HttpRule, defaultAction RuleAction) {
 		// Each rule's bucket pool gets its own keyspace under the proxy
 		// name so multiple proxies (lcd, rpc, etc.) don't share buckets.
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace, p.limiterOperations)
 		if err != nil {
 			p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
 			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)
@@ -873,7 +896,7 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 	// request forwarded upstream. RequestURI retains the escaped or opaque
 	// target, including ForceQuery, using the transport's URL semantics.
 	// Credential query params are stripped before forwarding (see
-	// rewriteDirector), so they must not split the cache per API key.
+	// rewriteRequest), so they must not split the cache per API key.
 	targetURL := *req.URL
 	query := req.URL.Query()
 	if p.auth != nil {

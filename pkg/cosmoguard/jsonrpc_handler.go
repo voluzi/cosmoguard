@@ -11,10 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/olric"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 type JsonRpcHandler struct {
@@ -44,10 +45,11 @@ type JsonRpcHandler struct {
 	auth *Authenticator
 	// limiters maps a rule's Fingerprint to its token-bucket. Built
 	// in SetRules; nil-safe lookup in handleHttpSingle.
-	limiters    map[uint64]RateLimiter
-	olricClient *olric.EmbeddedClient
-	proxyName   string
-	setRulesMu  sync.Mutex
+	limiters          map[uint64]RateLimiter
+	olricClient       *olric.EmbeddedClient
+	limiterOperations *boundedcall.Gate
+	proxyName         string
+	setRulesMu        sync.Mutex
 	// cacheConfig is the global cache config; used to resolve the
 	// cluster-wide coalesce / stale-while-revalidate / ttl defaults a rule
 	// inherits when unset. nil in tests that bypass New.
@@ -104,13 +106,14 @@ func NewJsonRpcHandler(name string, opts ...Option[JsonRpcHandlerOptions]) (*Jso
 		opt(cfg)
 	}
 	handler := &JsonRpcHandler{
-		wsPath:      cfg.WebsocketPath,
-		auth:        cfg.Authenticator,
-		olricClient: cfg.OlricClient,
-		proxyName:   name,
-		cacheConfig: cfg.CacheConfig,
-		cors:        cfg.CORSConfig,
-		now:         time.Now,
+		wsPath:            cfg.WebsocketPath,
+		auth:              cfg.Authenticator,
+		olricClient:       cfg.OlricClient,
+		limiterOperations: cfg.limiterOperations,
+		proxyName:         name,
+		cacheConfig:       cfg.CacheConfig,
+		cors:              cfg.CORSConfig,
+		now:               time.Now,
 	}
 
 	// Setup cache
@@ -120,7 +123,7 @@ func NewJsonRpcHandler(name string, opts ...Option[JsonRpcHandlerOptions]) (*Jso
 	}
 
 	var err error
-	handler.cache, err = newResponseCache[uint64, *JsonRpcMsg](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
+	handler.cache, err = newResponseCache[uint64, *JsonRpcMsg](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cfg.L2Operations, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +366,7 @@ func (h *JsonRpcHandler) SetRules(rules []*JsonRpcRule, defaultAction RuleAction
 			}
 		}
 		keyspace := h.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := newRuleRateLimiter(*r.RateLimit, h.cacheConfig, h.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, h.cacheConfig, h.olricClient, keyspace, h.limiterOperations)
 		if err != nil {
 			h.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
 			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)

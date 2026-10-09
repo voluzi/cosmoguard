@@ -9,7 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/olric"
 )
 
 // Identity is the resolved subject of an authenticated request. Built by
@@ -250,7 +251,7 @@ func NewAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient) (*Auth
 	return newAuthenticator(cfg, olricClient, false)
 }
 
-func newAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient, clustered bool) (*Authenticator, error) {
+func newAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient, clustered bool, gates ...*boundedcall.Gate) (*Authenticator, error) {
 	if cfg == nil || !cfg.Enable {
 		return &Authenticator{}, nil
 	}
@@ -264,7 +265,13 @@ func newAuthenticator(cfg *AuthConfig, olricClient *olric.EmbeddedClient, cluste
 		}
 		if clustered {
 			if replay, ok := store.(*olricReplayStore); ok {
-				replay.operationGate = replayOperations
+				if len(gates) > 0 {
+					replay.operationGate = gates[0]
+				}
+				if replay.operationGate == nil {
+					replay.operationGate = newReplayOperations()
+					replay.ownsGate = true
+				}
 			}
 		}
 		a.replay = store

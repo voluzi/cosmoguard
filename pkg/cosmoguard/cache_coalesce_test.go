@@ -190,7 +190,7 @@ func newCacheTestProxy(t *testing.T, upstreamDelay time.Duration, handler http.H
 	u.healthy.Store(true)
 	pool := newTestHTTPPool("weighted-round-robin", 0, u)
 
-	c, err := newResponseCache[string, CachedResponse](nil, nil, "test", CacheBudget{})
+	c, err := newResponseCache[string, CachedResponse](nil, nil, "test", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
@@ -447,7 +447,7 @@ func TestJSONRPCStaleStartsRefreshBeforeClientWriteCompletes(t *testing.T) {
 // TestJSONRPCSingleCoalesce_OneUpstreamCall proves the JSON-RPC single-request
 // path coalesces concurrent misses for the same method into one upstream call.
 func TestJSONRPCSingleCoalesce_OneUpstreamCall(t *testing.T) {
-	c, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, "t", CacheBudget{})
+	c, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, "t", CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 

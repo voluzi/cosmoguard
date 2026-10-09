@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 	"golang.org/x/time/rate"
 )
 
@@ -84,8 +84,8 @@ type RateLimitConfig struct {
 	Burst int `yaml:"burst,omitempty"`
 	// Scope determines whose request rate the bucket counts.
 	Scope RateLimitScope `yaml:"scope,omitempty" default:"per-ip"`
-	// Deprecated: FailureMode is accepted and ignored, and will be removed in
-	// the next major version. The per-replica limiter decides when the primary fails.
+	// Deprecated: FailureMode is accepted and ignored.
+	// The per-replica limiter decides when the primary fails.
 	FailureMode string `yaml:"failureMode,omitempty"`
 
 	local RateLimiter

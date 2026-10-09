@@ -17,7 +17,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 // spannedServerStream lets us replace the gRPC server stream's context
@@ -83,6 +83,19 @@ type grpcResponseOwner [1]byte
 // slack covers the struct header + StoredAt + map/entry bookkeeping.
 func (g grpcCachedResponse) CacheCost() uint64 {
 	return uint64(len(g.Payload)+grpcMDSize(g.Header)+grpcMDSize(g.Trailer)) + 64
+}
+
+func (g grpcCachedResponse) CacheEncodedSize() uint64 {
+	size := uint64(len(g.Payload)) + 128
+	for _, md := range []metadata.MD{g.Header, g.Trailer} {
+		for k, vals := range md {
+			size += uint64(len(k) + 12)
+			for _, v := range vals {
+				size += uint64(len(v) + 5)
+			}
+		}
+	}
+	return size
 }
 
 func grpcMDSize(md metadata.MD) int {

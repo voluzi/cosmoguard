@@ -36,7 +36,7 @@ type CacheBudget struct {
 	L1MaxBytes uint64
 	// L1MaxItems optionally caps the in-process entry count (0 = no cap).
 	L1MaxItems uint64
-	// L2MaxBytesPerNode caps the olric L2's per-node in-use bytes.
+	// L2MaxBytesPerNode caps response backing allocations per node.
 	L2MaxBytesPerNode uint64
 }
 
@@ -143,4 +143,18 @@ func guardNonZero(v uint64) uint64 {
 		return 1
 	}
 	return v
+}
+
+func responseWorkBytes() uint64 {
+	const mib = uint64(1 << 20)
+	limit, ok := memoryLimitProvider()
+	if !ok || limit == 0 {
+		return 16 * mib
+	}
+	n := limit / 16
+	n = ((n + mib - 1) / mib) * mib
+	if n > 64*mib {
+		return 64 * mib
+	}
+	return n
 }

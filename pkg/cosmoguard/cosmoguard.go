@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -52,7 +53,14 @@ type CosmoGuard struct {
 
 	// Metrics server, populated when Metrics.Enable is true. Per-instance so
 	// multiple CosmoGuards in one process don't clash on http.DefaultServeMux.
-	metricsServer *http.Server
+	metricsServer    *http.Server
+	constructed      atomic.Bool
+	draining         atomic.Bool
+	shutdownOnce     sync.Once
+	shutdownHoldOnce sync.Once
+	shutdownHold     chan struct{}
+	shutdownDone     chan struct{}
+	shutdownErr      error
 
 	// Standalone dashboard server, populated when Dashboard.IsEnabled
 	// is true. Bound on its own port so the metrics endpoint can be
@@ -176,6 +184,11 @@ func nodeEvmWsAddrs(nodes []NodeConfig) ([]string, error) {
 // found. The detected v3 syntax keeps working forever; the warning is
 // cosmetic.
 func NewFromFile(path string) (*CosmoGuard, error) {
+	return NewFromFileContext(context.Background(), path)
+}
+
+// NewFromFileContext cancels startup and leaves the cluster when ctx is canceled.
+func NewFromFileContext(ctx context.Context, path string) (*CosmoGuard, error) {
 	slog.Info("loading config file", "file", path)
 	cfg, err := ReadConfigFromFile(path)
 	if err != nil {
@@ -190,7 +203,7 @@ func NewFromFile(path string) (*CosmoGuard, error) {
 			LogV3Detection(DetectV3Syntax(&rawCfg), path)
 		}
 	}
-	cg, err := New(cfg)
+	cg, err := NewContext(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -207,10 +220,19 @@ func NewFromFile(path string) (*CosmoGuard, error) {
 // PrepareConfig is safe to invoke on an already-prepared config, so the
 // NewFromFile path (which prepared during load) incurs no extra work.
 func New(cfg *Config) (*CosmoGuard, error) {
-	return newWithLookup(cfg, nil)
+	return NewContext(context.Background(), cfg)
+}
+
+// NewContext cancels startup and leaves the cluster when ctx is canceled.
+func NewContext(ctx context.Context, cfg *Config) (*CosmoGuard, error) {
+	return newWithLookupContext(ctx, cfg, nil)
 }
 
 func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
+	return newWithLookupContext(context.Background(), cfg, lookup)
+}
+
+func newWithLookupContext(ctx context.Context, cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	if err := PrepareConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -257,26 +279,16 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// leaks goroutines for the lifetime of the process.
 	success := false
 	defer func() {
-		if success {
-			return
-		}
-		if cosmoGuard.auth != nil {
-			_ = cosmoGuard.auth.Close()
-		}
-		if cosmoGuard.tracingShutdown != nil {
-			_ = cosmoGuard.tracingShutdown(context.Background())
-		}
-		if cosmoGuard.obsReplicator != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cosmoGuard.obsReplicator.Close(ctx)
-			cancel()
-		}
-		if cosmoGuard.cluster != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cosmoGuard.cluster.Close(ctx)
+		if !success {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = cosmoGuard.Shutdown(cleanupCtx)
 			cancel()
 		}
 	}()
+
+	if err := cosmoGuard.startMetricsServer(); err != nil {
+		return nil, fmt.Errorf("error starting metrics server: %w", err)
+	}
 
 	// Set up tracing once. SetupTracing installs the W3C propagator
 	// regardless of cfg.Tracing.Enable so traceparent headers flow
@@ -293,7 +305,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// then split across the response caches that share the pod heap: the L1
 	// share is threaded into each proxy via WithCacheBudget, and the per-DMap
 	// L2 share configures olric's LRU eviction below.
-	cacheBudget := cfg.Cache.ResolveBudget().PerCache(countResponseCaches(cfg))
+	totalCacheBudget := cfg.Cache.ResolveBudget()
+	cacheBudget := totalCacheBudget.PerCache(countResponseCaches(cfg))
 
 	// Spin up the in-process olric daemon. In the zero-config default it
 	// runs embedded-only (loopback, ephemeral ports, no gossip); when
@@ -303,8 +316,12 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// share state across pods. Failure to start is fatal: downstream
 	// consumers assume the runtime is up.
 	cluster, err := newClusterRuntime(clusterRuntimeOptions{
-		Cluster:           cfg.Cache.Cluster,
-		L2MaxBytesPerNode: cacheBudget.L2MaxBytesPerNode,
+		Context:                 ctx,
+		Lookup:                  lookup,
+		Cluster:                 cfg.Cache.Cluster,
+		ResponsePoolBytes:       totalCacheBudget.L2MaxBytesPerNode,
+		ResponseLRUBytesPerDMap: cacheBudget.L2MaxBytesPerNode,
+		L2WorkBytes:             responseWorkBytes(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error setting up cluster runtime: %w", err)
@@ -316,7 +333,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	// seen-jti set across replicas. Calling NewAuthenticator earlier
 	// would pass a nil client and silently fall back to a per-pod
 	// memory store — a JWT could then be replayed once per replica.
-	authn, err := newAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client(), cfg.Cache.Cluster != nil)
+	authn, err := newAuthenticator(&cfg.Auth, cosmoGuard.cluster.Client(), cfg.Cache.Cluster != nil, cluster.replayOperations)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up authenticator: %w", err)
 	}
@@ -374,6 +391,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		cosmoGuard.cfg.GRPC.Protosets,
 		WithCacheConfig[GrpcProxyOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[GrpcProxyOptions](cacheBudget),
+		WithL2Operations[GrpcProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[GrpcProxyOptions](cluster.limiterOperations),
 		WithOlricClient[GrpcProxyOptions](cosmoGuard.cluster.Client()),
 		WithMetricsEnabled[GrpcProxyOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
 		WithAuthenticator[GrpcProxyOptions](cosmoGuard.auth),
@@ -389,6 +408,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		cosmoGuard.cfg.Nodes, "lcd",
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[HttpProxyOptions](cacheBudget),
+		WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 		WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -408,6 +429,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 	cosmoGuard.jsonRpcHandler, err = NewJsonRpcHandler("jsonrpc",
 		WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
+		WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 		WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 		WithWebSocketEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.RPC.WebSocketIsEnabled()),
 		WithWebSocketBackends[JsonRpcHandlerOptions](rpcWSBackends),
@@ -428,6 +451,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		cosmoGuard.cfg.Nodes, "rpc",
 		WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 		WithCacheBudget[HttpProxyOptions](cacheBudget),
+		WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+		withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 		WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 		WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 		WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -454,6 +479,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		cosmoGuard.evmJsonRpcHandler, err = NewJsonRpcHandler("evm_jsonrpc",
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
+			WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 			WithWebSocketEnabled[JsonRpcHandlerOptions](false),
 			WithMetricsEnabled[JsonRpcHandlerOptions](cosmoGuard.cfg.Metrics.IsEnabled()),
@@ -473,6 +500,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 			cosmoGuard.cfg.Nodes, "evm_rpc",
 			WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[HttpProxyOptions](cacheBudget),
+			WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 			WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 			WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 			WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -498,6 +527,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		cosmoGuard.evmJsonRpcWsHandler, err = NewJsonRpcHandler("evm_jsonrpc_ws",
 			WithCacheConfig[JsonRpcHandlerOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[JsonRpcHandlerOptions](cacheBudget),
+			WithL2Operations[JsonRpcHandlerOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[JsonRpcHandlerOptions](cluster.limiterOperations),
 			WithOlricClient[JsonRpcHandlerOptions](cosmoGuard.cluster.Client()),
 			WithWebSocketEnabled[JsonRpcHandlerOptions](true),
 			WithWebSocketConnections[JsonRpcHandlerOptions](cosmoGuard.cfg.EVM.WS.WebSocketConnections),
@@ -518,6 +549,8 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 			cosmoGuard.cfg.Nodes, "evm_rpc_ws",
 			WithCacheConfig[HttpProxyOptions](&cosmoGuard.cfg.Cache),
 			WithCacheBudget[HttpProxyOptions](cacheBudget),
+			WithL2Operations[HttpProxyOptions](cosmoGuard.cluster.ResponseOperations()),
+			withLimiterOperations[HttpProxyOptions](cluster.limiterOperations),
 			WithOlricClient[HttpProxyOptions](cosmoGuard.cluster.Client()),
 			WithServerConfig[HttpProxyOptions](&cosmoGuard.cfg.Server),
 			WithAuthenticator[HttpProxyOptions](cosmoGuard.auth),
@@ -629,26 +662,30 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		}
 	}
 
-	// Construct (but don't yet start) the metrics + ops server. MUST REMAIN
-	// SYNCHRONOUS — Shutdown reads f.metricsServer without a lock, relying on
-	// the happens-before chain: New returns → caller obtains *CosmoGuard →
-	// caller may call Shutdown. If anyone moves this assignment into a
-	// goroutine launched from New the race detector will catch it.
-	//
-	// Each instance gets its own mux so multiple CosmoGuards in one process
-	// (e.g. tests) don't clash on http.DefaultServeMux. The mux serves:
-	//   * /metrics   — Prometheus exposition
-	//   * /healthz   — liveness probe (200 if the process is running)
-	//   * /readyz    — readiness probe; 200 iff every served upstream pool
-	//                  has at least one healthy member. /info's
-	//                  upstreams.healthy mirrors the same gate so the
-	//                  dashboard never says "3/3 healthy" while readiness
-	//                  is failing.
-	//
-	// Gated on Metrics.Enable so operators who explicitly disable the
-	// metrics endpoint don't get an unexpected port bound. Kubernetes
-	// deployments wanting health probes therefore need metrics enabled
-	// (the default).
+	// Standalone read-only dashboard listener. Independent of
+	// Metrics.Enable so an operator who turns metrics off can still
+	// run the dashboard, and vice versa. Construction here keeps the
+	// happens-before chain that Shutdown relies on (see metricsServer
+	// comment above): every server field assigned before New returns.
+	cosmoGuard.dashboardServer = installDashboardServer(cosmoGuard, &cfg.Dashboard, cfg.Host)
+	// Peer-API listener — present only in cluster mode. The fan-out
+	// aggregators on the public dashboard read from this listener on
+	// every cluster peer. Building it AFTER the cluster runtime + the
+	// dashboard observability surfaces means the handlers see a
+	// fully-wired CosmoGuard from the first request.
+	cosmoGuard.peerApiServer = installPeerAPIServer(cosmoGuard)
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("construction canceled: %w", err)
+	}
+	cosmoGuard.constructed.Store(true)
+	success = true
+	return cosmoGuard, nil
+}
+
+// Health probes must listen while the coordinator is still preparing routing.
+func (cosmoGuard *CosmoGuard) startMetricsServer() error {
+	cfg := cosmoGuard.cfg
 	if cfg.Metrics.IsEnabled() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
@@ -712,7 +749,7 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 			// have failed UnhealthyAfter times. Covers gRPC + EVM in
 			// addition to LCD + RPC so a gRPC-only or EVM-only
 			// deployment can't lie its way to ready.
-			if !cosmoGuard.allPoolsReady() {
+			if cosmoGuard.draining.Load() || !cosmoGuard.constructed.Load() || !cosmoGuard.proxiesServing() || !cosmoGuard.allPoolsReady() {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = w.Write([]byte("no healthy upstreams"))
 				return
@@ -729,24 +766,35 @@ func newWithLookup(cfg *Config, lookup LookupFunc) (*CosmoGuard, error) {
 		if cfg.Metrics.WebUI.Enable {
 			installWebUI(mux, cosmoGuard, &cfg.Metrics.WebUI)
 		}
-		cosmoGuard.metricsServer = newMetricsServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Metrics.Port), mux, pprofEnabled)
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !cosmoGuard.constructed.Load() {
+				http.Error(w, "starting", http.StatusServiceUnavailable)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+		cosmoGuard.metricsServer = newMetricsServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Metrics.Port), handler, pprofEnabled)
+		listener, err := net.Listen("tcp", cosmoGuard.metricsServer.Addr)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := cosmoGuard.metricsServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+				slog.Error("metrics server returned", "error", err)
+			}
+		}()
 	}
 
-	// Standalone read-only dashboard listener. Independent of
-	// Metrics.Enable so an operator who turns metrics off can still
-	// run the dashboard, and vice versa. Construction here keeps the
-	// happens-before chain that Shutdown relies on (see metricsServer
-	// comment above): every server field assigned before New returns.
-	cosmoGuard.dashboardServer = installDashboardServer(cosmoGuard, &cfg.Dashboard, cfg.Host)
-	// Peer-API listener — present only in cluster mode. The fan-out
-	// aggregators on the public dashboard read from this listener on
-	// every cluster peer. Building it AFTER the cluster runtime + the
-	// dashboard observability surfaces means the handlers see a
-	// fully-wired CosmoGuard from the first request.
-	cosmoGuard.peerApiServer = installPeerAPIServer(cosmoGuard)
+	return nil
+}
 
-	success = true
-	return cosmoGuard, nil
+func (f *CosmoGuard) proxiesServing() bool {
+	for _, p := range []*HttpProxy{f.lcdProxy, f.rpcProxy, f.evmRpcProxy, f.evmRpcWsProxy} {
+		if p != nil && !p.serving.Load() {
+			return false
+		}
+	}
+	return f.grpcProxy != nil && f.grpcProxy.serving.Load()
 }
 
 // newMetricsServer bounds slow clients on the metrics/ops listener (which
@@ -796,15 +844,6 @@ func (f *CosmoGuard) Run() error {
 	// below, so the race is benign even if it occurred.
 	if f.discovery != nil {
 		f.discovery.Start()
-	}
-
-	if f.metricsServer != nil {
-		go func(srv *http.Server) {
-			slog.Info("starting metrics + ops server (/metrics, /healthz, /readyz)", "address", srv.Addr)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				slog.Error("error starting metrics server", "error", err)
-			}
-		}(f.metricsServer)
 	}
 
 	if f.dashboardServer != nil {
@@ -1391,121 +1430,4 @@ func (f *CosmoGuard) snapshotConfig() *Config {
 	f.configMutex.Lock()
 	defer f.configMutex.Unlock()
 	return f.cfg
-}
-
-// Shutdown stops every proxy and the metrics server, releasing all listeners.
-// Drains in-flight requests via each proxy's Shutdown(ctx), force-closes on
-// deadline expiry, then tears down the upstream pools, caches, rate
-// limiters, auth, and tracing exporter in dependency order. The signal
-// handler in cmd/cosmoguard wires Shutdown into SIGTERM/SIGINT with a
-// configurable grace window.
-//
-// Safe to call multiple times. Returns the first non-nil error encountered.
-func (f *CosmoGuard) Shutdown(ctx context.Context) error {
-	var firstErr error
-	record := func(err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	// Wake the Run() goroutine for cfg-file-less instances (which
-	// would otherwise park on `<-runDone` forever) and let
-	// double-Shutdown stay safe via the sync.Once.
-	if f.runDone != nil {
-		f.runDoneOnce.Do(func() { close(f.runDone) })
-	}
-	// Close the config watcher (if WatchConfigFile is running). Closing
-	// the watcher closes its event channel, which lets the WatchConfigFile
-	// goroutine exit instead of blocking forever on the next receive.
-	// Swap to nil so a second Shutdown call (documented safe) doesn't
-	// double-close the underlying inotify FD.
-	if w := f.configWatcher.Swap(nil); w != nil {
-		record(w.Close())
-	}
-	// Stop the DNS reconciler before tearing down proxies so a
-	// reconcile in flight doesn't try to call AddUpstream on a pool
-	// that's about to close its conns.
-	if f.discovery != nil {
-		f.discovery.Stop()
-	}
-	if f.metricsServer != nil {
-		record(f.metricsServer.Shutdown(ctx))
-	}
-	if f.dashboardServer != nil {
-		record(f.dashboardServer.Shutdown(ctx))
-	}
-	if f.peerApiServer != nil {
-		record(f.peerApiServer.Shutdown(ctx))
-	}
-	if f.lcdProxy != nil {
-		record(f.lcdProxy.Shutdown(ctx))
-	}
-	if f.rpcProxy != nil {
-		record(f.rpcProxy.Shutdown(ctx))
-	}
-	if f.grpcProxy != nil {
-		record(f.grpcProxy.Shutdown(ctx))
-	}
-	if f.evmRpcProxy != nil {
-		record(f.evmRpcProxy.Shutdown(ctx))
-	}
-	if f.evmRpcWsProxy != nil {
-		record(f.evmRpcWsProxy.Shutdown(ctx))
-	}
-	// JSON-RPC handlers own their own cache (separate from the HTTP proxy
-	// cache); reap their goroutines too.
-	if f.jsonRpcHandler != nil {
-		record(f.jsonRpcHandler.Shutdown())
-	}
-	if f.evmJsonRpcHandler != nil {
-		record(f.evmJsonRpcHandler.Shutdown())
-	}
-	if f.evmJsonRpcWsHandler != nil {
-		record(f.evmJsonRpcWsHandler.Shutdown())
-	}
-	// Replay store (if configured) owns its own goroutine / Redis pool.
-	if f.auth != nil {
-		record(f.auth.Close())
-	}
-	// Flush in-flight spans + close the OTLP exporter. No-op when
-	// tracing was never set up. Use a fresh 5s deadline rather than
-	// the caller's ctx: by the time we reach this line the proxy
-	// drain has typically consumed most or all of the operator's
-	// shutdownGrace, and a cancelled flush silently drops buffered
-	// spans — exactly the symptom operators chase under "shutdown
-	// lost the last spans I needed".
-	if f.tracingShutdown != nil {
-		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		record(f.tracingShutdown(flushCtx))
-		cancel()
-	}
-	// Flush the final observability snapshot to the DMap BEFORE we
-	// tear down the olric runtime — otherwise the last 30s of
-	// counters (often the most interesting ones during a planned
-	// rollout) would be lost. Use a fresh 5s deadline rather than
-	// the caller's ctx for the same reason the tracing flush above
-	// does: by the time we reach this line the proxy drain has
-	// typically consumed most of the operator's shutdownGrace, and
-	// a cancelled flush silently drops the snapshot — exactly the
-	// data peers need to seed the restarting pod's dashboard.
-	if f.obsReplicator != nil {
-		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		record(f.obsReplicator.Close(flushCtx))
-		cancel()
-	}
-	// Stop the in-process olric daemon last: every other consumer
-	// (proxies, JSON-RPC handlers, auth) had a chance to drain
-	// in-flight work before we yank the embedded client out from
-	// under them. Same fresh-deadline reasoning as the obs flush and
-	// tracing exporter above: a cancelled ctx makes olric.Shutdown
-	// return immediately and skip the polite memberlist leave, so
-	// peers wait the full failure-detector timeout before redirecting
-	// traffic away from this pod. 5s is well past LeaveTimeout=500ms,
-	// so the cap doesn't cost a healthy shutdown anything.
-	if f.cluster != nil {
-		clusterCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		record(f.cluster.Close(clusterCtx))
-		cancel()
-	}
-	return firstErr
 }

@@ -11,9 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/olric"
 	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
@@ -23,7 +25,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	cosmoguardcache "github.com/voluzi/cosmoguard/v5/pkg/cache"
+	cosmoguardcache "github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 // grpcRateLimitKey derives the bucket key for a gRPC rate-limit
@@ -99,6 +101,7 @@ const (
 )
 
 type GrpcProxy struct {
+	serving       atomic.Bool
 	defaultAction RuleAction
 	rules         []*GrpcRule
 	listener      net.Listener
@@ -136,10 +139,11 @@ type GrpcProxy struct {
 	auth *Authenticator
 	// limiters maps a rule's Fingerprint to its token-bucket. Built
 	// in SetRules from each rule's RateLimit; read under rulesMutex.
-	limiters    map[uint64]RateLimiter
-	olricClient *olric.EmbeddedClient
-	proxyName   string
-	setRulesMu  sync.Mutex
+	limiters          map[uint64]RateLimiter
+	olricClient       *olric.EmbeddedClient
+	limiterOperations *boundedcall.Gate
+	proxyName         string
+	setRulesMu        sync.Mutex
 	// writeLocks serializes cache writes per key (striped). The foreground
 	// single-flight group and the background SWR refresh group are
 	// independent, so both can Set the same key concurrently; without this a
@@ -212,6 +216,7 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	proxy.pool = pool
 	proxy.auth = cfg.Authenticator
 	proxy.olricClient = cfg.OlricClient
+	proxy.limiterOperations = cfg.limiterOperations
 	proxy.proxyName = name
 
 	// Build a cache for gRPC responses. Dispatch (olric / redis / memory)
@@ -223,7 +228,7 @@ func NewGrpcProxy(name, localAddr string, nodes []NodeConfig, upstreamCfg *Upstr
 	if cfg.CacheConfig != nil {
 		cacheOptions = append(cacheOptions, cosmoguardcache.DefaultTTL(cfg.CacheConfig.TTL))
 	}
-	gcache, err := newResponseCache[string, grpcCachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cacheOptions...)
+	gcache, err := newResponseCache[string, grpcCachedResponse](cfg.CacheConfig, cfg.OlricClient, name, cfg.CacheBudget, cfg.L2Operations, cacheOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +274,8 @@ func (p *GrpcProxy) Run() error {
 		p.pool.StartHealthchecks()
 	}
 	p.log.WithField("address", p.listener.Addr().String()).Info("starting grpc proxy")
+	p.serving.Store(true)
+	defer p.serving.Store(false)
 	return p.server.Serve(p.listener)
 }
 
@@ -330,7 +337,7 @@ func (p *GrpcProxy) SetRules(rules []*GrpcRule, defaultAction RuleAction) {
 			}
 		}
 		keyspace := p.proxyName + ":rl:" + strconv.FormatUint(r.Fingerprint, 16)
-		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace)
+		l, err := newRuleRateLimiter(*r.RateLimit, p.cacheConfig, p.olricClient, keyspace, p.limiterOperations)
 		if err != nil {
 			p.log.WithError(err).WithField("rule_priority", r.Priority).Error("rate limiter init failed; using local fallback")
 			newLimiters[r.Fingerprint] = limiterForFailedInit(r.RateLimit, err)

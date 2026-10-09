@@ -13,8 +13,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	cachepkg "github.com/voluzi/cosmoguard/v5/pkg/cache"
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	cachepkg "github.com/voluzi/cosmoguard/v6/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 type batchIDProbeCache struct {
@@ -422,7 +422,7 @@ func TestRejectedDuplicateBatchDoesNotDisruptSingleMissCoalescing(t *testing.T) 
 }
 
 func TestRejectedHTTPBatchCannotPoisonCacheReadByWebSocket(t *testing.T) {
-	responseCache, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, t.Name(), CacheBudget{})
+	responseCache, err := newResponseCache[uint64, *JsonRpcMsg](nil, nil, t.Name(), CacheBudget{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, responseCache.Close()) })
 	rule := &JsonRpcRule{

@@ -62,7 +62,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard"
 )
 
 func init() {

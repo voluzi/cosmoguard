@@ -7,8 +7,8 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
-	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard/testharness"
+	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard/testharness"
 )
 
 // TestI_AuthRequiredNoCredential — a rule with auth.require:true returns

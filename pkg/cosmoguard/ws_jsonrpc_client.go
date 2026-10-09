@@ -215,6 +215,13 @@ func (c *JsonRpcWsClient) SendMsg(msg *JsonRpcMsg) error {
 	return nil
 }
 
+func (c *JsonRpcWsClient) closeGoingAway(deadline time.Time) {
+	if c.conn != nil && !c.IsClosed() {
+		_ = c.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"), minTime(time.Now().Add(time.Second), deadline))
+	}
+	_ = c.Close()
+}
+
 func (c *JsonRpcWsClient) Close() error {
 	c.closeMux.Lock()
 	if c.closed.Load() {

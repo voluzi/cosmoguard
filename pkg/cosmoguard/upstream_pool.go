@@ -9,11 +9,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // HttpUpstream is one logical upstream node, scoped to a single service
@@ -229,11 +232,11 @@ type HttpUpstreamPool struct {
 	// helper expects the service identifier. Keeping them distinct
 	// avoids a future split-naming bug.
 	service string
-	// rewriteDirector is the per-request Director hook from the proxy
+	// rewriteRequest is the per-request rewrite hook from the proxy
 	// constructor; remembered so AddUpstream can build a new upstream
 	// with the same per-rule behavior (header strip etc.) without
 	// requiring the discoverer to re-supply it.
-	rewriteDirector func(*http.Request)
+	rewriteRequest func(*http.Request)
 	// modifyResponse / errorHandler are the per-upstream proxy hooks
 	// the HttpProxy installs on every upstream (CORS application,
 	// circuit-breaker outcome recording). Remembered so AddUpstream
@@ -315,16 +318,16 @@ func (p *HttpUpstreamPool) storeUpstreams(s []*HttpUpstream) {
 func NewHttpUpstreamPool(
 	nodes []NodeConfig,
 	service string,
-	rewriteDirector func(*http.Request),
+	rewriteRequest func(*http.Request),
 	logger *Entry,
 	opts ...HttpUpstreamPoolOption,
 ) (*HttpUpstreamPool, error) {
 	pool := &HttpUpstreamPool{
-		name:            service,
-		service:         service,
-		rewriteDirector: rewriteDirector,
-		log:             logger,
-		strategy:        "weighted-round-robin",
+		name:           service,
+		service:        service,
+		rewriteRequest: rewriteRequest,
+		log:            logger,
+		strategy:       "weighted-round-robin",
 	}
 	for _, opt := range opts {
 		opt(pool)
@@ -333,7 +336,7 @@ func NewHttpUpstreamPool(
 	registerSharedMetrics()
 	initial := make([]*HttpUpstream, 0, len(nodes))
 	for _, n := range nodes {
-		u, err := buildHttpUpstream(n, service, rewriteDirector)
+		u, err := buildHttpUpstream(n, service, rewriteRequest)
 		if err != nil {
 			return nil, err
 		}
@@ -396,7 +399,7 @@ func (p *HttpUpstreamPool) AddUpstream(n NodeConfig) error {
 			return nil // already in pool — discovery loop re-asserted the same IP
 		}
 	}
-	u, err := buildHttpUpstream(n, p.service, p.rewriteDirector)
+	u, err := buildHttpUpstream(n, p.service, p.rewriteRequest)
 	if err != nil {
 		return err
 	}
@@ -525,7 +528,39 @@ func (p *HttpUpstreamPool) RemoveUpstream(name string) {
 	deleteUpstreamHealthy(p.name, name)
 }
 
-func buildHttpUpstream(n NodeConfig, service string, rewriteDirector func(*http.Request)) (*HttpUpstream, error) {
+func finishUpstreamHeaders(r *http.Request, incoming http.Header) {
+	upgrade := ""
+	if httpguts.HeaderValuesContainsToken(r.Header["Connection"], "Upgrade") {
+		upgrade = r.Header.Get("Upgrade")
+	}
+	for _, value := range r.Header["Connection"] {
+		for name := range strings.SplitSeq(value, ",") {
+			r.Header.Del(textproto.TrimString(name))
+		}
+	}
+	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		r.Header.Del(name)
+	}
+	if httpguts.HeaderValuesContainsToken(incoming["Te"], "trailers") {
+		r.Header.Set("Te", "trailers")
+	}
+	if upgrade != "" {
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Upgrade", upgrade)
+	}
+	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		prior, present := r.Header["X-Forwarded-For"]
+		if present && prior == nil {
+			return
+		}
+		if len(prior) > 0 {
+			clientIP = strings.Join(prior, ", ") + ", " + clientIP
+		}
+		r.Header.Set("X-Forwarded-For", clientIP)
+	}
+}
+
+func buildHttpUpstream(n NodeConfig, service string, rewriteRequest func(*http.Request)) (*HttpUpstream, error) {
 	target, err := upstreamHTTPURL(n, service)
 	if err != nil {
 		return nil, err
@@ -538,10 +573,17 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteDirector func(*http.
 	// suffix must stay so the upstream node still routes correctly.
 	hostHeader := hostHeaderForTarget(target)
 	rewriteHost := n.TLS || nodeServiceOverride(n, service) != ""
-	rp := httputil.NewSingleHostReverseProxy(target)
-	origDirector := rp.Director
-	rp.Director = func(r *http.Request) {
-		origDirector(r)
+	rp := &httputil.ReverseProxy{}
+	rp.Rewrite = func(pr *httputil.ProxyRequest) {
+		// Restore headers for the hook, keeping the query sanitized by Rewrite.
+		// Connection-named headers are removed after the hook runs.
+		pr.Out.Header = pr.In.Header.Clone()
+		if pr.Out.Header == nil {
+			pr.Out.Header = make(http.Header)
+		}
+		pr.SetURL(target)
+		r := pr.Out
+		r.Host = pr.In.Host
 		// CosmoGuard is authoritative for forwarded host and protocol
 		// values; clients must not be able to spoof them.
 		if r.Host != "" {
@@ -555,8 +597,8 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteDirector func(*http.
 		if rewriteHost {
 			r.Host = hostHeader
 		}
-		if rewriteDirector != nil {
-			rewriteDirector(r)
+		if rewriteRequest != nil {
+			rewriteRequest(r)
 		}
 		// Propagate the active span as W3C traceparent so the upstream
 		// node (and anything downstream of it) joins the same trace.
@@ -565,6 +607,11 @@ func buildHttpUpstream(n NodeConfig, service string, rewriteDirector func(*http.
 		// inject either the current span or whatever traceparent the
 		// inbound request carried.
 		InjectHTTPHeaders(r.Context(), r.Header)
+		if values, err := url.ParseQuery(r.URL.RawQuery); err != nil {
+			r.URL.RawQuery = values.Encode()
+		}
+		r.Close = false
+		finishUpstreamHeaders(r, pr.In.Header)
 	}
 	w := n.Weight
 	if w < 1 {

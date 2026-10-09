@@ -8,7 +8,7 @@ import (
 
 	"gotest.tools/assert"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 // upstreamRejection is a JSON-RPC error as a node sends it, with the

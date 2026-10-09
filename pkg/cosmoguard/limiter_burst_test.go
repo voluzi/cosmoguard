@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 type trackedLimiter struct {
@@ -50,7 +50,7 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 					if bounded {
 						local, err := NewRateLimiter(cfg, nil, keyspace)
 						require.NoError(t, err)
-						limiter = &boundedRateLimiter{RateLimiter: tracker, local: local, operationGate: limiterOperations}
+						limiter = &boundedRateLimiter{RateLimiter: tracker, local: local, operationGate: a.limiterOperations}
 					}
 					limiters = append(limiters, limiter)
 				}
@@ -104,7 +104,7 @@ func TestClusterLimiterHealthyBurstAdmission(t *testing.T) {
 		})
 	}
 	t.Run("L2 healthy burst", func(t *testing.T) {
-		responseCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, a.Client(), "healthy-burst", CacheBudget{})
+		responseCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, a.Client(), "healthy-burst", CacheBudget{}, a.ResponseOperations())
 		require.NoError(t, err)
 		defer responseCache.Close()
 		var rejected, other atomic.Int32

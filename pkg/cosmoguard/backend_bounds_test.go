@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/olric"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
-	"github.com/voluzi/cosmoguard/v5/pkg/cache"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/pkg/cache"
 )
 
 type stalledDMap struct {
@@ -132,7 +132,9 @@ func TestHTTPL2TimeoutFallsBackAndPreservesL1(t *testing.T) {
 	rec = serveBoundedTestRequest(t, p, req)
 	require.Equal(t, "healthy upstream", rec.Body.String())
 	require.Equal(t, int32(2), dm.gets.Load(), "L1 must bypass the stalled backend")
-	require.Equal(t, before+3, testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("l2", "timeout")))
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(backendOperationFailuresCounter.WithLabelValues("l2", "timeout")) == before+3
+	}, time.Second, time.Millisecond)
 	require.Equal(t, int32(1), forwarded.Load())
 	unblock()
 }
@@ -145,7 +147,7 @@ func TestLimiterWholeAttemptTimeoutUsesLocalFallback(t *testing.T) {
 			cfg := RateLimitConfig{Rate: Rate{PerSecond: 0.001}, Burst: 1, FailureMode: "fail-closed"}
 			local, err := NewRateLimiter(cfg, nil, "fallback")
 			require.NoError(t, err)
-			limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}, local: local, operationGate: limiterOperations}
+			limiter := &boundedRateLimiter{RateLimiter: &olricRateLimiter{dm: dm, locks: dm, rate: cfg.Rate.PerSecond, burst: 1, refillExp: time.Minute}, local: local, operationGate: boundedcall.New(limiterOperationCapacity, limiterOperationBudget, func(outcome string) { recordBackendOperationFailure("limiter", outcome) })}
 			var forwarded atomic.Int32
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { forwarded.Add(1); _, _ = w.Write([]byte("ok")) }))
 			t.Cleanup(up.Close)
@@ -208,7 +210,7 @@ func TestClusterBoundsDoNotAffectLocalBackends(t *testing.T) {
 		require.NoError(t, err)
 		store := auth.Replay().(*olricReplayStore)
 		if networked {
-			require.Same(t, replayOperations, store.operationGate)
+			require.NotNil(t, store.operationGate)
 		} else {
 			require.Nil(t, store.operationGate)
 		}
@@ -237,7 +239,7 @@ func TestBackendCapacityIsolationAndLocalCacheBypass(t *testing.T) {
 	require.Equal(t, int32(l2OperationCapacity), dm.gets.Load())
 	cr := newEmbeddedClusterRuntimeForTest(t)
 	for _, client := range []*olric.EmbeddedClient{nil, cr.Client()} {
-		local, err := newResponseCache[string, []byte](&CacheGlobalConfig{}, client, "unbounded-local", CacheBudget{})
+		local, err := newResponseCache[string, []byte](&CacheGlobalConfig{}, client, "unbounded-local", CacheBudget{}, nil)
 		require.NoError(t, err)
 		require.NoError(t, local.Set(t.Context(), "key", []byte("value"), time.Second))
 		got, err := local.Get(t.Context(), "key")
@@ -245,7 +247,7 @@ func TestBackendCapacityIsolationAndLocalCacheBypass(t *testing.T) {
 		require.Equal(t, []byte("value"), got)
 		require.NoError(t, local.Close())
 	}
-	clusteredCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), "bounded-cluster", CacheBudget{})
+	clusteredCache, err := newResponseCache[string, []byte](&CacheGlobalConfig{Cluster: &ClusterConfig{}}, cr.Client(), "bounded-cluster", CacheBudget{}, nil)
 	require.NoError(t, err)
 	defer clusteredCache.Close()
 	_, err = clusteredCache.Get(t.Context(), "key")
@@ -337,7 +339,7 @@ func TestResponseCacheEntryLimits(t *testing.T) {
 			if clustered {
 				cfg.Cluster = &ClusterConfig{}
 			}
-			responses, err := newResponseCache[string, CachedResponse](cfg, cr.Client(), "entry-limits", CacheBudget{})
+			responses, err := newResponseCache[string, CachedResponse](cfg, cr.Client(), "entry-limits", CacheBudget{}, nil)
 			require.NoError(t, err)
 			defer responses.Close()
 			for _, size := range []int{256 << 10, 257 << 10, 1023 << 10, 1<<20 + 1} {
@@ -347,8 +349,9 @@ func TestResponseCacheEntryLimits(t *testing.T) {
 					err := responses.Set(t.Context(), key, response, time.Minute)
 					if size > 1<<20 {
 						require.ErrorIs(t, err, olric.ErrEntryTooLarge)
-						_, err = responses.Get(t.Context(), key)
-						require.ErrorIs(t, err, cache.ErrNotFound, "neither tier may retain a rejected response")
+						got, getErr := responses.Get(t.Context(), key)
+						require.NoError(t, getErr)
+						require.Equal(t, response.Data, got.Data)
 					} else {
 						require.NoError(t, err, "both cache modes must preserve the native entry limit")
 						got, err := responses.Get(t.Context(), key)

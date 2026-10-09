@@ -8,10 +8,10 @@ import (
 	"math"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 // olricRateLimiter is the cluster-aware token-bucket implementation: the
@@ -214,14 +214,17 @@ func (l *olricRateLimiter) Close() error { return nil }
 const limiterOperationBudget = time.Second
 const limiterOperationCapacity = 2048
 
-var limiterOperations = boundedcall.New(limiterOperationCapacity, limiterOperationBudget, func(outcome string) {
-	recordBackendOperationFailure("limiter", outcome)
-})
+func newLimiterOperations() *boundedcall.Gate {
+	return boundedcall.NewRecovering(limiterOperationCapacity, limiterOperationBudget, func(outcome string) {
+		recordBackendOperationFailure("limiter", outcome)
+	}, func(unavailable bool) { recordBackendUnavailable("limiter", unavailable) })
+}
 
 type boundedRateLimiter struct {
 	RateLimiter
 	local         RateLimiter
 	operationGate *boundedcall.Gate
+	ownsGate      bool
 }
 
 func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
@@ -234,7 +237,7 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 	}
 	res, err := boundedcall.Do(ctx, l.operationGate, func(opCtx context.Context) (decision, error) {
 		allowed, retry, err := l.RateLimiter.Allow(opCtx, key)
-		return decision{allowed, retry}, err
+		return decision{allowed, retry}, limiterOperationError(err)
 	})
 	if ctx.Err() != nil {
 		return false, 0, ctx.Err()
@@ -243,7 +246,9 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 		return res.allowed, res.retry, nil
 	}
 	reason := "backend_error"
-	if errors.Is(err, boundedcall.ErrTimeout) {
+	if errors.Is(err, boundedcall.ErrUnavailable) {
+		reason = "backend_unavailable"
+	} else if errors.Is(err, boundedcall.ErrTimeout) {
 		reason = "timeout"
 	} else if errors.Is(err, boundedcall.ErrRejected) {
 		reason = "capacity"
@@ -251,7 +256,7 @@ func (l *boundedRateLimiter) Allow(ctx context.Context, key string) (bool, time.
 	return localLimiterDecision(ctx, l.local, key, reason, err)
 }
 
-func newRuleRateLimiter(cfg RateLimitConfig, cacheCfg *CacheGlobalConfig, client *olric.EmbeddedClient, keyspace string) (RateLimiter, error) {
+func newRuleRateLimiter(cfg RateLimitConfig, cacheCfg *CacheGlobalConfig, client *olric.EmbeddedClient, keyspace string, gates ...*boundedcall.Gate) (RateLimiter, error) {
 	limiter, err := NewRateLimiter(cfg, client, keyspace)
 	if err != nil {
 		return nil, err
@@ -265,10 +270,17 @@ func newRuleRateLimiter(cfg RateLimitConfig, cacheCfg *CacheGlobalConfig, client
 		}
 	}
 	var gate *boundedcall.Gate
+	ownsGate := false
 	if client != nil && cacheCfg != nil && cacheCfg.Cluster != nil {
-		gate = limiterOperations
+		if len(gates) > 0 {
+			gate = gates[0]
+		}
+		if gate == nil {
+			gate = newLimiterOperations()
+			ownsGate = true
+		}
 	}
-	return &boundedRateLimiter{RateLimiter: limiter, local: local, operationGate: gate}, nil
+	return &boundedRateLimiter{RateLimiter: limiter, local: local, operationGate: gate, ownsGate: ownsGate}, nil
 }
 
 func localLimiterDecision(ctx context.Context, local RateLimiter, key, reason string, backendErr error) (bool, time.Duration, error) {
@@ -283,5 +295,20 @@ func localLimiterDecision(ctx context.Context, local RateLimiter, key, reason st
 }
 
 func (l *boundedRateLimiter) Close() error {
+	if l.ownsGate {
+		l.operationGate.Close()
+	}
 	return errors.Join(l.RateLimiter.Close(), l.local.Close())
+}
+
+func limiterOperationError(err error) error {
+	switch {
+	case errors.Is(err, olric.ErrOperationTimeout):
+		return fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
+	case errors.Is(err, olric.ErrKeyTooLarge), errors.Is(err, olric.ErrEntryTooLarge):
+		return boundedcall.HealthyError(err)
+	default:
+		// Allow reports a healthy allowance, denial or contention as a nil error.
+		return err
+	}
 }

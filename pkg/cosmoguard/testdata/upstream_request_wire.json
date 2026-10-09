@@ -1,0 +1,443 @@
+{
+  "forwarding named in connection": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "get": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "hop headers": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "Te": [
+        "trailers"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "http 1.0": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "incoming https": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "https"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "nil forwarding": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "non-address peer": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "unknown",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "203.0.113.7"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "odd query": {
+    "Method": "GET",
+    "URL": "/status?dup=1\u0026dup=2\u0026empty=\u0026ok=%2F++",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "override host and escaped path": {
+    "Method": "GET",
+    "URL": "/a%2Fb?q=%2f+%20\u0026x=1\u0026x=2",
+    "Host": "upstream.example:port",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "parsed odd query": {
+    "Method": "GET",
+    "URL": "/status?dup=1\u0026dup=2\u0026empty=\u0026ok=%2F++",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "parsed valid query": {
+    "Method": "GET",
+    "URL": "/status?ok=%2f+%20\u0026dup=1\u0026dup=2",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "post": {
+    "Method": "POST",
+    "URL": "/submit?x=1",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "hello",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "Content-Length": [
+        "5"
+      ],
+      "Content-Type": [
+        "text/plain"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ],
+      "X-Multi": [
+        "one",
+        "two"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 5,
+    "TransferEncoding": null
+  },
+  "trailers": {
+    "Method": "POST",
+    "URL": "/submit",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "hello",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "Te": [
+        "trailers"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": {
+      "X-Checksum": null
+    },
+    "ContentLength": -1,
+    "TransferEncoding": [
+      "chunked"
+    ]
+  },
+  "trusted forwarding": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "198.51.100.3",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "Forwarded": [
+        "for=203.0.113.7;proto=https"
+      ],
+      "Via": [
+        "1.1 edge"
+      ],
+      "X-Forwarded-For": [
+        "203.0.113.7, 198.51.100.3, 10.0.0.1, 10.0.0.2"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "untrusted forwarding": {
+    "Method": "GET",
+    "URL": "/status",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.9",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "Forwarded": [
+        "for=203.0.113.7;proto=https"
+      ],
+      "Via": [
+        "1.1 edge"
+      ],
+      "X-Forwarded-For": [
+        "203.0.113.7, 198.51.100.3, 10.0.0.1, 192.0.2.9"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ],
+      "X-Real-Ip": [
+        "203.0.113.8"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  },
+  "upgrade": {
+    "Method": "GET",
+    "URL": "/websocket",
+    "Host": "rpc.public.example:8080",
+    "Protocol": "HTTP/1.1",
+    "SourceIP": "192.0.2.1",
+    "Body": "",
+    "Header": {
+      "Accept-Encoding": [
+        "gzip"
+      ],
+      "Connection": [
+        "Upgrade"
+      ],
+      "Sec-Websocket-Key": [
+        "dGhlIHNhbXBsZSBub25jZQ=="
+      ],
+      "Sec-Websocket-Version": [
+        "13"
+      ],
+      "Te": [
+        "trailers"
+      ],
+      "Upgrade": [
+        "websocket"
+      ],
+      "X-Forwarded-For": [
+        "192.0.2.1"
+      ],
+      "X-Forwarded-Host": [
+        "rpc.public.example:8080"
+      ],
+      "X-Forwarded-Proto": [
+        "http"
+      ]
+    },
+    "Trailer": null,
+    "ContentLength": 0,
+    "TransferEncoding": null
+  }
+}

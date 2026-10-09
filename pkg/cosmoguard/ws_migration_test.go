@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/util"
+	"github.com/voluzi/cosmoguard/v6/pkg/util"
 )
 
 // fakeMigratingConn implements UpstreamConnManager with operator-

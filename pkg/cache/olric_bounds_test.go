@@ -2,15 +2,66 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/olric-data/olric"
 	"github.com/stretchr/testify/require"
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/olric"
 )
+
+type sizedMarshalValue struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (s sizedMarshalValue) CacheEncodedSize() uint64 { return 128 }
+func (s sizedMarshalValue) EncodeMsgpack(enc *msgpack.Encoder) error {
+	s.entered <- struct{}{}
+	<-s.release
+	return enc.EncodeBytes([]byte("shared response"))
+}
+
+func TestOlricCacheSizedMarshalsLeaveReadAdmissionAvailable(t *testing.T) {
+	client := embeddedOlric(t)
+	options := BoundedOperations(128, time.Second, 16<<20, nil, nil)
+	reader, err := NewOlricCache[string, []byte](client, "sized-marshals", options)
+	require.NoError(t, err)
+	require.NoError(t, reader.Set(t.Context(), "read", []byte("cached"), time.Minute))
+	writer, err := NewOlricCache[string, sizedMarshalValue](client, "sized-marshals", options)
+	require.NoError(t, err)
+	const writes = 3
+	entered, release := make(chan struct{}, writes), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	done := make(chan error, writes)
+	for i := range writes {
+		go func() {
+			done <- writer.Set(t.Context(), fmt.Sprint(i), sizedMarshalValue{entered, release}, time.Minute)
+		}()
+	}
+	for range writes {
+		select {
+		case <-entered:
+		case err := <-done:
+			t.Fatalf("a small sized marshal was rejected: %v", err)
+		case <-time.After(time.Second):
+			t.Fatal("small marshals did not enter")
+		}
+	}
+	value, err := reader.Get(t.Context(), "read")
+	require.NoError(t, err)
+	require.Equal(t, []byte("cached"), value)
+	unblock()
+	for range writes {
+		require.NoError(t, <-done)
+	}
+}
 
 type blockedCacheDMap struct {
 	olric.DMap
@@ -45,7 +96,7 @@ func TestOlricCacheBoundsAllOperations(t *testing.T) {
 			defer unblock()
 			dm := &blockedCacheDMap{release: release, entered: make(chan struct{}, 1)}
 			options := defaultOptions()
-			BoundedOperations(1, 10*time.Millisecond, nil)(options)
+			BoundedOperations(1, 10*time.Millisecond, 0, nil, nil)(options)
 			c := &OlricCache[string, []byte]{dm: dm, cfg: options, namespace: "test"}
 			done := make(chan error, 1)
 			go func() {
@@ -87,9 +138,164 @@ func TestOlricCacheRejectsOversizedPayloadBeforePut(t *testing.T) {
 	defer close(release)
 	dm := &blockedCacheDMap{release: release}
 	options := defaultOptions()
-	BoundedOperations(1, 10*time.Millisecond, nil)(options)
+	BoundedOperations(1, 10*time.Millisecond, 0, nil, nil)(options)
 	c := &OlricCache[string, []byte]{dm: dm, cfg: options, namespace: "test"}
 	err := c.Set(t.Context(), "key", make([]byte, 1<<20+1), time.Minute)
 	require.ErrorIs(t, err, olric.ErrEntryTooLarge)
 	require.Zero(t, dm.calls.Load())
+}
+
+type heldReadDMap struct {
+	olric.DMap
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (d heldReadDMap) Get(ctx context.Context, key string) (*olric.GetResponse, error) {
+	d.entered <- struct{}{}
+	<-d.release
+	return d.DMap.Get(ctx, key)
+}
+
+func TestOlricCacheSmallReadsAt250MiProfile(t *testing.T) {
+	client := embeddedOlric(t)
+	option := BoundedOperations(128, 10*time.Second, 16<<20, nil, nil)
+	c, err := NewOlricCache[string, []byte](client, "concurrent-small-reads", option)
+	require.NoError(t, err)
+	require.NoError(t, c.Set(t.Context(), "key", []byte("shared response"), time.Minute))
+	const readers = 7
+	entered := make(chan struct{}, readers)
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	c.dm = heldReadDMap{c.dm, entered, release}
+	done := make(chan error, readers)
+	for range readers {
+		go func() {
+			value, err := c.Get(t.Context(), "key")
+			if err == nil && string(value) != "shared response" {
+				err = fmt.Errorf("wrong shared response: %q", value)
+			}
+			done <- err
+		}()
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	admitted := 0
+wait:
+	for admitted < readers {
+		select {
+		case <-entered:
+			admitted++
+		case <-timer.C:
+			break wait
+		}
+	}
+	require.Equal(t, readers, admitted, "250Mi profile must admit more than two concurrent L2 reads")
+	reserved, capacity := option.OperationBytes()
+	require.LessOrEqual(t, reserved, capacity)
+	unblock()
+	for range readers {
+		require.NoError(t, <-done)
+	}
+	reserved, _ = option.OperationBytes()
+	require.Zero(t, reserved)
+}
+
+var heldReadDecode struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+type heldReadValue struct{ Body []byte }
+
+func (v *heldReadValue) UnmarshalMsgpack(raw []byte) error {
+	heldReadDecode.entered <- struct{}{}
+	<-heldReadDecode.release
+	body, err := DecodeValue[[]byte](raw)
+	v.Body = body
+	return err
+}
+
+func TestOlricCacheShrinksReadsBeforeDecode(t *testing.T) {
+	client := embeddedOlric(t)
+	dm, err := client.NewDMap("read-decode-charge")
+	require.NoError(t, err)
+	encoded, err := EncodeValue([]byte("shared response"))
+	require.NoError(t, err)
+	require.NoError(t, dm.Put(t.Context(), "key", encoded, olric.EX(time.Minute)))
+	option := BoundedOperations(128, 10*time.Second, 16<<20, nil, nil)
+	c, err := NewOlricCache[string, heldReadValue](client, "read-decode-charge", option)
+	require.NoError(t, err)
+	heldReadDecode.entered = make(chan struct{}, 32)
+	heldReadDecode.release = make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(heldReadDecode.release) }) }
+	defer unblock()
+	done := make(chan error, 32)
+	launched, admitted := 0, 0
+	for range 32 {
+		launched++
+		go func() {
+			value, err := c.Get(t.Context(), "key")
+			if err == nil && string(value.Body) != "shared response" {
+				err = fmt.Errorf("wrong decoded response: %q", value.Body)
+			}
+			done <- err
+		}()
+		select {
+		case <-heldReadDecode.entered:
+			admitted++
+		case <-time.After(5 * time.Second):
+		}
+		if admitted != launched {
+			break
+		}
+	}
+	reserved, _ := option.OperationBytes()
+	unblock()
+	var failures []error
+	for range launched {
+		if err := <-done; err != nil {
+			failures = append(failures, err)
+		}
+	}
+	require.Equal(t, 32, admitted, "known small values must free capacity before decoding completes")
+	require.LessOrEqual(t, reserved, uint64(512<<10))
+	require.Empty(t, failures)
+	reserved, _ = option.OperationBytes()
+	require.Zero(t, reserved)
+}
+
+type undersizedMarshalValue struct{ sizedMarshalValue }
+
+func (undersizedMarshalValue) CacheEncodedSize() uint64 { return 1 }
+
+func TestOlricCacheRejectsUnderreportedEncodedSize(t *testing.T) {
+	client := embeddedOlric(t)
+	c, err := NewOlricCache[string, undersizedMarshalValue](client, "underreported-size", BoundedOperations(128, time.Second, 16<<20, nil, nil))
+	require.NoError(t, err)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	close(release)
+	err = c.Set(t.Context(), "key", undersizedMarshalValue{sizedMarshalValue{entered, release}}, time.Minute)
+	require.ErrorIs(t, err, olric.ErrEntryTooLarge)
+	_, err = c.dm.Get(t.Context(), "key")
+	require.ErrorIs(t, err, olric.ErrKeyNotFound)
+}
+
+func TestOlricCacheHasDoesNotDecodeExistingValue(t *testing.T) {
+	client := embeddedOlric(t)
+	c, err := NewOlricCache[string, struct{ Value string }](client, "existence-only", BoundedOperations(1, time.Second, 4<<20, nil, nil))
+	require.NoError(t, err)
+	require.NoError(t, c.dm.Put(t.Context(), "corrupt", []byte{0xc1}))
+	_, err = c.Get(t.Context(), "corrupt")
+	require.Error(t, err)
+	present, err := c.Has(t.Context(), "corrupt")
+	require.NoError(t, err)
+	require.True(t, present)
+	present, err = c.Has(t.Context(), "missing")
+	require.NoError(t, err)
+	require.False(t, present)
 }

@@ -1,0 +1,691 @@
+package olricstore
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"log"
+	"regexp"
+	"sync"
+	"time"
+
+	"github.com/voluzi/olric/pkg/storage"
+
+	"github.com/voluzi/cosmoguard/v6/internal/bytebudget"
+)
+
+var ErrCapacity = errors.New("olric response storage capacity exhausted")
+var ErrClosed = errors.New("olric storage closed")
+var ErrInvalidEntry = errors.New("invalid native olric entry")
+
+type Policy uint8
+
+const (
+	Response Policy = iota
+	Security
+)
+const fragmentCharge = 512
+const headerSize = 48
+
+type PoolStats struct {
+	Capacity, Allocated, Inuse, Entries, ForkRejected, PutRejected, RawRejected, ImportDropped uint64
+	Codec                                                                                      bytebudget.Snapshot
+	LastCompactionUnixMilli                                                                    uint64
+}
+
+// Observer is called outside the allocator lock.
+type Observer func(string)
+type Pool struct {
+	mu                                                                   sync.Mutex
+	arena                                                                arena
+	policy                                                               Policy
+	observer                                                             Observer
+	engines                                                              *Engine
+	nextID, fragments                                                    uint64
+	used, entries, forkRejected, putRejected, rawRejected, importDropped uint64
+	codec                                                                *bytebudget.Budget
+	closed                                                               bool
+	lastCompactionUnixMilli                                              uint64
+}
+type Engine struct {
+	exportID               int
+	exportLow, exportHigh  uint64
+	p                      *Pool
+	next                   *Engine
+	id                     uint64
+	buckets                []uint64
+	inlineBuckets          [32]uint64
+	indexBytes             uint64
+	head, tail, generation uint64
+	bytes, length          int
+	earliestExpiry         int64
+	closed, destroyed      bool
+}
+
+var _ storage.Engine = (*Engine)(nil)
+
+func NewPool(limit uint64, policy Policy, observer Observer) *Pool {
+	return &Pool{arena: arena{limit: limit}, policy: policy, observer: observer, codec: bytebudget.New(2 * codecCharge)}
+}
+func (p *Pool) Close(_ context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	for p.engines != nil {
+		p.engines.destroyLocked()
+	}
+	return nil
+}
+func (p *Pool) Snapshot() PoolStats {
+	p.mu.Lock()
+	s := PoolStats{Capacity: p.arena.limit, Allocated: p.arena.allocated, Inuse: p.used, Entries: p.entries, ForkRejected: p.forkRejected, PutRejected: p.putRejected, RawRejected: p.rawRejected, ImportDropped: p.importDropped, LastCompactionUnixMilli: p.lastCompactionUnixMilli}
+	p.mu.Unlock()
+	s.Codec = p.codec.Snapshot()
+	return s
+}
+func NewEngine(p *Pool) *Engine             { return &Engine{p: p} }
+func (e *Engine) SetConfig(*storage.Config) {}
+func (e *Engine) SetLogger(*log.Logger)     {}
+func (e *Engine) Name() string              { return "cosmoguard-slab" }
+func (e *Engine) NewEntry() storage.Entry   { return NewEntry() }
+func (e *Engine) Start() error              { e.p.mu.Lock(); defer e.p.mu.Unlock(); return e.readyLocked() }
+func (e *Engine) readyLocked() error {
+	if e.closed || e.destroyed || e.p.closed {
+		return ErrClosed
+	}
+	return nil
+}
+func (e *Engine) registerLocked() error {
+	if err := e.readyLocked(); err != nil {
+		return err
+	}
+	if e.id != 0 {
+		return nil
+	}
+	if !e.p.arena.reserve(fragmentCharge) {
+		return ErrCapacity
+	}
+	e.p.nextID++
+	e.id = e.p.nextID
+	e.buckets = e.inlineBuckets[:]
+	e.next = e.p.engines
+	e.p.engines = e
+	e.p.used += fragmentCharge
+	e.p.fragments++
+	return nil
+}
+func (e *Engine) Fork(*storage.Config) (storage.Engine, error) {
+	e.p.mu.Lock()
+	if err := e.readyLocked(); err != nil {
+		e.p.mu.Unlock()
+		return nil, err
+	}
+	if !e.p.arena.reserve(fragmentCharge) {
+		e.p.forkRejected++
+		e.p.mu.Unlock()
+		if e.p.observer != nil {
+			e.p.observer("fork")
+		}
+		return nil, ErrCapacity
+	}
+	e.p.nextID++
+	child := &Engine{p: e.p, id: e.p.nextID, next: e.p.engines}
+	child.buckets = child.inlineBuckets[:]
+	e.p.engines = child
+	e.p.used += fragmentCharge
+	e.p.fragments++
+	e.p.mu.Unlock()
+	return child, nil
+}
+func field(b []byte, off int) uint64       { return binary.LittleEndian.Uint64(b[off : off+8]) }
+func setField(b []byte, off int, n uint64) { binary.LittleEndian.PutUint64(b[off:off+8], n) }
+func rawRecord(b []byte) []byte {
+	return b[headerSize : headerSize+int(binary.LittleEndian.Uint32(b[40:44]))]
+}
+func blockCharge(b []byte) int { return int(binary.LittleEndian.Uint32(b[44:48])) }
+func (e *Engine) bucket(h uint64) int {
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return int(h & uint64(len(e.buckets)-1))
+}
+func (e *Engine) growBucketsLocked() error {
+	if e.length < len(e.buckets)*4 {
+		return nil
+	}
+	charge := uint64(len(e.buckets)) * 16
+	// Reserve both arrays during rehash; each growth handles at most four
+	// records per old bucket on average. Failed growth leaves the index intact.
+	if !e.p.arena.reserve(charge) {
+		return ErrCapacity
+	}
+	e.buckets = make([]uint64, len(e.buckets)*2)
+	for loc := e.head; loc != 0; loc = field(e.p.arena.block(loc), 24) {
+		b := e.p.arena.block(loc)
+		bucket := e.bucket(field(b, 0))
+		setField(b, 8, e.buckets[bucket])
+		e.buckets[bucket] = loc
+	}
+	e.p.arena.allocated -= e.indexBytes
+	e.p.used += charge - e.indexBytes
+	e.bytes += int(charge - e.indexBytes)
+	e.indexBytes = charge
+	return nil
+}
+func (e *Engine) findLocked(h uint64) (uint64, uint64) {
+	var prev uint64
+	if len(e.buckets) == 0 {
+		return 0, 0
+	}
+	for loc := e.buckets[e.bucket(h)]; loc != 0; {
+		b := e.p.arena.block(loc)
+		if field(b, 0) == h {
+			return loc, prev
+		}
+		prev = loc
+		loc = field(b, 8)
+	}
+	return 0, prev
+}
+func (e *Engine) unlinkOrderLocked(loc uint64) {
+	b := e.p.arena.block(loc)
+	prev, next := field(b, 16), field(b, 24)
+	if prev == 0 {
+		e.head = next
+	} else {
+		setField(e.p.arena.block(prev), 24, next)
+	}
+	if next == 0 {
+		e.tail = prev
+	} else {
+		setField(e.p.arena.block(next), 16, prev)
+	}
+}
+func (e *Engine) appendOrderLocked(loc uint64) {
+	b := e.p.arena.block(loc)
+	setField(b, 16, e.tail)
+	setField(b, 24, 0)
+	e.generation++
+	setField(b, 32, e.generation)
+	if e.tail == 0 {
+		e.head = loc
+	} else {
+		setField(e.p.arena.block(e.tail), 24, loc)
+	}
+	e.tail = loc
+}
+func (e *Engine) removeLocked(loc, prev uint64) {
+	b := e.p.arena.block(loc)
+	h, next, size := field(b, 0), field(b, 8), blockCharge(b)
+	if prev == 0 {
+		e.buckets[e.bucket(h)] = next
+	} else {
+		setField(e.p.arena.block(prev), 8, next)
+	}
+	e.unlinkOrderLocked(loc)
+	e.bytes -= size
+	e.length--
+	e.p.used -= uint64(size)
+	e.p.entries--
+	e.p.arena.free(loc, size)
+}
+func expiredRaw(b []byte, now int64) bool {
+	k := int(b[0])
+	ttl := int64(binary.BigEndian.Uint64(b[1+k : 9+k]))
+	return ttl != 0 && ttl <= now
+}
+
+// earliestExpiry is conservative after removal or extension; at most one extra
+// sweep recomputes it. Never skip an earlier deadline inserted by a mutation.
+func (e *Engine) trackExpiryLocked(raw []byte) {
+	k := int(raw[0])
+	ttl := int64(binary.BigEndian.Uint64(raw[1+k : 9+k]))
+	if ttl != 0 && (e.earliestExpiry == 0 || ttl < e.earliestExpiry) {
+		e.earliestExpiry = ttl
+	}
+}
+func (e *Engine) sweepLocked(now int64) {
+	if e.earliestExpiry == 0 || now < e.earliestExpiry {
+		return
+	}
+	e.earliestExpiry = 0
+	for _, first := range e.buckets {
+		var prev uint64
+		for loc := first; loc != 0; {
+			b := e.p.arena.block(loc)
+			next := field(b, 8)
+			if expiredRaw(rawRecord(b), now) {
+				e.removeLocked(loc, prev)
+			} else {
+				e.trackExpiryLocked(rawRecord(b))
+				prev = loc
+			}
+			loc = next
+		}
+	}
+}
+func (e *Engine) Put(h uint64, v storage.Entry) error {
+	if len(v.Key()) > 255 {
+		return storage.ErrKeyTooLarge
+	}
+	if len(v.Value()) >= MaxEntryBytes-29-len(v.Key()) {
+		return storage.ErrEntryTooLarge
+	}
+	return e.put(h, v.Encode(), false)
+}
+func (e *Engine) PutRaw(h uint64, b []byte) error {
+	if len(b) >= MaxEntryBytes {
+		return storage.ErrEntryTooLarge
+	}
+	if !validRaw(b) {
+		return ErrInvalidEntry
+	}
+	return e.put(h, b, true)
+}
+func (e *Engine) put(h uint64, v []byte, isRaw bool) error {
+	err := func() error {
+		e.p.mu.Lock()
+		defer e.p.mu.Unlock()
+		err := e.putLocked(h, v)
+		if err == nil && !isRaw {
+			loc, _ := e.findLocked(h)
+			raw := rawRecord(e.p.arena.block(loc))
+			binary.BigEndian.PutUint64(raw[17+int(raw[0]):], uint64(time.Now().UnixNano()))
+		}
+		if errors.Is(err, ErrCapacity) {
+			if isRaw {
+				e.p.rawRejected++
+			} else {
+				e.p.putRejected++
+			}
+		}
+		return err
+	}()
+	if errors.Is(err, ErrCapacity) && e.p.observer != nil {
+		path := "put"
+		if isRaw {
+			path = "put_raw"
+		}
+		e.p.observer(path)
+	}
+	return err
+}
+func (e *Engine) putLocked(h uint64, v []byte) error {
+	if err := e.registerLocked(); err != nil {
+		return err
+	}
+	size := leafSize
+	for size < len(v)+headerSize {
+		size *= 2
+	}
+	loc, prev := e.findLocked(h)
+	if loc == 0 {
+		if err := e.growBucketsLocked(); err != nil {
+			return err
+		}
+	}
+	if loc != 0 && blockCharge(e.p.arena.block(loc)) == size {
+		b := e.p.arena.block(loc)
+		e.unlinkOrderLocked(loc)
+		binary.LittleEndian.PutUint32(b[40:44], uint32(len(v)))
+		copy(b[headerSize:], v)
+		e.trackExpiryLocked(v)
+		e.appendOrderLocked(loc)
+		return nil
+	}
+	dest, ok := e.p.arena.allocate(size)
+	if !ok {
+		return ErrCapacity
+	}
+	if loc != 0 {
+		e.removeLocked(loc, prev)
+	}
+	b := e.p.arena.block(dest)
+	setField(b, 0, h)
+	setField(b, 8, e.buckets[e.bucket(h)])
+	binary.LittleEndian.PutUint32(b[40:44], uint32(len(v)))
+	binary.LittleEndian.PutUint32(b[44:48], uint32(size))
+	copy(b[headerSize:], v)
+	e.trackExpiryLocked(v)
+	e.buckets[e.bucket(h)] = dest
+	e.appendOrderLocked(dest)
+	e.bytes += size
+	e.length++
+	e.p.used += uint64(size)
+	e.p.entries++
+	return nil
+}
+func (e *Engine) lookupLocked(h uint64) ([]byte, error) {
+	if err := e.readyLocked(); err != nil {
+		return nil, err
+	}
+	loc, _ := e.findLocked(h)
+	if loc == 0 {
+		return nil, storage.ErrKeyNotFound
+	}
+	return rawRecord(e.p.arena.block(loc)), nil
+}
+func (e *Engine) Get(h uint64) (storage.Entry, error) {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	b, err := e.lookupLocked(h)
+	if err != nil {
+		return nil, err
+	}
+	v := NewEntry()
+	// Native Get returns the pre-touch last access while updating stored metadata.
+	v.Decode(append([]byte(nil), b...))
+	k := int(b[0])
+	binary.BigEndian.PutUint64(b[17+k:25+k], uint64(time.Now().UnixNano()))
+	loc, _ := e.findLocked(h)
+	e.unlinkOrderLocked(loc)
+	e.appendOrderLocked(loc)
+	return v, nil
+}
+func (e *Engine) GetRaw(h uint64) ([]byte, error) {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	b, err := e.lookupLocked(h)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), b...), nil
+}
+func (e *Engine) GetTTL(h uint64) (int64, error) {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	b, err := e.lookupLocked(h)
+	if err != nil {
+		return 0, err
+	}
+	k := int(b[0])
+	return int64(binary.BigEndian.Uint64(b[1+k : 9+k])), nil
+}
+func (e *Engine) GetLastAccess(h uint64) (int64, error) {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	b, err := e.lookupLocked(h)
+	if err != nil {
+		return 0, err
+	}
+	k := int(b[0])
+	return int64(binary.BigEndian.Uint64(b[17+k : 25+k])), nil
+}
+func (e *Engine) GetKey(h uint64) (string, error) {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	b, err := e.lookupLocked(h)
+	if err != nil {
+		return "", err
+	}
+	return string(b[1 : 1+int(b[0])]), nil
+}
+func (e *Engine) UpdateTTL(h uint64, v storage.Entry) error {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	b, err := e.lookupLocked(h)
+	if err != nil {
+		return err
+	}
+	k := int(b[0])
+	binary.BigEndian.PutUint64(b[1+k:9+k], uint64(v.TTL()))
+	e.trackExpiryLocked(b)
+	binary.BigEndian.PutUint64(b[9+k:17+k], uint64(v.Timestamp()))
+	binary.BigEndian.PutUint64(b[17+k:25+k], uint64(time.Now().UnixNano()))
+	loc, _ := e.findLocked(h)
+	e.unlinkOrderLocked(loc)
+	e.appendOrderLocked(loc)
+	return nil
+}
+func (e *Engine) Delete(h uint64) error {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	if err := e.readyLocked(); err != nil {
+		return err
+	}
+	loc, prev := e.findLocked(h)
+	if loc == 0 {
+		return nil
+	}
+	e.removeLocked(loc, prev)
+	return nil
+}
+func (e *Engine) Check(h uint64) bool {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	_, err := e.lookupLocked(h)
+	return err == nil
+}
+func (e *Engine) Stats() storage.Stats {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	if e.destroyed || e.id == 0 {
+		return storage.Stats{}
+	}
+	n := e.p.fragments
+	backing := e.p.arena.allocated - n*fragmentCharge
+	s := storage.Stats{Allocated: fragmentCharge + int(backing/n), Inuse: e.bytes + fragmentCharge, Length: e.length, NumTables: int(e.p.arena.slabs / n)}
+	// Assign division remainders once so fragment totals equal the pool's backing.
+	if e == e.p.engines {
+		s.Allocated += int(backing % n)
+		s.NumTables += int(e.p.arena.slabs % n)
+	}
+	return s
+}
+
+type token struct{ hash, generation uint64 }
+
+type scanToken struct {
+	token
+	cursor uint64
+}
+
+// Scan cursors encode a bucket and chain position. Reads change recency only;
+// writes may change the index, so a scan concurrent with writes is best effort.
+func (e *Engine) scanBatch(cursor uint64) ([32]scanToken, int) {
+	var out [32]scanToken
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	if e.readyLocked() != nil {
+		return out, 0
+	}
+	bucket, position := cursor>>32, uint64(uint32(cursor))
+	n := 0
+	for ; bucket < uint64(len(e.buckets)); bucket++ {
+		loc := e.buckets[bucket]
+		for skip := uint64(0); skip < position && loc != 0; skip++ {
+			loc = field(e.p.arena.block(loc), 8)
+		}
+		for loc != 0 {
+			b := e.p.arena.block(loc)
+			position++
+			next := bucket<<32 | position
+			out[n] = scanToken{token{field(b, 0), field(b, 32)}, next}
+			n++
+			loc = field(b, 8)
+			if n == len(out) {
+				return out, n
+			}
+		}
+		position = 0
+	}
+	return out, n
+}
+
+func (e *Engine) batch(after, high uint64, resume token) ([32]token, int, token) {
+	var out [32]token
+	var n int
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	if e.readyLocked() != nil {
+		return out, 0, token{}
+	}
+	start := e.head
+	if resume.generation != 0 {
+		// Callbacks may delete or move the next entry between batches.
+		loc, _ := e.findLocked(resume.hash)
+		if loc != 0 && field(e.p.arena.block(loc), 32) == resume.generation {
+			start = loc
+		}
+	}
+	for loc := start; loc != 0; loc = field(e.p.arena.block(loc), 24) {
+		b := e.p.arena.block(loc)
+		g := field(b, 32)
+		if g > after && g <= high {
+			out[n] = token{field(b, 0), g}
+			n++
+			if n == len(out) {
+				if next := field(b, 24); next != 0 {
+					b = e.p.arena.block(next)
+					return out, n, token{field(b, 0), field(b, 32)}
+				}
+				return out, n, token{}
+			}
+		}
+	}
+	return out, n, token{}
+}
+func (e *Engine) copyToken(t token, matchGeneration bool) (storage.Entry, bool) {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	if e.readyLocked() != nil {
+		return nil, false
+	}
+	loc, _ := e.findLocked(t.hash)
+	if loc == 0 {
+		return nil, false
+	}
+	b := e.p.arena.block(loc)
+	if matchGeneration && field(b, 32) != t.generation {
+		return nil, false
+	}
+	v := NewEntry()
+	// Range and Scan expose a full entry after unlocking; its payload must be owned.
+	v.Decode(append([]byte(nil), rawRecord(b)...))
+	return v, true
+}
+func (e *Engine) highWater() uint64 { e.p.mu.Lock(); defer e.p.mu.Unlock(); return e.generation }
+func (e *Engine) walk(after, high uint64, f func(token) bool) {
+	var resume token
+	for {
+		batch, n, next := e.batch(after, high, resume)
+		if n == 0 {
+			return
+		}
+		for _, t := range batch[:n] {
+			after = t.generation
+			if !f(t) {
+				return
+			}
+		}
+		if next.generation == 0 {
+			return
+		}
+		resume = next
+	}
+}
+func (e *Engine) RangeHKey(f func(uint64) bool) {
+	e.walk(0, e.highWater(), func(t token) bool {
+		e.p.mu.Lock()
+		loc, _ := e.findLocked(t.hash)
+		ok := e.readyLocked() == nil && loc != 0 && field(e.p.arena.block(loc), 32) == t.generation
+		e.p.mu.Unlock()
+		return !ok || f(t.hash)
+	})
+}
+func (e *Engine) Range(f func(uint64, storage.Entry) bool) {
+	e.walk(0, e.highWater(), func(t token) bool {
+		v, ok := e.copyToken(t, true)
+		return !ok || f(t.hash, v)
+	})
+}
+func (e *Engine) Scan(c uint64, n int, f func(storage.Entry) bool) (uint64, error) {
+	return e.scan(c, n, nil, f)
+}
+func (e *Engine) ScanRegexMatch(c uint64, match string, n int, f func(storage.Entry) bool) (uint64, error) {
+	r, err := regexp.Compile(match)
+	if err != nil {
+		return 0, err
+	}
+	return e.scan(c, n, r, f)
+}
+func (e *Engine) scan(c uint64, n int, r *regexp.Regexp, f func(storage.Entry) bool) (uint64, error) {
+	err := func() error {
+		e.p.mu.Lock()
+		defer e.p.mu.Unlock()
+		return e.readyLocked()
+	}()
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, nil
+	}
+	for {
+		batch, count := e.scanBatch(c)
+		if count == 0 {
+			return 0, nil
+		}
+		for _, t := range batch[:count] {
+			c = t.cursor
+			v, ok := e.copyToken(t.token, false)
+			if !ok || (r != nil && !r.MatchString(v.Key())) {
+				continue
+			}
+			n--
+			if !f(v) || n == 0 {
+				return c, nil
+			}
+		}
+	}
+}
+func (e *Engine) Compaction() (bool, error) {
+	e.p.mu.Lock()
+	defer e.p.mu.Unlock()
+	if err := e.readyLocked(); err != nil {
+		return false, err
+	}
+	now := time.Now().UnixMilli()
+	e.sweepLocked(now)
+	e.p.lastCompactionUnixMilli = uint64(now)
+	return true, nil
+}
+func (e *Engine) Close() error { e.p.mu.Lock(); defer e.p.mu.Unlock(); e.closed = true; return nil }
+func (e *Engine) destroyLocked() {
+	if e.destroyed {
+		return
+	}
+	for i := range e.buckets {
+		for e.buckets[i] != 0 {
+			e.removeLocked(e.buckets[i], 0)
+		}
+	}
+	if e.id != 0 {
+		var prev *Engine
+		for x := e.p.engines; x != nil; x = x.next {
+			if x == e {
+				if prev == nil {
+					e.p.engines = e.next
+				} else {
+					prev.next = e.next
+				}
+				break
+			}
+			prev = x
+		}
+		e.p.arena.allocated -= fragmentCharge
+		e.p.used -= fragmentCharge
+		e.p.fragments--
+	}
+	e.p.arena.allocated -= e.indexBytes
+	e.p.used -= e.indexBytes
+	e.bytes = 0
+	e.indexBytes = 0
+	e.buckets = nil
+	e.closed = true
+	e.destroyed = true
+	e.next = nil
+}
+func (e *Engine) Destroy() error { e.p.mu.Lock(); defer e.p.mu.Unlock(); e.destroyLocked(); return nil }

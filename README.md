@@ -11,10 +11,10 @@ port), caches deterministic responses, throttles abusive traffic, fans
 out to multiple upstream nodes with active healthchecks, and authenticates
 clients via API keys / JWT / external validators.
 
-The current major version is **v4**. See the
-[release notes](https://github.com/voluzi/cosmoguard/releases) for what
-changed from v3; existing v3 configs continue to work — run
-`cosmoguard migrate-config` to rewrite them in v4 form when ready.
+The v6 module path is `github.com/voluzi/cosmoguard/v6`. See the
+[v6 upgrade notes](docs/upgrade-v6.md) for Go API changes, bounded L2 behavior
+and rolling replacement/rollback requirements. The configuration schema retains
+v5 compatibility; v3 configurations can use `cosmoguard migrate-config`.
 
 ## Highlights
 
@@ -28,9 +28,10 @@ changed from v3; existing v3 configs continue to work — run
   preservation, configurable header allowlists. Backed by an embedded
   olric distributed cache with an in-process L1 — single binary,
   no external dependency, shared automatically across replicas when
-  cluster mode is on. Clustered L2 waits are bounded at 100ms and fall
+  cluster mode is on. L2 waits are bounded at 100ms in every deployment mode and fall
   back upstream on timeout or saturation; 128 slots bound outstanding
-  L2 calls. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
+  L2 calls and a shared byte gate bounds controlled copies. Response slabs share
+  one replica-inclusive node cap, with a separate security pool. Responses still populate L1 during L2 timeout or rejection, and HTTP misses
   retain coalescing; L1 hits bypass L2.
 - **Rate limiting** with `per-ip`, `global`, and (post-auth) `per-
   identity` scopes. Buckets are sharded across replicas through the
@@ -43,7 +44,7 @@ changed from v3; existing v3 configs continue to work — run
   rate, plus local bursts around transitions. Embedded backend errors also use
   a local decision, with no new pool or wait.
   `rateLimit.failureMode` is deprecated and ignored; the per-replica limiter
-  decides on backend failure. The key remains accepted and validated and will be removed in the next major version.
+  decides on backend failure. The key remains accepted and validated in v6.
   See [cluster behavior](CONFIG.md#cluster-mode) for limits and metrics.
 - **Authentication**: api-key, JWT (HMAC + RSA/ECDSA/Ed25519), RFC 7662
   token introspection, and an external-validator method for
@@ -72,12 +73,20 @@ changed from v3; existing v3 configs continue to work — run
   peers for a single cluster-wide view. OpenTelemetry tracing and
   Prometheus metrics round out the surface.
 
-Cluster startup has a 45s default budget; `/healthz` on the metrics port starts
-answering after the bootstrap gate. The chart's startup probe allows 60s; other
-manifests must allow at least 60s. Non-clustered request paths add no wait bounds
-or pools and share the startup default. Embedded tiered writes preserve their
-existing behavior: L2 errors leave L1 untouched. The deprecated rate-limit key
-is ignored in every deployment mode.
+The enabled metrics/ops listener starts during construction: `/healthz` answers
+while Olric bootstraps, and `/readyz` remains unavailable until the proxy
+listeners serve and their upstream pools are healthy. Discovery and daemon start
+have a 45s default budget. A joiner keeps waiting for routing while its cluster
+has quorum and the coordinator answers authenticated PINGs; 45s without that
+evidence aborts startup. Total bootstrap waiting is capped at ten minutes from
+each runtime constructor's start. SIGTERM cancels startup and shuts down the daemon, so
+it can announce its leave. Tiered writes fill L1 before L2 and retain that entry
+on every L2 failure. The deprecated rate-limit key is ignored
+in every deployment mode.
+
+Go embedders can cancel construction with `NewContext` or `NewFromFileContext`.
+`New` and `NewFromFile` now start the enabled metrics/ops listener; call `Shutdown`
+even when you have not called `Run`.
 
 ## Installation
 
@@ -92,7 +101,7 @@ curl -s https://get.voluzi.com/cosmoguard! | bash
 ```
 
 ### Prerequisites
-- Go 1.25+ (for building from source).
+- Go 1.26.9+ (for building from source).
 
 ### Docker
 

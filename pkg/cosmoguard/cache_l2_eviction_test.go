@@ -3,7 +3,7 @@ package cosmoguard
 import (
 	"testing"
 
-	"github.com/olric-data/olric/config"
+	"github.com/voluzi/olric/config"
 )
 
 // TestApplyL2EvictionConfig_ExemptsSecurityDMaps is the security-critical

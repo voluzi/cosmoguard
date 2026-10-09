@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -10,15 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/voluzi/cosmoguard/v5/pkg/cosmoguard"
+	"github.com/voluzi/cosmoguard/v6/pkg/cosmoguard"
 )
 
-const (
-	defaultConfigFileName = "cosmoguard.yaml"
-	shutdownGrace         = 30 * time.Second
-)
+const defaultConfigFileName = "cosmoguard.yaml"
 
 // Top-level flags live on the root FlagSet (flag.CommandLine). Subcommands
 // each get their own FlagSet so subcommand-specific flags don't pollute
@@ -179,17 +176,17 @@ func main() {
 		return
 	}
 
-	f, err := cosmoguard.NewFromFile(configFile)
+	startupCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	f, err := cosmoguard.NewFromFileContext(startupCtx, configFile)
 	if err != nil {
+		if startupCanceledBySignal(startupCtx, err) {
+			slog.Info("startup canceled by shutdown signal", "error", err)
+			return
+		}
 		slog.Error("cosmoguard startup failed", "error", err)
 		os.Exit(1)
 	}
-
-	// Trap SIGTERM/SIGINT for graceful shutdown. On signal: stop accepting
-	// new connections, drain in-flight requests up to shutdownGrace,
-	// release caches/limiters, then exit.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	runErrCh := make(chan error, 1)
 	go func() { runErrCh <- f.Run() }()
@@ -205,18 +202,14 @@ func main() {
 		// operator needs to diagnose the failure — were lost.
 		if err != nil {
 			slog.Error("cosmoguard.Run returned", "error", err)
-			ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-			if sherr := f.Shutdown(ctx); sherr != nil {
+			if sherr := f.Shutdown(context.Background()); sherr != nil {
 				slog.Error("shutdown after Run error returned", "error", sherr)
 			}
-			cancel()
 			os.Exit(1)
 		}
-	case sig := <-sigCh:
-		slog.Info("shutdown signal received, draining", "signal", sig.String())
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-		defer cancel()
-		if err := f.Shutdown(ctx); err != nil {
+	case <-startupCtx.Done():
+		slog.Info("shutdown signal received, draining")
+		if err := f.DrainAndShutdown(context.Background()); err != nil {
 			slog.Error("shutdown returned error", "error", err)
 			os.Exit(1)
 		}
@@ -251,4 +244,8 @@ func setupSlog(levelStr, format string) {
 		handler = slog.NewJSONHandler(os.Stderr, opts)
 	}
 	slog.SetDefault(slog.New(handler))
+}
+
+func startupCanceledBySignal(ctx context.Context, err error) bool {
+	return errors.Is(ctx.Err(), context.Canceled) && errors.Is(err, context.Canceled)
 }

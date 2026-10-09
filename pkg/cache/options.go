@@ -3,7 +3,8 @@ package cache
 import (
 	"time"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/bytebudget"
 )
 
 const (
@@ -17,8 +18,10 @@ func defaultOptions() *Options {
 }
 
 type Options struct {
-	TTL           time.Duration
-	operationGate *boundedcall.Gate
+	TTL            time.Duration
+	operationGate  *boundedcall.Gate
+	operationBytes *bytebudget.Budget
+	onSkip         func(string)
 	// MaxCostBytes caps the in-memory (L1) working set by approximate
 	// payload cost in bytes, evicting least-recently-used entries above
 	// the cap. 0 means unbounded. Each entry is charged a flat per-entry
@@ -70,7 +73,40 @@ func OnEvict(fn func()) Option {
 // BoundedOperations limits olric caller waiting and outstanding operations.
 // Reusing the option shares one admission pool across cache instances.
 // Memory caches ignore it; expired operations may still finish in olric.
-func BoundedOperations(capacity int, budget time.Duration, onFailure func(string)) Option {
-	gate := boundedcall.New(capacity, budget, onFailure)
-	return func(o *Options) { o.operationGate = gate }
+func BoundedOperations(capacity int, budget time.Duration, maxBytes uint64, onFailure func(string), onSkip func(string)) Option {
+	return boundedOperations(boundedcall.New(capacity, budget, onFailure), maxBytes, onSkip)
+}
+
+func boundedOperations(gate *boundedcall.Gate, maxBytes uint64, onSkip func(string)) Option {
+	bytes := bytebudget.New(maxBytes)
+	return func(o *Options) { o.operationGate = gate; o.operationBytes = bytes; o.onSkip = onSkip }
+}
+
+// OperationBytes reports reservations for a shared response admission option.
+func (opt Option) OperationBytes() (reserved, capacity uint64) {
+	if opt == nil {
+		return 0, 0
+	}
+	o := defaultOptions()
+	opt(o)
+	if o.operationBytes == nil {
+		return 0, 0
+	}
+	s := o.operationBytes.Snapshot()
+	return s.Reserved, s.Limit
+}
+
+// CloseOperations stops new admission; admitted workers retain their leases.
+func (opt Option) CloseOperations() {
+	if opt != nil {
+		o := defaultOptions()
+		opt(o)
+		o.operationGate.Close()
+	}
+}
+
+// RecoveringOperations skips repeated backend waits during an outage.
+// State callbacks run synchronously under the gate lock and must not re-enter it.
+func RecoveringOperations(capacity int, budget time.Duration, maxBytes uint64, onFailure func(string), onSkip func(string), onUnavailable func(bool)) Option {
+	return boundedOperations(boundedcall.NewRecovering(capacity, budget, onFailure, onUnavailable), maxBytes, onSkip)
 }

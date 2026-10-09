@@ -4,23 +4,68 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/olric-data/olric"
-	"github.com/olric-data/olric/config"
+	"github.com/vmihailenco/msgpack/v5"
+	"github.com/voluzi/olric"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/bytebudget"
+	"github.com/voluzi/cosmoguard/v6/internal/olricstore"
 )
 
-// Use olric's sanitized engine default; native entry metadata can make the
-// effective value limit slightly smaller than the table size.
-var maxBoundedOlricPayloadBytes = func() int {
-	engine := config.NewEngine()
-	if err := engine.Sanitize(); err != nil {
-		panic(err)
+const maxBoundedOlricPayloadBytes = olricstore.MaxEntryBytes
+const unknownOperationCharge = 8 * olricstore.MaxEntryBytes
+const maxReadOperationCharge = 2*olricstore.MaxEntryBytes + 4096
+
+// CacheEncodedSizer bounds MessagePack bytes before encoding. The encoder also
+// enforces this bound, so an underestimated size cannot escape byte admission.
+type CacheEncodedSizer interface {
+	CacheEncodedSize() uint64
+}
+
+var ErrL2Skipped = errors.New("response L2 insertion skipped")
+var errEncode = errors.New("response encode failed")
+
+type skippedWrite struct{ cause error }
+
+func (e skippedWrite) Error() string   { return ErrL2Skipped.Error() + ": " + e.cause.Error() }
+func (e skippedWrite) Unwrap() []error { return []error{ErrL2Skipped, e.cause} }
+func writeSkipReason(err error) string {
+	switch {
+	case errors.Is(err, boundedcall.ErrUnavailable):
+		return "unavailable"
+	case boundedcall.IsFailure(err):
+		return "inflight"
+	case errors.Is(err, olricstore.ErrCapacity):
+		return "storage_capacity"
+	case errors.Is(err, olric.ErrEntryTooLarge), errors.Is(err, olric.ErrKeyTooLarge):
+		return "entry_size"
+	case errors.Is(err, errEncode):
+		return "encode"
+	default:
+		return "backend"
 	}
-	return int(engine.Config["tableSize"].(uint64))
-}()
+}
+
+// IsExpectedL2Skip reports a write skipped by admission, size or encoding limits.
+func IsExpectedL2Skip(err error) bool {
+	return errors.Is(err, ErrL2Skipped) && writeSkipReason(err) != "backend"
+}
+
+func roundedOperationBytes(n int) uint64 {
+	n = (n + 4095) / 4096 * 4096
+	if n < 4096 {
+		n = 4096
+	}
+	return uint64(n)
+}
+
+func operationCharge(n int) uint64 { return roundedOperationBytes(n) * 8 }
+
+// Reads retain the native entry and decoded payload; the allowance covers metadata.
+func readOperationCharge(n int) uint64 { return roundedOperationBytes(n)*2 + 4096 }
 
 // OlricCache implements Cache[K, V] backed by an olric DMap. The DMap name
 // is the cache namespace, so two cache instances created with different
@@ -79,29 +124,49 @@ func (c *OlricCache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Dur
 	if itemTTL == 0 {
 		itemTTL = c.cfg.TTL
 	}
-
-	payload, err := marshalForOlric(value)
-	if err != nil {
-		return err
-	}
-
-	if c.cfg.operationGate != nil {
-		// Reject before a cancellation-ignoring Put can park an oversized payload.
-		if len(payload) > maxBoundedOlricPayloadBytes {
-			return olric.ErrEntryTooLarge
+	k := c.keyStr(key)
+	skip := func(err error) error {
+		if err == nil {
+			return nil
 		}
-		// An encoder's spare backing capacity must not enlarge parked writes.
-		if cap(payload) > maxBoundedOlricPayloadBytes {
-			compact := make([]byte, len(payload))
-			copy(compact, payload)
-			payload = compact
+		if c.cfg.onSkip != nil {
+			c.cfg.onSkip(writeSkipReason(err))
 		}
+		return skippedWrite{err}
 	}
-
-	_, err = boundedcall.Do(ctx, c.cfg.operationGate, func(opCtx context.Context) (struct{}, error) {
-		return struct{}{}, c.dm.Put(opCtx, c.keyStr(key), payload, olric.EX(itemTTL))
+	if len(k) > 255 {
+		return skip(olric.ErrKeyTooLarge)
+	}
+	maxValue := maxBoundedOlricPayloadBytes - 1 - 29 - len(k)
+	charge := uint64(unknownOperationCharge)
+	if sized, ok := any(value).(CacheEncodedSizer); ok {
+		maxValue = int(min(uint64(maxValue), sized.CacheEncodedSize()))
+		charge = operationCharge(29 + len(k) + maxValue)
+	}
+	if b, ok := any(value).([]byte); ok {
+		if len(b) > maxValue {
+			return skip(olric.ErrEntryTooLarge)
+		}
+		charge = operationCharge(29 + len(k) + len(b))
+	}
+	backendErr, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, charge, func(opCtx context.Context, lease *bytebudget.Lease) (error, error) {
+		payload, err := marshalBounded(value, maxValue)
+		if err != nil {
+			return nil, operationError(err)
+		}
+		if lease != nil {
+			lease.ShrinkTo(operationCharge(29 + len(k) + cap(payload)))
+		}
+		err = operationError(c.dm.Put(opCtx, k, payload, olric.EX(itemTTL)))
+		if errors.Is(err, olricstore.ErrCapacity) {
+			return err, nil
+		}
+		return nil, err
 	})
-	return err
+	if err == nil {
+		err = backendErr
+	}
+	return skip(err)
 }
 
 func (c *OlricCache[K, V]) Get(ctx context.Context, key K) (V, error) {
@@ -124,39 +189,42 @@ func (c *OlricCache[K, V]) GetWithExpiry(ctx context.Context, key K) (V, int64, 
 }
 
 func (c *OlricCache[K, V]) getWithExpiry(ctx context.Context, key K) (V, int64, error) {
-	var zero V
-
-	resp, err := c.get(ctx, key)
-	if err != nil {
+	type result struct {
+		value   V
+		expiry  int64
+		missing bool
+	}
+	r, err := boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, maxReadOperationCharge, func(opCtx context.Context, lease *bytebudget.Lease) (result, error) {
+		k := c.keyStr(key)
+		resp, err := c.dm.Get(opCtx, k)
 		if errors.Is(err, olric.ErrKeyNotFound) {
-			return zero, 0, ErrNotFound
+			return result{missing: true}, nil
 		}
-		return zero, 0, err
+		if err != nil {
+			return result{}, operationError(err)
+		}
+		raw, err := resp.Byte()
+		if err != nil {
+			return result{}, err
+		}
+		if lease != nil {
+			lease.ShrinkTo(readOperationCharge(29 + len(k) + len(raw)))
+		}
+		v, err := unmarshalFromOlric[V](raw)
+		return result{value: v, expiry: resp.TTL()}, boundedcall.HealthyError(err)
+	})
+	if err == nil && r.missing {
+		err = ErrNotFound
 	}
-
-	raw, err := resp.Byte()
-	if err != nil {
-		return zero, 0, err
-	}
-
-	v, err := unmarshalFromOlric[V](raw)
-	return v, resp.TTL(), err
+	return r.value, r.expiry, err
 }
-
 func (c *OlricCache[K, V]) Has(ctx context.Context, key K) (bool, error) {
-	_, err := c.get(ctx, key)
-	if err != nil {
+	return boundedcall.DoWeighted(ctx, c.cfg.operationGate, c.cfg.operationBytes, maxReadOperationCharge, func(opCtx context.Context, _ *bytebudget.Lease) (bool, error) {
+		_, err := c.dm.Get(opCtx, c.keyStr(key))
 		if errors.Is(err, olric.ErrKeyNotFound) {
 			return false, nil
 		}
-		return false, err
-	}
-	return true, nil
-}
-
-func (c *OlricCache[K, V]) get(ctx context.Context, key K) (*olric.GetResponse, error) {
-	return boundedcall.Do(ctx, c.cfg.operationGate, func(opCtx context.Context) (*olric.GetResponse, error) {
-		return c.dm.Get(opCtx, c.keyStr(key))
+		return err == nil, operationError(err)
 	})
 }
 
@@ -169,33 +237,10 @@ func (c *OlricCache[K, V]) keyStr(key K) string {
 	return fmt.Sprintf("%v", key)
 }
 
-// marshalForOlric encodes a value for storage. []byte payloads are passed
-// through directly; everything else goes through msgpack.
-func marshalForOlric(value any) ([]byte, error) {
-	if b, ok := value.([]byte); ok {
-		// Defensive copy: olric writes msgpack-wrapped bytes for non-byte
-		// values, so we mirror the "value is fully owned by olric after
-		// Put" contract by copying. If the caller mutates the slice after
-		// Set, the cached entry stays intact.
-		cp := make([]byte, len(b))
-		copy(cp, b)
-		return cp, nil
-	}
-	return EncodeValue(value)
-}
-
-// unmarshalFromOlric is the inverse of marshalForOlric. When V is []byte we
-// hand back a defensive copy of the payload; otherwise we msgpack-decode
-// into V.
-//
-// The copy matters for embedded-mode reads: olric's GetResponse.Byte() walks
-// through resp.Scan, which for *[]byte aliases the entry's internal buffer
-// (`*v = b` in olric/internal/resp/scan.go) and Entry.Value() returns its
-// stored slice directly. For keys whose partition owner is this pod, the
-// returned []byte therefore shares memory with the cache's in-memory store
-// — a caller that mutates the slice would corrupt the cached value for
-// every subsequent reader. Symmetric to marshalForOlric, which copies on
-// the way in.
+// unmarshalFromOlric copies bytes at the adapter's ownership boundary. Native
+// local reads can alias their table. The slab engine returns owned data, but
+// this adapter also accepts native EmbeddedClients; GetResponse exposes no
+// engine-specific ownership contract.
 func unmarshalFromOlric[V any](raw []byte) (V, error) {
 	var zero V
 	if _, isBytes := any(zero).([]byte); isBytes {
@@ -206,4 +251,62 @@ func unmarshalFromOlric[V any](raw []byte) (V, error) {
 		return any(cp).(V), nil
 	}
 	return DecodeValue[V](raw)
+}
+
+type boundedWriter struct {
+	data  []byte
+	limit int
+}
+
+func (w *boundedWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit-len(w.data) {
+		return 0, olric.ErrEntryTooLarge
+	}
+	n := len(w.data) + len(p)
+	if n > cap(w.data) {
+		capacity := max(4096, cap(w.data)*2, n)
+		capacity = min(capacity, w.limit)
+		b := make([]byte, len(w.data), capacity)
+		copy(b, w.data)
+		w.data = b
+	}
+	w.data = append(w.data, p...)
+	return len(p), nil
+}
+func marshalBounded(value any, limit int) ([]byte, error) {
+	if b, ok := value.([]byte); ok {
+		if len(b) > limit {
+			return nil, olric.ErrEntryTooLarge
+		}
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		return cp, nil
+	}
+	w := boundedWriter{limit: limit}
+	if err := msgpack.NewEncoder(&w).Encode(value); err != nil {
+		if errors.Is(err, olric.ErrEntryTooLarge) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %w", errEncode, err)
+	}
+	return w.data, nil
+}
+
+func operationError(err error) error {
+	// RESP preserves unknown errors as messages, including remote storage skips.
+	if err != nil && !errors.Is(err, olricstore.ErrCapacity) {
+		message := err.Error()
+		capacity := olricstore.ErrCapacity.Error()
+		if message == capacity || strings.HasPrefix(message, capacity+": ") {
+			err = fmt.Errorf("%w: %w", olricstore.ErrCapacity, err)
+		}
+	}
+	if errors.Is(err, olric.ErrOperationTimeout) {
+		return fmt.Errorf("%w: %w", boundedcall.ErrTimeout, err)
+	}
+	switch {
+	case errors.Is(err, olricstore.ErrCapacity), errors.Is(err, olric.ErrEntryTooLarge), errors.Is(err, olric.ErrKeyTooLarge), errors.Is(err, errEncode):
+		return boundedcall.HealthyError(err)
+	}
+	return err
 }

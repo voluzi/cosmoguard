@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olric-data/olric"
+	"github.com/voluzi/olric"
 
-	"github.com/voluzi/cosmoguard/v5/internal/boundedcall"
+	"github.com/voluzi/cosmoguard/v6/internal/boundedcall"
 )
 
 // ReplayStore tracks seen JWT identifiers (`jti` claim) to block
@@ -94,15 +94,19 @@ func (s *memoryReplayStore) gcLoop() {
 const replayOperationBudget = 100 * time.Millisecond
 const replayOperationCapacity = 512
 
-var replayOperations = boundedcall.NewWaiting(replayOperationCapacity, replayOperationBudget, func(outcome string) {
-	recordBackendOperationFailure("replay", outcome)
-})
+// Replay checks each token; outage suppression would broaden fail-open admission.
+func newReplayOperations() *boundedcall.Gate {
+	return boundedcall.NewWaiting(replayOperationCapacity, replayOperationBudget, func(outcome string) {
+		recordBackendOperationFailure("replay", outcome)
+	})
+}
 
 // olricReplayStore uses olric.Put(NX, EX): the partition owner
 // serialises concurrent inserts, making the "seen or store" check
 // atomic across the cluster.
 type olricReplayStore struct {
 	operationGate *boundedcall.Gate
+	ownsGate      bool
 	dm            olric.DMap
 	keyspace      string
 }
@@ -125,8 +129,13 @@ func (s *olricReplayStore) SeenOrStore(ctx context.Context, key string, ttl time
 	return false, err
 }
 
-// Close is a no-op: the embedded olric client is owned by clusterRuntime.
-func (s *olricReplayStore) Close() error { return nil }
+// Close stops owned admission; the embedded client remains owned by its runtime.
+func (s *olricReplayStore) Close() error {
+	if s.ownsGate {
+		s.operationGate.Close()
+	}
+	return nil
+}
 
 // ErrReplay is returned by JWT verification when the token's jti
 // matches a previously-seen one within its TTL.
