@@ -141,7 +141,8 @@ type clusterRuntimeOptions struct {
 	// olric's default DEBUG verbosity drowns the cosmoguard log otherwise.
 	LogOutput io.Writer
 	// StartTimeout bounds startup and loss of coordinator reachability.
-	StartTimeout time.Duration
+	StartTimeout     time.Duration
+	BootstrapTimeout time.Duration
 	// Lookup is the DNS resolver used by the discovery plugin. nil →
 	// defaultLookup. Plumbed for tests so 2-node cluster integration tests
 	// don't depend on the host's resolver.
@@ -370,12 +371,16 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 
 	client := db.NewEmbeddedClient()
 	bootstrapAt := time.Now()
+	bootstrapBudget := opts.BootstrapTimeout
+	if bootstrapBudget == 0 {
+		bootstrapBudget = opts.StartTimeout
+	}
 	quorum := 1
 	password := ""
 	if clustered {
 		quorum, password = opts.Cluster.Quorum, opts.Cluster.EncryptionKey
 	}
-	if err := waitClusterBootstrapProgress(parent, client, opts.StartTimeout, startedAt.Add(bootstrapMaxWait), func(ctx context.Context) bool {
+	if err := waitClusterBootstrapProgress(parent, client, bootstrapBudget, startedAt.Add(bootstrapMaxWait), func(ctx context.Context) bool {
 		return bootstrapCoordinatorReachable(ctx, client, password, quorum)
 	}); err != nil {
 		shutdownCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)

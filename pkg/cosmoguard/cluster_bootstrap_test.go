@@ -117,7 +117,7 @@ func TestClusterRuntimeWaitsForRoutingTable(t *testing.T) {
 		}
 	})
 	go func() {
-		cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 200 * time.Millisecond})
+		cr, err := newClusterRuntime(clusterRuntimeOptions{Cluster: cfg, StartTimeout: 10 * time.Second, BootstrapTimeout: 200 * time.Millisecond})
 		result <- outcome{cr, err}
 	}()
 	var joiner bootstrapMember
