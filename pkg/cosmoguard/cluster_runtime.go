@@ -400,7 +400,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	if workBytes == 0 {
 		workBytes = responseWorkBytes()
 	}
-	cr.responseOperations = cache.RecoveringOperations(l2OperationCapacity, l2OperationBudget, workBytes, func(outcome string) { recordBackendOperationFailure("l2", outcome) }, func(reason string) { l2WriteSkips.WithLabelValues(reason).Inc() }, func(unavailable bool) { recordBackendUnavailable("l2", unavailable) })
+	cr.responseOperations = newResponseOperations(workBytes)
 	cr.limiterOperations = newLimiterOperations()
 	cr.replayOperations = newReplayOperations()
 	cr.removeMetrics = addL2Metrics(cr)
