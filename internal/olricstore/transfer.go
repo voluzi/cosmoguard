@@ -48,41 +48,45 @@ func (t *transfer) Export() ([]byte, int, error) {
 	}
 	defer l.Release()
 	idx := roaring64.New()
-	e.p.mu.Lock()
-	if err := e.readyLocked(); err != nil {
-		e.p.mu.Unlock()
+	p, id, err := func() (nativePack, int, error) {
+		e.p.mu.Lock()
+		defer e.p.mu.Unlock()
+		if err := e.readyLocked(); err != nil {
+			return nativePack{}, 0, err
+		}
+		e.sweepLocked(time.Now().UnixMilli())
+		capacity := min(e.bytes, 256<<10)
+		if e.head != 0 {
+			capacity = max(capacity, len(rawRecord(e.p.arena.block(e.head))))
+		}
+		p := nativePack{Allocated: MaxEntryBytes, State: 2, HKeys: make(map[uint64]uint64, min(e.length, 4096)), Memory: make([]byte, 0, capacity)}
+		e.exportID++
+		id := e.exportID
+		e.exportLow = 0
+		e.exportHigh = 0
+		for loc := e.head; loc != 0; loc = field(e.p.arena.block(loc), 24) {
+			b := e.p.arena.block(loc)
+			raw := rawRecord(b)
+			if len(p.HKeys) > 0 && (len(p.Memory)+len(raw) > 256<<10 || len(p.HKeys) >= 4096) {
+				break
+			}
+			off := uint64(len(p.Memory))
+			p.HKeys[field(b, 0)] = off
+			idx.Add(off)
+			p.Memory = append(p.Memory, raw...)
+			g := field(b, 32)
+			if e.exportLow == 0 {
+				e.exportLow = g
+			}
+			e.exportHigh = g
+		}
+		return p, id, nil
+	}()
+	if err != nil {
 		return nil, 0, err
 	}
-	e.sweepLocked(time.Now().UnixMilli())
-	capacity := min(e.bytes, 256<<10)
-	if e.head != 0 {
-		capacity = max(capacity, len(rawRecord(e.p.arena.block(e.head))))
-	}
-	p := nativePack{Allocated: MaxEntryBytes, State: 2, HKeys: make(map[uint64]uint64, min(e.length, 4096)), Memory: make([]byte, 0, capacity)}
-	e.exportID++
-	id := e.exportID
-	e.exportLow = 0
-	e.exportHigh = 0
-	for loc := e.head; loc != 0; loc = field(e.p.arena.block(loc), 24) {
-		b := e.p.arena.block(loc)
-		raw := rawRecord(b)
-		if len(p.HKeys) > 0 && (len(p.Memory)+len(raw) > 256<<10 || len(p.HKeys) >= 4096) {
-			break
-		}
-		off := uint64(len(p.Memory))
-		p.HKeys[field(b, 0)] = off
-		idx.Add(off)
-		p.Memory = append(p.Memory, raw...)
-		g := field(b, 32)
-		if e.exportLow == 0 {
-			e.exportLow = g
-		}
-		e.exportHigh = g
-	}
-	e.p.mu.Unlock()
 	p.Offset = uint64(len(p.Memory))
 	p.Inuse = p.Offset
-	var err error
 	p.OffsetIndex, err = idx.MarshalBinary()
 	if err != nil {
 		return nil, 0, err

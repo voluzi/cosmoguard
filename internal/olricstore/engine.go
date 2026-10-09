@@ -269,21 +269,24 @@ func (e *Engine) PutRaw(h uint64, b []byte) error {
 	return e.put(h, b, true)
 }
 func (e *Engine) put(h uint64, v []byte, isRaw bool) error {
-	e.p.mu.Lock()
-	err := e.putLocked(h, v)
-	if err == nil && !isRaw {
-		loc, _ := e.findLocked(h)
-		raw := rawRecord(e.p.arena.block(loc))
-		binary.BigEndian.PutUint64(raw[17+int(raw[0]):], uint64(time.Now().UnixNano()))
-	}
-	if errors.Is(err, ErrCapacity) {
-		if isRaw {
-			e.p.rawRejected++
-		} else {
-			e.p.putRejected++
+	err := func() error {
+		e.p.mu.Lock()
+		defer e.p.mu.Unlock()
+		err := e.putLocked(h, v)
+		if err == nil && !isRaw {
+			loc, _ := e.findLocked(h)
+			raw := rawRecord(e.p.arena.block(loc))
+			binary.BigEndian.PutUint64(raw[17+int(raw[0]):], uint64(time.Now().UnixNano()))
 		}
-	}
-	e.p.mu.Unlock()
+		if errors.Is(err, ErrCapacity) {
+			if isRaw {
+				e.p.rawRejected++
+			} else {
+				e.p.putRejected++
+			}
+		}
+		return err
+	}()
 	if errors.Is(err, ErrCapacity) && e.p.observer != nil {
 		path := "put"
 		if isRaw {
@@ -601,9 +604,11 @@ func (e *Engine) ScanRegexMatch(c uint64, match string, n int, f func(storage.En
 	return e.scan(c, n, r, f)
 }
 func (e *Engine) scan(c uint64, n int, r *regexp.Regexp, f func(storage.Entry) bool) (uint64, error) {
-	e.p.mu.Lock()
-	err := e.readyLocked()
-	e.p.mu.Unlock()
+	err := func() error {
+		e.p.mu.Lock()
+		defer e.p.mu.Unlock()
+		return e.readyLocked()
+	}()
 	if err != nil {
 		return 0, err
 	}
