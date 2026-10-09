@@ -64,11 +64,7 @@ type Engine struct {
 var _ storage.Engine = (*Engine)(nil)
 
 func NewPool(limit uint64, policy Policy, observer Observer) *Pool {
-	scratch := uint64(8 << 20)
-	if policy == Security {
-		scratch = 4 << 20
-	}
-	return &Pool{arena: arena{limit: limit}, policy: policy, observer: observer, codec: bytebudget.New(scratch)}
+	return &Pool{arena: arena{limit: limit}, policy: policy, observer: observer, codec: bytebudget.New(2 * codecCharge)}
 }
 func (p *Pool) Close(_ context.Context) error {
 	p.mu.Lock()

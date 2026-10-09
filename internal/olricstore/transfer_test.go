@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +69,53 @@ func TestNativeWireBothDirections(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSecurityTransferExportWhileImportIsActive(t *testing.T) {
+	_, src := testEngine(t, 8<<20, Response)
+	_, dst := testEngine(t, 0, Security)
+	if err := src.Put(1, item("incoming", 100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Put(2, item("outgoing", 100)); err != nil {
+		t.Fatal(err)
+	}
+	data, _, err := src.TransferIterator().Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	done := make(chan error, 1)
+	go func() {
+		done <- dst.Import(data, func(h uint64, v storage.Entry) error {
+			close(entered)
+			<-release
+			return dst.PutRaw(h, v.Encode())
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("import did not enter")
+	}
+	exported, _, err := dst.TransferIterator().Export()
+	unblock()
+	if err != nil {
+		t.Fatal("security export must coexist with import", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	_, receiver := testEngine(t, 0, Security)
+	if err := receiver.Import(exported, func(h uint64, v storage.Entry) error { return receiver.PutRaw(h, v.Encode()) }); err != nil {
+		t.Fatal(err)
+	}
+	if !receiver.Check(2) || !dst.Check(1) {
+		t.Fatal("overlapping transfers lost security records")
 	}
 }
 func TestTransferDropOnlyAcknowledgedGeneration(t *testing.T) {
