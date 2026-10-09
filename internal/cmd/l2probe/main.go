@@ -85,8 +85,11 @@ func run() (result error) {
 	debug.SetMemoryLimit(int64(*limit<<20) * 9 / 10)
 	cosmoguard.SetupRuntimeTuning(slog.Default())
 	budget := (&cosmoguard.CacheGlobalConfig{}).ResolveBudget()
-	memoryPool := cache.NewMemoryPool(budget.L1MaxBytes, budget.L1MaxItems)
-	defer memoryPool.Close()
+	var memoryPool *cache.MemoryPool
+	if *l1 {
+		memoryPool = cache.NewMemoryPool(budget.L1MaxBytes, budget.L1MaxItems)
+		defer memoryPool.Close()
+	}
 	response := olricstore.NewPool(budget.L2MaxBytesPerNode, olricstore.Response, nil)
 	security := olricstore.NewPool(0, olricstore.Security, nil)
 	defer response.Close(context.Background())
