@@ -14,6 +14,16 @@ spec.loader.exec_module(runner)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_generated_values_use_the_environment_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = runner.Run(SimpleNamespace(output=str(Path(directory) / "run"),
+                cpu="200m", memory="250Mi", replica_factor=2, restore_history=False, size=0))
+            run.secret, run.tools, run.workload = "fixture-secret", "fixture-tools", "fixture-guard"
+            values = run.values(4, "10s")
+            self.assertEqual(values["existingSecret"], run.secret)
+            self.assertFalse(values.get("cluster", {}).get("existingEncryptionKeySecret"),
+                "the fixture Secret has CLUSTER_ENCRYPTION_KEY, not encryptionKey")
+
     def test_inventory_writes_only_resource_identities(self):
         kinds = ["Pod", "Service", "Secret", "ConfigMap", "StatefulSet", "ServiceAccount", "NetworkPolicy", "PodDisruptionBudget"]
         items = [{"kind": kind, "metadata": {"namespace": "test", "name": kind.lower(), "uid": "uid-" + kind,

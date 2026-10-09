@@ -137,7 +137,7 @@ class Run:
         http = {"default": "deny", "rules": [sentinel, http_rule]}
         rpc = dict(http, jsonrpc={"default": "deny", "rules": [dict(ordinary, methods=["probe"])]})
         return {"fullnameOverride": self.workload, "replicaCount": 1, "existingSecret": self.secret,
-                "serviceAccount": {"create": False}, "cluster": {"existingEncryptionKeySecret": self.secret},
+                "serviceAccount": {"create": False},
                 "resources": {"limits": {"cpu": self.args.cpu, "memory": self.args.memory},
                               "requests": {"cpu": self.args.cpu, "memory": self.args.memory}},
                 "config": {"enableEvm": maps == 8, "cache": {"key": self.name, "ttl": "10s", "cluster": {
