@@ -107,7 +107,7 @@ defer operations.CloseOperations()
 `BoundedOperations` keeps per-request checks. `RecoveringOperations` adds outage
 suppression; `onUnavailable(bool)` observes transitions. `onFailure` receives
 `timeout`, `rejected`, or `unavailable`. `onSkip` receives `unavailable`, `inflight`, `storage_capacity`, `entry_size`, `backend`, or `encode`.
-`operations.OperationBytes()` returns current and total byte reservations.
+`operations.OperationBytes()` returns current byte reservations and the configured capacity.
 An opaque Olric write-quorum error is `backend`; a failed backup with successful
 quorum can increment storage rejection without producing a caller skip.
 

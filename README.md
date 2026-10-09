@@ -80,8 +80,8 @@ have a 45s default budget. A joiner keeps waiting for routing while its cluster
 has quorum and the coordinator answers authenticated PINGs; 45s without that
 evidence aborts startup. Total bootstrap waiting is capped at ten minutes from
 each runtime constructor's start. SIGTERM cancels startup and shuts down the daemon, so
-it can announce its leave. Embedded tiered writes preserve their existing
-behavior: L2 errors leave L1 untouched. The deprecated rate-limit key is ignored
+it can announce its leave. Tiered writes fill L1 before L2 and retain that entry
+on every L2 failure. The deprecated rate-limit key is ignored
 in every deployment mode.
 
 Go embedders can cancel construction with `NewContext` or `NewFromFileContext`.

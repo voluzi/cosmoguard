@@ -249,7 +249,9 @@ runtime. L1 uses LRU with approximate object/payload costs. A separate security
 pool holds rate-limit buckets, locks, JWT replay and observability records; response
 pressure never evicts those records. The security pool has no finite storage cap.
 
-The automatic budget still comes from the pod's cgroup v1/v2 memory limit:
+The budget comes from the pod's cgroup v1/v2 memory limit. An explicit
+`cache.memory.reserveFraction` uses that fraction × limit as the reserve,
+bypassing the automatic 50% cap. Without an explicit fraction:
 
 ```
 reserve = min(0.50 × limit, max(128 MiB, 0.20 × limit))
