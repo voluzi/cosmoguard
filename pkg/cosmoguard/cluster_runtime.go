@@ -51,9 +51,6 @@ const olricLRUSamples = 10
 
 const bootstrapMaxWait = 10 * time.Minute
 
-// Capture process startup before configuration and daemon construction.
-var processStartedAt = time.Now()
-
 // Standalone members have no clustered peers. Clustered members keep 271.
 const embeddedPartitionCount = 16
 
@@ -376,7 +373,7 @@ func newClusterRuntime(opts clusterRuntimeOptions) (*clusterRuntime, error) {
 	if clustered {
 		quorum, password = opts.Cluster.Quorum, opts.Cluster.EncryptionKey
 	}
-	if err := waitClusterBootstrapProgress(parent, client, opts.StartTimeout, processStartedAt.Add(bootstrapMaxWait), func(ctx context.Context) bool {
+	if err := waitClusterBootstrapProgress(parent, client, opts.StartTimeout, startedAt.Add(bootstrapMaxWait), func(ctx context.Context) bool {
 		return bootstrapCoordinatorReachable(ctx, client, password, quorum)
 	}); err != nil {
 		shutdownCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
@@ -503,7 +500,7 @@ func waitClusterBootstrapProgress(ctx context.Context, client interface {
 				timer.Reset(budget)
 			}
 		case <-hardLimit.C:
-			cause := fmt.Errorf("bootstrap exceeded the 10-minute process startup limit: %w", context.DeadlineExceeded)
+			cause := fmt.Errorf("bootstrap exceeded the 10-minute constructor startup limit: %w", context.DeadlineExceeded)
 			if wasReachable {
 				cause = fmt.Errorf("coordinator was reachable but no routing table arrived: %w", cause)
 			}

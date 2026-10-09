@@ -376,8 +376,8 @@ Olric routing table. `/readyz` returns 503 during construction, then applies the
 existing upstream readiness checks. Discovery and daemon start have a fixed 45s
 budget. A joiner may continue waiting beyond 45s while the advertised cluster has
 quorum and its coordinator answers authenticated PINGs; without that evidence
-startup fails. Total bootstrap waiting has a fixed **10-minute ceiling from process
-startup**, including reachable-coordinator extensions. At that ceiling the process
+startup fails. Total bootstrap waiting has a fixed **10-minute ceiling from each runtime constructor's
+start**, including reachable-coordinator extensions. At that ceiling the process
 exits with a clear error if the coordinator was reachable but no routing table
 arrived, allowing the kubelet to retry the join from scratch. Bootstrap does not wait for all migration to finish. SIGTERM
 cancels construction and cleans up immediately, including Olric's graceful leave.

@@ -274,14 +274,15 @@ func TestClusterBootstrapReachabilityRequiresAuthenticationAndQuorum(t *testing.
 
 func TestClusterBootstrapReachableCoordinatorHasHardDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		processStart := time.Now()
+		time.Sleep(11 * time.Minute)
+		constructorStart := time.Now()
 		time.Sleep(2 * time.Minute)
 		probe := &bootstrapProbe{open: func(int) error { return olric.ErrOperationTimeout }}
 		ctx, cancel := context.WithTimeout(t.Context(), 11*time.Minute)
 		defer cancel()
-		err := waitClusterBootstrapProgress(ctx, probe, 45*time.Second, processStart.Add(bootstrapMaxWait), func(context.Context) bool { return true })
+		err := waitClusterBootstrapProgress(ctx, probe, 45*time.Second, constructorStart.Add(bootstrapMaxWait), func(context.Context) bool { return true })
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		require.ErrorContains(t, err, "coordinator was reachable but no routing table arrived")
-		require.Equal(t, 10*time.Minute, time.Since(processStart))
+		require.Equal(t, 10*time.Minute, time.Since(constructorStart))
 	})
 }
