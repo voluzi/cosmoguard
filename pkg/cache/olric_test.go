@@ -193,6 +193,10 @@ func TestOlricCacheBytesBypass(t *testing.T) {
 	got, err := cache.Get(context.Background(), "k")
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
+	got[0] ^= 0xff
+	again, err := cache.Get(context.Background(), "k")
+	require.NoError(t, err)
+	require.Equal(t, payload, again, "mutating a returned value must not change the native store")
 
 	has, err := cache.Has(context.Background(), "k")
 	require.NoError(t, err)
