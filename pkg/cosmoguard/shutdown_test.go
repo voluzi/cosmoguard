@@ -2,6 +2,7 @@ package cosmoguard
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -84,6 +85,10 @@ func TestRepeatedShutdownHonorsItsCallerDeadline(t *testing.T) {
 
 func TestShutdownRetainsClusterUntilDependentWriteFinishes(t *testing.T) {
 	cr := newEmbeddedClusterRuntimeForTest(t)
+	var logs rateLimitLogBuffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
 	members, err := cr.Client().Members(t.Context())
 	require.NoError(t, err)
 	require.Len(t, members, 1)
@@ -116,4 +121,6 @@ func TestShutdownRetainsClusterUntilDependentWriteFinishes(t *testing.T) {
 	})
 	require.Eventually(t, func() bool { return !listening() }, 5*time.Second, 10*time.Millisecond,
 		"late cleanup did not stop the retained daemon")
+	require.Contains(t, logs.String(), "late olric leave failed")
+	require.Contains(t, logs.String(), context.DeadlineExceeded.Error())
 }

@@ -3,6 +3,7 @@ package cosmoguard
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -69,9 +70,14 @@ func (f *CosmoGuard) shutdown(ctx context.Context, hold bool) error {
 					f.shutdownErr = errors.Join(f.shutdownErr, shutdownTasks(leaveCtx, leave))
 					stopLeave()
 				default:
-					// A native DMap write may ignore cancellation. Retain its runtime until
-					// it returns; late leave still gets the original absolute deadline.
-					go func() { <-dependentDone; _ = leave() }()
+					// Retain Olric for the write without extending the caller's budget.
+					// Late cleanup is best-effort while the process lives; the binary may exit first.
+					go func() {
+						<-dependentDone
+						if err := leave(); err != nil {
+							slog.Error("late olric leave failed", "error", err)
+						}
+					}()
 				}
 			}
 		}()
