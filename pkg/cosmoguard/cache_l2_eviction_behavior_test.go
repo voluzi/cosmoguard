@@ -8,6 +8,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/voluzi/olric"
 )
 
 // TestL2Eviction_CacheEvictsButExemptDMapsDoNot drives a real embedded olric
@@ -85,11 +86,15 @@ func TestL2NativeLRUAndLocalPressureSequence(t *testing.T) {
 	for _, key := range keys[:4] {
 		require.NoError(t, dm.Put(t.Context(), key, make([]byte, 256<<10)))
 	}
-	_, err = dm.Get(t.Context(), keys[3])
+	require.Equal(t, uint64(4), cr.responsePool.Snapshot().Entries)
+	require.Zero(t, cr.responsePool.Snapshot().PressureEvictions)
+	// Four 512KiB blocks plus metadata cross the 32MiB / 16-partition threshold.
+	_, err = dm.Get(t.Context(), keys[0])
 	require.NoError(t, err)
 	require.NoError(t, dm.Put(t.Context(), keys[4], make([]byte, 900<<10)), "native candidate processing must finish before pressure retries")
-	require.Positive(t, cr.responsePool.Snapshot().PressureEvictions)
-	for _, key := range []string{keys[3], keys[4]} {
+	_, err = dm.Get(t.Context(), keys[1])
+	require.ErrorIs(t, err, olric.ErrKeyNotFound)
+	for _, key := range []string{keys[0], keys[4]} {
 		r, err := dm.Get(t.Context(), key)
 		require.NoError(t, err)
 		v, err := r.Byte()
@@ -100,6 +105,7 @@ func TestL2NativeLRUAndLocalPressureSequence(t *testing.T) {
 		}
 		require.Equal(t, make([]byte, want), v)
 	}
+	require.Equal(t, uint64(2), cr.responsePool.Snapshot().PressureEvictions, "native eviction removes one victim before pressure removes two more")
 	for _, name := range evictionExemptDMaps {
 		security, err := cr.Client().NewDMap(name)
 		require.NoError(t, err)
