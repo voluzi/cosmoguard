@@ -243,8 +243,8 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 
 	// Per-request request rewrite: stripped credential headers, anything
 	// else cosmoguard wants to sanitize before upstream sees it. Applied
-	// inside every per-upstream Director by the pool.
-	rewriteDirector := func(r *http.Request) {
+	// inside every per-upstream rewrite by the pool.
+	rewriteRequest := func(r *http.Request) {
 		if proxy.auth != nil {
 			proxy.auth.StripCredentialHeaders(r.Header)
 			proxy.auth.StripCredentialQuery(r)
@@ -261,7 +261,7 @@ func NewHttpProxy(name, localAddr string, nodes []NodeConfig, service string, op
 			WithUpstreamRetries(cfg.UpstreamConfig.Retries.Max),
 		)
 	}
-	pool, err := NewHttpUpstreamPool(nodes, service, rewriteDirector, proxy.log, poolOpts...)
+	pool, err := NewHttpUpstreamPool(nodes, service, rewriteRequest, proxy.log, poolOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -890,7 +890,7 @@ func (p *HttpProxy) getRequestHash(req *http.Request, ruleFingerprint uint64, ke
 	// request forwarded upstream. RequestURI retains the escaped or opaque
 	// target, including ForceQuery, using the transport's URL semantics.
 	// Credential query params are stripped before forwarding (see
-	// rewriteDirector), so they must not split the cache per API key.
+	// rewriteRequest), so they must not split the cache per API key.
 	targetURL := *req.URL
 	query := req.URL.Query()
 	if p.auth != nil {

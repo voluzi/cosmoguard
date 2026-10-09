@@ -450,11 +450,10 @@ func TestHTTPKeyMetadataHostUsesRequestAuthority(t *testing.T) {
 		_, _ = fmt.Fprint(w, r.Host)
 	})
 	upstreams := *p.pool.upstreams.Load()
-	director := upstreams[0].proxy.Director
-	upstreams[0].proxy.Director = func(req *http.Request) {
-		host := req.Host
-		director(req)
-		req.Host = host
+	rewrite := upstreams[0].proxy.Rewrite
+	upstreams[0].proxy.Rewrite = func(req *httputil.ProxyRequest) {
+		rewrite(req)
+		req.Out.Host = req.In.Host
 	}
 	rule := cacheRule(t, &RuleCache{
 		Enable:      true,

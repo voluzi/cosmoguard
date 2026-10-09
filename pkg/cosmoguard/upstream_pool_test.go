@@ -311,6 +311,21 @@ func TestBuildHttpUpstream_HealthcheckService(t *testing.T) {
 	}
 }
 
+func outboundPoolRequest(t *testing.T, u *HttpUpstream, req *http.Request) *http.Request {
+	t.Helper()
+	var outbound *http.Request
+	u.proxy.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		outbound = r
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody}, nil
+	})
+	recorder := httptest.NewRecorder()
+	u.proxy.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || outbound == nil {
+		t.Fatalf("upstream request failed: %d", recorder.Code)
+	}
+	return outbound
+}
+
 func TestBuildHttpUpstream_PlaintextNodePreservesInboundHost(t *testing.T) {
 	node := NodeConfig{Name: "n1", Host: "10.0.0.1", RpcPort: 26657}
 	u, err := buildHttpUpstream(node, serviceRPC, nil)
@@ -320,7 +335,7 @@ func TestBuildHttpUpstream_PlaintextNodePreservesInboundHost(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "http://rpc.public.example/status", nil)
 	req.Header.Set("X-Forwarded-Host", "spoofed.example")
-	u.proxy.Director(req)
+	req = outboundPoolRequest(t, u, req)
 
 	if got, want := req.Host, "rpc.public.example"; got != want {
 		t.Fatalf("Host=%q, want %q", got, want)
@@ -344,7 +359,7 @@ func TestBuildHttpUpstream_URLOverrideUsesUpstreamHost(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "http://rpc.public.example/status", nil)
 	req.Header.Set("X-Forwarded-Host", "spoofed.example")
-	u.proxy.Director(req)
+	req = outboundPoolRequest(t, u, req)
 
 	if got, want := req.Host, "rpc.upstream.example"; got != want {
 		t.Fatalf("Host=%q, want %q", got, want)
@@ -362,7 +377,7 @@ func TestBuildHttpUpstream_TLSNodeUsesUpstreamHost(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "http://rpc.public.example/status", nil)
-	u.proxy.Director(req)
+	req = outboundPoolRequest(t, u, req)
 
 	if got, want := req.Host, "rpc.internal.example:26657"; got != want {
 		t.Fatalf("Host=%q, want %q", got, want)
