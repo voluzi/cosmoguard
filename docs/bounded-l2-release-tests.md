@@ -117,9 +117,13 @@ Reproduce A first. Keep three guard members, four kind nodes, RF2/quorums,
 protocol, load balancing, response headers/bodies, upstream latency and TTL60s
 constant. Separate cold start, at least two TTLs warmup, at least ten TTLs steady
 load and idle drain. Repeat seeds; compare fixed offered load below saturation
-and maximum throughput separately. Count actual upstream receives and matched
-completed requests (`1 - upstream/client`), including errors, timeouts and window
-boundary effects. Hit headers do not count coalescing savings reliably.
+and maximum throughput separately. Calculate successful-response offload as
+`1 - U_s / C_s`, where `C_s` counts validated successful client responses and `U_s` counts the distinct upstream
+fetches that produced those responses (including a fetch shared by coalesced
+requests only once). Match requests and fetches across measurement-window
+boundaries; exclude failed/timed-out client requests from both counts and report
+all request, upstream, error and timeout totals separately. Hit headers do not
+count coalescing savings reliably.
 
 Record rps, p50/p95/p99, throttling, user/system/GC CPU, live heap/goal, RSS,
 cgroup current/peak, GC limiter, goroutines, restarts/OOMs and byte correctness.
