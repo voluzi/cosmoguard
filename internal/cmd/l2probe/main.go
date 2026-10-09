@@ -207,15 +207,8 @@ func run() (result error) {
 		return err
 	}
 	for i, name := range names[:*maps] {
-		seen := map[uint64]bool{}
-		for k := 0; len(seen) < 271; k++ {
-			key := fmt.Sprintf("seed-%d", k)
-			p := xxhash.Sum64String(name+key) % 271
-			if seen[p] {
-				continue
-			}
-			seen[p] = true
-			_ = caches[i].Set(context.Background(), key, []byte("seed"), *ttl)
+		if err := seedResponsePartitions(context.Background(), caches[i], name, *ttl); err != nil {
+			return err
 		}
 	}
 	for _, name := range []string{"ratelimit", "ratelimit-locks", "cosmoguard:jti", "observability"} {
@@ -274,6 +267,22 @@ func run() (result error) {
 		if err := snapshot("idle"); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func seedResponsePartitions(ctx context.Context, cc cache.Cache[string, []byte], name string, ttl time.Duration) error {
+	seen := map[uint64]bool{}
+	for k := 0; len(seen) < 271; k++ {
+		key := fmt.Sprintf("seed-%d", k)
+		p := xxhash.Sum64String(name+key) % 271
+		if seen[p] {
+			continue
+		}
+		if err := cc.Set(ctx, key, []byte("seed"), ttl); err != nil {
+			return fmt.Errorf("seed %s partition %d: %w", name, p, err)
+		}
+		seen[p] = true
 	}
 	return nil
 }
