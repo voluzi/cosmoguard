@@ -94,9 +94,10 @@ memory matrix in the [release procedure](bounded-l2-release-tests.md) passes.
    capped by the caller's deadline, and can report incomplete cleanup rather than
    extending beyond it. Cleanup workers retain ownership until they actually exit.
 
-10. Building or importing the module requires Go 1.26.9 or later. The release
-    image uses Go 1.27.2; these patch versions include the HTTP/2 fix for
-    GO-2026-6617, alongside `golang.org/x/net` v0.60.0.
+10. Building or importing the module requires Go 1.27.3 or later, which the
+    release image also uses. It includes the HTTP/2 fix for GO-2026-6617
+    (alongside `golang.org/x/net` v0.60.0) and the `crypto/x509` distrust of
+    the compromised eMudhra intermediate CAs.
 
 ## HTTP query behavior
 
