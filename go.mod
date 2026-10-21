@@ -2,6 +2,8 @@ module github.com/voluzi/cosmoguard/v6
 
 go 1.26.9
 
+toolchain go1.27.3
+
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/MicahParks/keyfunc/v3 v3.8.0

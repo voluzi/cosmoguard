@@ -100,7 +100,7 @@ jobs:
       # >= 1.27.
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.27.x"
+          go-version: "1.27.3"
           cache: true
 
       # Cap each target at 10s so a regular PR run takes <1 min total; the
