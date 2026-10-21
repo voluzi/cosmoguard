@@ -89,7 +89,7 @@ to isolate a case, and repeat at moderate load with old nodes at their actual
 ## Local release regressions
 
 CI runs the mixed native/custom loopback matrix once on each architecture. Before
-release, run `make test.mixed-engine MIXED_ENGINE_COUNT=10` with Go 1.26.10; this
+release, run `make test.mixed-engine MIXED_ENGINE_COUNT=10` with Go 1.27.3; this
 keeps ten race-detector repetitions as a release gate without multiplying every
 CI run's cluster setup and convergence waits. `make test.bounded-l2` also retains
 ten race repetitions for storage, admission and response cache tests.
