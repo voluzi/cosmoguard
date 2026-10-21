@@ -1,6 +1,6 @@
 module github.com/voluzi/cosmoguard/v6
 
-go 1.26.9
+go 1.26.10
 
 toolchain go1.27.3
 
